@@ -8,8 +8,8 @@ summary: Every pinned toolchain fact blaze has, in one folder: what each file pi
 Every fact blaze takes from the toolchain it is pinned to lives here, once (end-state.md D162).
 Nothing else in the tree keeps a copy. Rust reads these files through `crates/blaze-pins`, which
 parses them at compile time from `include_str!`: a missing or malformed pin fails the build and
-names the file and its line. Python reads them through `harness/toolchain_pins.py`. The flake,
-`tools/nix/units.nix` and CI read the files by path. No script reads a pin from inside a crate.
+names the file and its line. Python reads them through `harness/toolchain_pins.py`. The flake
+and CI read the files by path. No script reads a pin from inside a crate.
 
 `crates/blaze-producers` digests every file under this folder but the `.md` ones into each
 producer's id (the `pins` part of a row). So a change to any pin re-identifies everything blaze produced from it,
