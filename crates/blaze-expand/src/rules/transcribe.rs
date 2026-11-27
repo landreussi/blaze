@@ -94,7 +94,7 @@ impl<'f> Scratch<'f> {
         self.last = 0;
         // The token now last was joined to one let go of: it is last, so `Alone`.
         if let Some(last) = mark.tokens.checked_sub(1)
-            && matches!(out.exp.tokens.tokens()[last].kind, TokenKind::Ident { .. } | TokenKind::Literal { .. })
+            && out.exp.tokens.tokens()[last].kind.spacing() == Spacing::JointHidden
         {
             out.exp.tokens.set_spacing(last, Spacing::Alone);
         }
@@ -186,6 +186,26 @@ fn strip_invisible(view: &View<'_, '_>, toks: Toks) -> Toks {
         return Toks { at: toks.at + 1, end: toks.end - 1 };
     }
     toks
+}
+
+/// Splits leading outer attributes (`#[...]`) off `toks`, returning `(attrs, body)` with
+/// `attrs.end == body.at`. Keeping outer attributes outside the synthetic parentheses of a
+/// `Fragment::Expr` ensures `#[cfg(...)]` attaches to the parenthesized expression itself (e.g.
+/// inside `vec![#[cfg(windows)] "a".parse().unwrap(), ...]`) rather than leaving an empty
+/// `PAREN_EXPR` (`Expr::Missing`) when the `cfg` is false.
+fn split_leading_outer_attrs(view: &View<'_, '_>, toks: Toks) -> (Toks, Toks) {
+    let mut at = toks.at;
+    while at + 1 < toks.end
+        && view.char(at) == Some('#')
+        && view.kind(at + 1) == TokenKind::Open(Delim::Bracket)
+    {
+        let next = view.after_tree(at + 1);
+        if next > toks.end {
+            break;
+        }
+        at = next;
+    }
+    (Toks { at: toks.at, end: at }, Toks { at, end: toks.end })
 }
 
 /// The top-level trees of `toks`, as their first tokens.
@@ -382,8 +402,9 @@ pub(crate) fn transcribe<'f, B: Copying>(
                             }
                         }
                     }
+                    let frame = *scratch.stack.allocator();
                     if !ended
-                        && let Err(error) = integer(scratch, out, count(bindings, binding, 0, depth))
+                        && let Err(error) = integer(scratch, out, count(bindings, binding, 0, depth, frame))
                     {
                         return Ok(Err(error));
                     }
@@ -554,15 +575,36 @@ fn integer(scratch: &mut Scratch<'_>, out: &mut Out<'_, '_>, value: u32) -> Resu
 }
 
 /// `${count(..)}` of a binding at `depth`.
-fn count<B: Values>(bindings: &B, binding: B::Node, depth: u32, max: u32) -> u32 {
+fn count<B: Values>(bindings: &B, binding: B::Node, depth: u32, max: u32, frame: &Frame) -> u32 {
+    let mut stack: Vec<(B::Node, u32, u32, u32), &Frame> = Vec::new_in(frame);
+    let mut total = 0u32;
     match bindings.kind(binding) {
         NodeKind::Nested(len) => match depth == max {
-            true => len,
-            false => (0..len).map(|idx| count(bindings, bindings.child(binding, idx), depth + 1, max)).sum(),
+            true => return len,
+            false => stack.push((binding, depth, 0, len)),
         },
-        NodeKind::Empty => 0,
-        NodeKind::Fragment(_) | NodeKind::Missing(_) => 1,
+        NodeKind::Empty => return 0,
+        NodeKind::Fragment(_) | NodeKind::Missing(_) => return 1,
     }
+    while let Some((node, d, idx, len)) = stack.last_mut() {
+        if *idx >= *len {
+            stack.pop();
+            continue;
+        }
+        let cur = *idx;
+        *idx = cur + 1;
+        let child = bindings.child(*node, cur);
+        let next_d = *d + 1;
+        match bindings.kind(child) {
+            NodeKind::Nested(n) => match next_d == max {
+                true => total += n,
+                false => stack.push((child, next_d, 0, n)),
+            },
+            NodeKind::Empty => {}
+            NodeKind::Fragment(_) | NodeKind::Missing(_) => total += 1,
+        }
+    }
+    total
 }
 
 /// A metavariable's value at the repetitions' current iterations.
@@ -690,21 +732,25 @@ fn var<B: Copying>(
         }
         Value::Fragment(Fragment::Expr(toks)) => {
             let sub = strip_invisible(view, toks);
-            let len = sub.end - sub.at;
+            let (attrs, body) = split_leading_outer_attrs(view, sub);
+            let len = body.end - body.at;
             let negative_literal = len == 2
-                && view.char(sub.at) == Some('-')
-                && matches!(view.kind(sub.at + 1), TokenKind::Literal { .. });
-            let is_leaf = len == 1 && !matches!(view.kind(sub.at), TokenKind::Open(_));
-            let whole = negative_literal && follower != Follower::Postfix;
-            let parenthesized =
-                !(is_leaf || is_group(view, sub) || is_macro_call(view, sub) || whole);
+                && view.char(body.at) == Some('-')
+                && matches!(view.kind(body.at + 1), TokenKind::Literal { .. });
+            let is_leaf = len == 1 && !matches!(view.kind(body.at), TokenKind::Open(_));
+            let whole = attrs.is_empty() && negative_literal && follower != Follower::Postfix;
+            let parenthesized = !body.is_empty()
+                && !(is_leaf || is_group(view, body) || is_macro_call(view, body) || whole);
             if !whole {
                 invisible(scratch, out, true)?;
+            }
+            if !attrs.is_empty() {
+                push_view(scratch, out, view, attrs, true, B::RANGES)?;
             }
             if parenthesized {
                 paren(scratch, out, true)?;
             }
-            push_view(scratch, out, view, sub, true, B::RANGES)?;
+            push_view(scratch, out, view, body, true, B::RANGES)?;
             if parenthesized {
                 paren(scratch, out, false)?;
             }
@@ -833,14 +879,19 @@ fn unsuffixed(kind: TokenKind, text: &str) -> &str {
     }
 }
 
-/// Before a token from `next` is written: the last token written, an identifier or literal, is
-/// made joint with it (`JointHidden`) where [`copy::joint`] says the source had them joint, else
-/// `Alone`. Decided at each write, so a token written again after a truncation
-/// ([`Scratch::truncate`]) decides it again.
+/// Before a token from `next` is written: the last token written (if not a delimiter or a
+/// `Spacing::Joint` punctuation) is made `JointHidden` where [`copy::joint`] says the call's
+/// input had them joint, else `Alone`. Decided at each write, so a token written again after a
+/// truncation ([`Scratch::truncate`]) decides it again.
 fn join_prev(out: &mut Out<'_, '_>, next: TokenOrigin) {
     let Some(prev) = out.exp.tokens.len().checked_sub(1) else { return };
     let kind = out.exp.tokens.tokens()[prev].kind;
-    if !matches!(kind, TokenKind::Ident { .. } | TokenKind::Literal { .. }) {
+    if matches!(
+        kind,
+        TokenKind::Open(_)
+            | TokenKind::Close(_)
+            | TokenKind::Punct { spacing: Spacing::Joint, .. }
+    ) {
         return;
     }
     let a = out.exp.origins[prev];

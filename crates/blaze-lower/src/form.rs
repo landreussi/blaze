@@ -13,7 +13,7 @@ pub use crate::columns::BodyRange;
 use crate::asm::AsmRule;
 use crate::columns::Lens;
 pub use blaze_typeck::{
-    BinOp, BindAnn, ExprId, FloatTy, IntSuffix, IntTy, List, Mutbl, PatId, PathIdx, ScopeId, StmtId, UintTy,
+    BinOp, BindAnn, ExprId, FloatTy, IntSuffix, IntTy, List, LoopCost, Mutbl, PatId, PathIdx, ScopeId, StmtId, UintTy,
     UnOp,
 };
 
@@ -596,6 +596,9 @@ pub enum WherePred {
     /// condition, an anonymous constant of type `bool` over the item's generics (its range
     /// covers the `const` block); the item applies only where it evaluates to `true`.
     Const { cond: ConstIdx },
+    /// `where for<F in fields(T)> F: Bound`: field-quantified bound asserting `bounds` on
+    /// `subject` for every field type `param` of `container`.
+    ForFields { param: NameIdx, container: TypeId, subject: TypeId, bounds: List },
 }
 
 impl WherePred {
@@ -607,6 +610,9 @@ impl WherePred {
             }
             WherePred::Lifetime { name, bounds } => Node { a: name.0, d: bounds.start, e: bounds.len, ..n.with(1) },
             WherePred::Const { cond } => Node { a: cond.0, ..n.with(2) },
+            WherePred::ForFields { param, container, subject, bounds } => {
+                Node { a: param.0, b: container.0, c: subject.0, d: bounds.start, e: bounds.len, ..n.with(3) }
+            }
         }
     }
 
@@ -618,6 +624,12 @@ impl WherePred {
             0 => WherePred::Type { binder: list(n.a, n.b), ty: TypeId(n.c), bounds: list(n.d, n.e) },
             1 => WherePred::Lifetime { name: NameIdx(n.a), bounds: list(n.d, n.e) },
             2 => WherePred::Const { cond: ConstIdx(n.a) },
+            3 => WherePred::ForFields {
+                param: NameIdx(n.a),
+                container: TypeId(n.b),
+                subject: TypeId(n.c),
+                bounds: list(n.d, n.e),
+            },
             _ => return Err(bad("where predicates", n.tag)),
         })
     }
@@ -654,17 +666,25 @@ pub enum TypeRef {
     /// `pattern_type!` expands to in every type position (library/core/src/pat.rs: "Creates a
     /// pattern type. `type Positive = std::pat::pattern_type!(i32 is 1..);`").
     Pat { base: TypeId, pat: TyPat },
+    /// A structural record type (`#![blaze::records]`): `{ name: &str, depth: u32 = 0 }`.
+    /// Each element of `fields` is a [`ROW_FIELD`] row carrying name, type, and optional default.
+    Record(List),
+    /// A structural type set / error union (`#![blaze::error_unions]`): `A | B | C`.
+    /// Each element of the list is a member [`TypeId`].
+    Union(List),
     /// What the lowering cannot make (counted in `unhandled`).
     Error,
 }
 
-/// The pattern of a [`TypeRef::Pat`]: `!null` (core's `NonNull` pointer), or a pattern node
+/// The pattern of a [`TypeRef::Pat`]: `!null` (core's `NonNull` pointer), `in CONST_EXPR`
+/// (a finite const value-set pattern type, e.g. `SemVer is in VERSIONS`), or a pattern node
 /// (a [`Pat::Range`] with optional ends, a [`Pat::Lit`] or [`Pat::NegLit`] standing for
 /// itself, or a [`Pat::Or`] of those): the set the pinned library writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TyPat {
     NotNull,
     Of(PatId),
+    In(ConstIdx),
 }
 
 impl TypeRef {
@@ -695,7 +715,10 @@ impl TypeRef {
             TypeRef::For { binder, inner } => Node { a: binder.start, b: binder.len, c: inner.0, ..n.with(12) },
             TypeRef::Error => n.with(13),
             TypeRef::Pat { base, pat: TyPat::NotNull } => Node { a: base.0, ..n.with(14 | 1 << 8) },
+            TypeRef::Pat { base, pat: TyPat::In(c) } => Node { a: base.0, b: c.0, ..n.with(14 | 2 << 8) },
             TypeRef::Pat { base, pat: TyPat::Of(p) } => Node { a: base.0, b: p.0, ..n.with(14) },
+            TypeRef::Record(l) => Node { a: l.start, b: l.len, ..n.with(15) },
+            TypeRef::Union(l) => Node { a: l.start, b: l.len, ..n.with(16) },
         }
     }
 
@@ -726,8 +749,11 @@ impl TypeRef {
             11 => TypeRef::Macro(RowIdx(n.a)),
             12 => TypeRef::For { binder: list(n.a, n.b), inner: TypeId(n.c) },
             13 => TypeRef::Error,
+            14 if n.flags & (2 << 8) != 0 => TypeRef::Pat { base: TypeId(n.a), pat: TyPat::In(ConstIdx(n.b)) },
             14 if n.flags & (1 << 8) != 0 => TypeRef::Pat { base: TypeId(n.a), pat: TyPat::NotNull },
             14 => TypeRef::Pat { base: TypeId(n.a), pat: TyPat::Of(PatId(n.b)) },
+            15 => TypeRef::Record(list(n.a, n.b)),
+            16 => TypeRef::Union(list(n.a, n.b)),
             _ => return Err(bad("types", n.tag)),
         })
     }
@@ -793,7 +819,7 @@ pub enum Expr {
     Let { pat: PatId, init: ExprId },
     /// `arms` rows of [`Arm`].
     Match { scrutinee: ExprId, arms: List, source: MatchSource },
-    Loop { body: ExprId, source: LoopSource },
+    Loop { body: ExprId, source: LoopSource, cost: LoopCost },
     /// `target` the loop or labelled block it leaves; `None` where there is none (a
     /// diagnostic says so).
     Break { value: Option<ExprId>, target: Option<ExprId> },
@@ -836,6 +862,11 @@ pub enum Expr {
     Underscore,
     /// `operand.await`, in an async body.
     Await(ExprId),
+    /// An anonymous structural record literal (`#![blaze::records]`): `{ name: "x", depth: 2, .. }`.
+    Record { fields: List, base: StructBase },
+    /// Comptime field unrolling (`inline for pat in iter { body }`): preserved intact rather than
+    /// desugared to `IntoIterator` so `front2` can unroll it over each field's concrete type.
+    InlineFor { pat: PatId, iter: ExprId, body: ExprId },
 }
 
 const BIN_OPS: [BinOp; 18] = [
@@ -918,7 +949,9 @@ impl Expr {
             E::Match { scrutinee, arms, source } => {
                 Node { a: scrutinee.0, b: arms.start, c: arms.len, ..n(8).with(match_code(source)) }
             }
-            E::Loop { body, source } => Node { a: body.0, ..n(9).with(loop_code(source)) },
+            E::Loop { body, source, cost } => {
+                Node { a: body.0, ..n(9).with(loop_code(source) | ((cost as u16) << 2)) }
+            }
             E::Break { value, target } => {
                 Node { a: opt(value.map(|e| e.0)), b: opt(target.map(|e| e.0)), ..n(10) }
             }
@@ -960,6 +993,15 @@ impl Expr {
             E::OffsetOf { ty, fields } => Node { a: ty.0, b: fields.start, c: fields.len, ..n(34) },
             E::Underscore => n(35),
             E::Await(e) => Node { a: e.0, ..n(36) },
+            E::Record { fields, base } => {
+                let (k, c) = match base {
+                    StructBase::None => (0, NONE),
+                    StructBase::Expr(e) => (1, e.0),
+                    StructBase::Defaults => (2, NONE),
+                };
+                Node { a: fields.start, b: fields.len, c, ..n(37).with(k) }
+            }
+            E::InlineFor { pat, iter, body } => Node { a: pat.0, b: iter.0, c: body.0, ..n(38) },
         }
     }
 
@@ -996,15 +1038,28 @@ impl Expr {
                     _ => return Err(err),
                 },
             },
-            9 => E::Loop {
-                body: ExprId(n.a),
-                source: match n.flags {
-                    0 => LoopSource::Loop,
-                    1 => LoopSource::While,
-                    2 => LoopSource::ForLoop,
-                    _ => return Err(err),
-                },
-            },
+            9 => {
+                if n.flags & !0x1f != 0 {
+                    return Err(err);
+                }
+                E::Loop {
+                    body: ExprId(n.a),
+                    source: match n.flags & 3 {
+                        0 => LoopSource::Loop,
+                        1 => LoopSource::While,
+                        2 => LoopSource::ForLoop,
+                        _ => return Err(err),
+                    },
+                    cost: match (n.flags >> 2) & 7 {
+                        0 => LoopCost::Normal,
+                        1 => LoopCost::Bounded,
+                        2 => LoopCost::Amortized,
+                        3 => LoopCost::Reset,
+                        4 => LoopCost::Invalid,
+                        _ => return Err(err),
+                    },
+                }
+            }
             10 => E::Break { value: opt_expr(n.a), target: opt_expr(n.b) },
             11 => E::Continue { target: opt_expr(n.b) },
             12 => E::Return { value: opt_expr(n.a) },
@@ -1041,6 +1096,16 @@ impl Expr {
             34 => E::OffsetOf { ty: TypeId(n.a), fields: list(n.b, n.c) },
             35 => E::Underscore,
             36 => E::Await(ExprId(n.a)),
+            37 => E::Record {
+                fields: list(n.a, n.b),
+                base: match n.flags {
+                    0 => StructBase::None,
+                    1 => StructBase::Expr(ExprId(n.c)),
+                    2 => StructBase::Defaults,
+                    _ => return Err(err),
+                },
+            },
+            38 => E::InlineFor { pat: PatId(n.a), iter: ExprId(n.b), body: ExprId(n.c) },
             _ => return Err(err),
         })
     }
@@ -1057,7 +1122,7 @@ pub enum Pat {
     /// `shadows` is the binding of the same name this one hides where it comes into scope. A
     /// bare name that is a constant, a unit struct or a unit variant is never one: the
     /// lowering writes it as a [`Pat::Path`] (machine.rs `settle_patterns`).
-    Bind { ann: BindAnn, name: NameIdx, sub: Option<PatId>, shadows: Option<PatId> },
+    Bind { ann: BindAnn, name: NameIdx, sub: Option<PatId>, shadows: Option<PatId>, ty: Option<TypeId> },
     /// `rest` the position of `..`, if any; `elems` in `ids`.
     Tuple { elems: List, rest: Option<u32> },
     Ref { mutbl: Mutbl, inner: PatId },
@@ -1079,6 +1144,8 @@ pub enum Pat {
     Rest,
     /// A macro call in pattern position: a row of [`MacroCall`].
     MacroCall { row: RowIdx },
+    /// An anonymous structural record pattern (`#![blaze::records]`): `{ name, depth: d, .. }`.
+    Record { fields: List, rest: bool },
 }
 
 fn ann_bits(ann: BindAnn) -> u16 {
@@ -1108,10 +1175,11 @@ impl Pat {
         match self {
             P::Missing => n(0),
             P::Wild => n(1),
-            P::Bind { ann, name, sub, shadows } => Node {
+            P::Bind { ann, name, sub, shadows, ty } => Node {
                 a: name.0,
                 b: opt(sub.map(|p| p.0)),
                 c: opt(shadows.map(|p| p.0)),
+                d: opt(ty.map(|t| t.0)),
                 ..n(2).with(ann_bits(ann))
             },
             P::Tuple { elems, rest } => Node { a: elems.start, b: elems.len, c: opt(rest), ..n(3) },
@@ -1139,6 +1207,7 @@ impl Pat {
             }
             P::Rest => n(14),
             P::MacroCall { row } => Node { a: row.0, ..n(15) },
+            P::Record { fields, rest } => Node { a: fields.start, b: fields.len, ..n(16).with(u16::from(rest)) },
         }
     }
 
@@ -1153,6 +1222,7 @@ impl Pat {
                 name: NameIdx(n.a),
                 sub: unopt(n.b).map(PatId),
                 shadows: unopt(n.c).map(PatId),
+                ty: unopt(n.d).map(TypeId),
             },
             3 => P::Tuple { elems: list(n.a, n.b), rest: unopt(n.c) },
             4 => P::Ref { mutbl: mutbl(n.flags & 1 != 0), inner: PatId(n.a) },
@@ -1167,6 +1237,7 @@ impl Pat {
             13 => P::Range { lo: unopt(n.a).map(PatId), hi: unopt(n.b).map(PatId), inclusive: n.flags & 1 != 0 },
             14 => P::Rest,
             15 => P::MacroCall { row: RowIdx(n.a) },
+            16 => P::Record { fields: list(n.a, n.b), rest: n.flags & 1 != 0 },
             _ => return Err(err),
         })
     }
@@ -1282,7 +1353,7 @@ impl FieldInit {
         Node { a: self.name.0, b: self.expr.0, ..Node::of(ROW_FIELD_INIT).with(self.shorthand as u16) }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<FieldInit, BadRow> {
+    pub fn decode(n: Node) -> Result<FieldInit, BadRow> {
         check_tag!(n, ROW_FIELD_INIT, "field inits");
         Ok(FieldInit { name: NameIdx(n.a), expr: ExprId(n.b), shorthand: n.flags & 1 != 0 })
     }
@@ -1301,7 +1372,7 @@ impl FieldPat {
         Node { a: self.name.0, b: self.pat.0, ..Node::of(ROW_FIELD_PAT).with(self.shorthand as u16) }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<FieldPat, BadRow> {
+    pub fn decode(n: Node) -> Result<FieldPat, BadRow> {
         check_tag!(n, ROW_FIELD_PAT, "field pats");
         Ok(FieldPat { name: NameIdx(n.a), pat: PatId(n.b), shorthand: n.flags & 1 != 0 })
     }

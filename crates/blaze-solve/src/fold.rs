@@ -162,6 +162,16 @@ pub struct Scratch<'a> {
     /// On only while `Solver::why_no` runs, so a rule notes what only its chain reads (a
     /// negative impl naming the goal's type: trait_goals.rs `step_impl`). Not a shortcut.
     pub(crate) why_no: bool,
+    /// Reusable per-step buffers so structural and trait-goal steps do not allocate fresh
+    /// temporary `Vec`s into the body's bump frame on every solver step.
+    pub(crate) auto_tys: Vec<Ty, Alloc<'a>>,
+    pub(crate) auto_reach: Vec<crate::why_no::Reach, Alloc<'a>>,
+    pub(crate) auto_params: Vec<u32, Alloc<'a>>,
+    pub(crate) auto_opaque: Vec<u32, Alloc<'a>>,
+    pub(crate) wf_preds: Vec<crate::term::Pred, Alloc<'a>>,
+    pub(crate) wf_kids: Vec<Ty, Alloc<'a>>,
+    pub(crate) impl_keep: Vec<u32, Alloc<'a>>,
+    pub(crate) prematch_work: Vec<(Ty, Ty), Alloc<'a>>,
 }
 
 impl<'a> Scratch<'a> {
@@ -178,6 +188,14 @@ impl<'a> Scratch<'a> {
             auto: crate::auto_summary::Summaries::new_in(alloc),
             off: crate::eval::Off { summaries: false, prematch: false, memo: false },
             why_no: false,
+            auto_tys: Vec::new_in(alloc),
+            auto_reach: Vec::new_in(alloc),
+            auto_params: Vec::new_in(alloc),
+            auto_opaque: Vec::new_in(alloc),
+            wf_preds: Vec::new_in(alloc),
+            wf_kids: Vec::new_in(alloc),
+            impl_keep: Vec::new_in(alloc),
+            prematch_work: Vec::new_in(alloc),
         }
     }
 
@@ -245,6 +263,8 @@ pub fn rebuild<T: Tys>(tys: &mut T, k: TyKind, kids: &[Ty]) -> Result<Ty, SolveE
     let n = kids.len();
     let k2 = match k {
         TyKind::Tuple(_) => TyKind::Tuple(tys.mk_list(kids)?),
+        TyKind::Record(s, _) => TyKind::Record(s, tys.mk_list(kids)?),
+        TyKind::Union(_) => TyKind::Union(tys.mk_list(kids)?),
         TyKind::Adt(d, _) => TyKind::Adt(d, tys.mk_list(kids)?),
         TyKind::FnDef(d, _) => TyKind::FnDef(d, tys.mk_list(kids)?),
         TyKind::FnPtr(_, h) => TyKind::FnPtr(tys.mk_list(kids)?, h),
@@ -408,6 +428,21 @@ fn import_zero_arity<T: Tys>(
         },
         // Removing the enclosing binder moves variables bound farther out one level closer.
         TyKind::Bound(d, x) if d > depth && !inst.bound.is_empty() => tys.mk(TyKind::Bound(d - 1, x)),
+        TyKind::ReBound(d, x) if d == depth && !inst.bound.is_empty() => match inst.bound.get(x as usize) {
+            Some(&b) => match tys.kind(b) {
+                TyKind::Placeholder(u, i) => tys.mk(TyKind::RePlaceholder(u, i)),
+                TyKind::Infer(_) => tys.mk(TyKind::ReErased),
+                _ => land(tys, s, b, depth),
+            },
+            None => Err(SolveError::Malformed(Malformed::Param {
+                index: x,
+                args: inst.bound.len() as u32,
+                at,
+                goal: None,
+                head: None,
+            })),
+        },
+        TyKind::ReBound(d, x) if d > depth && !inst.bound.is_empty() => tys.mk(TyKind::ReBound(d - 1, x)),
         _ => tys.mk(k),
     }
 }
@@ -651,6 +686,21 @@ pub(crate) fn instantiate_bound<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, root: 
                 Ok(Some(land(tys, s, arg, depth)?))
             }
             TyKind::Bound(d, i) if d > depth => Ok(Some(tys.reindex_bound(t, d - 1, i)?)),
+            TyKind::ReBound(d, i) if d == depth => {
+                if i >= with.len {
+                    return Err(SolveError::Malformed(Malformed::Param {
+                        index: i, args: with.len, at, goal: None, head: None,
+                    }));
+                }
+                let arg = tys.list_get(with, i);
+                let out = match tys.kind(arg) {
+                    TyKind::Placeholder(u, v) => tys.mk(TyKind::RePlaceholder(u, v))?,
+                    TyKind::Infer(_) => tys.mk(TyKind::ReErased)?,
+                    _ => land(tys, s, arg, depth)?,
+                };
+                Ok(Some(out))
+            }
+            TyKind::ReBound(d, i) if d > depth => Ok(Some(tys.mk(TyKind::ReBound(d - 1, i))?)),
             _ => Ok(None),
         }
     })
@@ -663,7 +713,7 @@ pub fn visit<T: Tys>(
     tys: &T,
     work: &mut Vec<(Ty, u32), Alloc<'_>>,
     root: Ty,
-    mut visit: impl FnMut(Ty, TyKind) -> bool,
+    mut f: impl FnMut(Ty, TyKind) -> bool,
 ) -> Result<(), SolveError> {
     let base = work.len();
     work.push((root, 0));
@@ -677,7 +727,7 @@ pub fn visit<T: Tys>(
         }
         let t = tys.shallow_resolve(t);
         let k = tys.kind(t);
-        if !visit(t, k) {
+        if !f(t, k) {
             continue;
         }
         let c = children(k);

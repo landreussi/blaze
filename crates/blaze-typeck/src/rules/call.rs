@@ -36,6 +36,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         for &t in sig.inputs {
             inputs.push(self.lower(sig.types, t, Lower::Args(args), cause)?);
         }
+        if k == self.body.owner && self.inferred_output_ty.is_some() {
+            self.diag(DiagCode::InferredErrorSetCycle, At::of(cause), About::found(self.common.err));
+            let inputs = self.mk_list(&inputs)?;
+            return Ok(Some((inputs, self.common.err)));
+        }
         // A trait fn's `impl Trait` at a concrete `Self` is the impl's type (rules/rpitit_use.rs).
         self.rpitit = self.rpitit_rows(k, sig.types, sig.output, args)?;
         let output = self.lower(sig.types, sig.output, Lower::Args(args), cause);
@@ -63,19 +68,21 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     fn record_lifetime_impls(&mut self, call: ExprId, item: ItemKey, args: TyList, first: usize) -> Result<(), Stop> {
         let preds = self.reads.predicates(item)?;
         for &clause in preds.clauses {
-            let crate::world::PClause::Trait { trait_, args: formal } = clause else { continue };
-            if crate::selected::holds_alias(preds.types, formal, self.alloc)? {
-                continue;
-            }
+            let (trait_, name, formal) = match clause {
+                crate::world::PClause::Trait { trait_, args: formal } => (trait_, None, formal),
+                crate::world::PClause::Projection { trait_, args: formal, name, .. } => (trait_, Some(name), formal),
+                _ => continue,
+            };
             let actual = self.lower_list(preds.types, formal, args, Cause::Expr(call))?;
-            // One row per trait reference at a call: a projection row of the same trait at the
-            // same arguments (`T: Tr` beside `T::Out`) is this bound's row too, since a
-            // projection is proven through its trait reference's source (rustc's next solver:
-            // `NormalizesTo` merges by the trait goal's `TraitGoalProvenVia`), and the borrow
-            // check reads a bound from any row of its trait and self type (blaze-flow-lower
-            // trait_ties.rs `tie_by_impl`). Selecting it twice is work done twice (rule 77).
-            if !self.projected[first..].iter().any(|&(e, tr, _, a)| e == call && tr == trait_ && a == actual) {
-                self.projected.push((call, trait_, None, actual));
+            // One row per trait reference (or projection) at a call: a projection row of the
+            // same trait at the same arguments (`T: Tr` beside `T::Out`) is this bound's row too,
+            // since a projection is proven through its trait reference's source.
+            let dup = match name {
+                None => self.projected[first..].iter().any(|&(e, tr, _, a)| e == call && tr == trait_ && a == actual),
+                Some(n) => self.projected[first..].iter().any(|&(e, tr, m, a)| e == call && tr == trait_ && m == Some(n) && a == actual),
+            };
+            if !dup {
+                self.projected.push((call, trait_, name, actual));
             }
         }
         Ok(())
@@ -168,11 +175,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                             }
                             None => None,
                         },
-                        // Calling through `unsafe extern "C" fn(A, ...)` needs the variable
-                        // arguments' promotions and the variadic call ABI on a fn pointer
-                        // callee (rules/c_variadic.rs reads them from a fn item's signature).
-                        TyView::FnPtr(_, h) if h.c_variadic => {
-                            return Err(crate::error::CheckError::Unported("a call through a C-variadic fn pointer").into());
+                        // Calling through `unsafe extern "C" fn(A, ...)`: extend the formal inputs
+                        // with one fresh variable per extra argument; `check_c_variadic_args` enforces
+                        // C's default argument promotions (E0617) after all arguments are typed.
+                        TyView::FnPtr(l, h) if h.c_variadic => {
+                            let (inputs, output) = self.fn_ptr_sig(l)?;
+                            let inputs = self.c_variadic_extra_inputs(inputs, arg_ids.len())?;
+                            Some((inputs, output))
                         }
                         TyView::FnPtr(l, _) => Some(self.fn_ptr_sig(l)?),
                         TyView::Closure(_, sig) | TyView::ClosureOf { sig, .. } => match self.view(sig) {
@@ -229,7 +238,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     return Ok(Flow::Wait);
                 }
                 // Every argument is typed: the `...` ones are held to C's promotions (E0617).
-                self.check_c_variadic_args(e, arg_ids)?;
+                self.check_c_variadic_args(e, callee, arg_ids)?;
                 // The arguments at legacy const generic positions give the callee's constants.
                 self.bind_legacy_consts(e, callee, arg_ids)?;
                 Ok(Flow::Done(f.u))

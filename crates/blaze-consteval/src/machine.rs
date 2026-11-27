@@ -10,10 +10,11 @@ mod late_tests;
 
 use core::alloc::Allocator;
 
+use blaze_build::vtable::{VtableKey, VtableRef, vtable_key};
 use blaze_build::{InstanceKey, instance_key};
 use blaze_ids::ContentId;
 use blaze_own::{Alloc, Vec};
-use blaze_typeck::{BinOp, FloatTy, IntTy, ItemKey, List, Mutbl, PNode, PTy, PTys, PortableTys, UnOp};
+use blaze_typeck::{AdtKind, BinOp, FloatTy, IntTy, ItemKey, List, Mutbl, Name, PNode, PTy, PTys, PortableTys, UnOp};
 
 pub use code::Codes;
 use code::{Code, CodeTable, EnumFacts, Meta, Num, Op, Reg, TyInfo, Valid};
@@ -24,7 +25,7 @@ use crate::arith::{int_bits, smax, smin, umax};
 use crate::error::{At, ConstError, Op as Arith, PanicPart, Refusal};
 use crate::layout::{self, IntRepr, Layout, LayoutCx};
 use crate::mem::{AllocId, Memory, Origin, PTR, Pointer, Scalar};
-use crate::record::{ConstFn, ConstRecord, DataAlloc, DataRecord, DataReloc, DataTarget, RecordKey};
+use crate::record::{ConstFn, ConstRecord, ConstVtable, DataAlloc, DataRecord, DataReloc, DataTarget, RecordKey};
 use crate::soft::Format;
 use crate::{ConstWorld, Intrinsic, Limits};
 
@@ -97,7 +98,7 @@ const fn unsupported<'a>(what: &'static str) -> Stop<'a> {
 /// (consteval.md, "Seams"): one call per constant used, its record placed as data. `codes` is
 /// the unit's compiled bodies: it lives as long as `ground` and `layout`, whose ids it holds.
 #[allow(clippy::too_many_arguments)]
-pub fn value_of<'a, W: ConstWorld, L: Layout, A: Allocator + Clone>(
+pub fn value_of<'a, W: ConstWorld, L: Layout, A: Allocator + Copy>(
     world: &W,
     layout: &mut L,
     codes: &mut Codes<A>,
@@ -122,7 +123,7 @@ pub fn value_of<'a, W: ConstWorld, L: Layout, A: Allocator + Clone>(
 /// An array length or a const generic argument of type `usize`: the value of the anonymous
 /// const `item` (the length's expression) as a `u64`, and its record to keep. The checker's
 /// seam: `World::const_value` answers from the record ([`len_of`]).
-pub fn eval_len<'a, W: ConstWorld, L: Layout, A: Allocator + Clone>(
+pub fn eval_len<'a, W: ConstWorld, L: Layout, A: Allocator + Copy>(
     world: &W,
     layout: &mut L,
     codes: &mut Codes<A>,
@@ -325,8 +326,10 @@ enum Mode {
     Place,
 }
 
-/// Sentinel for an integer word (no allocation provenance) in a compact [`Pair`].
+/// Sentinel for an integer word (no allocation provenance) in a compact [`Pair`] or no metadata in [`Place`].
 const NO_ALLOC: u32 = u32::MAX;
+/// Sentinel in [`Place::meta_alloc`] for integer metadata (a slice or `str` length).
+const INT_META: u32 = u32::MAX - 1;
 
 /// Two 8-byte scalars (a wide pointer's address and metadata), packed into 24 bytes (align 8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -425,31 +428,77 @@ impl Val {
     }
 }
 
-/// A place: an address, and a length for a slice's or `str`'s.
+/// A place: an address (an allocation and offset, or an integer address with `alloc == NO_ALLOC`
+/// when formed by dereferencing a provenance-free raw pointer), and optional metadata: a length
+/// (`meta_alloc == INT_META`) for a slice or `str`, or a vtable pointer (`meta_alloc < INT_META`)
+/// for a trait object (`dyn Trait`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Place {
-    ptr: Pointer,
+    alloc: u32,
+    meta_alloc: u32,
+    offset: u64,
     meta: u64,
-    has_meta: bool,
 }
 
 impl Place {
     #[inline(always)]
     fn of(ptr: Pointer) -> Place {
-        Place { ptr, meta: 0, has_meta: false }
+        Place { alloc: ptr.alloc.0, meta_alloc: NO_ALLOC, offset: ptr.offset, meta: 0 }
     }
 
     #[inline(always)]
-    fn with_meta(ptr: Pointer, meta: Option<u64>) -> Place {
+    fn encode_meta(meta: Option<Scalar>) -> (u32, u64) {
         match meta {
-            Some(m) => Place { ptr, meta: m, has_meta: true },
-            None => Place { ptr, meta: 0, has_meta: false },
+            None => (NO_ALLOC, 0),
+            Some(Scalar::Int(m)) => (INT_META, u64::try_from(m & u128::from(u64::MAX)).unwrap_or(0)),
+            Some(Scalar::Ptr(p)) => (p.alloc.0, p.offset),
         }
     }
 
     #[inline(always)]
-    fn meta(self) -> Option<u64> {
-        self.has_meta.then_some(self.meta)
+    fn with_meta(ptr: Pointer, meta: Option<Scalar>) -> Place {
+        let (meta_alloc, meta) = Self::encode_meta(meta);
+        Place { alloc: ptr.alloc.0, meta_alloc, offset: ptr.offset, meta }
+    }
+
+    #[inline(always)]
+    fn from_int(addr: u64, meta: Option<Scalar>) -> Place {
+        let (meta_alloc, meta) = Self::encode_meta(meta);
+        Place { alloc: NO_ALLOC, meta_alloc, offset: addr, meta }
+    }
+
+    #[inline(always)]
+    fn ptr(self) -> Result<Pointer, Refusal<'static>> {
+        if self.alloc == NO_ALLOC {
+            Err(Refusal::IntAsPointer)
+        } else {
+            Ok(Pointer { alloc: AllocId(self.alloc), offset: self.offset })
+        }
+    }
+
+    #[inline(always)]
+    fn has_meta(self) -> bool {
+        self.meta_alloc != NO_ALLOC
+    }
+
+    #[inline(always)]
+    fn drop_meta(&mut self) {
+        self.meta_alloc = NO_ALLOC;
+        self.meta = 0;
+    }
+
+    #[inline(always)]
+    fn meta(self) -> Option<Scalar> {
+        match self.meta_alloc {
+            NO_ALLOC => None,
+            INT_META => Some(Scalar::Int(u128::from(self.meta))),
+            a => Some(Scalar::Ptr(Pointer { alloc: AllocId(a), offset: self.meta })),
+        }
+    }
+
+    #[inline(always)]
+    fn len_meta(self) -> Option<u64> {
+        (self.meta_alloc == INT_META).then_some(self.meta)
     }
 }
 
@@ -531,10 +580,18 @@ enum Flow {
 
 const _: () = assert!(core::mem::size_of::<Flow>() <= 8);
 
+/// What a `TypeId` produced during this constant evaluation identifies, for `#[rustc_comptime]`
+/// reflection intrinsics (`core::mem::type_info`).
+#[derive(Clone, Copy, Debug)]
+enum TypeIdTarget {
+    Ty(PTy),
+    Field { base: PTy, variant: u32, field: u32 },
+}
+
 /// The machine's working vectors, kept in [`Codes`] between evaluations of its unit and
 /// borrowed in place (`&mut Work`): each evaluation empties them and keeps their room, so
 /// after the first few nothing grows and nothing moves by value.
-pub(crate) struct Work<K: Allocator + Clone> {
+pub(crate) struct Work<K: Allocator + Copy> {
     mem: Memory<K>,
     frames: Vec<Frame, K>,
     regs: Vec<Out, K>,
@@ -543,15 +600,18 @@ pub(crate) struct Work<K: Allocator + Clone> {
     decoded: Vec<(RecordKey, AllocId), K>,
     statics: Vec<(ItemKey, AllocId), K>,
     fns: Vec<(ConstFn, AllocId), K>,
+    vtables: Vec<(ConstVtable, AllocId), K>,
     /// Cached immutable string/byte-string literal allocations by `(code_idx << 32) | str_idx`.
     strs: Vec<(u64, AllocId), K>,
     /// Cached `type_name::<T>()` allocations by ground `PTy`: `(ty, alloc, len)`.
     type_names: Vec<(PTy, AllocId, u64), K>,
+    /// Map of 128-bit `TypeId` values produced in this evaluation back to their ground type or field.
+    type_ids: Vec<(u128, TypeIdTarget), K>,
     reads: Vec<ContentId, K>,
     entered: Vec<u32, K>,
 }
 
-impl<K: Allocator + Clone> Work<K> {
+impl<K: Allocator + Copy> Work<K> {
     pub(crate) fn new_in(alloc: K) -> Work<K> {
         Work {
             mem: Memory::new_in(0, alloc.clone()),
@@ -562,8 +622,10 @@ impl<K: Allocator + Clone> Work<K> {
             decoded: Vec::new_in(alloc.clone()),
             statics: Vec::new_in(alloc.clone()),
             fns: Vec::new_in(alloc.clone()),
+            vtables: Vec::new_in(alloc),
             strs: Vec::new_in(alloc.clone()),
             type_names: Vec::new_in(alloc.clone()),
+            type_ids: Vec::new_in(alloc),
             reads: Vec::new_in(alloc.clone()),
             entered: Vec::new_in(alloc),
         }
@@ -578,14 +640,16 @@ impl<K: Allocator + Clone> Work<K> {
         self.decoded.clear();
         self.statics.clear();
         self.fns.clear();
+        self.vtables.clear();
         self.strs.clear();
         self.type_names.clear();
+        self.type_ids.clear();
         self.reads.clear();
         self.entered.clear();
     }
 }
 
-struct Machine<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> {
+struct Machine<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> {
     world: &'w W,
     layout: &'l mut L,
     ground: &'g mut PortableTys<'t>,
@@ -597,12 +661,15 @@ struct Machine<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator +
     at: Option<At>,
     /// Parked root return value when `step` returns `Flow::Done`.
     result: Val,
+    /// Minimum log2 alignment from a root place load (e.g. promoted `&ALIGNED_BYTES.bytes`
+    /// inheriting the base struct's alignment at the field's offset).
+    result_align: u8,
     /// Parked stop when `step` returns `Flow::Stop`.
     error: Option<Stop<'a>>,
     plant: Plant,
 }
 
-impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine<'w, 'l, 'g, 't, 'wk, 'a, W, L, K> {
+impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Machine<'w, 'l, 'g, 't, 'wk, 'a, W, L, K> {
     /// A machine borrowing `work` in place, emptied (every evaluation starts from nothing).
     fn new(world: &'w W, layout: &'l mut L, ground: &'g mut PortableTys<'t>, limits: Limits, alloc: Alloc<'a>, work: &'wk mut Work<K>) -> Self {
         work.reset(limits.memory);
@@ -616,6 +683,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             steps: 0,
             at: None,
             result: Val::Zst,
+            result_align: 0,
             error: None,
             plant: Plant::None,
         }
@@ -637,8 +705,8 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
 
     // ---- The evaluation ----
 
-    fn evaluate<A: Allocator + Clone>(&mut self, codes: &mut CodeTable<A>, item: ItemKey, args: List) -> R<'a, ConstRecord<Alloc<'a>>> {
-        let ci = self.code(codes, item, args)?;
+    fn evaluate<A: Allocator + Copy>(&mut self, codes: &mut CodeTable<A>, item: ItemKey, args: List) -> R<'a, ConstRecord<Alloc<'a>>> {
+        let ci = self.code(codes, item, args, &[])?;
         let (code_id, ret) = {
             let c = &codes.list[ci as usize];
             (c.code_id, c.ret)
@@ -655,7 +723,8 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
         let mut reads = Vec::with_capacity_in(self.work.reads.len(), self.alloc);
         reads.extend_from_slice(&self.work.reads);
         let fns = self.fns_named(&data)?;
-        Ok(ConstRecord { key, data, reads, fns })
+        let vtables = self.vtables_named(&data)?;
+        Ok(ConstRecord { key, data, reads, fns, vtables })
     }
 
     /// The instance of each fn word of `data` ([`ConstFn`]), sorted by key, each once: every
@@ -674,13 +743,37 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
         Ok(fns)
     }
 
+    /// The vtable reference of each vtable word of `data` ([`ConstVtable`]), sorted by key,
+    /// each once: every vtable allocation this evaluation made or decoded was made from one
+    /// (`vtable_ptr`), so a word with none is malformed.
+    fn vtables_named(&self, data: &DataRecord<Alloc<'a>>) -> R<'a, Vec<ConstVtable, Alloc<'a>>> {
+        let mut vtables: Vec<ConstVtable, Alloc<'a>> = Vec::new_in(self.alloc);
+        for a in data.allocs.iter() {
+            for r in a.relocs.iter() {
+                let DataTarget::Vtable(key) = r.target else { continue };
+                let Err(at) = vtables.binary_search_by_key(&key, |v| v.key) else { continue };
+                let named = self.work.vtables.iter().find(|(v, _)| v.key == key).ok_or(malformed("a vtable word whose table the evaluation did not make"))?;
+                vtables.insert_shift(at, named.0);
+            }
+        }
+        Ok(vtables)
+    }
+
+    fn vtable_key_of(&mut self, concrete: PTy, principal: ItemKey, args: List) -> R<'a, VtableKey> {
+        let mut args_buf: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
+        args_buf.extend_from_slice(self.ground.view().list(args).map_err(|_| malformed("a trait object's arguments past the ground table"))?);
+        let shape = self.world.code_id(principal);
+        vtable_key(concrete, principal, &args_buf, shape, self.ground, self.alloc)
+            .map_err(|_| malformed("a vtable's types past the ground table"))
+    }
+
     fn instance(&self, item: ItemKey, args: List) -> R<'a, InstanceKey> {
         instance_key(self.world.code_id(item), args, self.ground.view(), self.alloc).map_err(|_| malformed("an instance's arguments past the ground table"))
     }
 
     /// Pushes a frame running code `ci` with registers from `base`; its value goes to the
     /// caller's register `dst`.
-    fn enter<A: Allocator + Clone>(&mut self, codes: &CodeTable<A>, ci: u32, dst: Reg, base: u32) -> R<'a, ()> {
+    fn enter<A: Allocator + Copy>(&mut self, codes: &CodeTable<A>, ci: u32, dst: Reg, base: u32) -> R<'a, ()> {
         if self.work.frames.len() as u32 >= self.limits.depth {
             return Err(Stop::Refused(Refusal::CallDepth { limit: self.limits.depth }));
         }
@@ -707,7 +800,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
     // Not inlined: inside `value_of`'s large frame the loop's values were spilled and reloaded
     // through the stack on every step.
     #[inline(never)]
-    fn run<A: Allocator + Clone>(&mut self, codes: &mut CodeTable<A>) -> R<'a, Val> {
+    fn run<A: Allocator + Copy>(&mut self, codes: &mut CodeTable<A>) -> R<'a, Val> {
         'frame: loop {
             let top = self.work.frames.len().checked_sub(1).ok_or(malformed("no frame"))?;
             let mut f = self.work.frames[top];
@@ -878,13 +971,22 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 self.set(b, dst, Out::Place(pl));
             }
             Op::Static { dst, k } => {
-                let item = code.statics[k as usize];
-                let id = try_step!(self.static_alloc(item));
+                let (item, mutable) = code.statics[k as usize];
+                let id = try_step!(self.static_alloc(item, mutable));
                 self.set(b, dst, Out::Place(Place::of(Pointer { alloc: id, offset: 0 })));
             }
             Op::Load { dst, src, ty } => {
                 let out = match self.work.regs[(b + src) as usize] {
-                    Out::Place(pl) => Out::val(try_step!(self.load_i(pl, code.tys[ty as usize]))),
+                    Out::Place(pl) => {
+                        if self.work.frames.len() == 1
+                            && matches!(usize::try_from(f.pc).ok().and_then(|pc| code.ops.get(pc + 1)), Some(&Op::Ret { src: r }) if r == dst)
+                        {
+                            let ptr = try_step!(pl.ptr());
+                            try_step!(self.ensure_loaded(ptr.alloc));
+                            self.result_align = try_step!(self.place_align_log2(ptr));
+                        }
+                        Out::val(try_step!(self.load_i(pl, code.tys[ty as usize])))
+                    }
                     other => other,
                 };
                 self.set(b, dst, out);
@@ -910,16 +1012,21 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             }
             Op::Borrow { dst, src, meta } => {
                 let mut pl = try_step!(self.place(b, src));
-                match meta {
-                    Meta::Keep => {}
-                    Meta::Drop => pl.has_meta = false,
-                    Meta::Need => {
-                        if !pl.has_meta {
-                            return self.fail(malformed("an unsized place with no length"));
-                        }
+                let raw = match meta {
+                    Meta::Keep => false,
+                    Meta::Drop => {
+                        pl.drop_meta();
+                        false
                     }
-                }
-                let v = try_step!(self.borrow(pl));
+                    Meta::Need => {
+                        if !pl.has_meta() {
+                            return self.fail(malformed("an unsized place with no metadata"));
+                        }
+                        false
+                    }
+                    Meta::Raw => true,
+                };
+                let v = try_step!(self.borrow(pl, raw));
                 self.set(b, dst, Out::val(v));
             }
             Op::Unsize { dst, src, n } => match try_step!(self.val(b, src)).as_scalar() {
@@ -931,6 +1038,43 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 match try_step!(self.val(b, src)).as_scalar() {
                     Some(p) => self.set(b, dst, Out::Pair(Pair::of(p, Scalar::Int(u128::from(n))))),
                     None => return self.fail(malformed("an unsizing coercion of a wide pointer")),
+                }
+            }
+            Op::UnsizeDyn { dst, src, k } => {
+                let Some(&named) = usize::try_from(k).ok().and_then(|i| code.vtables.get(i)) else {
+                    return self.fail(malformed("a trait-object vtable index past the code's table"));
+                };
+                let Some(p) = try_step!(self.val(b, src)).as_scalar() else {
+                    return self.fail(malformed("a trait-object unsizing of a wide pointer"));
+                };
+                let vt = try_step!(self.vtable_ptr(named));
+                self.set(b, dst, Out::Pair(Pair::of(p, Scalar::Ptr(vt))));
+            }
+            Op::UnsizeDynUpcast { dst, src, k } => {
+                let Some(&(principal, args)) = usize::try_from(k).ok().and_then(|i| code.dyn_upcasts.get(i)) else {
+                    return self.fail(malformed("a trait-object upcast index past the code's table"));
+                };
+                let Val::Pair(pair) = try_step!(self.val(b, src)) else {
+                    return self.fail(malformed("a trait-object upcast of a value that is not a wide pointer"));
+                };
+                let Scalar::Ptr(vp) = pair.second() else {
+                    return self.fail(malformed("a trait-object upcast whose metadata is not a vtable pointer"));
+                };
+                let old_key = match try_step!(self.work.mem.get(vp.alloc)).origin {
+                    Origin::Vtable(key) => key,
+                    _ => return self.fail(malformed("a trait-object upcast whose metadata does not point to a vtable")),
+                };
+                let old = match self.work.vtables.iter().find(|(v, _)| v.key == old_key) {
+                    Some(&(named, _)) => named,
+                    None => return self.fail(malformed("a trait-object upcast whose vtable was not registered")),
+                };
+                if old.vtable.principal == principal && old.vtable.args == args {
+                    self.set(b, dst, Out::Pair(pair));
+                } else {
+                    let concrete = old.vtable.concrete;
+                    let key = try_step!(self.vtable_key_of(concrete, principal, args));
+                    let vt = try_step!(self.vtable_ptr(ConstVtable { key, vtable: VtableRef { concrete, principal, args } }));
+                    self.set(b, dst, Out::Pair(Pair::of(pair.first(), Scalar::Ptr(vt))));
                 }
             }
             Op::FnPtr { dst, k } => {
@@ -981,13 +1125,15 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             Op::Field { dst, src, off, tail } => {
                 let pl = try_step!(self.place(b, src));
                 let meta = if tail { pl.meta() } else { None };
-                self.set(b, dst, Out::Place(Place::with_meta(pl.ptr.at(u64::from(off)), meta)));
+                let next = try_step!(self.place_offset(pl, u64::from(off), meta));
+                self.set(b, dst, Out::Place(next));
             }
             Op::FieldWide { dst, src, k, tail } => {
                 let pl = try_step!(self.place(b, src));
                 let off = code.u64s[k as usize];
                 let meta = if tail { pl.meta() } else { None };
-                self.set(b, dst, Out::Place(Place::with_meta(pl.ptr.at(off), meta)));
+                let next = try_step!(self.place_offset(pl, off, meta));
+                self.set(b, dst, Out::Place(next));
             }
             Op::Index { dst, k } => {
                 let idx = code.indexes[k as usize];
@@ -995,27 +1141,33 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 let pl = try_step!(self.place(b, idx.base));
                 let len = match idx.len {
                     Some(n) => n,
-                    None => try_step!(pl.meta().ok_or(malformed("a slice place with no length"))),
+                    None => try_step!(pl.len_meta().ok_or(malformed("a slice place with no length"))),
                 };
                 let Some(i) = i.as_int() else { return self.fail(Stop::Refused(Refusal::PointerAsInt)) };
                 if i >= u128::from(len) {
                     return self.fail(Stop::Refused(Refusal::IndexOutOfBounds { index: i as u64, len }));
                 }
-                self.set(b, dst, Out::Place(Place::of(pl.ptr.at(idx.size * i as u64))));
+                let Some(off) = idx.size.checked_mul(i as u64) else {
+                    return self.fail(Stop::Refused(Refusal::OutOfBounds { offset: u64::MAX, size: 0, len }));
+                };
+                let next = try_step!(self.place_offset(pl, off, None));
+                self.set(b, dst, Out::Place(next));
             }
             Op::FromEnd { dst, src, k } => {
                 let s = code.slice_ops[k as usize];
                 let pl = try_step!(self.place(b, src));
-                let len = try_step!(pl.meta().ok_or(malformed("a slice place with no length")));
+                let len = try_step!(pl.len_meta().ok_or(malformed("a slice place with no length")));
                 let i = try_step!(len.checked_sub(s.back).ok_or(malformed("a slice pattern's element past a slice its length test let through")));
-                self.set(b, dst, Out::Place(Place::of(pl.ptr.at(s.size * i))));
+                let next = try_step!(self.place_offset(pl, s.size * i, None));
+                self.set(b, dst, Out::Place(next));
             }
             Op::Subslice { dst, src, k } => {
                 let s = code.slice_ops[k as usize];
                 let pl = try_step!(self.place(b, src));
-                let len = try_step!(pl.meta().ok_or(malformed("a slice place with no length")));
+                let len = try_step!(pl.len_meta().ok_or(malformed("a slice place with no length")));
                 let left = try_step!(len.checked_sub(s.from + s.back).ok_or(malformed("a slice pattern's `..` past a slice its length test let through")));
-                self.set(b, dst, Out::Place(Place::with_meta(pl.ptr.at(s.size * s.from), Some(left))));
+                let next = try_step!(self.place_offset(pl, s.size * s.from, Some(Scalar::Int(u128::from(left)))));
+                self.set(b, dst, Out::Place(next));
             }
             Op::Build { dst, k } => {
                 let build = code.builds[k as usize];
@@ -1163,21 +1315,25 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             Op::IfLen { place, k, fail } => {
                 let (len, at_least) = code.if_lens[k as usize];
                 let pl = try_step!(self.place(b, place));
-                let have = try_step!(pl.meta().ok_or(malformed("a slice place with no length")));
+                let have = try_step!(pl.len_meta().ok_or(malformed("a slice place with no length")));
                 if if at_least { have < len } else { have != len } {
                     return Flow::Goto(fail);
                 }
             }
             Op::Copy { dst, src, size } => {
                 let (d, s) = (try_step!(self.place(b, dst)), try_step!(self.place(b, src)));
-                try_step!(self.ensure_loaded(s.ptr.alloc));
-                try_step!(self.work.mem.copy(s.ptr, d.ptr, u64::from(size)));
+                let (dp, sp) = (try_step!(d.ptr()), try_step!(s.ptr()));
+                try_step!(self.ensure_loaded(sp.alloc));
+                try_step!(self.ensure_loaded(dp.alloc));
+                try_step!(self.work.mem.copy(sp, dp, u64::from(size)));
             }
             Op::CopyWide { dst, src, k } => {
                 let size = code.u64s[k as usize];
                 let (d, s) = (try_step!(self.place(b, dst)), try_step!(self.place(b, src)));
-                try_step!(self.ensure_loaded(s.ptr.alloc));
-                try_step!(self.work.mem.copy(s.ptr, d.ptr, size));
+                let (dp, sp) = (try_step!(d.ptr()), try_step!(s.ptr()));
+                try_step!(self.ensure_loaded(sp.alloc));
+                try_step!(self.ensure_loaded(dp.alloc));
+                try_step!(self.work.mem.copy(sp, dp, size));
             }
             Op::Late { k } => {
                 // A pending stop made this code incomplete when it was compiled
@@ -1190,20 +1346,32 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
 
     /// A `const fn` call: the callee's code (compiled when first called), its frame, its
     /// arguments in its first registers.
-    fn call<A: Allocator + Clone>(&mut self, codes: &mut CodeTable<A>, f: Frame, dst: Reg, k: u32) -> R<'a, ()> {
-        let (item, args, link) = {
+    fn call<A: Allocator + Copy>(&mut self, codes: &mut CodeTable<A>, f: Frame, dst: Reg, k: u32) -> R<'a, ()> {
+        let (item, args, link, regs) = {
             let c = &codes.list[f.code as usize].calls[k as usize];
-            (c.item, c.args, c.link.get())
+            (c.item, c.args, c.link.get(), c.regs)
         };
         let ci = if link != u32::MAX && codes.list[link as usize].complete {
             link
         } else {
-            let ci = self.code(codes, item, args)?;
+            let reg_start = usize::try_from(regs.0).map_err(|_| malformed("a call's argument register past usize"))?;
+            let reg_len = usize::try_from(regs.1).map_err(|_| malformed("a call's argument count past usize"))?;
+            let reg_end = reg_start.checked_add(reg_len).ok_or(malformed("a call's argument register overflow"))?;
+            let code_idx = usize::try_from(f.code).map_err(|_| malformed("a frame's code index past usize"))?;
+            let arg_regs = codes
+                .list
+                .get(code_idx)
+                .and_then(|c| c.regs_of.get(reg_start..reg_end))
+                .ok_or(malformed("a call's argument registers past its code"))?;
+            let mut param_tys: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(reg_len, self.alloc);
+            for &(_, t) in arg_regs {
+                param_tys.push(t);
+            }
+            let ci = self.code(codes, item, args, &param_tys)?;
             codes.list[f.code as usize].calls[k as usize].link.set(ci);
             ci
         };
         let caller = &codes.list[f.code as usize];
-        let regs = caller.calls[k as usize].regs;
         if regs.1 != codes.list[ci as usize].params {
             return Err(malformed("a call with another count of arguments than parameters"));
         }
@@ -1259,7 +1427,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             }
             PNode::FnPtr(..) => Repr::Scalar(PTR),
             PNode::FnDef(..) | PNode::Never => Repr::Zst,
-            PNode::Str | PNode::Slice(_) => return Err(unsupported("a value of an unsized type")),
+            PNode::Str | PNode::Slice(_) | PNode::Dynamic(_) => return Err(unsupported("a value of an unsized type")),
             _ => match self.size_align(t)?.0 {
                 0 => Repr::Zst,
                 n => Repr::Mem(n),
@@ -1285,10 +1453,28 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
         Ok(TyInfo { repr, size, align, valid })
     }
 
-    /// The ground type of field `field` (of the variant's own numbering) of ADT or tuple `t`.
+    /// The ground type of field `field` (of the variant's own numbering) of ADT, tuple, record or
+    /// structural union `t`.
     fn field_ty(&mut self, t: PTy, variant: u32, field: u32) -> R<'a, PTy> {
         match self.node(t)? {
-            PNode::Tuple(l) => self.ground.view().list(l).ok().and_then(|l| l.get(field as usize).copied()).ok_or(malformed("a tuple field past its tuple")),
+            PNode::Tuple(l) | PNode::Record(_, l) => self
+                .ground
+                .view()
+                .list(l)
+                .ok()
+                .and_then(|l| usize::try_from(field).ok().and_then(|i| l.get(i).copied()))
+                .ok_or(malformed("a tuple field past its tuple")),
+            PNode::Union(l) => {
+                if field != 0 {
+                    return Err(malformed("a union variant field other than 0"));
+                }
+                self.ground
+                    .view()
+                    .list(l)
+                    .ok()
+                    .and_then(|l| usize::try_from(variant).ok().and_then(|i| l.get(i).copied()))
+                    .ok_or(malformed("a union variant past its union"))
+            }
             PNode::Adt(key, args) => {
                 let adt = self.world.adt(key).ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: key }))?;
                 let v = adt.variants.get(variant as usize).ok_or(malformed("a variant past its ADT"))?;
@@ -1328,6 +1514,10 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
     /// A static's or decoded record's allocation, its bytes loaded.
     fn ensure_loaded(&mut self, id: AllocId) -> R<'a, ()> {
         let a = self.work.mem.get(id)?;
+        if a.mut_static {
+            let Origin::Static(item) = a.origin else { return Err(malformed("a mutable static with no item")) };
+            return Err(Stop::Refused(Refusal::MutableStatic { item }));
+        }
         if a.loaded {
             return Ok(());
         }
@@ -1345,22 +1535,33 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
         Ok(self.work.mem.read(p, n)?)
     }
 
+    /// Guaranteed log2 byte alignment of `ptr` within its allocation: the allocation's own
+    /// alignment when `ptr.offset == 0`, otherwise capped by the lowest set bit of `ptr.offset`.
+    fn place_align_log2(&self, ptr: Pointer) -> R<'a, u8> {
+        let src = self.work.mem.get(ptr.alloc)?.align_log2;
+        Ok(if ptr.offset == 0 { src } else { src.min(u8::try_from(ptr.offset.trailing_zeros()).unwrap_or(u8::MAX)) })
+    }
+
     fn load_i(&mut self, pl: Place, t: TyInfo) -> R<'a, Val> {
-        self.ensure_loaded(pl.ptr.alloc)?;
+        let ptr = pl.ptr()?;
+        self.ensure_loaded(ptr.alloc)?;
         Ok(match t.repr {
             Repr::Zst => {
-                self.work.mem.check_access(pl.ptr, 0)?;
+                self.work.mem.check_access(ptr, 0)?;
                 Val::Zst
             }
             Repr::Scalar(n) => {
-                let s = self.work.mem.read(pl.ptr, n)?;
+                let s = self.work.mem.read(ptr, n)?;
                 valid(s, t.valid)?;
                 Val::scalar(s)
             }
-            Repr::Pair => Val::pair(self.work.mem.read(pl.ptr, PTR)?, self.work.mem.read(pl.ptr.at(PTR), PTR)?),
+            Repr::Pair => Val::pair(self.work.mem.read(ptr, PTR)?, self.work.mem.read(ptr.at(PTR), PTR)?),
             Repr::Mem(n) => {
-                let to = self.temp_i(t)?;
-                self.work.mem.copy(pl.ptr, to, n)?;
+                let align = t.align.max(self.place_align_log2(ptr)?);
+                let id = self.work.mem.allocate(t.size, align, true, Origin::Data)?;
+                self.work.temps.push(id);
+                let to = Pointer { alloc: id, offset: 0 };
+                self.work.mem.copy(ptr, to, n)?;
                 Val::Mem(to)
             }
         })
@@ -1372,19 +1573,21 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
     }
 
     fn store_i(&mut self, pl: Place, t: TyInfo, v: Val) -> R<'a, ()> {
+        let ptr = pl.ptr()?;
+        self.ensure_loaded(ptr.alloc)?;
         match (t.repr, v) {
             (Repr::Zst, _) => Ok(()),
             (Repr::Scalar(n), v) => {
                 let Some(s) = v.as_scalar() else { return Err(malformed("a value of another shape than its type")) };
-                Ok(self.work.mem.write(pl.ptr, n, s)?)
+                Ok(self.work.mem.write(ptr, n, s)?)
             }
             (Repr::Pair, Val::Pair(pair)) => {
-                self.work.mem.write(pl.ptr, PTR, pair.first())?;
-                Ok(self.work.mem.write(pl.ptr.at(PTR), PTR, pair.second())?)
+                self.work.mem.write(ptr, PTR, pair.first())?;
+                Ok(self.work.mem.write(ptr.at(PTR), PTR, pair.second())?)
             }
             (Repr::Mem(n), Val::Mem(src)) => {
                 self.ensure_loaded(src.alloc)?;
-                Ok(self.work.mem.copy(src, pl.ptr, n)?)
+                Ok(self.work.mem.copy(src, ptr, n)?)
             }
             _ => Err(malformed("a value of another shape than its type")),
         }
@@ -1405,44 +1608,88 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
         Ok(pl)
     }
 
-    /// The place a pointer value points to; checks the allocation is live.
-    fn deref(&mut self, v: Val) -> R<'a, Place> {
-        let (ptr, meta) = match v {
-            Val::Ptr(p) => (p, None),
-            Val::Pair(pair) => match (pair.first(), pair.second()) {
-                (Scalar::Ptr(p), Scalar::Int(n)) => (p, Some(n as u64)),
-                (Scalar::Int(_), _) => return Err(Stop::Refused(Refusal::IntAsPointer)),
-                _ => return Err(malformed("a dereference of a value that is not a pointer")),
-            },
-            Val::Int(_) | Val::Int128(_) => return Err(Stop::Refused(Refusal::IntAsPointer)),
+    /// The place a pointer value points to. Does not load or read the pointee: `&raw const *p`
+    /// may form a place from a null, integer, uninitialized, or dangling pointer without
+    /// dereferencing it; reads, writes, non-zero projections, and safe references check
+    /// provenance, liveness, and bounds.
+    fn deref(&self, v: Val) -> R<'a, Place> {
+        Ok(match v {
+            Val::Ptr(p) => Place::of(p),
+            Val::Int(addr) => Place::from_int(addr, None),
+            Val::Pair(pair) => {
+                let meta = Some(pair.second());
+                match pair.first() {
+                    Scalar::Ptr(p) => Place::with_meta(p, meta),
+                    Scalar::Int(addr) => {
+                        let addr = u64::try_from(addr).map_err(|_| Stop::Refused(Refusal::IntAsPointer))?;
+                        Place::from_int(addr, meta)
+                    }
+                }
+            }
+            Val::Int128(_) => return Err(Stop::Refused(Refusal::IntAsPointer)),
             _ => return Err(malformed("a dereference of a value that is not a pointer")),
-        };
-        self.ensure_loaded(ptr.alloc)?;
-        if !self.work.mem.get(ptr.alloc)?.live {
-            return Err(Stop::Refused(Refusal::Dangling));
-        }
-        Ok(Place::with_meta(ptr, meta))
+        })
     }
 
-    /// A reference to `pl`. A constant's value used as a place is a fresh temporary at each use
-    /// (the Reference, "Constant items": "constants are essentially inlined wherever they are
-    /// used"; "Temporaries"): borrowing it copies its decoded record into a temporary of its own,
-    /// so two borrows of one constant are two allocations, as two uses may be in the program,
-    /// and a write through `&mut` reaches only its own copy. Reads take the record in place.
-    fn borrow(&mut self, mut pl: Place) -> R<'a, Val> {
-        if self.work.decoded.iter().any(|&(_, id)| id == pl.ptr.alloc) {
+    /// Offsets a place by `off` bytes (field or index projection), replacing its metadata with
+    /// `meta`. A zero-byte projection preserves provenance-free and dangling places as Rust's
+    /// `&raw const (*p).first_field` allows; a non-zero projection requires a live allocation
+    /// and (when its size is loaded) stays within `0..=len`.
+    fn place_offset(&self, pl: Place, off: u64, meta: Option<Scalar>) -> R<'a, Place> {
+        if off == 0 {
+            let (meta_alloc, meta) = Place::encode_meta(meta);
+            return Ok(Place { alloc: pl.alloc, meta_alloc, offset: pl.offset, meta });
+        }
+        let ptr = pl.ptr()?;
+        let a = self.work.mem.get(ptr.alloc)?;
+        if !a.live {
+            return Err(Stop::Refused(Refusal::Dangling));
+        }
+        let new_off = ptr.offset.checked_add(off).ok_or(Stop::Refused(Refusal::OutOfBounds {
+            offset: u64::MAX,
+            size: 0,
+            len: a.len(),
+        }))?;
+        if a.loaded && new_off > a.len() {
+            return Err(Stop::Refused(Refusal::OutOfBounds { offset: new_off, size: 0, len: a.len() }));
+        }
+        Ok(Place::with_meta(Pointer { alloc: ptr.alloc, offset: new_off }, meta))
+    }
+
+    /// A reference (`!raw`) or raw pointer (`raw`) to `pl`. A constant's value used as a place
+    /// is a fresh temporary at each use (the Reference, "Constant items": "constants are
+    /// essentially inlined wherever they are used"; "Temporaries"): borrowing it copies its
+    /// decoded record into a temporary of its own, so two borrows of one constant are two
+    /// allocations, as two uses may be in the program, and a write through `&mut` or `*mut`
+    /// reaches only its own copy. Reads take the record in place.
+    fn borrow(&mut self, mut pl: Place, raw: bool) -> R<'a, Val> {
+        if pl.alloc == NO_ALLOC {
+            if !raw {
+                return Err(Stop::Refused(Refusal::IntAsPointer));
+            }
+            return Ok(match pl.meta() {
+                Some(m) => Val::pair(Scalar::Int(u128::from(pl.offset)), m),
+                None => Val::Int(pl.offset),
+            });
+        }
+        let id = AllocId(pl.alloc);
+        if !raw && !self.work.mem.get(id)?.live {
+            return Err(Stop::Refused(Refusal::Dangling));
+        }
+        if self.work.decoded.iter().any(|&(_, d)| d == id) {
             let (size, align) = {
-                let a = self.work.mem.get(pl.ptr.alloc)?;
+                let a = self.work.mem.get(id)?;
                 (a.len(), a.align_log2)
             };
-            let id = self.work.mem.allocate(size, align, true, Origin::Data)?;
-            self.work.temps.push(id);
-            self.work.mem.copy(Pointer { alloc: pl.ptr.alloc, offset: 0 }, Pointer { alloc: id, offset: 0 }, size)?;
-            pl.ptr.alloc = id;
+            let copy = self.work.mem.allocate(size, align, true, Origin::Data)?;
+            self.work.temps.push(copy);
+            self.work.mem.copy(Pointer { alloc: id, offset: 0 }, Pointer { alloc: copy, offset: 0 }, size)?;
+            pl.alloc = copy.0;
         }
+        let ptr = Pointer { alloc: AllocId(pl.alloc), offset: pl.offset };
         Ok(match pl.meta() {
-            Some(n) => Val::pair(Scalar::Ptr(pl.ptr), Scalar::Int(u128::from(n))),
-            None => Val::Ptr(pl.ptr),
+            Some(m) => Val::pair(Scalar::Ptr(ptr), m),
+            None => Val::Ptr(ptr),
         })
     }
 
@@ -1460,12 +1707,31 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
         Ok(Pointer { alloc: id, offset: 0 })
     }
 
-    fn static_alloc(&mut self, item: ItemKey) -> R<'a, AllocId> {
+    /// The pointer to vtable `named`: one zero-sized allocation per vtable key an evaluation,
+    /// which remembers the table reference so the record can name it ([`ConstVtable`]).
+    fn vtable_ptr(&mut self, named: ConstVtable) -> R<'a, Pointer> {
+        let id = match self.work.vtables.iter().find(|(v, _)| v.key == named.key) {
+            Some(&(_, id)) => id,
+            None => {
+                let id = self.work.mem.allocate(0, 0, false, Origin::Vtable(named.key))?;
+                self.work.vtables.push((named, id));
+                id
+            }
+        };
+        Ok(Pointer { alloc: id, offset: 0 })
+    }
+
+    fn static_alloc(&mut self, item: ItemKey, mutable: bool) -> R<'a, AllocId> {
         if let Some(&(_, id)) = self.work.statics.iter().find(|(k, _)| *k == item) {
+            if mutable {
+                self.work.mem.get_mut(id)?.mut_static = true;
+            }
             return Ok(id);
         }
         let id = self.work.mem.allocate(0, 0, false, Origin::Static(item))?;
-        self.work.mem.get_mut(id)?.loaded = false;
+        let a = self.work.mem.get_mut(id)?;
+        a.loaded = false;
+        a.mut_static = mutable;
         self.work.statics.push((item, id));
         Ok(id)
     }
@@ -1495,14 +1761,15 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             for r in a.relocs.iter() {
                 let target = match r.target {
                     DataTarget::Local(j) => *ids.get(j as usize).ok_or(malformed("a relocation past its record"))?,
-                    DataTarget::Static(k) => self.static_alloc(k)?,
+                    DataTarget::Static(k) => self.static_alloc(k, false)?,
                     DataTarget::Fn(key) => {
                         let named = record.fn_named(key).ok_or(malformed("a record's fn word whose instance the record does not name"))?;
                         self.fn_ptr(named)?.alloc
                     }
-                    // A `&dyn Tr` in a const (codegen.md, "Trait objects"): the builder refuses
-                    // it in a const's record, so none reaches here yet; refused by name.
-                    DataTarget::Vtable(_) => return Err(unsupported("a vtable's address in a constant (a `&dyn` in a const)")),
+                    DataTarget::Vtable(key) => {
+                        let named = record.vtable_named(key).ok_or(malformed("a record's vtable word whose table the record does not name"))?;
+                        self.vtable_ptr(named)?.alloc
+                    }
                 };
                 relocs.push((u64::from(r.offset), target));
             }
@@ -1536,9 +1803,13 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             // No allocation is at address 0, so a pointer into one or one past its end is not
             // null; past that, its address is not known.
             (Scalar::Ptr(p), Scalar::Int(i)) | (Scalar::Int(i), Scalar::Ptr(p)) => {
-                self.ensure_loaded(p.alloc)?;
-                let len = self.work.mem.get(p.alloc)?.len();
-                if i == 0 && p.offset <= len { 0 } else { 2 }
+                if self.work.mem.get(p.alloc)?.mut_static {
+                    if i == 0 && p.offset == 0 { 0 } else { 2 }
+                } else {
+                    self.ensure_loaded(p.alloc)?;
+                    let len = self.work.mem.get(p.alloc)?.len();
+                    if i == 0 && p.offset <= len { 0 } else { 2 }
+                }
             }
             // One allocation: one base, so the addresses differ exactly when the offsets do.
             (Scalar::Ptr(p), Scalar::Ptr(q)) if p.alloc == q.alloc => u128::from(p.offset == q.offset),
@@ -1549,13 +1820,16 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             // with an equal fn, and one past the end of one may be the start of another: not
             // known.
             (Scalar::Ptr(p), Scalar::Ptr(q)) => {
+                if self.work.mem.get(p.alloc)?.mut_static || self.work.mem.get(q.alloc)?.mut_static {
+                    return Ok(2);
+                }
                 self.ensure_loaded(p.alloc)?;
                 self.ensure_loaded(q.alloc)?;
                 let (pa, qa) = (self.work.mem.get(p.alloc)?, self.work.mem.get(q.alloc)?);
                 let own = |a: &crate::mem::Allocation| match a.origin {
                     Origin::Local => a.live,
                     Origin::Static(_) => true,
-                    Origin::Data | Origin::Fn(_) => false,
+                    Origin::Data | Origin::Fn(_) | Origin::Vtable(_) => false,
                 };
                 let inside = p.offset < pa.len() && q.offset < qa.len();
                 if inside && (own(pa) || own(qa)) { 0 } else { 2 }
@@ -1566,12 +1840,28 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
     /// The variant of the enum value at `pl`, its tag read and decoded by `facts`: no layout
     /// lookup.
     fn variant_of(&mut self, pl: Place, facts: &EnumFacts, discrs: &[i128]) -> R<'a, u32> {
+        let ptr = pl.ptr()?;
         let bits = match facts.tag_at() {
-            Some((off, size)) => match self.read(pl.ptr.at(off), size)? {
+            Some((off, size)) => match self.read(ptr.at(off), size)? {
                 Scalar::Int(bits) => bits,
-                _ => return Err(Stop::Refused(Refusal::PointerAsInt)),
+                Scalar::Ptr(p) => {
+                    let in_bounds = if self.work.mem.get(p.alloc)?.mut_static {
+                        p.offset == 0
+                    } else {
+                        self.ensure_loaded(p.alloc)?;
+                        p.offset <= self.work.mem.get(p.alloc)?.len()
+                    };
+                    if in_bounds && let Some(v) = facts.ptr_variant() {
+                        return Ok(v);
+                    }
+                    return Err(Stop::Refused(Refusal::PointerAsInt));
+                }
             },
-            None => 0,
+            None => {
+                self.ensure_loaded(ptr.alloc)?;
+                self.work.mem.check_access(ptr, 0)?;
+                0
+            }
         };
         Ok(facts.variant(bits, discrs)?)
     }
@@ -1674,8 +1964,9 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
         Ok(match (node, v) {
             (PNode::Ref(_, s), Val::Pair(pair)) if self.node(s)? == PNode::Str => {
                 let Scalar::Int(n) = pair.second() else { return Ok(PanicPart::Other) };
-                let pl = self.deref(Val::Pair(pair))?;
-                let slice = self.work.mem.read_bytes(pl.ptr, n as u64)?;
+                let ptr = self.deref(Val::Pair(pair))?.ptr()?;
+                self.ensure_loaded(ptr.alloc)?;
+                let slice = self.work.mem.read_bytes(ptr, n as u64)?;
                 let mut bytes = Vec::with_capacity_in(slice.len(), self.alloc);
                 bytes.extend_from_slice(slice);
                 PanicPart::Str(bytes)
@@ -1719,6 +2010,20 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 let t = t0.ok_or(malformed("`size_of` with no type"))?;
                 let (size, align) = self.size_align(t)?;
                 s(if i == Intrinsic::SizeOf { u128::from(size) } else { 1u128 << align })
+            }
+            Intrinsic::VariantCount => {
+                let t = t0.ok_or(malformed("`variant_count` with no type"))?;
+                let n = match self.ground.view().node(t).map_err(|_| malformed("`variant_count` type"))? {
+                    PNode::Adt(key, _) => {
+                        let adt = self.world.adt(key).ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: key }))?;
+                        match adt.kind {
+                            blaze_typeck::AdtKind::Enum => u128::try_from(adt.variants.len()).unwrap_or(0),
+                            blaze_typeck::AdtKind::Struct | blaze_typeck::AdtKind::Union => 0,
+                        }
+                    }
+                    _ => 0,
+                };
+                s(n)
             }
             // `transmute_unchecked` is `transmute` without the compile-time size check (the
             // pinned core, library/core/src/intrinsics/mod.rs: different sizes are "Undefined
@@ -1828,13 +2133,16 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 let (PNode::Ptr(_, pointee) | PNode::Ref(_, pointee)) = self.node(pt)? else { return Err(malformed("`offset` of a value that is not a pointer")) };
                 let (size, _) = self.size_align(pointee)?;
                 let Val::Ptr(p) = pv else { return Err(Stop::Refused(Refusal::IntAsPointer)) };
-                self.ensure_loaded(p.alloc)?;
-                let len = self.work.mem.get(p.alloc)?.len();
                 let count_signed = if csigned {
                     sext(count, ctbits)
                 } else {
-                    i128::try_from(count).map_err(|_| Stop::Refused(Refusal::OutOfBounds { offset: u64::MAX, size: 0, len }))?
+                    i128::try_from(count).map_err(|_| Stop::Refused(Refusal::OutOfBounds { offset: u64::MAX, size: 0, len: 0 }))?
                 };
+                if count_signed == 0 && self.work.mem.get(p.alloc)?.mut_static {
+                    return Ok(Val::Ptr(p));
+                }
+                self.ensure_loaded(p.alloc)?;
+                let len = self.work.mem.get(p.alloc)?.len();
                 let Some(delta) = count_signed.checked_mul(i128::from(size)) else {
                     return Err(Stop::Refused(Refusal::OutOfBounds { offset: u64::MAX, size: 0, len }));
                 };
@@ -1849,6 +2157,45 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                     return Err(Stop::Refused(Refusal::OutOfBounds { offset: clamped, size: 0, len }));
                 }
                 Ok(Val::Ptr(Pointer { alloc: p.alloc, offset: off as u64 }))
+            }
+            Intrinsic::PtrOffsetFrom | Intrinsic::PtrOffsetFromUnsigned => {
+                let &(av, at) = vals.first().ok_or(malformed("`ptr_offset_from` arguments"))?;
+                let &(bv, _) = vals.get(1).ok_or(malformed("`ptr_offset_from` arguments"))?;
+                let (PNode::Ptr(_, pointee) | PNode::Ref(_, pointee)) = self.node(at)? else {
+                    return Err(malformed("`ptr_offset_from` of a value that is not a pointer"));
+                };
+                let (size, _) = self.size_align(pointee)?;
+                if size == 0 {
+                    return Err(Stop::Refused(Refusal::DivByZero));
+                }
+                let (a_off, b_off) = match (av, bv) {
+                    (Val::Ptr(p), Val::Ptr(q)) => {
+                        if p.alloc != q.alloc {
+                            return Err(Stop::Refused(Refusal::PointerCompare));
+                        }
+                        (p.offset, q.offset)
+                    }
+                    (Val::Int(a), Val::Int(b)) => (a, b),
+                    _ => return Err(Stop::Refused(Refusal::PointerCompare)),
+                };
+                let (bits, _) = info(self, rt)?;
+                if i == Intrinsic::PtrOffsetFromUnsigned {
+                    let Some(diff) = a_off.checked_sub(b_off) else {
+                        return Err(Stop::Refused(Refusal::Overflow { op: Arith::Sub }));
+                    };
+                    if diff % size != 0 {
+                        return Err(Stop::Refused(Refusal::Overflow { op: Arith::Div }));
+                    }
+                    s(mask(u128::from(diff / size), bits))
+                } else {
+                    let diff = i128::from(a_off) - i128::from(b_off);
+                    let sz = i128::from(size);
+                    if diff % sz != 0 {
+                        return Err(Stop::Refused(Refusal::Overflow { op: Arith::Div }));
+                    }
+                    let q = diff / sz;
+                    s(mask(q.cast_unsigned(), bits))
+                }
             }
             Intrinsic::DiscriminantValue => {
                 Err(malformed("`discriminant_value` not compiled to its enum's facts"))
@@ -1936,16 +2283,179 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             // `data` words, little-endian, so `TypeId::as_u128` reads them back whole.
             Intrinsic::TypeId => {
                 let t = t0.ok_or(malformed("`type_id` with no type"))?;
-                let bits = blaze_build::instance::type_id_hash(t, self.ground.view(), self.alloc)
-                    .map_err(|_| unsupported("`type_id` of a type that is not ground (an alias, parameter or inference variable left)"))?;
-                let info = self.tyinfo(rt)?;
-                if info.repr != Repr::Mem(16) {
-                    return Err(malformed("a `type_id` result that is not `TypeId`'s 16 bytes"));
+                let bits = self.record_type_id(t)?;
+                self.write_type_id(bits, rt)
+            }
+            Intrinsic::TypeIdTypeOf => {
+                let tid = self.read_type_id(vals.first().ok_or(malformed("`type_id_type_of` argument"))?.0)?;
+                let ty = self.lookup_type_id_ty(tid)?;
+                self.build_type_info(ty, rt)
+            }
+            Intrinsic::TypeIdVariants => {
+                let tid = self.read_type_id(vals.first().ok_or(malformed("`type_id_variants` argument"))?.0)?;
+                let ty = self.lookup_type_id_ty(tid)?;
+                let n: usize = match self.node(ty)? {
+                    PNode::Adt(k, _) => {
+                        let adt = self
+                            .world
+                            .adt(k)
+                            .ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: k }))?;
+                        match adt.kind {
+                            AdtKind::Enum => adt.variants.len(),
+                            AdtKind::Struct | AdtKind::Union => 1,
+                        }
+                    }
+                    PNode::Tuple(_) | PNode::Record(..) => 1,
+                    _ => 0,
+                };
+                s(u128::try_from(n).unwrap_or(0))
+            }
+            Intrinsic::TypeIdFields => {
+                let tid = self.read_type_id(vals.first().ok_or(malformed("`type_id_fields` arguments"))?.0)?;
+                let ty = self.lookup_type_id_ty(tid)?;
+                let v_ix = usize::try_from(int(1)?).map_err(|_| malformed("`type_id_fields` variant index overflow"))?;
+                let n: u32 = match self.node(ty)? {
+                    PNode::Adt(k, _) => {
+                        let adt = self
+                            .world
+                            .adt(k)
+                            .ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: k }))?;
+                        let v = adt.variants.get(v_ix).ok_or(Stop::Refused(Refusal::OutOfBounds {
+                            offset: u64::try_from(v_ix).unwrap_or(u64::MAX),
+                            size: 1,
+                            len: u64::try_from(adt.variants.len()).unwrap_or(u64::MAX),
+                        }))?;
+                        v.fields.len
+                    }
+                    PNode::Tuple(l) | PNode::Record(_, l) => {
+                        if v_ix != 0 {
+                            return Err(Stop::Refused(Refusal::OutOfBounds { offset: u64::try_from(v_ix).unwrap_or(u64::MAX), size: 1, len: 1 }));
+                        }
+                        l.len
+                    }
+                    _ => {
+                        if v_ix != 0 {
+                            return Err(Stop::Refused(Refusal::OutOfBounds { offset: u64::try_from(v_ix).unwrap_or(u64::MAX), size: 1, len: 1 }));
+                        }
+                        0
+                    }
+                };
+                s(u128::from(n))
+            }
+            Intrinsic::TypeIdFieldRepresentingType => {
+                let tid = self.read_type_id(vals.first().ok_or(malformed("`type_id_field_representing_type` arguments"))?.0)?;
+                let base = self.lookup_type_id_ty(tid)?;
+                let variant = u32::try_from(int(1)?).map_err(|_| malformed("`type_id_field_representing_type` variant overflow"))?;
+                let field = u32::try_from(int(2)?).map_err(|_| malformed("`type_id_field_representing_type` field overflow"))?;
+                let field_count = match self.node(base)? {
+                    PNode::Adt(k, _) => {
+                        let adt = self
+                            .world
+                            .adt(k)
+                            .ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: k }))?;
+                        let v_ix = usize::try_from(variant).map_err(|_| malformed("variant index"))?;
+                        let v = adt.variants.get(v_ix).ok_or(Stop::Refused(Refusal::OutOfBounds {
+                            offset: u64::from(variant),
+                            size: 1,
+                            len: u64::try_from(adt.variants.len()).unwrap_or(u64::MAX),
+                        }))?;
+                        v.fields.len
+                    }
+                    PNode::Tuple(l) | PNode::Record(_, l) => {
+                        if variant != 0 {
+                            return Err(Stop::Refused(Refusal::OutOfBounds { offset: u64::from(variant), size: 1, len: 1 }));
+                        }
+                        l.len
+                    }
+                    _ => return Err(Stop::Refused(Refusal::OutOfBounds { offset: u64::from(field), size: 1, len: 0 })),
+                };
+                if field >= field_count {
+                    return Err(Stop::Refused(Refusal::OutOfBounds {
+                        offset: u64::from(field),
+                        size: 1,
+                        len: u64::from(field_count),
+                    }));
                 }
-                let p = self.temp_i(info)?;
-                self.work.mem.write(p, 8, Scalar::Int(bits & u128::from(u64::MAX)))?;
-                self.work.mem.write(p.at(8), 8, Scalar::Int(bits >> 64))?;
-                Ok(Val::Mem(p))
+                let frt_bits = frt_hash(tid, variant, field);
+                if !self.work.type_ids.iter().any(|&(k, _)| k == frt_bits) {
+                    self.work.type_ids.push((frt_bits, TypeIdTarget::Field { base, variant, field }));
+                }
+                self.write_type_id(frt_bits, rt)
+            }
+            Intrinsic::FieldRepresentingTypeActualTypeId => {
+                let frt = self.read_type_id(vals.first().ok_or(malformed("`field_representing_type_actual_type_id` argument"))?.0)?;
+                let (base, variant, field) = self.lookup_type_id_field(frt)?;
+                let ft = self.field_ty(base, variant, field)?;
+                let bits = self.record_type_id(ft)?;
+                self.write_type_id(bits, rt)
+            }
+            Intrinsic::FieldRepresentingTypeOffset => {
+                let frt = self.read_type_id(vals.first().ok_or(malformed("`field_representing_type_offset` argument"))?.0)?;
+                let (base, variant, field) = self.lookup_type_id_field(frt)?;
+                let off = self.field_offset(base, variant, field)?;
+                s(u128::from(off))
+            }
+            Intrinsic::TypeIdIsSigned => {
+                let tid = self.read_type_id(vals.first().ok_or(malformed("`type_id_is_signed` argument"))?.0)?;
+                let ty = self.lookup_type_id_ty(tid)?;
+                s(u128::from(matches!(self.node(ty)?, PNode::Int(_))))
+            }
+            Intrinsic::TypeIdArrayLen => {
+                let tid = self.read_type_id(vals.first().ok_or(malformed("`type_id_array_len` argument"))?.0)?;
+                let ty = self.lookup_type_id_ty(tid)?;
+                let len = match self.node(ty)? {
+                    PNode::Array(_, n) => u128::from(self.len(n)?),
+                    _ => 0,
+                };
+                s(len)
+            }
+            Intrinsic::TypeIdElementTy => {
+                let tid = self.read_type_id(vals.first().ok_or(malformed("`type_id_element_ty` argument"))?.0)?;
+                let ty = self.lookup_type_id_ty(tid)?;
+                let elem = match self.node(ty)? {
+                    PNode::Array(elem, _) | PNode::Slice(elem) => Some(elem),
+                    _ => None,
+                };
+                self.build_option_type_id(rt, elem)
+            }
+            Intrinsic::TypeIdSizeOf => {
+                let tid = self.read_type_id(vals.first().ok_or(malformed("`type_id_size_of` argument"))?.0)?;
+                let ty = self.lookup_type_id_ty(tid)?;
+                if layout::is_unsized(self.world, self.ground, ty, self.alloc)? {
+                    self.build_option_val(rt, None)
+                } else {
+                    let (sz, _) = self.size_align(ty)?;
+                    self.build_option_val(rt, Some(Val::Int(sz)))
+                }
+            }
+            Intrinsic::TypeIdPointsTo => {
+                let tid = self.read_type_id(vals.first().ok_or(malformed("`type_id_points_to` argument"))?.0)?;
+                let ty = self.lookup_type_id_ty(tid)?;
+                let pointee = match self.node(ty)? {
+                    PNode::Ref(_, p) | PNode::Ptr(_, p) => Some(p),
+                    _ => None,
+                };
+                self.build_option_type_id(rt, pointee)
+            }
+            Intrinsic::TypeIdPointsMutably => {
+                let tid = self.read_type_id(vals.first().ok_or(malformed("`type_id_points_mutably` argument"))?.0)?;
+                let ty = self.lookup_type_id_ty(tid)?;
+                s(u128::from(matches!(self.node(ty)?, PNode::Ref(Mutbl::Mut, _) | PNode::Ptr(Mutbl::Mut, _))))
+            }
+            Intrinsic::AssertInhabited | Intrinsic::AssertZeroValid | Intrinsic::AssertMemUninitializedValid => {
+                let t = t0.ok_or(malformed("validity assertion type argument"))?;
+                let check = blaze_build::intrinsics::validity::Check::of(i).ok_or(malformed("validity assertion"))?;
+                let ok = self.permits(check, t)?;
+                if !ok {
+                    let (pre, post) = check.message();
+                    let mut text = Vec::with_capacity_in(pre.len() + post.len(), self.alloc);
+                    text.extend_from_slice(pre.as_bytes());
+                    text.extend_from_slice(post.as_bytes());
+                    let mut parts = Vec::with_capacity_in(1, self.alloc);
+                    parts.push(PanicPart::Str(text));
+                    return Err(Stop::Refused(Refusal::Panic { parts }));
+                }
+                Ok(Val::Zst)
             }
             // blaze's `blaze_int_cast::<S, D>(x)` (library/core/src/intrinsics/mod.rs): "`x as D`
             // between two integer types of any width ... it truncates to `D`'s width, or extends
@@ -1954,6 +2464,81 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 let (from, to) = (t0.ok_or(malformed("`blaze_int_cast` types"))?, t1.ok_or(malformed("`blaze_int_cast` types"))?);
                 let ((fb, fs), (tb, _)) = (info(self, from)?, info(self, to)?);
                 s(blaze_build::intrinsics::int_cast_bits(int(0)?, fb, fs, tb))
+            }
+            // blaze's structural reflection intrinsics: the one rule in blaze-build intrinsics.rs
+            // (`field_count`, `records_disjoint`, `record_schema_id`).
+            Intrinsic::BlazeFieldCount => {
+                let t = t0.ok_or(malformed("`blaze_field_count` with no type"))?;
+                let count = blaze_build::intrinsics::field_count(t, self.ground.view(), self.world).map_err(|e| match e {
+                    blaze_build::intrinsics::FieldCountError::MissingType => malformed("`blaze_field_count` of a type not in the ground table"),
+                    blaze_build::intrinsics::FieldCountError::NoAdt(item) => Stop::Refused(Refusal::Missing { what: "ADT definition", item }),
+                })?;
+                s(u128::from(count))
+            }
+            Intrinsic::BlazeRecordsDisjoint => {
+                let (a, b) = (t0.ok_or(malformed("`blaze_records_disjoint` types"))?, t1.ok_or(malformed("`blaze_records_disjoint` types"))?);
+                let disjoint = blaze_build::intrinsics::records_disjoint(a, b, self.ground.view()).map_err(|e| match e {
+                    blaze_build::intrinsics::DisjointError::MissingType => malformed("`blaze_records_disjoint` of a type not in the ground table"),
+                    blaze_build::intrinsics::DisjointError::MissingRecordNames => malformed("`blaze_records_disjoint` of a record without registered schema field names"),
+                })?;
+                s(u128::from(disjoint))
+            }
+            Intrinsic::BlazeRecordSchemaId => {
+                let t = t0.ok_or(malformed("`blaze_record_schema_id` with no type"))?;
+                let id = blaze_build::intrinsics::record_schema_id(t, self.ground.view())
+                    .ok_or(malformed("`blaze_record_schema_id` of a type not in the ground table"))?;
+                s(u128::from(id))
+            }
+            Intrinsic::BlazeIsEnum => {
+                let t = t0.ok_or(malformed("`blaze_is_enum` with no type"))?;
+                let yes = blaze_build::intrinsics::is_enum(t, self.ground.view(), self.world).map_err(|e| match e {
+                    blaze_build::intrinsics::FieldCountError::MissingType => malformed("`blaze_is_enum` of a type not in the ground table"),
+                    blaze_build::intrinsics::FieldCountError::NoAdt(item) => Stop::Refused(Refusal::Missing { what: "ADT definition", item }),
+                })?;
+                s(u128::from(yes))
+            }
+            Intrinsic::BlazeIsUnitEnum => {
+                let t = t0.ok_or(malformed("`blaze_is_unit_enum` with no type"))?;
+                let yes = blaze_build::intrinsics::is_unit_enum(t, self.ground.view(), self.world).map_err(|e| match e {
+                    blaze_build::intrinsics::FieldCountError::MissingType => malformed("`blaze_is_unit_enum` of a type not in the ground table"),
+                    blaze_build::intrinsics::FieldCountError::NoAdt(item) => Stop::Refused(Refusal::Missing { what: "ADT definition", item }),
+                })?;
+                s(u128::from(yes))
+            }
+            Intrinsic::BlazeVariantCount => {
+                let t = t0.ok_or(malformed("`blaze_variant_count` with no type"))?;
+                let count = blaze_build::intrinsics::variant_count(t, self.ground.view(), self.world).map_err(|e| match e {
+                    blaze_build::intrinsics::FieldCountError::MissingType => malformed("`blaze_variant_count` of a type not in the ground table"),
+                    blaze_build::intrinsics::FieldCountError::NoAdt(item) => Stop::Refused(Refusal::Missing { what: "ADT definition", item }),
+                })?;
+                s(u128::from(count))
+            }
+            Intrinsic::BlazeVariantName => {
+                let t = t0.ok_or(malformed("`blaze_variant_name` with no type"))?;
+                let raw_idx = int(0)?;
+                let mut text = blaze_own::String::new_in(self.alloc);
+                if let Some(PNode::Adt(adt_key, _)) = self.ground.view().get(t).copied()
+                    && let Ok(v_idx) = u32::try_from(raw_idx)
+                {
+                    let adt = self
+                        .world
+                        .adt(adt_key)
+                        .ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: adt_key }))?;
+                    if adt.kind == blaze_typeck::AdtKind::Enum && usize::try_from(v_idx).is_ok_and(|ix| ix < adt.variants.len()) {
+                        let names = self
+                            .world
+                            .type_names()
+                            .ok_or(unsupported("`blaze_variant_name` in a world that names no items (`ConstWorld::type_names`)"))?;
+                        let _ = names.variant_name(adt_key, v_idx, &mut |s| text.push_str(s));
+                    }
+                }
+                let len = u64::try_from(text.len()).unwrap_or(0);
+                let id = self.work.mem.allocate(len, 0, true, Origin::Data)?;
+                if len > 0 {
+                    self.work.mem.fill(id, text.as_bytes(), &[])?;
+                }
+                self.work.mem.get_mut(id)?.mutable = false;
+                Ok(Val::pair(Scalar::Ptr(Pointer { alloc: id, offset: 0 }), Scalar::Int(u128::from(len))))
             }
             // `raw_eq::<T>(a, b)` ("Determines whether the raw bytes of the two values are
             // equal") and `compare_bytes(left, right, bytes)` ("Lexicographically compare ... as
@@ -1965,7 +2550,9 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                     Intrinsic::RawEq => self.size_align(t0.ok_or(malformed("`raw_eq` with no type"))?)?.0,
                     _ => u64::try_from(int(2)?).map_err(|_| malformed("a `usize` past 64 bits"))?,
                 };
-                let (pa, pb) = (self.deref(a)?.ptr, self.deref(b)?.ptr);
+                let (pa, pb) = (self.deref(a)?.ptr()?, self.deref(b)?.ptr()?);
+                self.ensure_loaded(pa.alloc)?;
+                self.ensure_loaded(pb.alloc)?;
                 let left = self.work.mem.read_bytes(pa, n)?;
                 let right = self.work.mem.read_bytes(pb, n)?;
                 let order = blaze_build::intrinsics::byte_order(left, right);
@@ -1974,9 +2561,260 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                     _ => s(u128::from(order as u32)),
                 }
             }
+            // The pinned core (library/core/src/intrinsics/mod.rs): `read_via_copy::<T>(ptr)` is
+            // the implementation detail of `core::ptr::read`, a bitwise copy of `*ptr` of type
+            // `T`. A zero-sized read through a non-null, aligned integer pointer (e.g.
+            // `NonNull::dangling()`) succeeds without touching memory; null or unaligned integer
+            // pointers, dangling allocations, out-of-bounds, uninit scalars, and invalid scalar
+            // values are refused.
+            Intrinsic::ReadViaCopy => {
+                let t = t0.ok_or(malformed("`read_via_copy` with no type"))?;
+                let (v, _) = *vals.first().ok_or(malformed("`read_via_copy` with no pointer"))?;
+                let pl = self.deref(v)?;
+                let info = self.tyinfo(t)?;
+                if info.repr == Repr::Zst && pl.alloc == NO_ALLOC {
+                    let (_, align_log2) = self.size_align(t)?;
+                    let align = 1u64 << align_log2;
+                    if pl.offset == 0 || !pl.offset.is_multiple_of(align) {
+                        return Err(Stop::Refused(Refusal::IntAsPointer));
+                    }
+                    return Ok(Val::Zst);
+                }
+                self.load_i(pl, info)
+            }
+            Intrinsic::WriteBytes => {
+                let t = t0.ok_or(malformed("`write_bytes` with no type"))?;
+                let (dst, _) = *vals.first().ok_or(malformed("`write_bytes` arguments"))?;
+                let byte = u8::try_from(int(1)? & 0xff).unwrap_or(0);
+                let count = u64::try_from(int(2)?).map_err(|_| malformed("`write_bytes` count past 64 bits"))?;
+                let (size, align_log2) = self.size_align(t)?;
+                let total = size.checked_mul(count).ok_or(Stop::Refused(Refusal::OutOfBounds {
+                    offset: u64::MAX,
+                    size,
+                    len: 0,
+                }))?;
+                let pl = self.deref(dst)?;
+                if total == 0 {
+                    if pl.alloc == NO_ALLOC {
+                        let align = 1u64 << align_log2;
+                        if pl.offset == 0 || !pl.offset.is_multiple_of(align) {
+                            return Err(Stop::Refused(Refusal::IntAsPointer));
+                        }
+                    }
+                    return Ok(Val::Zst);
+                }
+                let p = pl.ptr()?;
+                self.ensure_loaded(p.alloc)?;
+                self.work.mem.memset(p, total, byte)?;
+                Ok(Val::Zst)
+            }
+            Intrinsic::CopyNonoverlapping | Intrinsic::Copy => {
+                let t = t0.ok_or(malformed("`copy` / `copy_nonoverlapping` with no type"))?;
+                let (src, _) = *vals.first().ok_or(malformed("`copy` arguments"))?;
+                let (dst, _) = *vals.get(1).ok_or(malformed("`copy` arguments"))?;
+                let count = u64::try_from(int(2)?).map_err(|_| malformed("`copy` count past 64 bits"))?;
+                let (size, align_log2) = self.size_align(t)?;
+                let total = size.checked_mul(count).ok_or(Stop::Refused(Refusal::OutOfBounds {
+                    offset: u64::MAX,
+                    size,
+                    len: 0,
+                }))?;
+                let ps_pl = self.deref(src)?;
+                let pd_pl = self.deref(dst)?;
+                if total == 0 {
+                    let align = 1u64 << align_log2;
+                    for pl in [ps_pl, pd_pl] {
+                        if pl.alloc == NO_ALLOC && (pl.offset == 0 || !pl.offset.is_multiple_of(align)) {
+                            return Err(Stop::Refused(Refusal::IntAsPointer));
+                        }
+                    }
+                    return Ok(Val::Zst);
+                }
+                let ps = ps_pl.ptr()?;
+                let pd = pd_pl.ptr()?;
+                self.ensure_loaded(ps.alloc)?;
+                self.ensure_loaded(pd.alloc)?;
+                if i == Intrinsic::CopyNonoverlapping
+                    && ps.alloc == pd.alloc
+                    && ps.offset < pd.offset.saturating_add(total)
+                    && pd.offset < ps.offset.saturating_add(total)
+                {
+                    return Err(Stop::Refused(Refusal::Unreachable));
+                }
+                self.work.mem.copy(ps, pd, total)?;
+                Ok(Val::Zst)
+            }
             // A row of the table the evaluator does not compute: refused by its name.
             other => Err(unsupported(other.entry().name)),
         }
+    }
+
+    fn record_type_id(&mut self, t: PTy) -> R<'a, u128> {
+        let bits = blaze_build::instance::type_id_hash(t, self.ground.view(), self.alloc)
+            .map_err(|_| unsupported("`type_id` of a type that is not ground (an alias, parameter or inference variable left)"))?;
+        if !self.work.type_ids.iter().any(|&(k, _)| k == bits) {
+            self.work.type_ids.push((bits, TypeIdTarget::Ty(t)));
+        }
+        Ok(bits)
+    }
+
+    fn write_type_id(&mut self, bits: u128, rt: PTy) -> R<'a, Val> {
+        let info = self.tyinfo(rt)?;
+        if info.repr != Repr::Mem(16) {
+            return Err(malformed("a `type_id` result that is not `TypeId`'s 16 bytes"));
+        }
+        let p = self.temp_i(info)?;
+        self.work.mem.write(p, 8, Scalar::Int(bits & u128::from(u64::MAX)))?;
+        self.work.mem.write(p.at(8), 8, Scalar::Int(bits >> 64))?;
+        Ok(Val::Mem(p))
+    }
+
+    fn read_type_id(&mut self, v: Val) -> R<'a, u128> {
+        let Val::Mem(p) = v else {
+            return Err(malformed("a `TypeId` argument that is not 16 bytes in memory"));
+        };
+        self.ensure_loaded(p.alloc)?;
+        let bytes = self.work.mem.read_bytes(p, 16)?;
+        let arr: [u8; 16] = bytes.try_into().map_err(|_| malformed("a `TypeId` not 16 bytes"))?;
+        Ok(u128::from_le_bytes(arr))
+    }
+
+    fn lookup_type_id_ty(&self, bits: u128) -> R<'a, PTy> {
+        match self.work.type_ids.iter().find(|&&(k, _)| k == bits).map(|&(_, v)| v) {
+            Some(TypeIdTarget::Ty(ty)) => Ok(ty),
+            Some(TypeIdTarget::Field { .. }) => Err(malformed("expected a type's `TypeId`, found a `FieldRepresentingType`")),
+            None => Err(unsupported("a `TypeId` whose type was not produced in this constant evaluation")),
+        }
+    }
+
+    fn lookup_type_id_field(&self, bits: u128) -> R<'a, (PTy, u32, u32)> {
+        match self.work.type_ids.iter().find(|&&(k, _)| k == bits).map(|&(_, v)| v) {
+            Some(TypeIdTarget::Field { base, variant, field }) => Ok((base, variant, field)),
+            Some(TypeIdTarget::Ty(_)) => Err(malformed("expected a `FieldRepresentingType` `TypeId`, found a type")),
+            None => Err(unsupported("a `FieldRepresentingType` `TypeId` not produced in this constant evaluation")),
+        }
+    }
+
+    fn option_variants(&self, rt: PTy) -> R<'a, (u32, u32)> {
+        let PNode::Adt(opt_key, _) = self.node(rt)? else {
+            return Err(malformed("an `Option` reflection result that is not an ADT"));
+        };
+        let adt = self
+            .world
+            .adt(opt_key)
+            .ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: opt_key }))?;
+        let none_v = adt
+            .variants
+            .iter()
+            .position(|v| v.name == Name::of("None"))
+            .or_else(|| adt.variants.iter().position(|v| v.fields.len == 0))
+            .ok_or(malformed("`Option` without a `None` variant"))?;
+        let some_v = adt
+            .variants
+            .iter()
+            .position(|v| v.name == Name::of("Some"))
+            .or_else(|| adt.variants.iter().position(|v| v.fields.len == 1))
+            .ok_or(malformed("`Option` without a `Some` variant"))?;
+        let none_v = u32::try_from(none_v).map_err(|_| malformed("variant index overflow"))?;
+        let some_v = u32::try_from(some_v).map_err(|_| malformed("variant index overflow"))?;
+        Ok((none_v, some_v))
+    }
+
+    fn build_option_val(&mut self, rt: PTy, payload: Option<Val>) -> R<'a, Val> {
+        let (none_v, some_v) = self.option_variants(rt)?;
+        let v_idx = if payload.is_some() { some_v } else { none_v };
+        let info = self.tyinfo(rt)?;
+        let p = self.temp_i(info)?;
+        if let Some(val) = payload {
+            let ft = self.field_ty(rt, some_v, 0)?;
+            let off = self.field_offset(rt, some_v, 0)?;
+            self.store(Place::of(p.at(off)), ft, val)?;
+        }
+        let tag = {
+            let (mut cx, l) = self.cx();
+            l.tag_write(rt, v_idx, &mut cx)?
+        };
+        if let Some(w) = tag {
+            self.work.mem.write(p.at(w.offset), w.size, Scalar::Int(w.value))?;
+        }
+        self.load_i(Place::of(p), info)
+    }
+
+    fn build_option_type_id(&mut self, rt: PTy, inner: Option<PTy>) -> R<'a, Val> {
+        let payload = match inner {
+            Some(t) => {
+                let (_, some_v) = self.option_variants(rt)?;
+                let ft = self.field_ty(rt, some_v, 0)?;
+                let bits = self.record_type_id(t)?;
+                Some(self.write_type_id(bits, ft)?)
+            }
+            None => None,
+        };
+        self.build_option_val(rt, payload)
+    }
+
+    fn build_type_info(&mut self, ty: PTy, rt: PTy) -> R<'a, Val> {
+        let want = match self.node(ty)? {
+            PNode::Tuple(_) => Name::of("Tuple"),
+            PNode::Array(..) => Name::of("Array"),
+            PNode::Slice(_) => Name::of("Slice"),
+            PNode::Dynamic(_) => Name::of("DynTrait"),
+            PNode::Adt(k, _) => {
+                let adt = self
+                    .world
+                    .adt(k)
+                    .ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: k }))?;
+                match adt.kind {
+                    AdtKind::Struct => Name::of("Struct"),
+                    AdtKind::Enum => Name::of("Enum"),
+                    AdtKind::Union => Name::of("Union"),
+                }
+            }
+            PNode::Bool => Name::of("Bool"),
+            PNode::Char => Name::of("Char"),
+            PNode::Int(_) | PNode::Uint(_) => Name::of("Int"),
+            PNode::Float(_) => Name::of("Float"),
+            PNode::Str => Name::of("Str"),
+            PNode::Ref(..) => Name::of("Reference"),
+            PNode::Ptr(..) => Name::of("Pointer"),
+            PNode::FnPtr(..) => Name::of("FnPtr"),
+            _ => Name::of("Other"),
+        };
+        let kind_ty = self.field_ty(rt, 0, 0)?;
+        let kind_off = self.field_offset(rt, 0, 0)?;
+        let PNode::Adt(kind_key, _) = self.node(kind_ty)? else {
+            return Err(malformed("`Type::kind` is not an ADT"));
+        };
+        let kind_adt = self
+            .world
+            .adt(kind_key)
+            .ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: kind_key }))?;
+        let v_idx = kind_adt
+            .variants
+            .iter()
+            .position(|v| v.name == want)
+            .ok_or(malformed("`TypeKind` lacks the expected variant"))?;
+        let v_idx = u32::try_from(v_idx).map_err(|_| malformed("`TypeKind` variant overflow"))?;
+        let rt_info = self.tyinfo(rt)?;
+        let p = self.temp_i(rt_info)?;
+        let kp = p.at(kind_off);
+        if want == Name::of("DynTrait") {
+            let dyn_ty = self.field_ty(kind_ty, v_idx, 0)?;
+            let dyn_off = self.field_offset(kind_ty, v_idx, 0)?;
+            let slice_ty = self.field_ty(dyn_ty, 0, 0)?;
+            let slice_off = self.field_offset(dyn_ty, 0, 0)?;
+            let empty_id = self.work.mem.allocate(0, 3, false, Origin::Data)?;
+            let empty = Val::pair(Scalar::Ptr(Pointer { alloc: empty_id, offset: 0 }), Scalar::Int(0));
+            self.store(Place::of(kp.at(dyn_off + slice_off)), slice_ty, empty)?;
+        }
+        let tag = {
+            let (mut cx, l) = self.cx();
+            l.tag_write(kind_ty, v_idx, &mut cx)?
+        };
+        if let Some(w) = tag {
+            self.work.mem.write(kp.at(w.offset), w.size, Scalar::Int(w.value))?;
+        }
+        self.load_i(Place::of(p), rt_info)
     }
 
     fn build_tuple(&mut self, t: PTy, parts: &[(Val, PTy)]) -> R<'a, Val> {
@@ -2007,9 +2845,11 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 if n != m {
                     return Ok(false);
                 }
-                let (pa, pb) = (self.deref(Val::Pair(p))?, self.deref(Val::Pair(q))?);
-                let left = self.work.mem.read_bytes(pa.ptr, n as u64)?;
-                let right = self.work.mem.read_bytes(pb.ptr, m as u64)?;
+                let (pa, pb) = (self.deref(Val::Pair(p))?.ptr()?, self.deref(Val::Pair(q))?.ptr()?);
+                self.ensure_loaded(pa.alloc)?;
+                self.ensure_loaded(pb.alloc)?;
+                let left = self.work.mem.read_bytes(pa, n as u64)?;
+                let right = self.work.mem.read_bytes(pb, m as u64)?;
                 left == right
             }
             (Val::Zst, Val::Zst) => true,
@@ -2024,12 +2864,13 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
     /// `held`: a static's record marks the allocations written in place
     /// ([`Machine::written_in_place`]); a copied value's marks none.
     fn intern(&mut self, v: Val, t: PTy, held: Held) -> R<'a, DataRecord<Alloc<'a>>> {
-        let (size, align) = self.size_align(t)?;
-        // A value already a whole temporary of its size is the root as it is.
+        let (size, ty_align) = self.size_align(t)?;
+        let align = ty_align.max(self.result_align);
+        // A value already a whole temporary of its size and alignment is the root as it is.
         let whole = match v {
             Val::Mem(p) if p.offset == 0 => {
                 let a = self.work.mem.get(p.alloc)?;
-                (a.live && a.origin == Origin::Data && a.len() == size).then_some(p.alloc)
+                (a.live && a.origin == Origin::Data && a.len() == size && a.align_log2 >= align).then_some(p.alloc)
             }
             _ => None,
         };
@@ -2066,6 +2907,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 let target = match t.origin {
                     Origin::Static(k) => DataTarget::Static(k),
                     Origin::Fn(key) => DataTarget::Fn(key),
+                    Origin::Vtable(key) => DataTarget::Vtable(key),
                     Origin::Data | Origin::Local => {
                         if !t.live {
                             return Err(Stop::Refused(Refusal::Dangling));
@@ -2167,10 +3009,27 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                         }
                     }
                 }
-                PNode::Tuple(l) => {
+                PNode::Tuple(l) | PNode::Record(_, l) => {
                     let len = self.ground.view().list(l).map_err(|_| malformed("a list past the ground table"))?.len() as u32;
                     for f in 0..len {
                         let (off, ft) = (self.field_offset(ty, 0, f)?, self.field_ty(ty, 0, f)?);
+                        todo.push((i, base + off, ft));
+                    }
+                }
+                PNode::Union(l) => {
+                    let variants = l.len;
+                    let (mut cx, lay) = self.cx();
+                    let tag = lay.tag(ty, &mut cx)?;
+                    let live = match tag.at {
+                        None if variants == 0 => 0..0,
+                        None => {
+                            let index = tag.variant(0, &[])?;
+                            index..index + 1
+                        }
+                        Some(_) => 0..variants,
+                    };
+                    for v in live {
+                        let (off, ft) = (self.field_offset(ty, v, 0)?, self.field_ty(ty, v, 0)?);
                         todo.push((i, base + off, ft));
                     }
                 }
@@ -2222,6 +3081,11 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
         let (mut cx, l) = self.cx();
         Ok(l.interior_mut(t, &mut cx)?)
     }
+
+    fn permits(&mut self, check: blaze_build::intrinsics::validity::Check, t: PTy) -> R<'a, bool> {
+        let (mut cx, l) = self.cx();
+        Ok(l.permits(check, t, &mut cx)?)
+    }
 }
 
 /// How the evaluated value is held: a static's record is the static's memory (its
@@ -2251,7 +3115,7 @@ fn valid<'a>(s: Scalar, v: Valid) -> R<'a, ()> {
 
 /// `value_of` with a planted bug, for the tests' controls.
 #[cfg(test)]
-pub(crate) fn value_of_planted<'a, W: ConstWorld, L: Layout, A: Allocator + Clone>(
+pub(crate) fn value_of_planted<'a, W: ConstWorld, L: Layout, A: Allocator + Copy>(
     world: &W,
     layout: &mut L,
     codes: &mut Codes<A>,
@@ -2271,6 +3135,24 @@ pub(crate) fn value_of_planted<'a, W: ConstWorld, L: Layout, A: Allocator + Clon
         Err(Stop::Need(n)) => Ok(Answer::Need(n)),
         Err(Stop::Refused(refusal)) => Err(ConstError { constant: item, at, refusal }),
     }
+}
+
+/// Deterministic 128-bit identifier for a `FieldRepresentingType` `(base_type_id, variant, field)`
+/// during constant evaluation (`type_id_field_representing_type`).
+fn frt_hash(base: u128, variant: u32, field: u32) -> u128 {
+    let mix = |mut z: u64| -> u64 {
+        z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    };
+    let [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15] = base.to_le_bytes();
+    let lo_in = u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
+    let hi_in = u64::from_le_bytes([b8, b9, b10, b11, b12, b13, b14, b15]);
+    let vf = (u64::from(variant) << 32) | u64::from(field);
+    let lo = mix(lo_in ^ vf ^ 0x6672_745f_6c6f_3031);
+    let hi = mix(hi_in ^ lo ^ vf.rotate_left(17) ^ 0x6672_745f_6869_3032);
+    u128::from(lo) | (u128::from(hi) << 64)
 }
 
 /// `eval_discriminant` with a planted bug.

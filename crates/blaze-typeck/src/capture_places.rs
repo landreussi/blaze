@@ -59,7 +59,7 @@ use crate::diag::At;
 use crate::error::{CheckError, Limit, Malformed, Stop};
 use crate::ids::{Edition, ExprId, ItemKey, LangItem, Mutbl, PatId};
 use crate::machine::{Lower, Machine, RECURSION_LIMIT};
-use crate::ty::{Cause, ClosureKind, FulfillErrorKind, Goal, Obligation, Ty, TyList, TyView, TypeCtx};
+use crate::ty::{Cause, ClosureKind, FulfillErrorKind, Goal, Obligation, Ty, TyFlags, TyList, TyView, TypeCtx};
 use crate::world::{Adt, AdtKind, Def, TypeAttrs, World};
 
 /// How a place is captured, weakest first: a merge of two uses takes the stronger.
@@ -217,8 +217,6 @@ pub(crate) enum CaptureWiden {
     EnumField,
     /// A captured place through a `Box`'s contents.
     BoxDeref,
-    /// A captured place through a pointer to an unsized value (a wide pointer).
-    WideDeref,
 }
 
 /// The walk's stop: the checker's, or a gap of this owner.
@@ -301,11 +299,15 @@ pub(crate) struct CapturePlaces<'a> {
     chain: Vec<ExprId, Alloc<'a>>,
     pat_stack: Vec<(PatId, PlaceRef, u32), Alloc<'a>>,
     arena: Vec<Proj, Alloc<'a>>,
-    uses: Vec<(PlaceRef, PlaceMode), Alloc<'a>>,
+    /// The scrutinee expression currently being matched by [`Machine::walk_pat`], if any.
+    pat_ctx: Option<ExprId>,
+    uses: Vec<(PlaceRef, PlaceMode, Option<ExprId>), Alloc<'a>>,
     /// The owner's places a pattern is matched against or a struct update takes fields of.
     scrutinees: Vec<PlaceRef, Alloc<'a>>,
     /// The owner's places a pattern binding moves out (not a plain `let x = place;`).
     pat_moves: Vec<PlaceRef, Alloc<'a>>,
+    /// The owner's places a pattern binding borrows by `ref`/`ref mut` (could escape the match).
+    pat_ref_borrows: Vec<PlaceRef, Alloc<'a>>,
     caps: Vec<Cap, Alloc<'a>>,
     roots: Vec<PatId, Alloc<'a>>,
     /// Every widening of the body's owners, in the order made: owner, binding, why.
@@ -481,9 +483,11 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             chain: Vec::new_in(alloc),
             pat_stack: Vec::new_in(alloc),
             arena: Vec::new_in(alloc),
+            pat_ctx: None,
             uses: Vec::new_in(alloc),
             scrutinees: Vec::new_in(alloc),
             pat_moves: Vec::new_in(alloc),
+            pat_ref_borrows: Vec::new_in(alloc),
             caps: Vec::new_in(alloc),
             roots: Vec::new_in(alloc),
             widened: Vec::new_in(alloc),
@@ -594,9 +598,11 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         let is_move = self.captures_by_move(owner)?;
         let suspends = self.mark_owner_bound(cp, owner)?;
         cp.arena.clear();
+        cp.pat_ctx = None;
         cp.uses.clear();
         cp.scrutinees.clear();
         cp.pat_moves.clear();
+        cp.pat_ref_borrows.clear();
         cp.caps.clear();
         cp.roots.clear();
         cp.tasks.clear();
@@ -722,7 +728,10 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 Task::Pat { pat, init, guard, plain_let } => {
                     if let Some(place) = self.cat(cp, init, true)? {
                         cp.scrutinees.push(place);
-                        self.walk_pat(cp, pat, place, guard, plain_let)?;
+                        cp.pat_ctx = Some(init);
+                        let res = self.walk_pat(cp, pat, place, guard, plain_let);
+                        cp.pat_ctx = None;
+                        res?;
                     }
                 }
                 Task::Fru { expr, base } => self.fru(cp, expr, base)?,
@@ -749,6 +758,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             }
             Expr::Repeat { elem, .. } => cp.tasks.push(Task::Consume(elem)),
             Expr::Break { value, .. } | Expr::Return { value } => cp.tasks.extend(value.map(Task::Consume)),
+            Expr::Become { value } => cp.tasks.push(Task::Consume(value)),
             // A comparison takes its operands by reference (rustc's autoref of `PartialEq` and
             // `PartialOrd`, present when the closure is analysed); the others by value.
             Expr::Binary { op, lhs, rhs } => {
@@ -782,7 +792,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                     cp.tasks.push(Task::Consume(x));
                 }
             }
-            Expr::Struct { fields, base, .. } => {
+            Expr::Struct { fields, base, .. } | Expr::Record { fields, base } => {
                 if let Some(base) = base.expr() {
                     cp.tasks.push(Task::Walk(base, Mutbl::Not));
                     cp.tasks.push(Task::Fru { expr: e, base });
@@ -1059,7 +1069,10 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 | AdjustKind::ClosureFnPointer
                 | AdjustKind::UnsafeFnPointer
                 | AdjustKind::MutToConstPointer
-                | AdjustKind::Unsize => {
+                | AdjustKind::Unsize
+                | AdjustKind::UnionInject { .. }
+                | AdjustKind::UnionWiden
+                | AdjustKind::RecordProject => {
                     // Creating a fn pointer or unsizing consumes the value into an rvalue.
                     self.consume_or_copy(cp, place, At::Expr(e))?;
                     place = None;
@@ -1101,7 +1114,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         let t = cp.place_ty(place);
         match self.copy_of(cp, t)? {
             Copyness::Copy => self.borrow(cp, place, PlaceMode::ImmBorrow),
-            Copyness::NotCopy => cp.uses.push((place, PlaceMode::ByValue)),
+            Copyness::NotCopy => cp.uses.push((place, PlaceMode::ByValue, cp.pat_ctx)),
             Copyness::Undecided => return Err(gap(at, CaptureGapKind::CopyUndecided)),
         }
         Ok(())
@@ -1117,7 +1130,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 break;
             }
         }
-        cp.uses.push((place, mode));
+        cp.uses.push((place, mode, cp.pat_ctx));
     }
 
     /// Whether `t` is `Copy`: decided once per type. No `Copy` lang item: nothing is (as
@@ -1131,9 +1144,23 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         let answer = match cp.copy_trait {
             None => Copyness::NotCopy,
             Some(copy) => {
-                let args = self.mk_list(&[t])?;
+                let resolved = self.ty.resolve(t)?;
+                let args = self.mk_list(&[resolved])?;
                 let goal = Goal::Trait { trait_: copy, args };
-                if !self.ty.may_hold(goal, &mut self.reads)? { Copyness::NotCopy } else { self.probe_copy(goal)? }
+                if !self.ty.may_hold(goal, &mut self.reads)? {
+                    Copyness::NotCopy
+                } else {
+                    match self.probe_copy(goal)? {
+                        // A rigid type with no unresolved inference variables (e.g. an
+                        // unnormalized generic associated type `T::ExecutionData` or
+                        // `SealedHeader<N::BlockHeader>`) whose `Copy` bound is not proven by
+                        // the body's param-env is not `Copy` in Rust (`rustc`'s
+                        // `type_is_copy_modulo_regions`), even though the new trait solver
+                        // reports `Ambiguous` for unnormalized aliases.
+                        Copyness::Undecided if !self.ty.ty_flags(resolved).has(TyFlags::HAS_INFER) => Copyness::NotCopy,
+                        other => other,
+                    }
+                }
             }
         };
         cp.copy_cache.insert_shift(at, (t, answer));
@@ -1205,7 +1232,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     fn variant_field_ty(&mut self, adt: Adt<'w>, variant: u32, field: usize, args: TyList, sub: PatId) -> Result<Ty, Halt> {
         let fields = adt.fields.get(adt.variants[variant as usize].fields.range()).unwrap_or(&[]);
         let Some(f) = fields.get(field).copied() else { return Err(gap(At::Pat(sub), CaptureGapKind::PatternType)) };
-        let t = self.lower(adt.types, f.ty, Lower::Args(args), Cause::Pat(sub))?;
+        let t = self.lower(adt.types, f.ty, Lower::NormalizedArgs(args), Cause::Pat(sub))?;
         Ok(self.ty.resolve(t)?)
     }
 
@@ -1256,7 +1283,10 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                         },
                     };
                     match by_ref {
-                        Some(m) => self.borrow(cp, place, PlaceMode::of(m)),
+                        Some(m) => {
+                            cp.pat_ref_borrows.push(place);
+                            self.borrow(cp, place, PlaceMode::of(m));
+                        }
                         None => {
                             let before = cp.uses.len();
                             self.consume_or_copy(cp, Some(place), At::Pat(p))?;
@@ -1310,13 +1340,35 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                         self.borrow(cp, place, PlaceMode::ImmBorrow);
                     }
                     let (adt, variant, args) = self.pat_variant(cp, p, t)?;
+                    let adt_key = match self.view(t) {
+                        TyView::Adt(k, _) => Some(k),
+                        _ => None,
+                    };
                     let declared = adt.fields.get(adt.variants[variant as usize].fields.range()).unwrap_or(&[]);
                     for fp in self.body.field_pat_list(fields)?.iter().rev() {
-                        let Some(at) = declared.iter().position(|d| d.name == fp.name) else {
+                        let at = match adt_key {
+                            Some(k) => self.find_adt_field(k, variant, declared, fp.name).map(|i| i as usize),
+                            None => declared.iter().position(|d| d.name == fp.name),
+                        };
+                        let Some(at) = at else {
                             return Err(gap(At::Pat(fp.pat), CaptureGapKind::PatternField));
                         };
                         let ty = self.variant_field_ty(adt, variant, at, args, fp.pat)?;
                         let sub = cp.extend(place, ProjKind::Field { variant, field: at as u32 }, ty, limit)?;
+                        cp.pat_stack.push((fp.pat, sub, mode));
+                    }
+                }
+                Pat::Record { fields, .. } => {
+                    let TyView::Record(schema, field_tys) = self.view(t) else {
+                        return Err(gap(At::Pat(p), CaptureGapKind::PatternType));
+                    };
+                    let n = self.ty.list_len(field_tys);
+                    for fp in self.body.field_pat_list(fields)?.iter().rev() {
+                        let Some(at) = self.record_field_index(schema, fp.name).filter(|&i| i < n) else {
+                            return Err(gap(At::Pat(fp.pat), CaptureGapKind::PatternField));
+                        };
+                        let ty = self.ty.resolve(self.ty.list_get(field_tys, at))?;
+                        let sub = cp.extend(place, ProjKind::Field { variant: 0, field: at }, ty, limit)?;
                         cp.pat_stack.push((fp.pat, sub, mode));
                     }
                 }
@@ -1391,6 +1443,19 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         self.ty.may_hold(Goal::Trait { trait_: drop, args }, &mut self.reads)
     }
 
+    /// The first projection of `place` that dereferences `Box<T>` (`LangItem::OwnedBox`), if any.
+    fn first_box_deref(&mut self, cp: &CapturePlaces<'a>, place: PlaceRef) -> Option<u32> {
+        let owned_box = cp.owned_box?;
+        for i in 0..place.len {
+            if cp.proj(place, i).kind == ProjKind::Deref
+                && matches!(self.view(cp.ty_before(place, i)), TyView::Adt(k, _) if k == owned_box)
+            {
+                return Some(i);
+            }
+        }
+        None
+    }
+
     /// `truncate_place_to_len_and_update_capture_kind`.
     fn truncate(&mut self, cp: &CapturePlaces<'a>, place: PlaceRef, mode: PlaceMode, len: u32) -> (PlaceRef, PlaceMode) {
         if len >= place.len {
@@ -1413,7 +1478,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     fn settle_uses(&mut self, cp: &mut CapturePlaces<'a>, is_move: bool) -> Result<ClosureKind, Halt> {
         let mut kind = ClosureKind::Fn;
         for u in 0..cp.uses.len() {
-            let (mut place, mut mode) = cp.uses[u];
+            let (mut place, mut mode, _) = cp.uses[u];
             // `restrict_repr_packed_field_ref_capture`, which rustc applies in `borrow` and
             // `fake_read` before anything else (a `Copy` read is a borrow too): a reference into
             // a `repr(packed)` struct may be unaligned, so a BORROW of a field (any alignment)
@@ -1440,6 +1505,13 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             if let Some(i) = cp.first(place, ProjKind::Index) {
                 (place, mode) = self.truncate(cp, place, mode, i);
             }
+            // `blaze-build` does not lower a captured place through `Box`'s contents (`(*b).f`),
+            // so stop the place at the `Box` itself (just before its deref) instead of widening
+            // the entire root binding in `widen`. That preserves disjoint sibling captures like
+            // `self.command.program` (capturing `self.command`) while `self.limit` is moved.
+            if let Some(i) = self.first_box_deref(cp, place) {
+                (place, mode) = self.truncate(cp, place, mode, i);
+            }
             // `truncate_capture_for_optimization`: through a shared reference, the reference.
             if let Some(i) = (0..place.len).rev().find(|&i| cp.proj(place, i).kind == ProjKind::Deref)
                 && matches!(self.view(cp.ty_before(place, i)), TyView::Ref(Mutbl::Not, _))
@@ -1458,7 +1530,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 (place, mode) = self.truncate(cp, place, mode, i);
             }
             // `restrict_precision_for_drop_types`.
-            if mode == PlaceMode::ByValue {
+            if mode == PlaceMode::ByValue && place.len > 0 {
                 let t = cp.place_ty(place);
                 match self.copy_of(cp, t)? {
                     Copyness::Copy => {}
@@ -1588,19 +1660,41 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                     {
                         return Ok(Some(CaptureWiden::BoxDeref));
                     }
-                    if matches!(self.view(p.ty), TyView::Str | TyView::Slice(_) | TyView::Dynamic(_)) {
-                        return Ok(Some(CaptureWiden::WideDeref));
-                    }
                 }
                 ProjKind::Index => {}
             }
         }
         if cap.mode == PlaceMode::ByValue {
-            if cp.uses.iter().any(|&(u, m)| m == PlaceMode::ByValue && cp.relation(cap.place, u) == Some(Ordering::Less)) {
-                return Ok(Some(CaptureWiden::MoveBelow));
+            // If every use of `cap.place` in this owner comes from one pattern match/let whose
+            // scrutinee is `cap.place` itself with no `ref`/`ref mut` bindings that could escape,
+            // `blaze-build` lowers that scrutinee by moving `cap.place` once into `Owner::Temp`
+            // (`Task::Eval` -> `env_moved`), so no widening to the whole binding is needed.
+            let mut single_init: Option<ExprId> = None;
+            let mut only_one_move_match = true;
+            for &(u, _, ctx) in cp.uses.iter() {
+                if cp.relation(cap.place, u).is_none() {
+                    continue;
+                }
+                match (ctx, single_init) {
+                    (Some(init), None) => single_init = Some(init),
+                    (Some(init), Some(prev)) if init == prev => {}
+                    _ => {
+                        only_one_move_match = false;
+                        break;
+                    }
+                }
             }
-            if cp.pat_moves.iter().any(|&m| matches!(cp.relation(cap.place, m), Some(Ordering::Less | Ordering::Equal))) {
-                return Ok(Some(CaptureWiden::PatternMove));
+            let single_move_match = only_one_move_match
+                && single_init.is_some()
+                && cp.scrutinees.iter().all(|&s| cp.relation(cap.place, s).is_none_or(|o| o == Ordering::Equal))
+                && cp.pat_ref_borrows.iter().all(|&r| cp.relation(cap.place, r).is_none());
+            if !single_move_match {
+                if cp.uses.iter().any(|&(u, m, _)| m == PlaceMode::ByValue && cp.relation(cap.place, u) == Some(Ordering::Less)) {
+                    return Ok(Some(CaptureWiden::MoveBelow));
+                }
+                if cp.pat_moves.iter().any(|&m| matches!(cp.relation(cap.place, m), Some(Ordering::Less | Ordering::Equal))) {
+                    return Ok(Some(CaptureWiden::PatternMove));
+                }
             }
         }
         for &s in cp.scrutinees.iter() {

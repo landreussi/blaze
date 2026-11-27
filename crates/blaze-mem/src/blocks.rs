@@ -93,8 +93,8 @@ pub const MAX_ALIGN: usize = 4096;
 pub const AT_ONCE: usize = 256 << 10;
 
 /// The warm bytes a class of smaller blocks keeps, pages and all, before a giver trims it
-/// down to half of this: about 2 MiB a class, under 0.2 GiB for every class blaze uses.
-pub const KEEP: usize = 2 << 20;
+/// down to half of this: 1 MiB a class, halving idle dirty blocks without mid-wave slab thrash.
+pub const KEEP: usize = 1 << 20;
 
 /// The net bytes a thread gives or takes of one class before it adds them to the class's
 /// counts: a class's count is short of the truth by at most this per thread.
@@ -169,9 +169,9 @@ struct Class {
     cold: Stack,
     counts: Counts,
     /// Where the one thread trimming ([`Counts::trimming`]) sorts the indices of the blocks it
-    /// took: [`TRIM_MOST`] of them, committed when the class is made (128 KiB of address
-    /// space a class; resident once the class has trimmed).
-    scratch: Region,
+    /// took: [`TRIM_MOST`] of them, reserved and committed lazily on the class's first trim
+    /// (128 KiB of address space; zero mmaps for classes that never trim).
+    scratch: OnceLock<Region>,
 }
 
 /// A class's counts, in bytes; warm and cold are folded in from threads ([`GATHER`]), so each
@@ -263,11 +263,7 @@ impl Class {
             warm: Stack::new(),
             cold: Stack::new(),
             counts: Counts::new(),
-            scratch: {
-                let scratch = Region::reserve(TRIM_MOST * size_of::<u32>(), free)?;
-                scratch.ensure(TRIM_MOST * size_of::<u32>())?;
-                scratch
-            },
+            scratch: OnceLock::new(),
         })
     }
 
@@ -450,16 +446,45 @@ impl Class {
     #[cold]
     #[inline(never)]
     fn trim(&self) -> Trimmed {
+        self.trim_to(i64::try_from(KEEP / 2).unwrap_or(i64::MAX))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn trim_to(&self, goal: i64) -> Trimmed {
         if self.counts.trimming.swap(true, Ordering::Acquire) {
             return Trimmed { busy: true, ..Trimmed::default() };
         }
-        // SAFETY: the scratch holds `TRIM_MOST` `u32`s, committed when the class was made and
-        // aligned to a page; the `trimming` flag, swapped to true above, makes this thread the
-        // one that touches it until the flag is cleared below.
-        let held = unsafe {
-            core::slice::from_raw_parts_mut(self.scratch.base().cast::<u32>().as_ptr(), TRIM_MOST)
+        let scratch = match self.scratch.get() {
+            Some(scratch) => scratch,
+            None => {
+                let bytes = TRIM_MOST * size_of::<u32>();
+                let region = match Region::reserve(bytes, self.free)
+                    .and_then(|region| region.ensure(bytes).map(|()| region))
+                {
+                    Ok(region) => region,
+                    Err(_) => {
+                        let left = self.counts.warm.load(Ordering::Relaxed);
+                        self.counts.trim_at.store(trim_at(left), Ordering::Relaxed);
+                        self.counts.trimming.store(false, Ordering::Release);
+                        return Trimmed { busy: true, ..Trimmed::default() };
+                    }
+                };
+                // Only the thread holding `trimming` initializes `scratch`.
+                let _ = self.scratch.set(region);
+                let Some(scratch) = self.scratch.get() else {
+                    self.counts.trimming.store(false, Ordering::Release);
+                    return Trimmed { busy: true, ..Trimmed::default() };
+                };
+                scratch
+            }
         };
-        let goal = (KEEP / 2) as i64;
+        // SAFETY: `scratch` holds `TRIM_MOST` `u32`s, reserved and committed above on the first
+        // trim and aligned to a page; the `trimming` flag, swapped to true above, makes this
+        // thread the one that touches it until the flag is cleared below.
+        let held = unsafe {
+            core::slice::from_raw_parts_mut(scratch.base().cast::<u32>().as_ptr(), TRIM_MOST)
+        };
         let mut taken = 0;
         let mut warm = self.counts.warm.load(Ordering::Relaxed);
         while taken < TRIM_MOST && warm > goal {
@@ -625,6 +650,26 @@ pub fn snapshot() -> Snapshot {
         }
     }
     snapshot
+}
+
+/// Gives back whole pages held by warm free blocks across every initialized size class (for
+/// phase boundaries after a burst, alongside [`crate::chunks::trim`]). Returns bytes given back.
+pub fn trim_all() -> usize {
+    let _ = tag::gathered(fold_thread);
+    let mut given = 0usize;
+    for class in &CLASS {
+        if let Some(Ok(class)) = class.get() {
+            if class.counts.warm.load(Ordering::Relaxed) > 0 {
+                let trimmed = class.trim_to(0);
+                if !trimmed.busy {
+                    class.counts.trims.fetch_add(1, Ordering::Relaxed);
+                    class.counts.given_back.fetch_add(u64::try_from(trimmed.given_back).unwrap_or(u64::MAX), Ordering::Relaxed);
+                    given += trimmed.given_back;
+                }
+            }
+        }
+    }
+    given
 }
 
 /// The class of the smallest block that holds `bytes` aligned to `align`.

@@ -23,9 +23,13 @@
     reason = "a std Mutex holds the findings across the expansion's threads; blaze_core::lock is not a dependency of this crate"
 )]
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    fs,
+    path::{Component, Path},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 use blaze_expand::{
@@ -133,6 +137,12 @@ struct MacroCrate {
     /// `name version`.
     label: String,
     module: Result<ModuleRecord, ModuleError>,
+    /// Module store root (`<home>/.blaze/v2`) for late-published modules compiled on demand by a
+    /// `MacroModule` task after `ProcRunner` was initialized.
+    module_store: Option<std::path::PathBuf>,
+    /// Populated once when an initially-`Missing` module is published to `module_store` later in
+    /// the same command.
+    published: PublishOnce<ModuleRecord>,
     /// Whether its missing or unloadable module was reported.
     reported: AtomicBool,
     /// Its module as the runtime loaded it, for the command: asked of the runtime once (its
@@ -143,6 +153,29 @@ struct MacroCrate {
 }
 
 impl MacroCrate {
+    /// Returns the module record, checking `module_store` once if the module was initially missing
+    /// (e.g. self-compiled on demand by a `MacroModule` task that completed after `ProcRunner`
+    /// started).
+    fn resolve_module(&self) -> Result<&ModuleRecord, &ModuleError> {
+        match &self.module {
+            Ok(module) => Ok(module),
+            Err(error) => {
+                if let Some(module) = self.published.get() {
+                    return Ok(module);
+                }
+                if let (Some(store), ModuleError::Missing { name, version, key }) = (&self.module_store, error)
+                    && let Ok(record) = crate::module::read_module_by_key(store, key.clone(), name, version)
+                {
+                    drop(self.published.set(record));
+                    if let Some(module) = self.published.get() {
+                        return Ok(module);
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
     /// See [`MacroCrate::loaded`].
     fn loaded(&self, runtime: &Runtime, module: &ModuleRecord) -> Result<Arc<Loaded>, RuntimeError> {
         if let Some(loaded) = self.loaded.get() {
@@ -167,6 +200,13 @@ pub struct ProcMacros<'r> {
     /// Warm pool of native `rust-analyzer-proc-macro-srv` workers for zero-Wasm `.dylib`/`.so`
     /// proc-macro modules (D175 fast path; spawned lazily only when a native module runs).
     native_pool: Arc<crate::native_bridge::NativeServerPool>,
+    /// Whether the built-in comptime patch library (`crate::comptime_patch`: `serde_derive`,
+    /// `bytemuck_derive`, `thiserror-impl`, `derive_more`, `strum_macros`, `paste`) is enabled.
+    /// Enabled by default; disable with `BLAZE_NO_COMPTIME_PATCH=1` or [`Self::set_comptime_patch`].
+    comptime_patch_enabled: bool,
+    patch_hits: AtomicU64,
+    patch_fallbacks: AtomicU64,
+    stage_seq: AtomicU64,
     /// Each package a call was expanded in, with its crate name's results and its own
     /// verdicts on them: sorted by the package's address, which a slot keeps alive, so a
     /// package is found by identity with no hash of it a call.
@@ -200,6 +240,7 @@ pub struct KeptAll {
 
 impl<'r> ProcMacros<'r> {
     pub fn new(runtime: &'r Runtime, store: &'r DirStore, limits: Limits) -> ProcMacros<'r> {
+        let comptime_patch_enabled = std::env::var_os("BLAZE_NO_COMPTIME_PATCH").is_none();
         ProcMacros {
             runtime,
             store,
@@ -207,8 +248,31 @@ impl<'r> ProcMacros<'r> {
             crates: Vec::new(),
             findings: Mutex::new(Vec::new()),
             native_pool: Arc::new(crate::native_bridge::NativeServerPool::new()),
+            comptime_patch_enabled,
+            patch_hits: AtomicU64::new(0),
+            patch_fallbacks: AtomicU64::new(0),
+            stage_seq: AtomicU64::new(0),
             slots: Mutex::new(Vec::new()),
             tables: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Enable or disable Blaze's default built-in comptime patch library (`serde_derive`,
+    /// `bytemuck_derive`, `thiserror-impl`, `derive_more`, `strum_macros`, `paste`).
+    pub fn set_comptime_patch(&mut self, enabled: bool) {
+        self.comptime_patch_enabled = enabled;
+    }
+
+    /// Whether the built-in comptime patch library is enabled on this hook.
+    pub fn comptime_patch_enabled(&self) -> bool {
+        self.comptime_patch_enabled
+    }
+
+    /// Telemetry counters for comptime-patch hits and lossless fallbacks.
+    pub fn comptime_patch_stats(&self) -> crate::comptime_patch::ComptimePatchStats {
+        crate::comptime_patch::ComptimePatchStats {
+            hits: self.patch_hits.load(Ordering::Relaxed),
+            fallbacks: self.patch_fallbacks.load(Ordering::Relaxed),
         }
     }
 
@@ -270,8 +334,8 @@ impl<'r> ProcMacros<'r> {
     pub fn keep_all(&self) -> Result<KeptAll, RecordError> {
         let mut mark = self.runtime.parts().start();
         // clone: the slots and tables, a refcount each: no table is written under a lock.
-        let slots: Vec<Arc<CrateSlot>> = crate::host::lock(&self.slots).clone();
-        let tables: Vec<Arc<CrateResults>> = crate::host::lock(&self.tables).clone();
+        use crate::ShareArc;
+        let (slots, tables): (Vec<_>, Vec<_>) = (crate::host::lock(&self.slots).iter().map(ShareArc::share_arc).collect(), crate::host::lock(&self.tables).iter().map(ShareArc::share_arc).collect());
         let mut kept = KeptAll::default();
         for results in &tables {
             let verdicts: Vec<&Verdicts> = slots.iter().filter(|slot| Arc::ptr_eq(&slot.results, results)).map(|slot| &slot.verdicts).collect();
@@ -289,10 +353,23 @@ impl<'r> ProcMacros<'r> {
     /// gave it) under `key`, the crate key its definitions carry. A crate with no module is
     /// registered all the same: its calls are refused, and it is reported once.
     pub fn add_crate(&mut self, key: CrateItemKey, name: &str, version: &str, module: Result<ModuleRecord, ModuleError>) {
+        self.add_crate_in(None, key, name, version, module);
+    }
+
+    /// Registers a macro crate backed by `store` so that if its module is initially `Missing`
+    /// (because a `MacroModule` task is still self-compiling it on demand in the same command),
+    /// the first consumer call after `MacroModule` finishes picks up the published module cleanly.
+    pub fn add_crate_from_store(&mut self, store: &Path, key: CrateItemKey, name: &str, version: &str, module: Result<ModuleRecord, ModuleError>) {
+        self.add_crate_in(Some(store.to_path_buf()), key, name, version, module);
+    }
+
+    fn add_crate_in(&mut self, module_store: Option<std::path::PathBuf>, key: CrateItemKey, name: &str, version: &str, module: Result<ModuleRecord, ModuleError>) {
         self.crates.push(MacroCrate {
             key,
             label: format!("{name} {version}"),
             module,
+            module_store,
+            published: PublishOnce::new(),
             reported: AtomicBool::new(false),
             loaded: PublishOnce::new(),
         });
@@ -312,7 +389,7 @@ impl<'r> ProcMacros<'r> {
         match crate::module::read_module(store, &id) {
             Err(e) if !matches!(e, ModuleError::Missing { .. }) => Err(named(AddWhy::Module(e))),
             module => {
-                self.add_crate(key, reached.name, reached.version, module);
+                self.add_crate_from_store(store, key, reached.name, reached.version, module);
                 Ok(key)
             }
         }
@@ -320,7 +397,7 @@ impl<'r> ProcMacros<'r> {
 
     /// The macros `key`'s module exports; none when it has no module.
     pub fn exports(&self, key: CrateItemKey) -> &[Exported] {
-        match self.crates.iter().find(|it| it.key == key).map(|it| &it.module) {
+        match self.crates.iter().find(|it| it.key == key).map(MacroCrate::resolve_module) {
             Some(Ok(module)) => &module.macros,
             _ => &[],
         }
@@ -328,7 +405,7 @@ impl<'r> ProcMacros<'r> {
 
     /// Each registered crate: its key, `name version`, and whether it has a module.
     pub fn crates(&self) -> impl Iterator<Item = (CrateItemKey, &str, bool)> {
-        self.crates.iter().map(|it| (it.key, it.label.as_str(), it.module.is_ok()))
+        self.crates.iter().map(|it| (it.key, it.label.as_str(), it.resolve_module().is_ok()))
     }
 
     /// The findings so far, taken, with the compiled records the runtime refused.
@@ -389,15 +466,21 @@ impl<'r> ProcMacros<'r> {
     pub fn refusal_of(&self, def: &MacroDefinition<'_>) -> Option<Finding> {
         let MacroKind::ProcMacro { krate, kind } = def.kind() else { return None };
         let Some(macro_crate) = self.crates.iter().find(|it| it.key == krate) else { return Some(Finding::UnknownCrate { krate }) };
-        let module = match &macro_crate.module {
+        let name = def.proc_name().unwrap_or("");
+        let module = match macro_crate.resolve_module() {
             Ok(module) => module,
             Err(error) => {
+                if self.comptime_patch_enabled && crate::comptime_patch::has_patch(&macro_crate.label, kind, name) {
+                    return None;
+                }
                 let (name, version) = macro_crate.label.split_once(' ').unwrap_or((&macro_crate.label, ""));
                 return Some(Finding::MissingModule { name: name.to_owned(), version: version.to_owned(), why: error.to_string() });
             }
         };
-        let name = def.proc_name().unwrap_or("");
         if module.find(kind, name).is_none() {
+            if self.comptime_patch_enabled && crate::comptime_patch::has_patch(&macro_crate.label, kind, name) {
+                return None;
+            }
             return Some(Finding::NoSuchMacro { krate: macro_crate.label.clone(), name: name.to_owned(), kind });
         }
         if module.native_dylib.is_some() {
@@ -426,9 +509,24 @@ impl<'r> ProcMacros<'r> {
             self.report(Finding::UnknownCrate { krate });
             return Err(refused);
         };
-        let module = match &macro_crate.module {
+        let name = def.proc_name().unwrap_or("");
+        let module = match macro_crate.resolve_module() {
             Ok(module) => module,
             Err(error) => {
+                // Default built-in comptime patch fast path: expand patched crates (`serde_derive`,
+                // `bytemuck_derive`, `thiserror-impl`, `derive_more`, `strum_macros`, `paste`) in-process
+                // even when no `.dylib`/`.wasm` proc-macro module has been compiled!
+                if self.comptime_patch_enabled && crate::comptime_patch::has_patch(&macro_crate.label, kind, name) {
+                    match crate::comptime_patch::try_expand(&macro_crate.label, kind, name, call, edition, alloc) {
+                        crate::comptime_patch::PatchResult::Expanded(produced) => {
+                            self.patch_hits.fetch_add(1, Ordering::Relaxed);
+                            return Ok(produced);
+                        }
+                        crate::comptime_patch::PatchResult::Fallback => {
+                            self.patch_fallbacks.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
                 if !macro_crate.reported.swap(true, Ordering::Relaxed) {
                     let (name, version) = macro_crate.label.split_once(' ').unwrap_or((&macro_crate.label, ""));
                     self.report(Finding::MissingModule { name: name.to_owned(), version: version.to_owned(), why: error.to_string() });
@@ -436,11 +534,25 @@ impl<'r> ProcMacros<'r> {
                 return Err(refused);
             }
         };
-        let name = def.proc_name().unwrap_or("");
         let Some(export) = module.find(kind, name) else {
             self.report(Finding::NoSuchMacro { krate: macro_crate.label.clone(), name: name.to_owned(), kind });
             return Err(refused);
         };
+        // Default built-in comptime patch fast path: expand in-process in microseconds without
+        // touching the disk proc-macro answer store (never polluting the real proc-macro's
+        // `base_key`), falling back losslessly to the cached/native/Wasm proc macro on exotic
+        // attributes or hygiene-sensitive macro_rules! inputs.
+        if self.comptime_patch_enabled && crate::comptime_patch::has_patch(&macro_crate.label, kind, &export.name) {
+            match crate::comptime_patch::try_expand(&macro_crate.label, kind, &export.name, call, edition, alloc) {
+                crate::comptime_patch::PatchResult::Expanded(produced) => {
+                    self.patch_hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(produced);
+                }
+                crate::comptime_patch::PatchResult::Fallback => {
+                    self.patch_fallbacks.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
         let parts = self.runtime.parts();
         let mut mark = parts.start();
         let base = base_key(&module.wasm_sha256, export, edition, call);
@@ -457,70 +569,97 @@ impl<'r> ProcMacros<'r> {
         };
         // Native zero-Wasm fast path (D175): expand directly via `NativeServerPool` on host `.dylib`/`.so`.
         if let Some(ref dylib) = module.native_dylib {
-            let real_dir: Option<String> = match &package.files {
-                crate::sandbox::Files::Folder(dir) => {
-                    let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
-                    Some(canon.to_string_lossy().into_owned())
-                }
+            let listed_dir: Option<blaze_own::AString<'_>>;
+            let member_joined;
+            let raw_dir: Option<&Path> = match &package.files {
+                crate::sandbox::Files::Folder(dir) => Some(dir.as_path()),
                 crate::sandbox::Files::Member { workspace, root } => {
                     let seen = root.seen().to_string();
                     let rel = seen.strip_prefix("/workspace").unwrap_or("").trim_start_matches('/');
-                    let base = if workspace.as_os_str().is_empty() { std::path::PathBuf::from(".") } else { workspace.clone() };
-                    let full = if rel.is_empty() { base } else { base.join(rel) };
-                    let canon = std::fs::canonicalize(&full).unwrap_or(full);
-                    Some(canon.to_string_lossy().into_owned())
-                }
-                crate::sandbox::Files::Listed(files) => {
-                    // Materialize `Cargo.toml` once by content digest so fetched-crate proc macros
-                    // (`proc-macro-crate`, `jsonrpsee`, `derive_more`, etc.) can read `$CARGO_MANIFEST_DIR/Cargo.toml`.
-                    files.iter().find(|(name, _)| name == "Cargo.toml").and_then(|(_, bytes)| {
-                        let digest = blaze_sha256::digest(bytes);
-                        let mut hex = String::with_capacity(64);
-                        for b in digest {
-                            use core::fmt::Write;
-                            let _ = write!(&mut hex, "{b:02x}");
-                        }
-                        let dir = std::env::temp_dir().join("blaze-pm-manifests").join(&hex);
-                        let manifest = dir.join("Cargo.toml");
-                        if !manifest.is_file() {
-                            let _ = std::fs::create_dir_all(&dir);
-                            let tmp = dir.join(format!(".Cargo.toml.{}", std::process::id()));
-                            if std::fs::write(&tmp, bytes).is_ok() {
-                                let _ = std::fs::rename(&tmp, &manifest);
-                            }
-                        }
-                        let canon = std::fs::canonicalize(&dir).unwrap_or(dir);
-                        Some(canon.to_string_lossy().into_owned())
-                    })
-                }
-            };
-            let mut env_owned: Vec<(String, String)> = package
-                .env
-                .vars()
-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                .collect();
-            if let Some(ref dir) = real_dir {
-                let manifest_path = std::path::Path::new(dir).join("Cargo.toml").to_string_lossy().into_owned();
-                let mut had_dir = false;
-                let mut had_path = false;
-                for (k, v) in &mut env_owned {
-                    if k == "CARGO_MANIFEST_DIR" {
-                        *v = dir.clone();
-                        had_dir = true;
-                    } else if k == "CARGO_MANIFEST_PATH" {
-                        *v = manifest_path.clone();
-                        had_path = true;
+                    let base = if workspace.as_os_str().is_empty() {
+                        Path::new(".")
+                    } else {
+                        workspace.as_path()
+                    };
+                    if rel.is_empty() {
+                        Some(base)
+                    } else {
+                        member_joined = base.join(rel);
+                        Some(member_joined.as_path())
                     }
                 }
-                if !had_dir {
-                    env_owned.push(("CARGO_MANIFEST_DIR".to_owned(), dir.clone()));
+                crate::sandbox::Files::Listed(listed) => {
+                    if let Some((sub, commit)) = listed.iter().find_map(|(p, b)| match b {
+                        crate::sandbox::ListedBytes::Submodule(c) => Some((p.as_str(), *c)),
+                        _ => None,
+                    }) {
+                        let mut hex = blaze_own::AString::new_in(alloc);
+                        for byte in commit {
+                            let _ = core::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));
+                        }
+                        let why = format!(
+                            "package contains unpopulated git submodule `{sub}` at commit {hex}; native proc-macro materialization refuses unpopulated submodules"
+                        );
+                        let expand_err = ExpandError {
+                            krate: macro_crate.label.as_str().to_owned(),
+                            name: export.name.as_str().to_owned(),
+                            error: CallError::Failed(why.as_str().to_owned()),
+                        };
+                        let refused = RunRefused { host: expand_err.error.host_error(), call: Some(CallError::Failed(why)) };
+                        self.report(Finding::Call { base, error: expand_err });
+                        return Err(refused);
+                    }
+                    // Materialize all safe relative files from the fetched crate once by content
+                    // digest so proc macros (`proc-macro-crate`, `i18n-embed-fl`, `jsonrpsee`,
+                    // `rust-embed`, etc.) can read any package file under `$CARGO_MANIFEST_DIR`.
+                    let base = std::env::temp_dir().join("blaze-pm-manifests");
+                    let seq = self.stage_seq.fetch_add(1, Ordering::Relaxed);
+                    listed_dir = materialize_listed_in(&base, &package.files, seq, alloc);
+                    listed_dir.as_deref().map(Path::new)
                 }
-                if !had_path {
-                    env_owned.push(("CARGO_MANIFEST_PATH".to_owned(), manifest_path));
+            };
+            let real_dir: Option<String> = raw_dir.map(|dir| {
+                let canon = fs::canonicalize(dir);
+                let resolved = canon.as_deref().unwrap_or(dir);
+                resolved.to_string_lossy().into_owned()
+            });
+            let manifest_path = real_dir
+                .as_deref()
+                .map(|dir| Path::new(dir).join("Cargo.toml").to_string_lossy().into_owned());
+            let mut orig_manifest_dir = None;
+            let mut env_refs: Vec<(&str, &str)> = Vec::new();
+            let mut had_dir = false;
+            let mut had_path = false;
+            for (k, v) in package.env.vars() {
+                if let Some(dir) = real_dir.as_deref() {
+                    if k == "CARGO_MANIFEST_DIR" {
+                        orig_manifest_dir = Some(v);
+                        env_refs.push((k, dir));
+                        had_dir = true;
+                        continue;
+                    }
+                    if k == "CARGO_MANIFEST_PATH"
+                        && let Some(mp) = manifest_path.as_deref()
+                    {
+                        env_refs.push((k, mp));
+                        had_path = true;
+                        continue;
+                    }
+                }
+                env_refs.push((k, v));
+            }
+            if let Some(dir) = real_dir.as_deref() {
+                if !had_dir {
+                    env_refs.push(("CARGO_MANIFEST_DIR", dir));
+                }
+                if !had_path
+                    && let Some(mp) = manifest_path.as_deref()
+                {
+                    env_refs.push(("CARGO_MANIFEST_PATH", mp));
                 }
             }
-            let env_refs: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-            match self.native_pool.expand_macro(dylib, &export.name, call, edition, &env_refs, real_dir.as_deref(), alloc) {
+            let path_remap = real_dir.as_deref().zip(orig_manifest_dir);
+            match self.native_pool.expand_macro(dylib, &export.name, call, edition, &env_refs, real_dir.as_deref(), path_remap, alloc) {
                 Ok(produced) => {
                     let mut mark = parts.start();
                     let kept = slot.results.insert(self.store, base, &produced);
@@ -553,7 +692,8 @@ impl<'r> ProcMacros<'r> {
                 return Err(failed);
             }
         };
-        match self.runtime.expand(&loaded, export, call, edition, package.clone(), self.limits, alloc) {
+        use crate::ShareArc as _;
+        match self.runtime.expand(&loaded, export, call, edition, package.share_arc(), self.limits, alloc) {
             Ok(ran) => {
                 let mut mark = parts.start();
                 let kept = slot.results.insert(self.store, base, &ran.produced);
@@ -641,5 +781,200 @@ impl<C: ExpandCx> ExpandCx for ProcCx<'_, '_, C> {
 
     fn run_proc_macro<'a>(&self, def: &MacroDefinition<'_>, call: ProcCall<'_>, alloc: Alloc<'a>) -> Result<Produced<'a>, HostError> {
         self.procs.run(def, &call, self.edition, &self.package, alloc)
+    }
+}
+
+/// Validates a relative path from [`crate::sandbox::Files::Listed`], refusing empty paths,
+/// NUL bytes, backslashes, absolute prefixes, `.` and `..` traversal components.
+fn safe_rel_path(name: &str) -> bool {
+    if name.is_empty() || name.as_bytes().contains(&0) || name.contains('\\') {
+        return false;
+    }
+    if name.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..") {
+        return false;
+    }
+    let mut saw_normal = false;
+    for comp in Path::new(name).components() {
+        match comp {
+            Component::Normal(part) if !part.is_empty() => saw_normal = true,
+            _ => return false,
+        }
+    }
+    saw_normal
+}
+
+/// Materializes all safe relative files from [`crate::sandbox::Files::Listed`] under
+/// `base/<tree-hex>/`, keyed by a SHA-256 digest of the canonically sorted `(name, bytes)`
+/// list. Uses a unique staging directory + atomic rename + sibling `<tree-hex>.ready` marker
+/// so concurrent workers never observe a half-populated tree and reuse the directory across runs.
+fn materialize_listed_in<'a>(base: &Path, files: &crate::sandbox::Files, seq: u64, alloc: Alloc<'a>) -> Option<blaze_own::AString<'a>> {
+    use core::fmt::Write as _;
+
+    let crate::sandbox::Files::Listed(files) = files else {
+        return None;
+    };
+    let mut entries: blaze_own::Vec<(&str, &[u8]), Alloc<'a>> = blaze_own::Vec::new_in(alloc);
+    for (name, bytes) in files.iter() {
+        if matches!(bytes, crate::sandbox::ListedBytes::Submodule(_)) {
+            continue;
+        }
+        if safe_rel_path(name) {
+            entries.push((name.as_str(), bytes.as_slice()));
+        }
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut hasher = blaze_sha256::Sha256::new();
+    hasher.update(b"blaze-pm-listed-tree-v1\0");
+    for &(name, bytes) in entries.iter() {
+        let name_len = u64::try_from(name.len()).unwrap_or(u64::MAX);
+        let bytes_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        hasher.update(&name_len.to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(&bytes_len.to_le_bytes());
+        hasher.update(bytes);
+    }
+    let digest = hasher.finish();
+    let mut hex_buf = blaze_own::AString::new_in(alloc);
+    for b in digest {
+        let _ = write!(&mut hex_buf, "{b:02x}");
+    }
+    let hex = hex_buf.as_str();
+
+    let dir = base.join(hex);
+    let mut ready_name = blaze_own::AString::new_in(alloc);
+    let _ = write!(&mut ready_name, "{hex}.ready");
+    let ready = base.join(ready_name.as_str());
+
+    if !(ready.is_file() && dir.is_dir()) {
+        let pid = std::process::id();
+        let mut stage_name = blaze_own::AString::new_in(alloc);
+        let _ = write!(&mut stage_name, ".stage-{hex}-{pid}-{seq}");
+        let stage = base.join(stage_name.as_str());
+
+        let mk_dir = |p: &Path| fs::create_dir_all(p);
+        let write_file = |p: &Path, b: &[u8]| fs::write(p, b);
+        let rename = |from: &Path, to: &Path| fs::rename(from, to);
+        let rm_dir = |p: &Path| {
+            let _ = fs::remove_dir_all(p);
+        };
+
+        rm_dir(&stage);
+        if mk_dir(&stage).is_err() {
+            return None;
+        }
+        for &(rel, bytes) in entries.iter() {
+            let dest = stage.join(rel);
+            let ok = dest.parent().is_none_or(|p| mk_dir(p).is_ok()) && write_file(&dest, bytes).is_ok();
+            if !ok {
+                rm_dir(&stage);
+                return None;
+            }
+        }
+        if rename(&stage, &dir).is_err() {
+            rm_dir(&stage);
+            if !dir.is_dir() {
+                return None;
+            }
+        }
+        let mut ready_tmp_name = blaze_own::AString::new_in(alloc);
+        let _ = write!(&mut ready_tmp_name, ".ready-{hex}-{pid}-{seq}");
+        let ready_tmp = base.join(ready_tmp_name.as_str());
+        if write_file(&ready_tmp, b"1").is_ok() {
+            let _ = rename(&ready_tmp, &ready);
+        }
+    }
+
+    let mut out = blaze_own::AString::new_in(alloc);
+    out.push_str(dir.to_str()?);
+    Some(out)
+}
+
+#[cfg(test)]
+mod listed_dir_tests {
+    use super::{Arc, Path, fs, materialize_listed_in, safe_rel_path};
+    use crate::sandbox::{Files, ListedBytes};
+
+    fn listed<const N: usize>(items: [(&str, &'static [u8]); N]) -> Files {
+        Files::Listed(Arc::from(items.map(|(name, bytes)| (name.into(), ListedBytes::Static(bytes)))))
+    }
+
+    #[test]
+    fn safe_rel_path_rejects_traversal_and_unsafe_paths() {
+        assert!(safe_rel_path("Cargo.toml"));
+        assert!(safe_rel_path("i18n/en-US/age.ftl"));
+        for bad in ["", "/etc/passwd", "../escape", "a/../b", "./a", "a/./b", "a//b", "a\0b", r"a\b"] {
+            assert!(!safe_rel_path(bad), "expected {bad:?} to be rejected");
+        }
+    }
+
+    #[test]
+    fn materializes_all_files_reuses_and_keys_by_full_tree() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let mut root_str = blaze_own::AString::new_in(alloc);
+        {
+            use core::fmt::Write as _;
+            let _ = write!(&mut root_str, "/tmp/blaze-hook-listed-test-{}", core::ptr::from_ref(&heap) as usize);
+        }
+        let root = Path::new(root_str.as_str());
+        let _ = fs::remove_dir_all(root);
+
+        let files_a = listed([
+            ("Cargo.toml", b"[package]\nname = \"age\"\n".as_slice()),
+            ("i18n.toml", b"fallback_language = \"en-US\"\n[fluent]\nassets_dir = \"i18n\"\n".as_slice()),
+            ("i18n/en-US/age.ftl", b"err-decryption = Decryption failed\n".as_slice()),
+            ("../escape.txt", b"must not be written".as_slice()),
+            ("/abs.txt", b"must not be written".as_slice()),
+        ]);
+        let files_a_reordered = listed([
+            ("i18n/en-US/age.ftl", b"err-decryption = Decryption failed\n".as_slice()),
+            ("Cargo.toml", b"[package]\nname = \"age\"\n".as_slice()),
+            ("i18n.toml", b"fallback_language = \"en-US\"\n[fluent]\nassets_dir = \"i18n\"\n".as_slice()),
+        ]);
+        let files_b = listed([
+            ("Cargo.toml", b"[package]\nname = \"age\"\n".as_slice()),
+            ("i18n.toml", b"fallback_language = \"fr\"\n".as_slice()),
+        ]);
+
+        let dir1_s = materialize_listed_in(root, &files_a, 0, alloc).expect("materializes safe files");
+        let dir1 = Path::new(dir1_s.as_str());
+        assert_eq!(fs::read(dir1.join("Cargo.toml")).unwrap(), b"[package]\nname = \"age\"\n");
+        assert_eq!(fs::read(dir1.join("i18n.toml")).unwrap(), b"fallback_language = \"en-US\"\n[fluent]\nassets_dir = \"i18n\"\n");
+        assert_eq!(fs::read(dir1.join("i18n/en-US/age.ftl")).unwrap(), b"err-decryption = Decryption failed\n");
+        assert!(!root.join("escape.txt").exists(), "traversal path must not escape");
+        assert!(!dir1.join(".ready").exists(), "marker must live outside the package dir");
+
+        // Reordered identical safe files reuse the exact same content-addressed directory.
+        let dir2_s = materialize_listed_in(root, &files_a_reordered, 1, alloc).expect("reuses tree");
+        assert_eq!(dir1_s.as_str(), dir2_s.as_str());
+
+        // Simulating a race where another worker published `dir` before writing `.ready`:
+        // removing `.ready` and re-running with a different seq still succeeds and restores `.ready`.
+        let hex = dir1.file_name().and_then(|s| s.to_str()).expect("hex dir name");
+        let mut ready_name = blaze_own::AString::new_in(alloc);
+        {
+            use core::fmt::Write as _;
+            let _ = write!(&mut ready_name, "{hex}.ready");
+        }
+        let ready = root.join(ready_name.as_str());
+        assert!(ready.is_file(), "ready marker must be created");
+        let _ = fs::remove_file(&ready);
+        let dir_race_s = materialize_listed_in(root, &files_a, 2, alloc).expect("handles existing dir race");
+        assert_eq!(dir1_s.as_str(), dir_race_s.as_str());
+        assert!(ready.is_file(), "ready marker must be restored");
+
+        // Changing a non-Cargo.toml file produces a distinct directory digest.
+        let dir3_s = materialize_listed_in(root, &files_b, 3, alloc).expect("distinct tree");
+        assert_ne!(dir1_s.as_str(), dir3_s.as_str());
+
+        // Empty or all-unsafe file lists return None.
+        assert!(materialize_listed_in(root, &listed([]), 4, alloc).is_none());
+        assert!(materialize_listed_in(root, &listed([("../bad", b"x".as_slice()), ("/bad", b"y".as_slice())]), 5, alloc).is_none());
+
+        let _ = fs::remove_dir_all(root);
     }
 }

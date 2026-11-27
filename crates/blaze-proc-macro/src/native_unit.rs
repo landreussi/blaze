@@ -19,7 +19,7 @@ use blaze_build_script::{
 };
 use blaze_pins::{CLANG_JSON, CLANG_PATH};
 use blaze_ids::ContentId;
-use blaze_own::{AVec, Alloc, Vec};
+use blaze_own::{AString, AVec, Alloc, String as OwnString, Vec};
 use blaze_unit_graph::{UnitGraph, UnitId};
 use bstd::{
     fs::Durable,
@@ -28,11 +28,11 @@ use bstd::{
 
 use crate::{
     native_facts,
-    native_script::{NativeScript, NativeScriptError, listed_under, remove, run_script},
+    native_script::{ConfinedFiles, NativeScript, NativeScriptError, NativeScriptRun, listed_under, remove, run_script, walk_tree},
     record::native_world,
     script::ScriptRun,
     script_sandbox::{
-        Read, Tree, answer_now,
+        NOT_A_FILE, Read, Tree, TreeRead, answer_now,
         dep_mount::{self, DepProducer, native::LayError},
     },
     script_unit::module_of_native,
@@ -120,6 +120,9 @@ pub struct NativeSetting<'s> {
     /// The command's jobserver ([`crate::jobserver`]): each run's children share the command's
     /// workers through it. Never in a key (`blaze_build_script::env::Jobs`).
     pub jobs: &'s crate::jobserver::Jobserver,
+    /// The canonical path of the content-addressed fact shim placed by this command
+    /// ([`crate::native_facts::place_shim`]); `None` falls back to `placed_shim(work)`.
+    pub shim: Option<&'s str>,
 }
 
 /// The native part of a run key, known before the run.
@@ -243,16 +246,82 @@ fn read_file(folder: &str, name: &str) -> Result<std::vec::Vec<u8>, NativeUnitEr
     Ok(bytes.as_slice().to_vec())
 }
 
+/// Removes `<work>/<rel>` (files, then nested directories deepest-first, then `<rel>` itself)
+/// through `bstd`, never touching ambient `std::fs`.
+fn remove_tree_under(work: &str, rel: &str, alloc: Alloc<'_>) {
+    let Ok((io, root)) = native_world(Path::new(work)) else { return };
+    let Ok(cx) = io.cx(Duration::from_secs(60), TASK_FRAME) else { return };
+    let full = blaze_own::format_in!(alloc, "{work}/{rel}");
+    if let Some((dirs, files)) = walk_tree(full.as_str(), alloc) {
+        for file in files.iter() {
+            let sub = blaze_own::format_in!(alloc, "{rel}/{}", file.as_str());
+            if let Ok(path) = bstd::path::Path::new(sub.as_str()) {
+                let _ = root.remove(&cx, &path, Durable::No);
+            }
+        }
+        // `walk_tree` sorts paths lexicographically by bytes, so reverse order visits every child
+        // directory before its parent (`a/b` before `a`).
+        for dir in dirs.iter().rev() {
+            let sub = blaze_own::format_in!(alloc, "{rel}/{}", dir.as_str());
+            if let Ok(path) = bstd::path::Path::new(sub.as_str()) {
+                let _ = root.remove_dir(&cx, &path, Durable::No);
+            }
+        }
+    }
+    if let Ok(path) = bstd::path::Path::new(rel) {
+        let _ = root.remove_dir(&cx, &path, Durable::No);
+    }
+}
+
+/// Removes a single native build-script invocation's private work folders and lock files (each
+/// named relative to `work`) when the run ends (whether `Ok` or `Err`). Must be declared before
+/// any lock handle (`ShimRun`) so the lock fd closes before the lock file is unlinked.
+pub(crate) struct RunWorkGuard<'w, 'a> {
+    work: &'w str,
+    dirs: AVec<'a, AString<'a>>,
+    files: AVec<'a, AString<'a>>,
+    alloc: Alloc<'a>,
+}
+
+impl<'w, 'a> RunWorkGuard<'w, 'a> {
+    pub(crate) fn new(work: &'w str, alloc: Alloc<'a>) -> Self {
+        Self { work, dirs: Vec::new_in(alloc), files: Vec::new_in(alloc), alloc }
+    }
+
+    pub(crate) fn push_dir(&mut self, rel: AString<'a>) {
+        self.dirs.push(rel);
+    }
+
+    pub(crate) fn push_file(&mut self, rel: AString<'a>) {
+        self.files.push(rel);
+    }
+}
+
+impl Drop for RunWorkGuard<'_, '_> {
+    fn drop(&mut self) {
+        for rel in self.dirs.iter() {
+            remove_tree_under(self.work, rel.as_str(), self.alloc);
+        }
+        if !self.files.is_empty()
+            && let Ok((io, root)) = native_world(Path::new(self.work))
+            && let Ok(cx) = io.cx(Duration::from_secs(60), TASK_FRAME)
+        {
+            for rel in self.files.iter() {
+                if let Ok(path) = bstd::path::Path::new(rel.as_str()) {
+                    let _ = root.remove(&cx, &path, Durable::No);
+                }
+            }
+        }
+    }
+}
+
 /// `work/<rel>/` made to hold exactly `files` (none when `files` is empty: an empty folder):
-/// what an earlier run left there is removed first.
-fn fresh_folder(work: &str, rel: &str, files: &[(String, std::vec::Vec<u8>)], package: &str) -> Result<String, NativeUnitError> {
+/// what an earlier run left there is removed completely (subdirectories included) first.
+pub(crate) fn fresh_folder(work: &str, rel: &str, files: &[(String, std::vec::Vec<u8>)], package: &str, alloc: Alloc<'_>) -> Result<String, NativeUnitError> {
     let folder = format!("{work}/{rel}");
     let failed = |why: String| NativeUnitError::Files { package: package.to_owned(), folder: folder.clone(), why };
     if Path::new(&folder).exists() {
-        // Listed, never read: an earlier run's `OUT_DIR` may hold a C library's archive.
-        for left in listed_under(&folder).map_err(|e| failed(e.to_string()))? {
-            remove(&folder, &left.name).map_err(|e| failed(e.to_string()))?;
-        }
+        remove_tree_under(work, rel, alloc);
     }
     let (io, root) = native_world(Path::new(work)).map_err(|e| failed(e.to_string()))?;
     let cx = io.cx(Duration::from_secs(60), TASK_FRAME).map_err(|_| failed("its world stopped".to_owned()))?;
@@ -298,16 +367,16 @@ pub fn native_outputs<'a>(
 ) -> Result<ScriptRun<'a>, NativeUnitError> {
     let unit = &graph.units[script.index()];
     let (name, version) = (unit.name.as_str(), unit.version.as_str());
-    let package = format!("{name} {version}");
+    let pkg = || format!("{name} {version}");
     let Some(native) = setting.native else {
         let because = &graph.units[because.index()];
-        return Err(NativeUnitError::NoNativeSetting { package, because: format!("{} {}", because.name.as_str(), because.version.as_str()) });
+        return Err(NativeUnitError::NoNativeSetting { package: pkg(), because: format!("{} {}", because.name.as_str(), because.version.as_str()) });
     };
 
     // The host binary the interim builder made with exactly the unit's features.
     let features: std::vec::Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
-    let module = module_of_native(setting.store, name, version, &features, setting.host).map_err(NativeUnitError::Lookup)?.ok_or_else(|| NativeUnitError::NoModule {
-        package: package.clone(),
+    let module = crate::script_unit::module_of_native_files(setting.store, name, version, &features, setting.host, setting.files_digest).map_err(NativeUnitError::Lookup)?.ok_or_else(|| NativeUnitError::NoModule {
+        package: pkg(),
         features: features.iter().map(|f| (*f).to_owned()).collect(),
         store: setting.store.display().to_string(),
     })?;
@@ -324,7 +393,7 @@ pub fn native_outputs<'a>(
     // function of the producers' records alone) and what the producers serve (`views.key`
     // below), as a wasm reader's key does; the run is given the values as IT sees them (laid
     // below). A value under neither of a producer's trees is refused here, naming it.
-    let dep_error = |why: LayError| NativeUnitError::DepLinks { package: package.clone(), why };
+    let dep_error = |why: LayError| NativeUnitError::DepLinks { package: pkg(), why };
     let viewed = dep_mount::view_with_stored(&tree, producers, deps, alloc).map_err(|e| dep_error(LayError::View(e)))?;
     let mut keyed: AVec<'a, DepMetadata<'_>> = Vec::new_in(alloc);
     for (dep, value) in deps.iter().zip(viewed.values.iter()) {
@@ -334,7 +403,7 @@ pub fn native_outputs<'a>(
     let env = blaze_build_script::env(&given, alloc);
 
     // D71: the host tools the table grants this package, each at its real path, by digest.
-    let pin = |why: String| NativeUnitError::PinTable { package: package.clone(), why };
+    let pin = |why: String| NativeUnitError::PinTable { package: pkg(), why };
     let table = host_tools::host_tools(CLANG_JSON, setting.host, alloc).map_err(|e| pin(e.to_string()))?;
     let tools: AVec<'a, HostTool<'_>> = host_tools::granted(&table, name, alloc);
     // Every granted program is keyed at its real path: the tool under its name, then each
@@ -356,7 +425,7 @@ pub fn native_outputs<'a>(
         let program = program.as_str();
         let real = std::fs::canonicalize(program).map_err(|e| NativeUnitError::Read { path: program.to_owned(), why: e.to_string() })?;
         if real.as_os_str() != program {
-            return Err(NativeUnitError::ToolNotReal { package: package.clone(), tool: tool.name.to_owned(), path: program.to_owned(), real: real.display().to_string() });
+            return Err(NativeUnitError::ToolNotReal { package: pkg(), tool: tool.name.to_owned(), path: program.to_owned(), real: real.display().to_string() });
         }
         let (dir, file) = program.rsplit_once('/').unwrap_or(("/", program));
         let digest = blaze_sha256::digest(&read_file(if dir.is_empty() { "/" } else { dir }, file)?);
@@ -389,61 +458,98 @@ pub fn native_outputs<'a>(
     // What the producers serve is in the key, as for a wasm reader (rule 21).
     let base: ContentId = viewed.views.key(key::base(&inputs, &mut scratch));
     // The package on disk (a workspace member's folder as it is; a fetched package written out
-    // under its key) and an empty `OUT_DIR`.
+    // under its private run folder) and a private empty `OUT_DIR`. Each invocation uses its own
+    // unique `run_key` (`<key_hex>-<cmd_id>-<seq>`) from the command's jobserver so concurrent
+    // runs of the same build-script key (same command or separate processes) never collide on
+    // `pkg/`, `out/`, `facts/`, or `deps/`.
     let key_hex = hex(&base.0);
-    let (package_dir, workspace_read, listed): (String, Option<String>, std::vec::Vec<String>) = match &tree {
+    let (cmd_id, run_seq) = native.jobs.next_run_id();
+    let run_key = blaze_own::format_in!(alloc, "{key_hex}-{cmd_id}-{run_seq}");
+    let mut work_guard = RunWorkGuard::new(native.work, alloc);
+    let (package_dir, ws_root_dir, listed): (String, Option<String>, Option<AVec<'a, AString<'a>>>) = match &tree {
         // Already the resolved root (`RealRoot`, the edge's one realpath, as Seatbelt matches
         // paths): not resolved again. For a workspace member (`root.seen()` = `/workspace/<rel>`),
         // `package_dir` (CARGO_MANIFEST_DIR + cwd) is `<workspace>/<rel>`, while the workspace
         // root itself remains granted read-only so workspace-relative reads still succeed.
+        // Walking and hashing the full workspace is deferred until after the run, and skipped
+        // entirely when confined certification proves a smaller exact read set.
         Tree::Dir(dir) => {
-            let ws_real = dir.path().to_str().ok_or_else(|| NativeUnitError::Files { package: package.clone(), folder: dir.path().display().to_string(), why: "not UTF-8".to_owned() })?.to_owned();
+            let ws_real = dir.path().to_str().ok_or_else(|| NativeUnitError::Files { package: pkg(), folder: dir.path().display().to_string(), why: "not UTF-8".to_owned() })?.to_owned();
             let seen_str = root.seen().to_string();
             let rel = seen_str.strip_prefix("/workspace").unwrap_or("").trim_start_matches('/');
             let pkg_path = if rel.is_empty() { dir.path().to_path_buf() } else { std::fs::canonicalize(dir.path().join(rel)).unwrap_or_else(|_| dir.path().join(rel)) };
-            let pkg_real = pkg_path.to_str().ok_or_else(|| NativeUnitError::Files { package: package.clone(), folder: pkg_path.display().to_string(), why: "not UTF-8".to_owned() })?.to_owned();
-            let names = listed_under(&ws_real).map_err(|e| NativeUnitError::Files { package: package.clone(), folder: ws_real.clone(), why: e.to_string() })?;
-            let names = names.into_iter().map(|listed| listed.name).collect();
-            let extra_read = (pkg_real != ws_real).then_some(ws_real);
-            (pkg_real, extra_read, names)
+            let pkg_real = pkg_path.to_str().ok_or_else(|| NativeUnitError::Files { package: pkg(), folder: pkg_path.display().to_string(), why: "not UTF-8".to_owned() })?.to_owned();
+            (pkg_real, Some(ws_real), None)
         }
-        Tree::Mem { files, .. } => {
-            let dir = fresh_folder(native.work, &format!("pkg/{key_hex}"), files, &package)?;
-            (dir, None, files.iter().map(|(n, _)| n.clone()).collect())
+        Tree::Mem { files, submodules, .. } => {
+            if let Some((sub, commit)) = submodules.first() {
+                let mut hex = blaze_own::AString::new_in(alloc);
+                for byte in commit {
+                    let _ = core::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));
+                }
+                return Err(NativeUnitError::Files {
+                    package: pkg(),
+                    folder: sub.as_str().to_owned(),
+                    why: format!("package contains unpopulated git submodule `{sub}` at commit {hex}; native build-script materialization refuses unpopulated submodules"),
+                });
+            }
+            let pkg_rel = blaze_own::format_in!(alloc, "pkg/{}", run_key.as_str());
+            let dir = fresh_folder(native.work, pkg_rel.as_str(), files, &pkg(), alloc)?;
+            work_guard.push_dir(pkg_rel);
+            let mut names = Vec::with_capacity_in(files.len(), alloc);
+            for (n, _) in files.iter() {
+                names.push(OwnString::from_str_in(n.as_str(), alloc));
+            }
+            (dir, None, Some(names))
         }
     };
-    let out_dir = fresh_folder(native.work, &format!("out/{key_hex}"), &[], &package)?;
+    let out_rel = blaze_own::format_in!(alloc, "out/{}", run_key.as_str());
+    let out_dir = fresh_folder(native.work, out_rel.as_str(), &[], &pkg(), alloc)?;
+    work_guard.push_dir(out_rel);
     let clang_major = toolchain::clang_major(CLANG_JSON).map_err(|e| pin(e.to_string()))?;
     let c = CInputs { shelf: Shelf { dir: native.shelf, clang_major }, sysroot: native.sdk, out_dir: &out_dir, package: &package_dir, seen: root.seen(), macos_min: MACOS_MIN };
     // N7: the fact shim the command placed in its work folder, and this run's facts folder.
     // A native run's probes are answered from the pins through the fact shim; the questions
     // asked become reads in the wasm path's fact form (native_facts::reads).
     let pins = setting.spawn_setting.pins.as_ref();
-    let facts_error = |e: native_facts::NativeFactsError| NativeUnitError::Facts { package: package.clone(), why: e.to_string() };
-    let shim = native_facts::placed_shim(native.work).map_err(facts_error)?;
-    let facts = native_facts::prepare(&shim, native.work, &key_hex, pins, alloc).map_err(facts_error)?;
+    let facts_error = |e: native_facts::NativeFactsError| NativeUnitError::Facts { package: pkg(), why: e.to_string() };
+    let fallback_shim;
+    let shim: &str = match native.shim {
+        Some(path) => path,
+        None => {
+            fallback_shim = native_facts::placed_shim(native.work, None).map_err(facts_error)?;
+            fallback_shim.as_str()
+        }
+    };
+    let facts = native_facts::prepare(shim, native.work, run_key.as_str(), pins, alloc).map_err(facts_error)?;
+    work_guard.push_dir(blaze_own::format_in!(alloc, "facts/{}", run_key.as_str()));
+    work_guard.push_file(blaze_own::format_in!(alloc, "facts/{}.lock", run_key.as_str()));
     // The home's file area: each file the script leaves goes there by digest, renamed, never
     // read whole (librocksdb-sys's 810 MB archive); made once, canonical as Seatbelt's paths.
     let area = setting.store.join(blaze_build_script::outputs::FILE_AREA);
-    let area_failed = |why: String| NativeUnitError::Files { package: package.clone(), folder: area.display().to_string(), why };
+    let area_failed = |why: String| NativeUnitError::Files { package: pkg(), folder: area.display().to_string(), why };
     std::fs::create_dir_all(&area).map_err(|e| area_failed(e.to_string()))?;
     let area = std::fs::canonicalize(&area).map_err(|e| area_failed(e.to_string()))?;
     let area = area.to_str().ok_or_else(|| area_failed("not UTF-8".to_owned()))?.to_owned();
     // Brief N8: the producers' trees laid read-only under this run's own folder, each value as
     // this run sees it; what the script prints under them is kept in the record's form.
-    let laid = dep_mount::native::lay_with_area(native.work, &format!("deps/{key_hex}"), Some(Path::new(&area)), producers, deps, alloc).map_err(dep_error)?;
+    let deps_rel = blaze_own::format_in!(alloc, "deps/{}", run_key.as_str());
+    let laid = dep_mount::native::lay_with_area(native.work, deps_rel.as_str(), Some(Path::new(&area)), producers, deps, alloc).map_err(dep_error)?;
+    work_guard.push_dir(deps_rel);
     let mut run_deps: AVec<'a, DepMetadata<'_>> = Vec::new_in(alloc);
     for (dep, value) in deps.iter().zip(laid.values.iter()) {
         run_deps.push(DepMetadata { links: dep.links, key: dep.key, value: value.as_str() });
     }
     let run_env = blaze_build_script::env(&Given { deps: &run_deps, ..given }, alloc);
-    let mut dep_reads: AVec<'a, &str> = Vec::new_in(alloc);
-    if let Some(ref ws) = workspace_read {
-        dep_reads.push(ws.as_str());
-    }
+    let mut laid_folders: AVec<'a, &str> = Vec::new_in(alloc);
     for folder in laid.folders.iter() {
-        dep_reads.push(folder.as_str());
+        laid_folders.push(folder.as_str());
     }
+    let mut dep_reads: AVec<'a, &str> = Vec::new_in(alloc);
+    if let Some(ws) = ws_root_dir.as_deref().filter(|&ws| ws != package_dir.as_str()) {
+        dep_reads.push(ws);
+    }
+    dep_reads.extend_from_slice(&laid_folders);
     let mut dep_shown: AVec<'a, (&str, &str)> = Vec::new_in(alloc);
     for (real, shown) in laid.shown.iter() {
         dep_shown.push((real.as_str(), shown.as_str()));
@@ -459,6 +565,7 @@ pub fn native_outputs<'a>(
         host_tools: &tools,
         facts: Some(&facts),
         jobs: Some(native.jobs),
+        confined: None,
         limits: RunLimits::STANDARD,
         deadline: native.deadline,
     };
@@ -466,21 +573,402 @@ pub fn native_outputs<'a>(
     let asked = native_facts::reads(&facts, pins, alloc).map_err(facts_error)?;
     let ran = match ran {
         Ok(ran) => ran,
-        Err(run) if !asked.refused.is_empty() => return Err(NativeUnitError::FactRefused { package: package.clone(), refused: asked.refused, run }),
+        Err(run) if !asked.refused.is_empty() => return Err(NativeUnitError::FactRefused { package: pkg(), refused: asked.refused, run }),
         Err(run) => return Err(NativeUnitError::Run(run)),
     };
 
-    // The read list, coarse and correct: every file of the package by its digest now (a native
-    // run's own reads are not seen; build-scripts.md, "The record").
-    let mut reads: std::vec::Vec<Read> = std::vec::Vec::with_capacity(listed.len());
-    for rel in listed {
-        let subject = format!("file:{rel}");
-        let digest = answer_now(&tree, &subject).map_err(|e| NativeUnitError::Files { package: package.clone(), folder: package_dir.clone(), why: e.0 })?;
-        reads.push(Read { subject, digest });
+    // Prefer a kernel-confined certified read set for workspace members: proves that the script
+    // produces byte-identical outputs when Seatbelt/Landlock grants ONLY the recorded paths,
+    // avoiding walking/hashing the entire workspace and preventing spurious incremental wakes.
+    let certified = match ws_root_dir.as_deref() {
+        Some(ws_real) => certify_member_reads(
+            CertifyInput {
+                tree: &tree,
+                ws_real,
+                pkg_real: &package_dir,
+                out_dir: &out_dir,
+                work: native.work,
+                key_hex: run_key.as_str(),
+                package_label: name,
+                run: &run,
+                laid_folders: &laid_folders,
+                shim: Some(shim),
+                pins,
+                ran: &ran,
+                asked: &asked,
+            },
+            alloc,
+        ),
+        None => None,
+    };
+    let specs: AVec<'a, (&'static str, AString<'a>, Option<ContentId>)> = match certified {
+        Some(specs) => specs,
+        None => {
+            let names: AVec<'a, AString<'a>> = match listed {
+                Some(names) => names,
+                None => {
+                    let ws_real = ws_root_dir.as_deref().unwrap_or(package_dir.as_str());
+                    match listed_under(ws_real) {
+                        Ok(entries) => {
+                            let mut out = Vec::with_capacity_in(entries.len(), alloc);
+                            for entry in entries {
+                                out.push(OwnString::from_str_in(entry.name.as_str(), alloc));
+                            }
+                            out
+                        }
+                        Err(e) => return Err(NativeUnitError::Files { package: pkg(), folder: ws_root_dir.unwrap_or(package_dir), why: e.to_string() }),
+                    }
+                }
+            };
+            let mut out = Vec::with_capacity_in(names.len(), alloc);
+            for rel in names {
+                let subject = blaze_own::format_in!(alloc, "file:{}", rel.as_str());
+                let digest = match answer_now(&tree, subject.as_str()) {
+                    Ok(digest) => digest,
+                    Err(e) => return Err(NativeUnitError::Files { package: pkg(), folder: package_dir, why: e.0 }),
+                };
+                out.push(("file:", rel, digest));
+            }
+            out
+        }
+    };
+    let mut reads: std::vec::Vec<Read> = std::vec::Vec::with_capacity(specs.len());
+    for (prefix, rel, digest) in specs.iter() {
+        let subject = format!("{prefix}{}", rel.as_str());
+        reads.push(Read { subject, digest: *digest });
     }
     // The facts the script asked (N7), each with the pins' answer now (`None` where refused).
     reads.extend(asked.reads);
     Ok(ScriptRun { outputs: ran.outputs, base, reads, fuel: 0, peak_memory: 0, spawns: 0 })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RerunTarget<'a> {
+    WorkspaceRel(AString<'a>),
+    OutDir,
+    WorkspaceRoot,
+    Escape,
+}
+
+fn strip_dir_prefix<'p>(path: &'p str, dir: &str) -> Option<&'p str> {
+    let rest = path.strip_prefix(dir)?;
+    if rest.is_empty() {
+        Some("")
+    } else {
+        rest.strip_prefix('/')
+    }
+}
+
+fn normalize_under_workspace<'a>(base_rel: &str, raw_rel: &str, alloc: Alloc<'a>) -> RerunTarget<'a> {
+    let mut segs: AVec<'a, &str> = Vec::new_in(alloc);
+    if !base_rel.is_empty() {
+        for seg in base_rel.split('/') {
+            if !seg.is_empty() {
+                segs.push(seg);
+            }
+        }
+    }
+    for seg in raw_rel.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if segs.pop().is_none() {
+                    return RerunTarget::Escape;
+                }
+            }
+            part => segs.push(part),
+        }
+    }
+    if segs.is_empty() {
+        return RerunTarget::WorkspaceRoot;
+    }
+    let mut out: AString<'a> = OwnString::new_in(alloc);
+    for (idx, seg) in segs.iter().enumerate() {
+        if idx > 0 {
+            out.push('/');
+        }
+        out.push_str(seg);
+    }
+    RerunTarget::WorkspaceRel(out)
+}
+
+/// Resolves a `cargo:rerun-if-changed=<raw>` path to a normalized workspace-relative path.
+/// Returns `WorkspaceRoot` or `Escape` when the path cannot be safely narrowed below the full
+/// workspace root, causing certification to fall back to the coarse workspace read list.
+fn resolve_rerun_path<'a>(raw: &str, ws_real: &str, pkg_rel: &str, out_dir: &str, alloc: Alloc<'a>) -> RerunTarget<'a> {
+    if raw.is_empty() {
+        return RerunTarget::Escape;
+    }
+    if raw.starts_with('/') {
+        if strip_dir_prefix(raw, out_dir).is_some() {
+            return RerunTarget::OutDir;
+        }
+        if let Some(rest) = strip_dir_prefix(raw, ws_real) {
+            return normalize_under_workspace("", rest, alloc);
+        }
+        if let Some(rest) = strip_dir_prefix(raw, "/workspace") {
+            return normalize_under_workspace("", rest, alloc);
+        }
+        return RerunTarget::Escape;
+    }
+    normalize_under_workspace(pkg_rel, raw, alloc)
+}
+
+fn covers_package(rel: &str, pkg_rel: &str) -> bool {
+    if pkg_rel.is_empty() {
+        return !rel.is_empty();
+    }
+    rel == pkg_rel || strip_dir_prefix(rel, pkg_rel).is_some()
+}
+
+fn join_rel<'a>(base: &str, sub: &str, alloc: Alloc<'a>) -> AString<'a> {
+    if base.is_empty() {
+        OwnString::from_str_in(sub, alloc)
+    } else if sub.is_empty() {
+        OwnString::from_str_in(base, alloc)
+    } else {
+        blaze_own::format_in!(alloc, "{base}/{sub}")
+    }
+}
+
+fn cleanup_cert_dir(dir: &str) {
+    if let Ok(entries) = listed_under(dir) {
+        for entry in entries {
+            let _ = remove(dir, &entry.name);
+        }
+    }
+}
+
+pub struct CertifyInput<'a, 's> {
+    pub tree: &'s Tree,
+    pub ws_real: &'s str,
+    pub pkg_real: &'s str,
+    pub out_dir: &'s str,
+    pub work: &'s str,
+    pub key_hex: &'s str,
+    pub package_label: &'s str,
+    pub run: &'s NativeScript<'s>,
+    pub laid_folders: &'s [&'s str],
+    pub shim: Option<&'s str>,
+    pub pins: Option<&'s crate::spawn_route::FactPins>,
+    pub ran: &'s NativeScriptRun<'a>,
+    pub asked: &'s native_facts::Asked,
+}
+
+/// Certifies a narrow, exact read set for a native workspace-member build script by re-running it
+/// under stricter OS confinement (Seatbelt literal file rules / Landlock) and verifying identical
+/// outputs, headers, and fact queries. Returns `None` on any mismatch or edge case so the caller
+/// falls back to the coarse whole-workspace read list (100% sound).
+pub fn certify_member_reads<'a>(
+    input: CertifyInput<'a, '_>,
+    alloc: Alloc<'a>,
+) -> Option<AVec<'a, (&'static str, AString<'a>, Option<ContentId>)>> {
+    if input.ran.headers_read != 0 || !input.run.host_tools.is_empty() || !input.ran.outputs.errors.is_empty() {
+        return None;
+    }
+    let pkg_rel = strip_dir_prefix(input.pkg_real, input.ws_real)?;
+    let mut cert_guard = RunWorkGuard::new(input.work, alloc);
+    let cert_key = match input.run.jobs {
+        Some(jobs) => {
+            let (cmd_id, seq) = jobs.next_run_id();
+            blaze_own::format_in!(alloc, "{}-cert-{cmd_id}-{seq}", input.key_hex)
+        }
+        None => blaze_own::format_in!(alloc, "{}-cert", input.key_hex),
+    };
+    let cert_out_rel = blaze_own::format_in!(alloc, "out/{}", cert_key.as_str());
+    let cert_out_dir = fresh_folder(input.work, cert_out_rel.as_str(), &[], input.package_label, alloc).ok()?;
+    cert_guard.push_dir(cert_out_rel);
+    let cert_facts = match input.shim {
+        Some(shim) => {
+            let f = native_facts::prepare(shim, input.work, cert_key.as_str(), input.pins, alloc).ok()?;
+            cert_guard.push_dir(blaze_own::format_in!(alloc, "facts/{}", cert_key.as_str()));
+            cert_guard.push_file(blaze_own::format_in!(alloc, "facts/{}.lock", cert_key.as_str()));
+            Some(f)
+        }
+        None => None,
+    };
+
+    if !input.ran.rerun_if_changed.is_empty() {
+        let mut candidates: AVec<'a, AString<'a>> = Vec::new_in(alloc);
+        for raw in input.ran.rerun_if_changed.iter() {
+            match resolve_rerun_path(raw.as_str(), input.ws_real, pkg_rel, input.out_dir, alloc) {
+                RerunTarget::OutDir => {}
+                RerunTarget::WorkspaceRoot | RerunTarget::Escape => {
+                    cleanup_cert_dir(&cert_out_dir);
+                    return None;
+                }
+                RerunTarget::WorkspaceRel(rel) => candidates.push(rel),
+            }
+        }
+        candidates.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        candidates.dedup_by(|a, b| a.as_str() == b.as_str());
+
+        let mut confined_files: AVec<'a, AString<'a>> = Vec::new_in(alloc);
+        let mut granted_dirs: AVec<'a, AString<'a>> = Vec::new_in(alloc);
+        let mut granted_dir_rels: AVec<'a, AString<'a>> = Vec::new_in(alloc);
+        let mut specs: AVec<'a, (&'static str, AString<'a>, Option<ContentId>)> = Vec::new_in(alloc);
+
+        for rel in candidates.iter() {
+            let rel_str = rel.as_str();
+            match TreeRead::File.answer(input.tree, rel_str) {
+                Err(_) => {
+                    cleanup_cert_dir(&cert_out_dir);
+                    return None;
+                }
+                Ok(None) => {
+                    specs.push(("file:", OwnString::from_str_in(rel_str, alloc), None));
+                }
+                Ok(Some(digest)) if digest == NOT_A_FILE => {
+                    if !input.tree.is_direct(rel_str) {
+                        cleanup_cert_dir(&cert_out_dir);
+                        return None;
+                    }
+                    let listing = TreeRead::Listing.answer(input.tree, rel_str).ok()?;
+                    specs.push(("dir:", OwnString::from_str_in(rel_str, alloc), listing));
+                    let full_dir = blaze_own::format_in!(alloc, "{}/{rel_str}", input.ws_real);
+                    let (sub_dirs, sub_files) = walk_tree(full_dir.as_str(), alloc)?;
+                    for sub in sub_dirs.iter() {
+                        let sub_rel = join_rel(rel_str, sub.as_str(), alloc);
+                        if !input.tree.is_direct(sub_rel.as_str()) {
+                            cleanup_cert_dir(&cert_out_dir);
+                            return None;
+                        }
+                        let sub_listing = TreeRead::Listing.answer(input.tree, sub_rel.as_str()).ok()?;
+                        specs.push(("dir:", sub_rel, sub_listing));
+                    }
+                    for file in sub_files.iter() {
+                        let file_rel = join_rel(rel_str, file.as_str(), alloc);
+                        if !input.tree.is_direct(file_rel.as_str()) {
+                            cleanup_cert_dir(&cert_out_dir);
+                            return None;
+                        }
+                        let file_digest = TreeRead::File.answer(input.tree, file_rel.as_str()).ok()?;
+                        specs.push(("file:", file_rel, file_digest));
+                    }
+                    granted_dirs.push(full_dir);
+                    granted_dir_rels.push(OwnString::from_str_in(rel_str, alloc));
+                }
+                Ok(Some(digest)) => {
+                    if !input.tree.is_direct(rel_str) {
+                        cleanup_cert_dir(&cert_out_dir);
+                        return None;
+                    }
+                    confined_files.push(OwnString::from_str_in(rel_str, alloc));
+                    specs.push(("file:", OwnString::from_str_in(rel_str, alloc), Some(digest)));
+                }
+            }
+        }
+
+        // Ensure `c.package` (the child's cwd) gets ancestor `file-read-metadata` in the SBPL
+        // profile by anchoring at least one existing direct file or directory under `pkg_rel`.
+        let has_cwd_anchor = confined_files.iter().any(|f| covers_package(f.as_str(), pkg_rel))
+            || granted_dir_rels.iter().any(|d| covers_package(d.as_str(), pkg_rel));
+        if !has_cwd_anchor {
+            let mut anchored = false;
+            for name in ["build.rs", "Cargo.toml"] {
+                let anchor = join_rel(pkg_rel, name, alloc);
+                if input.tree.is_direct(anchor.as_str()) {
+                    if let Ok(Some(digest)) = TreeRead::File.answer(input.tree, anchor.as_str()) {
+                        if digest != NOT_A_FILE {
+                            confined_files.push(OwnString::from_str_in(anchor.as_str(), alloc));
+                            specs.push(("file:", anchor, Some(digest)));
+                            anchored = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !anchored {
+                cleanup_cert_dir(&cert_out_dir);
+                return None;
+            }
+        }
+
+        confined_files.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        confined_files.dedup_by(|a, b| a.as_str() == b.as_str());
+        let mut confined_refs: AVec<'a, &str> = Vec::new_in(alloc);
+        for f in confined_files.iter() {
+            confined_refs.push(f.as_str());
+        }
+        let mut cert_reads: AVec<'a, &str> = Vec::new_in(alloc);
+        cert_reads.extend_from_slice(input.laid_folders);
+        for dir in granted_dirs.iter() {
+            cert_reads.push(dir.as_str());
+        }
+
+        let cert_run = NativeScript {
+            c: CInputs { out_dir: &cert_out_dir, ..input.run.c },
+            reads: &cert_reads,
+            facts: cert_facts.as_ref(),
+            confined: Some(ConfinedFiles { workspace: input.ws_real, files: &confined_refs }),
+            ..*input.run
+        };
+        let cert_res = run_script(&cert_run, alloc);
+        cleanup_cert_dir(&cert_out_dir);
+        let cert = cert_res.ok()?;
+        if let Some(ref cf) = cert_facts {
+            let cert_asked = native_facts::reads(cf, input.pins, alloc).ok()?;
+            if !cert_asked.refused.is_empty() || cert_asked.reads != input.asked.reads {
+                return None;
+            }
+        }
+        if cert.headers_read != 0 || cert.headers != input.ran.headers || cert.outputs != input.ran.outputs {
+            return None;
+        }
+
+        specs.sort_unstable_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.as_str().cmp(b.1.as_str())));
+        specs.dedup_by(|a, b| a.0 == b.0 && a.1.as_str() == b.1.as_str());
+        return Some(specs);
+    }
+
+    // No `rerun-if-changed` emitted: for a member below the workspace root, try certifying with
+    // ONLY `c.package` granted (not the whole workspace). If certified, record directory listings
+    // and file digests under `pkg_rel` only, so edits in other crates never wake this script.
+    if !pkg_rel.is_empty() && input.tree.is_direct(pkg_rel) {
+        let cert_run = NativeScript {
+            c: CInputs { out_dir: &cert_out_dir, ..input.run.c },
+            reads: input.laid_folders,
+            facts: cert_facts.as_ref(),
+            confined: None,
+            ..*input.run
+        };
+        let cert_res = run_script(&cert_run, alloc);
+        cleanup_cert_dir(&cert_out_dir);
+        let cert = cert_res.ok()?;
+        if let Some(ref cf) = cert_facts {
+            let cert_asked = native_facts::reads(cf, input.pins, alloc).ok()?;
+            if !cert_asked.refused.is_empty() || cert_asked.reads != input.asked.reads {
+                return None;
+            }
+        }
+        if cert.headers_read != 0 || cert.headers != input.ran.headers || cert.outputs != input.ran.outputs {
+            return None;
+        }
+        let pkg_listing = TreeRead::Listing.answer(input.tree, pkg_rel).ok()?;
+        let (sub_dirs, sub_files) = walk_tree(input.pkg_real, alloc)?;
+        let mut out = Vec::with_capacity_in(1 + sub_dirs.len() + sub_files.len(), alloc);
+        out.push(("dir:", OwnString::from_str_in(pkg_rel, alloc), pkg_listing));
+        for sub in sub_dirs.iter() {
+            let sub_rel = join_rel(pkg_rel, sub.as_str(), alloc);
+            if !input.tree.is_direct(sub_rel.as_str()) {
+                return None;
+            }
+            let listing = TreeRead::Listing.answer(input.tree, sub_rel.as_str()).ok()?;
+            out.push(("dir:", sub_rel, listing));
+        }
+        for file in sub_files.iter() {
+            let file_rel = join_rel(pkg_rel, file.as_str(), alloc);
+            if !input.tree.is_direct(file_rel.as_str()) {
+                return None;
+            }
+            let digest = TreeRead::File.answer(input.tree, file_rel.as_str()).ok()?;
+            out.push(("file:", file_rel, digest));
+        }
+        return Some(out);
+    }
+
+    cleanup_cert_dir(&cert_out_dir);
+    None
 }
 
 #[cfg(test)]
@@ -610,5 +1098,25 @@ mod tests {
         assert_eq!(sdk_version(r#"{"CanonicalName":"macosx27.2","Version":"27.2"}"#), Some("27.2"));
         assert_eq!(sdk_version("{\n  \"Version\" : \"15.0\",\n}"), Some("15.0"));
         assert_eq!(sdk_version(r#"{"CanonicalName":"macosx"}"#), None);
+    }
+
+    #[test]
+    fn rerun_if_changed_path_resolution_handles_member_root_and_escapes() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let ws = "/repo";
+        let pkg = "crates/chainspec";
+        let out = "/work/out/abc";
+        let resolved = |raw: &str| super::resolve_rerun_path(raw, ws, pkg, out, alloc);
+        assert_eq!(resolved("build.rs"), super::RerunTarget::WorkspaceRel(super::OwnString::from_str_in("crates/chainspec/build.rs", alloc)));
+        assert_eq!(resolved("src/zone_verifier/pcrs.json"), super::RerunTarget::WorkspaceRel(super::OwnString::from_str_in("crates/chainspec/src/zone_verifier/pcrs.json", alloc)));
+        assert_eq!(resolved("../../mainnet-network-identity.json"), super::RerunTarget::WorkspaceRel(super::OwnString::from_str_in("mainnet-network-identity.json", alloc)));
+        assert_eq!(resolved("/repo/mainnet-network-identity.json"), super::RerunTarget::WorkspaceRel(super::OwnString::from_str_in("mainnet-network-identity.json", alloc)));
+        assert_eq!(resolved("/workspace/crates/chainspec/build.rs"), super::RerunTarget::WorkspaceRel(super::OwnString::from_str_in("crates/chainspec/build.rs", alloc)));
+        assert_eq!(resolved("/work/out/abc/gen.rs"), super::RerunTarget::OutDir);
+        assert_eq!(resolved("/repo"), super::RerunTarget::WorkspaceRoot);
+        assert_eq!(resolved("../.."), super::RerunTarget::WorkspaceRoot);
+        assert_eq!(resolved("../../../outside.txt"), super::RerunTarget::Escape);
+        assert_eq!(resolved("/etc/passwd"), super::RerunTarget::Escape);
+        assert_eq!(resolved(""), super::RerunTarget::Escape);
     }
 }

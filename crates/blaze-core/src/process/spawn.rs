@@ -66,6 +66,9 @@ pub(super) struct ChildAsk<'a> {
     pub(super) procs: RawFd,
     pub(super) extra: &'a [(RawFd, RawFd)],
     pub(super) group: bool,
+    /// Whether it leads a new session (`setsid()` before exec), detached from the parent's group
+    /// and controlling terminal.
+    pub(super) session: bool,
     /// This process's pid where the child arms `PR_SET_PDEATHSIG(SIGKILL)`; 0: not armed.
     pub(super) parent: libc::pid_t,
     pub(super) confine: Option<&'a blaze_sys::linux::confine::ChildConfine<'a>>,
@@ -133,7 +136,7 @@ pub(super) fn spawn_with(
     {
         let procs = procs.map(|path| open(path, libc::O_WRONLY)).transpose()?;
         let joins = procs.as_ref().map_or(-1, |it| it.as_raw_fd());
-        let child = ChildAsk { procs: joins, extra, group, parent: 0, confine: None };
+        let child = ChildAsk { procs: joins, extra, group, session: false, parent: 0, confine: None };
         match while_busy(|| clone(&plan, fds, &child))? {
             Cloned::Started { pid, pidfd } => Ok(Spawned { pid, pidfd, stdin, stdout, stderr }),
             // No confinement was asked of this start (`confine: None` above), so none refused.
@@ -145,7 +148,7 @@ pub(super) fn spawn_with(
     #[cfg(target_os = "macos")]
     {
         debug_assert!(procs.is_none(), "no cgroups on macOS");
-        let pid = posix_spawn(&plan, fds, extra, group)?;
+        let pid = posix_spawn(&plan, fds, extra, group, false)?;
         Ok(Spawned { pid, stdin, stdout, stderr })
     }
 }
@@ -375,13 +378,18 @@ fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn open(path: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
-    // SAFETY: a NUL-terminated path.
-    let fd = unsafe { libc::open(path.as_ptr(), flags | libc::O_CLOEXEC) };
-    if fd < 0 {
+    let fd = loop {
+        // SAFETY: a NUL-terminated path.
+        let fd = unsafe { libc::open(path.as_ptr(), flags | libc::O_CLOEXEC) };
+        if fd >= 0 {
+            break fd;
+        }
         let error = io::Error::last_os_error();
-        // alloc: an error path.
-        return Err(io::Error::new(error.kind(), format!("{}: {error}", path.to_string_lossy())));
-    }
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
+    };
     // SAFETY: the call returned a descriptor of its own.
     above_stdio(unsafe { OwnedFd::from_raw_fd(fd) })
 }
@@ -420,11 +428,15 @@ struct Child<'a> {
     extra: &'a [(RawFd, RawFd)],
     /// Whether it leads a process group of its own.
     group: bool,
+    /// Whether it leads a new session (`setsid()` before exec).
+    session: bool,
     /// This process's pid where the child arms `PR_SET_PDEATHSIG(SIGKILL)`; 0: not armed.
     parent: libc::pid_t,
     /// The confinement it enters last before `execve` (D177): data the parent made, which the
     /// child only reads.
     confine: Option<&'a blaze_sys::linux::confine::ChildConfine<'a>>,
+    /// Typed `argv`/`envp` for `blaze_sys::linux::execveat` when `confine.exec_fd` is `Some`.
+    exec_args: Option<(blaze_sys::linux::Args<'a>, blaze_sys::linux::Args<'a>)>,
     /// The error slot, the one memory of the parent's the child writes, read by the parent only
     /// after the child has exec'd or exited: the step that failed (0: none) and its errno, and
     /// for a refused confinement ([`CONFINE_STEP`]) which of its steps.
@@ -457,6 +469,37 @@ fn clone(plan: &Plan, fds: [RawFd; 3], ask: &ChildAsk<'_>) -> io::Result<Cloned>
 /// until this returns; the child's frames go there while the calling thread waits.
 #[cfg(target_os = "linux")]
 unsafe fn clone_on(stack: *mut u8, plan: &Plan, fds: [RawFd; 3], ask: &ChildAsk<'_>) -> io::Result<Cloned> {
+    let mut argv_vec = blaze_own::Vec::new_in(blaze_own::SharedAlloc::global());
+    let mut envp_vec = blaze_own::Vec::new_in(blaze_own::SharedAlloc::global());
+    let exec_args = if ask.confine.and_then(|c| c.exec_fd).is_some() {
+        argv_vec.reserve(plan.argv.len());
+        for &p in &plan.argv {
+            let arg = if p.is_null() {
+                blaze_sys::linux::Arg::END
+            } else {
+                // SAFETY: `Plan` keeps every NUL-terminated argument string live until `clone_on` returns.
+                blaze_sys::linux::Arg::new(unsafe { CStr::from_ptr(p) })
+            };
+            argv_vec.push(arg);
+        }
+        envp_vec.reserve(plan.envp.len());
+        for &p in &plan.envp {
+            let arg = if p.is_null() {
+                blaze_sys::linux::Arg::END
+            } else {
+                // SAFETY: `Plan` keeps every NUL-terminated env string live until `clone_on` returns.
+                blaze_sys::linux::Arg::new(unsafe { CStr::from_ptr(p) })
+            };
+            envp_vec.push(arg);
+        }
+        let argv = blaze_sys::linux::Args::new(argv_vec.as_slice())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid execveat argv"))?;
+        let envp = blaze_sys::linux::Args::new(envp_vec.as_slice())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid execveat envp"))?;
+        Some((argv, envp))
+    } else {
+        None
+    };
     // It grows down from its end, which both ABIs (x86-64, AArch64) want on 16 bytes.
     let top = stack.wrapping_add(STACK).map_addr(|it| it & !15);
     let mut child = Child {
@@ -465,8 +508,10 @@ unsafe fn clone_on(stack: *mut u8, plan: &Plan, fds: [RawFd; 3], ask: &ChildAsk<
         procs: ask.procs,
         extra: ask.extra,
         group: ask.group,
+        session: ask.session,
         parent: ask.parent,
         confine: ask.confine,
+        exec_args,
         step: 0,
         failed: 0,
         refused: None,
@@ -519,6 +564,11 @@ unsafe fn clone_on(stack: *mut u8, plan: &Plan, fds: [RawFd; 3], ask: &ChildAsk<
     if let (CONFINE_STEP, Some((step, errno))) = (step, refused) {
         return Ok(Cloned::ConfineRefused { step, errno });
     }
+    if step == 4 && failed != 0 {
+        // Preserve `raw_os_error()` (e.g. ENOENT, ETXTBSY) for `while_busy` and `LinkError.os`,
+        // matching macOS `posix_spawn`.
+        return Err(io::Error::from_raw_os_error(failed));
+    }
     let what = match step {
         1 => "giving it its input and output",
         2 => "putting it in its cgroup",
@@ -528,6 +578,7 @@ unsafe fn clone_on(stack: *mut u8, plan: &Plan, fds: [RawFd; 3], ask: &ChildAsk<
         7 => "arming its kill at its parent's death (PR_SET_PDEATHSIG)",
         8 => "finding its parent alive after arming its kill at the parent's death",
         CONFINE_STEP => "entering its confinement (D177)",
+        10 => "making it the leader of a session of its own (setsid)",
         _ => "running its program",
     };
     let error = io::Error::from_raw_os_error(failed);
@@ -610,12 +661,20 @@ extern "C" fn run(arg: *mut libc::c_void) -> libc::c_int {
             fail(child, 8);
         }
     }
-    // A group of its own, made before its program runs, so the parent (waiting, CLONE_VFORK)
-    // can signal the group the moment `clone` returns.
-    // SAFETY: no pointers; this process's own group set to its pid. Async-signal-safe
-    // (POSIX.1-2017 section 2.4.3 lists `setpgid`).
-    if child.group && unsafe { libc::setpgid(0, 0) } != 0 {
-        fail(child, 5);
+    // A new session of its own (`setsid`, detached from parent's group and controlling terminal),
+    // or a process group of its own (`setpgid(0, 0)`), made before its program runs.
+    if child.session {
+        // SAFETY: no pointers; creates a new session for this child process (not yet a process
+        // group leader, so `setsid` succeeds). Async-signal-safe (POSIX.1-2017 section 2.4.3).
+        if unsafe { libc::setsid() } < 0 {
+            fail(child, 10);
+        }
+    } else if child.group {
+        // SAFETY: no pointers; this process's own group set to its pid. Async-signal-safe
+        // (POSIX.1-2017 section 2.4.3 lists `setpgid`).
+        if unsafe { libc::setpgid(0, 0) } != 0 {
+            fail(child, 5);
+        }
     }
     for (target, fd) in (0..).zip(child.fds) {
         // SAFETY: an open descriptor past 2 onto one of 0, 1 and 2; the copy keeps no
@@ -675,22 +734,38 @@ extern "C" fn run(arg: *mut libc::c_void) -> libc::c_int {
             unsafe { libc::_exit(crate::exit::Exit::ExecFailed.code()) }
         }
     }
-    // SAFETY: a NUL-terminated path and two NULL-terminated arrays of NUL-terminated strings,
-    // all kept by the parent until the program runs. Async-signal-safe; on success the child
-    // leaves the shared memory and the parent runs again.
-    unsafe { libc::execve(child.plan.program, child.plan.argv.as_ptr(), child.plan.envp.as_ptr()) };
+    if let (Some(exec_fd), Some((argv, envp))) = (child.confine.and_then(|c| c.exec_fd), child.exec_args) {
+        let errno = blaze_sys::linux::execveat(
+            exec_fd,
+            blaze_sys::Path::EMPTY,
+            argv,
+            envp,
+            blaze_sys::linux::AtFlags::EMPTY_PATH,
+        );
+        child.failed = libc::c_int::from(errno.raw());
+        child.step = 4;
+        // SAFETY: the end of the child, running nothing of the parent's; one syscall.
+        unsafe { libc::_exit(crate::exit::Exit::ExecFailed.code()) }
+    } else {
+        // SAFETY: a NUL-terminated path and two NULL-terminated arrays of NUL-terminated strings,
+        // all kept by the parent until the program runs. Async-signal-safe; on success the child
+        // leaves the shared memory and the parent runs again.
+        unsafe { libc::execve(child.plan.program, child.plan.argv.as_ptr(), child.plan.envp.as_ptr()) };
+    }
     fail(child, 4)
 }
 
-/// `extra` and `group` as [`spawn_with`] says: one `posix_spawn_file_actions_adddup2` per
-/// extra, after the standard three (under `CLOEXEC_DEFAULT` a descriptor a file action gives is
-/// the one kept open), and `POSIX_SPAWN_SETPGROUP` with group 0, the child's own pid.
+/// `extra`, `group` and `session` as [`spawn_with`] says: one `posix_spawn_file_actions_adddup2`
+/// per extra, after the standard three (under `CLOEXEC_DEFAULT` a descriptor a file action gives
+/// is the one kept open), `POSIX_SPAWN_SETSID` when `session` is set, else `POSIX_SPAWN_SETPGROUP`
+/// with group 0, the child's own pid.
 #[cfg(target_os = "macos")]
 fn posix_spawn(
     plan: &Plan,
     fds: [RawFd; 3],
     extra: &[(RawFd, RawFd)],
     group: bool,
+    session: bool,
 ) -> io::Result<libc::pid_t> {
     unsafe extern "C" {
         fn posix_spawn_file_actions_addchdir_np(
@@ -705,9 +780,11 @@ fn posix_spawn(
         ) -> libc::c_int;
     }
     /// Every descriptor not given by a file action is closed in the child (Apple's).
-    const CLOEXEC_DEFAULT: libc::c_short = 0x4000;
+    const CLOEXEC_DEFAULT: i16 = 0x4000;
     /// The group of `posix_spawnattr_setpgroup` is set before the program runs (spawn.h).
-    const SETPGROUP: libc::c_short = 0x0002;
+    const SETPGROUP: i16 = 0x0002;
+    /// The child starts a new session (`setsid`) before the program runs (Apple `<sys/spawn.h>`).
+    const SETSID: i16 = 0x0400;
     let check = |code: libc::c_int| match code {
         0 => Ok(()),
         _ => Err(io::Error::from_raw_os_error(code)),
@@ -732,7 +809,7 @@ fn posix_spawn(
             // reads (`spawn_with`).
             check(unsafe { libc::posix_spawn_file_actions_adddup2(&mut actions, source, target) })?;
         }
-        if group {
+        if group && !session {
             // SAFETY: made above; group 0 is the child's own pid.
             check(unsafe { posix_spawnattr_setpgroup(&mut attr, 0) })?;
         }
@@ -751,23 +828,35 @@ fn posix_spawn(
         let flags = CLOEXEC_DEFAULT
             | libc::POSIX_SPAWN_SETSIGDEF as libc::c_short
             | libc::POSIX_SPAWN_SETSIGMASK as libc::c_short
-            | if group { SETPGROUP } else { 0 };
+            | if session {
+                SETSID
+            } else if group {
+                SETPGROUP
+            } else {
+                0
+            };
         // SAFETY: made above.
         check(unsafe { libc::posix_spawnattr_setflags(&mut attr, flags) })?;
         let mut pid = 0;
         while_busy(|| {
-            // SAFETY: a NUL-terminated path, the actions and attributes made above, and two
-            // NULL-terminated arrays of NUL-terminated strings kept by `plan`.
-            check(unsafe {
-                libc::posix_spawn(
-                    &mut pid,
-                    plan.program,
-                    &actions,
-                    &attr,
-                    plan.argv.as_ptr().cast(),
-                    plan.envp.as_ptr().cast(),
-                )
-            })
+            loop {
+                // SAFETY: a NUL-terminated path, the actions and attributes made above, and two
+                // NULL-terminated arrays of NUL-terminated strings kept by `plan`.
+                let result = check(unsafe {
+                    libc::posix_spawn(
+                        &mut pid,
+                        plan.program,
+                        &actions,
+                        &attr,
+                        plan.argv.as_ptr().cast(),
+                        plan.envp.as_ptr().cast(),
+                    )
+                });
+                if result.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::Interrupted) {
+                    continue;
+                }
+                return result;
+            }
         })?;
         Ok(pid)
     })();

@@ -1,18 +1,20 @@
-//! The `MacroModule` task: whether the module store holds a proc-macro crate's compiled
-//! module (docs/v2/plan/design/proc-macros.md). A lookup only: the module is never compiled
-//! here and nothing is run; the sandbox runtime is not needed for it.
+//! The `MacroModule` task: resolves and self-compiles a proc-macro crate's `wasm64` (`memory64`)
+//! module (docs/v2/plan/design/proc-macros.md).
 //!
 //! The store is the user's shared store, `<home>/.blaze/v2/proc-macro/modules/<key>/`: a
 //! module is keyed by its crate's identity alone (the lock's pin of its sources, its dependency
-//! closure, its features, the toolchain), the same for every project, so it lives beside the
-//! toolchain shelf, never under a project. The home is the passed value main.rs reads at the
-//! edge. The bootstrap tool (`toolrun.sh proc_macro_modules`) fills it; later CI's cache does.
+//! closure including path-dependency file digests, its features, and the toolchain), the same for
+//! every project, so it lives beside the toolchain shelf, never under a project. On a cache miss,
+//! `wasm64_compile::compile_proc_macro` self-compiles the proc-macro crate via
+//! `blaze-lir -> wasm64-blaze-wasip1` (zero `rustc`) and atomically publishes the record before
+//! `Stage::Names` invokes `ProcRunner`.
 //!
 //! The `UnitGraph` job names one `MacroModule` part per proc-macro unit ([`parts`]); its
 //! source is the graph's source with the crate's name and version, so a lock or member edit
-//! asks again and nothing else does. Present: a record whose out is the module's wasm digest.
-//! Absent: one filed failure naming the crate and the bootstrap command; the store's listing is
-//! in the part's key ([`MODULE_LISTING`]), so the next command asks again once the store moves.
+//! asks again and nothing else does. Present (or freshly self-compiled): a record whose out is
+//! the module's wasm digest. Failed: a typed failure naming the crate and cause; the store's
+//! listing is in the part's key ([`MODULE_LISTING`]), so the next command asks again once the
+//! store moves.
 
 use std::alloc::Global;
 
@@ -55,19 +57,19 @@ pub type MacroCrates = std::vec::Vec<(ContentId, Result<MacroIdentity, Unidentif
 pub(crate) struct Place<'p, 'r> {
     pub home: Option<&'p str>,
     pub checkout: &'p str,
-    pub members: Option<&'p [(LockId, blaze_unit_graph::Text<'static>)]>,
+    pub members: Option<&'p [crate::graph::CheckoutDir]>,
     pub rows: &'p crate::sweep::Rows<'r>,
 }
 
 impl Place<'_, '_> {
-    /// The files digest of the member `id` (hex, `blaze_proc_macro::module::files_digest`) as
-    /// its `MacroFiles` row holds it: what a path macro crate's module key holds, by
+    /// The files digest of the checkout path package `id` (hex, `blaze_proc_macro::module::files_digest`)
+    /// as its `MacroFiles` row holds it: what a path macro crate's module key holds, by
     /// package-relative paths and bytes (rule 25), and what the lookup's own key holds through
-    /// the units' source (rule 21); `None` for a package that is no member, or a member no row
-    /// of which was read (then `PathWithoutFolder`, by name).
+    /// the units' source (rule 21); `None` for a package with no checkout folder or no row
+    /// read (then `PathWithoutFolder`, by name).
     pub(crate) fn member_files(&self, id: LockId) -> Option<std::string::String> {
-        let (_, dir) = self.members?.iter().find(|(member, _)| *member == id)?;
-        crate::macro_files::member_hex(self.rows, dir.as_str())
+        let entry = self.members?.iter().find(|entry| entry.id == id)?;
+        crate::macro_files::member_hex(self.rows, entry.dir.as_str())
     }
 
     /// The checkout as the bootstrap tool's `checkout` input takes it.
@@ -77,12 +79,17 @@ impl Place<'_, '_> {
 }
 
 /// A macro crate's subject: its name and version.
-pub(crate) fn subject(unit: &Unit<'_>) -> ContentId {
+pub(crate) fn subject_of(name: &str, version: &str) -> ContentId {
     let mut text = std::vec::Vec::new_in(Global);
-    text.extend_from_slice(unit.name.as_str().as_bytes());
+    text.extend_from_slice(name.as_bytes());
     text.push(b' ');
-    text.extend_from_slice(unit.version.as_str().as_bytes());
+    text.extend_from_slice(version.as_bytes());
     ContentId::of(SUBJECT_DOMAIN, &text)
+}
+
+/// A macro crate's subject: its name and version.
+pub(crate) fn subject(unit: &Unit<'_>) -> ContentId {
+    subject_of(unit.name.as_str(), unit.version.as_str())
 }
 
 /// The `MacroModule` parts of a graph record `graph_record` made over the graph source
@@ -172,6 +179,7 @@ pub(crate) fn run<'b>(
     lock: Option<&crate::fetch::Lockfile<'_>>,
     crates: &mut Option<MacroCrates>,
     place: Place<'_, '_>,
+    compile: Option<crate::wasm64_compile::CompileInputs<'_>>,
     task: &Task<'_>,
     frame: &Frame,
     held: &'b Frame,
@@ -222,16 +230,36 @@ pub(crate) fn run<'b>(
             Ok(Did::Done(made))
         }
         Err(ModuleError::Missing { name: package, version, key }) => {
-            let features = identity.with_id(|id| match id.features.is_empty() {
-                true => std::string::String::new(),
-                false => std::format!("\"{}\"", id.features.join("\", \"")),
-            });
+            if let Some(inputs) = compile {
+                let _compile_cx = cx.span("macro module: self-compile proc-macro to wasm64");
+                match crate::wasm64_compile::compile_proc_macro(&modules, inputs, identity) {
+                    Ok(wasm_sha256) => {
+                        let mut made = Made::new_in(name, held);
+                        made.out = ContentId::of(OUT_DOMAIN, wasm_sha256.as_bytes());
+                        return Ok(Did::Done(made));
+                    }
+                    Err(why) => {
+                        let what = if why.is_tier2() {
+                            "proc-macro requires Tier-2 native/host features unsupported in wasm64"
+                        } else {
+                            "proc-macro wasm64 self-compilation failed"
+                        };
+                        let words = bstd::mem::format_in!(
+                            held,
+                            "{package} {version}: wasm64 proc-macro self-compilation failed (key {key}): {why}"
+                        );
+                        return Ok(Did::FailedSaying(
+                            refused(what),
+                            held_str(words.as_str(), held),
+                        ));
+                    }
+                }
+            }
             let words = bstd::mem::format_in!(
                 held,
-                "{package} {version}: no compiled proc-macro module in {} (key {key}); build it with `toolrun.sh proc_macro_modules` (input: {{\"checkout\": \"{}\", \"store\": \"{}\", \"crates\": [{{\"name\": \"{package}\", \"version\": \"{version}\", \"features\": [{features}]}}]}})",
+                "{package} {version}: no compiled proc-macro module in {} (key {key}) and no on-disk checkout ({}) was available for wasm64 self-compilation (no rustc fallback, rules 1 & 3)",
                 modules.join("proc-macro/modules").display(),
                 place.checkout_shown(),
-                modules.display(),
             );
             // Filed: the store's listing is in this part's key ([`MODULE_LISTING`]), and a
             // member's files are too (its `MacroFiles` row), so the failure stands until a

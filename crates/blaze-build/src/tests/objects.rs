@@ -12,7 +12,7 @@ use blaze_typeck::{Adt, ExprId, InferCtx, ItemKey, LangItem, Mutbl, Needs, Outco
 
 use super::{Tables, run_native_vt};
 use crate::layout::{LayoutFacts, Missing, ReprAttrs, ValidRange};
-use crate::vtable::{ObjectMethod, ObjectSuper, ObjectTrait};
+use crate::vtable::{MethodDispatch, ObjectMethod, ObjectSuper, ObjectTrait};
 use crate::{Abi, Adts, Built, Intrinsic, Subst};
 
 mod boxed_slice;
@@ -112,7 +112,7 @@ fn world_with(field: BoxField) -> World {
     let main_us = fx.func("main_us", 0, &[], usize_, Vec::new());
     let boxes = boxes(&mut fx, p0, u64_, &mut impls, field);
     fx.finish();
-    let method = |item| ObjectMethod { item, dispatch: true };
+    let method = |item| ObjectMethod { item, dispatch: MethodDispatch::Direct };
     let traits = std::vec![
         (tr, StdVec::new(), std::vec![method(m)]),
         (sub, std::vec![ObjectSuper::plain(tr)], std::vec![method(n)]),
@@ -340,7 +340,7 @@ impl World {
             text.push_str(&std::format!("{k:?} {s:?} {m:?};"));
             stack.extend(s.iter().rev().map(|x| x.trait_));
         }
-        Some(ObjectTrait { supers, super_args: &[], methods, shape: id(&text) })
+        Some(ObjectTrait { supers, tys: blaze_typeck::PTys::EMPTY, methods, shape: id(&text) })
     }
 }
 
@@ -784,9 +784,11 @@ fn records(w: &World, obj: ItemKey, method: &str) -> Records {
     let main_key = record_key_of(w, &b, w.main, root, &[(lit, 5)], &mut ground);
     let gu64 = ground_of(&w.fx, &mut ground, w.u64_);
     let facts = w.object_trait(obj).expect("the trait's facts");
-    let key = crate::vtable::vtable_key(gu64, obj, &[], facts.shape, &mut ground, Alloc::global()).expect("the key");
-    let shape = crate::vtable::Shape::of(obj, |t| w.object_trait(t), Global).expect("the shape");
-    let table = crate::vtable::Vtable::build(&shape, gu64, &[], 8, 8, None, &mut ground, Global).expect("the table");
+    let alloc = blaze_own::testing::heap().alloc();
+    let key = crate::vtable::vtable_key(gu64, obj, &[], facts.shape, &mut ground, alloc).expect("the key");
+    let adts = FxAdts { w, lits: &[] };
+    let shape = crate::vtable::Shape::of(obj, |t| w.object_trait(t), alloc).expect("the shape");
+    let table = crate::vtable::Vtable::build(&shape, gu64, &[], 8, 8, None, &mut ground, &adts, alloc, Global).expect("the table");
     Records { main: blaze_lir::print(main.func.view()), main_key, key, bytes: table.bytes.to_vec(), relocs: table.relocs.to_vec() }
 }
 
@@ -828,7 +830,7 @@ fn a_trait_edit_rekeys_exactly_the_callers_whose_slot_moved() {
     let edit = |at_end: bool| {
         let mut w = world();
         let methods = &mut w.traits.iter_mut().find(|(k, _, _)| *k == tr).expect("Tr").2;
-        let new = ObjectMethod { item: e, dispatch: true };
+        let new = ObjectMethod { item: e, dispatch: MethodDispatch::Direct };
         if at_end { methods.push(new) } else { methods.insert(0, new) }
         w
     };
@@ -884,7 +886,7 @@ fn a_trait_method_added_rebuilds_tables_and_only_callers_of_moved_slots() {
     let (tr, e) = (w.tr, w.boxes.get);
     let edit = |w: &mut World, at_end: bool| {
         let methods = &mut w.traits.iter_mut().find(|(k, _, _)| *k == tr).expect("Tr").2;
-        let new = ObjectMethod { item: e, dispatch: true };
+        let new = ObjectMethod { item: e, dispatch: MethodDispatch::Direct };
         if at_end { methods.push(new) } else { methods.insert(0, new) }
     };
     edit(&mut w, true);
@@ -923,7 +925,7 @@ fn a_slotless_method_on_an_object_is_refused_not_called_directly() {
         let tr = w.tr;
         let obj = if obj == "tr" { w.tr } else { w.sub };
         for m in w.traits.iter_mut().find(|(k, _, _)| *k == tr).expect("Tr").2.iter_mut() {
-            m.dispatch = false;
+            m.dispatch = MethodDispatch::None;
         }
         let mut b = Bb::new();
         let x = b.bind("x");

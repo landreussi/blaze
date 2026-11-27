@@ -35,7 +35,7 @@ pub(crate) use ctor_fn::build_ctor_fn;
 // And the `Clone::clone` it gives a tuple, a closure, a fn item and a fn pointer.
 #[path = "clone_fn.rs"]
 mod clone_fn;
-pub(crate) use clone_fn::build_builtin_clone;
+pub(crate) use clone_fn::{build_builtin_clone, build_builtin_fn_ptr, build_builtin_from};
 
 /// The closures of `body` with their ORDINALS: a closure's position among its owner body's
 /// closures in expression order (typeck.md, "A closure's identity"). The one place the builder
@@ -72,7 +72,7 @@ fn method_name(which: FnTrait) -> &'static str {
     }
 }
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Whether the checker resolved call `e` through a `Fn*` trait (its callee row names
     /// `call`, `call_mut` or `call_once`): a callee of a type parameter `F: Fn*(..)`, which an
     /// instance may ground to a closure. The Reference, "Call expressions": "for closures and
@@ -96,7 +96,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         };
         let facts = self.adts.facts();
         let c = facts.closure(owner, ordinal).ok_or(TyErr::Unsupported("a closure whose facts the world did not answer"))?;
-        let mut a: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut a: Vec<PTy, A> = Vec::new_in(self.alloc);
         a.extend_from_slice(self.ground.view().list(args).map_err(|_| TyErr::Malformed("a list past the ground table"))?);
         let sig = crate::instance::ground(c.types, c.sig, &a, self.ground, self.scratch, facts).map_err(TyErr::Other)?;
         let env = crate::instance::ground(c.types, c.env, &a, self.ground, self.scratch, facts).map_err(TyErr::Other)?;
@@ -168,21 +168,21 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let t = self.expr_ty(e)?;
         let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
         let repr = self.repr(g).map_err(|error| Self::ty_err(e, error))?;
-        let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc.clone());
-        for f in self.checked.env_fields(e) {
+        let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc);
+        for f in self.checked.env_fields_by::<crate::layout::BuildEnv>(e) {
             fields.push(f);
         }
         if let Repr::None = repr {
-            if fields.iter().any(|f| !f.is_whole()) {
-                return Err(BuildError::Unsupported {
-                    expr: e,
-                    what: "not lowered: a zero-sized closure environment holding a captured place below its binding",
-                });
+            for &f in fields.iter() {
+                if !f.is_whole() {
+                    let zst = self.temp(Repr::None);
+                    self.store_env_place(e, f, zst)?;
+                }
             }
             self.push_val(V::None, None);
             return Ok(());
         }
-        let mut offs = Vec::new_in(self.alloc.clone());
+        let mut offs = Vec::new_in(self.alloc);
         self.capture_offsets(e, g, fields.len(), &mut offs)?;
         let at = self.temp(repr);
         for (j, &f) in fields.iter().enumerate() {
@@ -244,7 +244,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         };
         let all = self.ground.view().list(l).map_err(|_| malformed("a list past the ground table"))?;
         let (&output, inputs) = all.split_last().ok_or(malformed("a closure's signature without its output"))?;
-        let mut own: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut own: Vec<PTy, A> = Vec::new_in(self.alloc);
         own.extend_from_slice(inputs);
         let list = self.ground.intern_list(&own).map_err(full)?;
         Ok((self.ground.intern(PNode::Tuple(list)).map_err(full)?, output))
@@ -284,8 +284,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let instance = self.body_instance(e, g, parts)?;
         let n = written.len() + 1;
         let base = self.vals.len().checked_sub(n).ok_or(malformed("a closure call's arguments missing from the value stack (a build bug)"))?;
-        let mut reprs = Vec::with_capacity_in(n, self.alloc.clone());
-        let mut passes = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut reprs = Vec::with_capacity_in(n, self.alloc);
+        let mut passes = Vec::with_capacity_in(n, self.alloc);
         match parts.kind {
             FnTrait::Fn | FnTrait::FnMut => {
                 let V::Place(p, off) = self.vals[base] else {
@@ -337,6 +337,9 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         if which < parts.kind {
             return Err(BuildError::UnsupportedType { expr: closure, what: "a closure called through a trait stronger than its kind" });
         }
+        if matches!(self.expr(closure)?, Expr::Closure { is_async: true, .. }) {
+            return self.run_async_closure(closure, g, parts, which);
+        }
         if which > parts.kind {
             return self.run_entry(closure, g, parts, which);
         }
@@ -344,7 +347,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let PNode::Tuple(l) = self.ground_node(tuple).map_err(|error| Self::ty_err(closure, error))? else {
             return Err(malformed("a closure's arguments not a tuple"));
         };
-        let mut inputs: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut inputs: Vec<PTy, A> = Vec::new_in(self.alloc);
         inputs.extend_from_slice(self.ground.view().list(l).map_err(|_| malformed("a list past the ground table"))?);
         if inputs.len() != self.body.params.len() {
             return Err(malformed("a closure whose signature and parameters differ in number"));
@@ -353,8 +356,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             FnTrait::Fn | FnTrait::FnMut => Repr::Ptr,
             FnTrait::FnOnce => self.repr(g).map_err(|error| Self::ty_err(closure, error))?,
         };
-        let mut reprs = Vec::with_capacity_in(inputs.len() + 1, self.alloc.clone());
-        let mut passes = Vec::with_capacity_in(inputs.len() + 1, self.alloc.clone());
+        let mut reprs = Vec::with_capacity_in(inputs.len() + 1, self.alloc);
+        let mut passes = Vec::with_capacity_in(inputs.len() + 1, self.alloc);
         reprs.push(env_repr);
         passes.push(match parts.kind {
             FnTrait::Fn | FnTrait::FnMut => self.rust_pass(Repr::Ptr)?,
@@ -373,7 +376,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let entry = self.create();
         self.reached[entry.index()] = true;
         self.begin(entry);
-        let mut values = Vec::with_capacity_in(params.len(), self.alloc.clone());
+        let mut values = Vec::with_capacity_in(params.len(), self.alloc);
         for p in params.iter() {
             values.push(self.b.param(p.ty));
         }
@@ -389,11 +392,11 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             V::None => None,
             V::Unsized(..) => return Err(malformed("a closure's environment as an unsized place")),
         };
-        let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc.clone());
-        for f in self.checked.env_fields(closure) {
+        let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc);
+        for f in self.checked.env_fields_by::<crate::layout::BuildEnv>(closure) {
             fields.push(f);
         }
-        let mut offs = Vec::new_in(self.alloc.clone());
+        let mut offs = Vec::new_in(self.alloc);
         self.capture_offsets(closure, g, fields.len(), &mut offs)?;
         for (j, &f) in fields.iter().enumerate() {
             // A place below its binding (`x.a`): its uses read the field (walk/moves/env_places.rs).
@@ -455,6 +458,128 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         self.walk_root()
     }
 
+    /// Calls an `async` closure (`Expr::Closure { is_async: true, .. }`): constructs and returns
+    /// its coroutine state (`PNode::Coroutine { owner, ordinal: CLOSURE_BASE + k, args }`) with
+    /// the closure's captures and call arguments packed into the coroutine's unpolled `env`
+    /// prefix and its tag set to `UNRESUMED`.
+    ///
+    /// - `FnTrait::FnOnce`: receives the closure environment BY VALUE (never delegating through
+    ///   `run_entry` -> `&env`, which would drop the captures before the returned future is
+    ///   polled!) and moves each capture into the coroutine state.
+    /// - `FnTrait::Fn` / `FnTrait::FnMut`: receives `&env` / `&mut env` and copies the capture
+    ///   pointers when every capture is held by reference; refuses by-value captures called by
+    ///   reference (`CallRefFuture`).
+    fn run_async_closure(&mut self, closure: ExprId, g: PTy, parts: Parts, which: FnTrait) -> Result<(), BuildError> {
+        let err = |error| Self::ty_err(closure, error);
+        let (tuple, output) = self.args_tuple(closure, parts.sig)?;
+        let PNode::Tuple(l) = self.ground_node(tuple).map_err(err)? else {
+            return Err(malformed("a closure's arguments not a tuple"));
+        };
+        let mut inputs: Vec<PTy, A> = Vec::new_in(self.alloc);
+        inputs.extend_from_slice(self.ground.view().list(l).map_err(|_| malformed("a list past the ground table"))?);
+        if inputs.len() != self.body.params.len() {
+            return Err(malformed("a closure whose signature and parameters differ in number"));
+        }
+        let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc);
+        for f in self.checked.env_fields_by::<crate::layout::BuildEnv>(closure) {
+            fields.push(f);
+        }
+        if which != FnTrait::FnOnce && fields.iter().any(|f| f.how == CaptureKind::ByValue) {
+            return Err(BuildError::Unsupported {
+                expr: closure,
+                what: "an async move closure with by-value captures called by reference (CallRefFuture)",
+            });
+        }
+        let of = crate::coroutine_of(self.ground.view(), output).ok_or(malformed("an async closure whose output is not a coroutine"))?;
+        let shape = self.state_shape(closure, of)?;
+        let env_repr = match which {
+            FnTrait::Fn | FnTrait::FnMut => Repr::Ptr,
+            FnTrait::FnOnce => self.repr(g).map_err(err)?,
+        };
+        let mut reprs = Vec::with_capacity_in(inputs.len() + 1, self.alloc);
+        let mut passes = Vec::with_capacity_in(inputs.len() + 1, self.alloc);
+        reprs.push(env_repr);
+        passes.push(match which {
+            FnTrait::Fn | FnTrait::FnMut => self.rust_pass(Repr::Ptr)?,
+            FnTrait::FnOnce => self.pass(g, env_repr, Abi::Rust, None)?,
+        });
+        for &gi in inputs.iter() {
+            let repr = self.repr(gi).map_err(err)?;
+            reprs.push(repr);
+            passes.push(self.pass(gi, repr, Abi::Rust, None)?);
+        }
+        self.ret = self.repr(output).map_err(err)?;
+        let Repr::Agg(ret_l) = self.ret else {
+            return Err(malformed("an async closure's coroutine state of no size"));
+        };
+        self.ret_pass = self.pass(output, self.ret, Abi::Rust, None)?;
+        let (params, rets) = self.sig_of(&passes, self.ret_pass);
+        let own = self.b.sig(Conv::C, Variadic::No, &params, &rets);
+        self.b.set_signature(own);
+        let entry = self.create();
+        self.reached[entry.index()] = true;
+        self.begin(entry);
+        let mut values = Vec::with_capacity_in(params.len(), self.alloc);
+        for p in params.iter() {
+            values.push(self.b.param(p.ty));
+        }
+        let mut next = values.iter().copied();
+        if let Pass::Ref | Pass::Memory { .. } = self.ret_pass {
+            self.sret = Some(next.next().ok_or(malformed("a result pointer without its value"))?);
+        }
+        self.scope_marks.push(0);
+        // The closure environment: a pointer for `Fn`/`FnMut`, or by value for `FnOnce` (spilled
+        // to a temp when passed in scalar/pair registers so capture offsets can be read uniformly).
+        let env = match (which, self.take_passed(env_repr, passes[0], &mut next)?) {
+            (_, V::Unsized(..)) => return Err(malformed("a closure's environment as an unsized place")),
+            (_, V::None) => None,
+            (_, V::Place(p, off)) => Some((p, off)),
+            (FnTrait::FnOnce, v) => {
+                let tmp = self.temp(env_repr);
+                self.store(v, env_repr, tmp)?;
+                Some(tmp)
+            }
+            (_, V::Scalar(p)) => Some((p, 0)),
+        };
+        let at = self.temp(self.ret);
+        if !fields.is_empty() || !inputs.is_empty() {
+            let co_parts = self.coroutine_parts(output).map_err(err)?;
+            let le = self.layout(co_parts.env).map_err(err)?;
+            self.env_holds(closure, co_parts.env, fields.len() + inputs.len())?;
+            let base = self.field_offset(ret_l, 0)?;
+            let PNode::Tuple(el) = self.ground_node(co_parts.env).map_err(err)? else {
+                return Err(malformed("a coroutine environment that is not a tuple"));
+            };
+            let mut co_env_tys: Vec<PTy, A> = Vec::with_capacity_in(fields.len() + inputs.len(), self.alloc);
+            co_env_tys.extend_from_slice(self.ground.view().list(el).map_err(|_| malformed("a list past the ground table"))?);
+            if !fields.is_empty() {
+                let mut offs = Vec::new_in(self.alloc);
+                self.capture_offsets(closure, g, fields.len(), &mut offs)?;
+                if let Some((env_base, env_off)) = env {
+                    for j in 0..fields.len() {
+                        let cap_repr = self.repr(co_env_tys[j]).map_err(err)?;
+                        let src = (env_base, env_off + offs[j] as i32);
+                        let dst = (at.0, at.1 + (base + self.field_offset(le, j)?) as i32);
+                        let v = self.load(cap_repr, src);
+                        self.store(v, cap_repr, dst)?;
+                    }
+                }
+            }
+            for k in 0..inputs.len() {
+                let arg_v = self.take_passed(reprs[k + 1], passes[k + 1], &mut next)?;
+                let dst = (at.0, at.1 + (base + self.field_offset(le, fields.len() + k)?) as i32);
+                self.store(arg_v, reprs[k + 1], dst)?;
+            }
+        }
+        let tag = self.b.iconst(shape.tag_ty, u128::from(blaze_lir::coroutine::UNRESUMED));
+        self.b.store(Flags::NONE, tag, at.0, at.1 + shape.tag_offset as i32, MemAttrs::aligned(0));
+        self.ret_value(V::Place(at.0, at.1))?;
+        if let Some(error) = self.b.error() {
+            return Err(BuildError::Lir(error.clone()));
+        }
+        Ok(())
+    }
+
     /// The thin ENTRY of closure `g` as trait method `which`, weaker than its kind (codegen.md,
     /// "Closures and the Fn traits", ENTRIES): core's `trait Fn<Args>: FnMut<Args>` and `trait
     /// FnMut<Args>: FnOnce<Args>` make every `Fn` closure `FnMut` and `FnOnce` too.
@@ -467,12 +592,12 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let PNode::Tuple(l) = self.ground_node(tuple).map_err(|error| Self::ty_err(closure, error))? else {
             return Err(malformed("a closure's arguments not a tuple"));
         };
-        let mut inputs: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut inputs: Vec<PTy, A> = Vec::new_in(self.alloc);
         inputs.extend_from_slice(self.ground.view().list(l).map_err(|_| malformed("a list past the ground table"))?);
         let env_repr = self.repr(g).map_err(|error| Self::ty_err(closure, error))?;
         let n = inputs.len() + 1;
-        let mut reprs = Vec::with_capacity_in(n, self.alloc.clone());
-        let mut passes = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut reprs = Vec::with_capacity_in(n, self.alloc);
+        let mut passes = Vec::with_capacity_in(n, self.alloc);
         match which {
             FnTrait::Fn | FnTrait::FnMut => {
                 reprs.push(Repr::Ptr);
@@ -496,7 +621,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let entry = self.create();
         self.reached[entry.index()] = true;
         self.begin(entry);
-        let mut values = Vec::with_capacity_in(params.len(), self.alloc.clone());
+        let mut values = Vec::with_capacity_in(params.len(), self.alloc);
         for p in params.iter() {
             values.push(self.b.param(p.ty));
         }
@@ -521,6 +646,13 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             }
         };
         if let Some(at) = owned {
+            // Own the moved closure environment in the entry's drop scope BEFORE the call so
+            // it is dropped on unwind if the inner `call`/`call_mut` panics as well as on normal
+            // return (the Reference, "Closure types", "Drop order").
+            if self.needs_drop(g).map_err(|error| Self::ty_err(closure, error))? {
+                let l = self.layout(g).map_err(|error| Self::ty_err(closure, error))?;
+                self.scope_pats.push(Held::Rest { at, l, variant: None, moved: crate::walk::moves::FieldBits::EMPTY });
+            }
             let a = self.address(at);
             self.push_val(V::Scalar(a), None);
         }
@@ -539,11 +671,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         if let PNode::Never = self.ground_node(output).map_err(|error| Self::ty_err(closure, error))? {
             self.unreachable_of(TrapKind::AfterDivergingCall, Some(closure));
         } else {
-            if let Some(at) = owned
-                && self.needs_drop(g).map_err(|error| Self::ty_err(closure, error))?
-            {
-                self.drop_at(g, at)?;
-            }
+            // `ret_value` stores/passes `v` and then runs `drop_from(0)`, dropping `owned`.
             self.ret_value(v)?;
         }
         if let Some(error) = self.b.error() {
@@ -569,7 +697,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let PNode::Tuple(l) = self.ground_node(tuple).map_err(sig_err)? else {
             return Err(malformed("a fn shim's arguments not a tuple"));
         };
-        let mut inputs: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut inputs: Vec<PTy, A> = Vec::new_in(self.alloc);
         inputs.extend_from_slice(self.ground.view().list(l).map_err(past)?);
         // The direct callee (a fn item's instance) or none (a pointer), the callee's ABI, the
         // item a C refusal names, and the output.
@@ -608,8 +736,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             FnTrait::FnOnce => self.repr(callee).map_err(sig_err)?,
         };
         let n = inputs.len() + 1;
-        let mut reprs = Vec::with_capacity_in(n, self.alloc.clone());
-        let mut passes = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut reprs = Vec::with_capacity_in(n, self.alloc);
+        let mut passes = Vec::with_capacity_in(n, self.alloc);
         reprs.push(self_repr);
         passes.push(self.rust_pass(self_repr)?);
         for &gi in inputs.iter() {
@@ -625,7 +753,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let entry = self.create();
         self.reached[entry.index()] = true;
         self.begin(entry);
-        let mut values = Vec::with_capacity_in(params.len(), self.alloc.clone());
+        let mut values = Vec::with_capacity_in(params.len(), self.alloc);
         for p in params.iter() {
             values.push(self.b.param(p.ty));
         }
@@ -638,7 +766,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let me = self.take_passed(reprs[0], passes[0], &mut next)?;
         // A tracked fn item's hidden last argument: a row of this shim's `Fn*` method's
         // definition site (walk/track_caller.rs `shim_caller_arg`). A fn pointer's target is
-        // never tracked (its reify is refused for a tracked fn).
+        // never tracked directly (reifying a tracked fn points to its `ReifyShim`, which has
+        // the plain fn pointer ABI).
         let mut loc = None;
         let callee_ref = match target {
             Some(instance) => {
@@ -658,8 +787,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 Callee::Pointer(p)
             }
         };
-        let mut treprs = Vec::with_capacity_in(n - 1, self.alloc.clone());
-        let mut tpasses = Vec::with_capacity_in(n - 1, self.alloc.clone());
+        let mut treprs = Vec::with_capacity_in(n - 1, self.alloc);
+        let mut tpasses = Vec::with_capacity_in(n - 1, self.alloc);
         for i in 1..n {
             let v = self.take_passed(reprs[i], passes[i], &mut next)?;
             self.push_val(v, None);
@@ -681,10 +810,362 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         } else {
             self.ret_value(v)?;
         }
+        self.check_lir_error()
+    }
+
+    fn check_lir_error(&self) -> Result<(), BuildError> {
         if let Some(error) = self.b.error() {
             return Err(BuildError::Lir(error.clone()));
         }
         Ok(())
+    }
+
+    /// The `ReifyShim` of a `#[track_caller]` fn `callee` at `self.args` (lib.rs
+    /// `build_reify_shim`): takes the plain fn pointer ABI (no hidden `&Location` parameter),
+    /// materializes a `Location` row for `callee`'s own definition site (`Adts::def_site`), and
+    /// calls `callee` directly with that location passed last.
+    fn run_reify_shim(&mut self, callee: ItemKey, sig: &FnSig<'_>) -> Result<(), BuildError> {
+        let sig_err = |error: TyErr| match error {
+            TyErr::Unsupported(what) => BuildError::UnsupportedSig { what },
+            TyErr::Malformed(what) => malformed(what),
+            TyErr::Other(error) => error,
+        };
+        let generics = sig.parent_count.checked_add(sig.own_count).ok_or(malformed("a generic count past u32"))?;
+        if u32::try_from(self.args.len()).ok() != Some(generics) {
+            return Err(malformed("a reify shim whose argument count is not its fn's generic count"));
+        }
+        let abi = self.adts.abi(callee).ok_or(BuildError::NoAbi { item: callee })?;
+        if abi == Abi::RustCall {
+            return Err(BuildError::UnsupportedSig { what: "a \"rust-call\" function taken as a fn pointer" });
+        }
+        let n = sig.inputs.len();
+        let mut reprs = blaze_own::Vec::with_capacity_in(n, self.alloc);
+        let mut passes = blaze_own::Vec::with_capacity_in(n, self.alloc);
+        for &t in sig.inputs.iter() {
+            let g = self.ground_in(sig.types, t).map_err(sig_err)?;
+            let repr = self.repr(g).map_err(sig_err)?;
+            let pass = self.pass(g, repr, abi, Some(callee))?;
+            reprs.push(repr);
+            passes.push(pass);
+        }
+        let output = self.ground_in(sig.types, sig.output).map_err(sig_err)?;
+        self.ret = self.repr(output).map_err(sig_err)?;
+        self.ret_pass = self.pass(output, self.ret, abi, Some(callee))?;
+        let (params, rets) = self.sig_of(&passes, self.ret_pass);
+        let own = self.b.sig(Conv::C, Variadic::No, &params, &rets);
+        self.b.set_signature(own);
+        let entry = self.create();
+        if let Some(slot) = self.reached.get_mut(entry.index()) {
+            *slot = true;
+        }
+        self.begin(entry);
+        let mut values = blaze_own::Vec::with_capacity_in(params.len(), self.alloc);
+        for p in params.iter() {
+            values.push(self.b.param(p.ty));
+        }
+        let mut next = values.iter().copied();
+        if let Pass::Ref | Pass::Memory { .. } = self.ret_pass {
+            self.sret = Some(next.next().ok_or(malformed("a result pointer without its value"))?);
+        }
+        self.scope_marks.push(0);
+        let args = self.ground.intern_list(self.args).map_err(|_| malformed("the ground table is full"))?;
+        let target = Instance { item: callee, args };
+        let loc = self.reify_caller_arg(target)?;
+        let callee_nounwind = self.adts.nounwind(callee) == Some(true);
+        let place = self.ref_place(target);
+        let callee_ref = Callee::Direct(self.b.reference(RefKind::Func, place));
+        let mut treprs = blaze_own::Vec::with_capacity_in(n + usize::from(loc.is_some()), self.alloc);
+        let mut tpasses = blaze_own::Vec::with_capacity_in(n + usize::from(loc.is_some()), self.alloc);
+        for (&repr, &pass) in reprs.iter().zip(passes.iter()) {
+            let v = self.take_passed(repr, pass, &mut next)?;
+            self.push_val(v, None);
+            treprs.push(repr);
+            tpasses.push(pass);
+        }
+        if let Some(loc) = loc {
+            self.push_val(V::Scalar(loc), None);
+            treprs.push(Repr::Ptr);
+            tpasses.push(track_caller::PASS);
+        }
+        let rrepr = self.ret;
+        let rpass = self.ret_pass;
+        self.emit_call_from(callee_ref, &treprs, &tpasses, None, callee_nounwind, rrepr, rpass)?;
+        let v = self.pop()?;
+        if let PNode::Never = self.ground_node(output).map_err(sig_err)? {
+            self.unreachable_of(TrapKind::AfterDivergingCall, None);
+        } else {
+            self.ret_value(v)?;
+        }
+        self.check_lir_error()
+    }
+
+    /// The by-value `self` `VTableShim` for `target` (lib.rs `build_vtable_shim`): receives
+    /// `(data_ptr: *mut Self, args..)` from a dynamic call (e.g. `Box<dyn FnOnce>::call_once`),
+    /// reads/moves the concrete `Self` by value from `data_ptr`, and calls `target` directly.
+    fn run_vtable_shim(&mut self, target: Instance, sig: Option<&FnSig<'_>>) -> Result<(), BuildError> {
+        let sig_err = |error: TyErr| match error {
+            TyErr::Unsupported(what) => BuildError::UnsupportedSig { what },
+            TyErr::Malformed(what) => malformed(what),
+            TyErr::Other(error) => error,
+        };
+        let past = |_| malformed("a list past the ground table");
+        let is_fn_once_method = self.adts.fn_trait_method(FnTrait::FnOnce) == Some(target.item);
+        let target_args = self.ground.view().list(target.args).map_err(past)?;
+        let builtin_fn_once = if is_fn_once_method
+            && let &[callee_ty, tuple_ty] = target_args
+        {
+            match self.ground_node(callee_ty).map_err(sig_err)? {
+                PNode::Closure { .. } | PNode::FnDef(..) | PNode::FnPtr(..) => Some((callee_ty, tuple_ty)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let mut arg_tys: blaze_own::Vec<PTy, A> = blaze_own::Vec::new_in(self.alloc);
+        let (self_ty, output, callee_abi, callee_item) = if let Some((callee_ty, tuple_ty)) = builtin_fn_once {
+            let PNode::Tuple(tl) = self.ground_node(tuple_ty).map_err(sig_err)? else {
+                return Err(malformed("a `FnOnce` vtable shim's arguments not a tuple"));
+            };
+            arg_tys.extend_from_slice(self.ground.view().list(tl).map_err(past)?);
+            let output = match self.ground_node(callee_ty).map_err(sig_err)? {
+                PNode::Closure { .. } => {
+                    let parts = self.closure_parts(callee_ty).map_err(sig_err)?;
+                    let PNode::FnPtr(fl, _) = self.ground_node(parts.sig).map_err(sig_err)? else {
+                        return Err(malformed("a closure's signature that is not a fn pointer"));
+                    };
+                    *self.ground.view().list(fl).map_err(past)?.last().ok_or(malformed("a closure's signature without its output"))?
+                }
+                PNode::FnDef(_, fn_args) => {
+                    let sig = sig.ok_or(malformed("a fn item's vtable shim built without the item's signature"))?;
+                    if self.ground.view().list(fn_args).map_err(past)? != self.args {
+                        return Err(malformed("a fn item's vtable shim whose instance arguments are not the item's"));
+                    }
+                    self.ground_in(sig.types, sig.output).map_err(sig_err)?
+                }
+                PNode::FnPtr(fl, _) => {
+                    *self.ground.view().list(fl).map_err(past)?.last().ok_or(malformed("a fn pointer type without its output"))?
+                }
+                _ => return Err(malformed("a built-in `FnOnce` vtable shim on an unexpected receiver type")),
+            };
+            (callee_ty, output, Abi::RustCall, None)
+        } else {
+            let sig = sig.ok_or(malformed("a vtable shim built without its target's signature"))?;
+            let abi = self.adts.abi(target.item).ok_or(BuildError::NoAbi { item: target.item })?;
+            let (&first, rest) = sig.inputs.split_first().ok_or(malformed("a by-value vtable shim target without a `self` parameter"))?;
+            let self_ty = self.ground_in(sig.types, first).map_err(sig_err)?;
+            let output = self.ground_in(sig.types, sig.output).map_err(sig_err)?;
+            if abi == Abi::RustCall {
+                let (&last, mid) = rest.split_last().ok_or(malformed("a \"rust-call\" vtable shim target without its tuple parameter"))?;
+                for &t in mid {
+                    arg_tys.push(self.ground_in(sig.types, t).map_err(sig_err)?);
+                }
+                let tuple_ty = self.ground_in(sig.types, last).map_err(sig_err)?;
+                let PNode::Tuple(tl) = self.ground_node(tuple_ty).map_err(sig_err)? else {
+                    return Err(malformed("a \"rust-call\" vtable shim target's last parameter is not a tuple"));
+                };
+                arg_tys.extend_from_slice(self.ground.view().list(tl).map_err(past)?);
+            } else {
+                for &t in rest {
+                    arg_tys.push(self.ground_in(sig.types, t).map_err(sig_err)?);
+                }
+            }
+            (self_ty, output, abi, Some(target.item))
+        };
+
+        let n_args = arg_tys.len();
+        let mut arg_reprs = blaze_own::Vec::with_capacity_in(n_args, self.alloc);
+        let mut shim_passes = blaze_own::Vec::with_capacity_in(1 + n_args, self.alloc);
+        shim_passes.push(self.rust_pass(Repr::Ptr)?);
+        for &gi in arg_tys.iter() {
+            let repr = self.repr(gi).map_err(sig_err)?;
+            let pass = self.pass(gi, repr, callee_abi, callee_item)?;
+            arg_reprs.push(repr);
+            shim_passes.push(pass);
+        }
+        self.ret = self.repr(output).map_err(sig_err)?;
+        self.ret_pass = self.pass(output, self.ret, callee_abi, callee_item)?;
+        let (params, rets) = self.sig_of(&shim_passes, self.ret_pass);
+        let own = self.b.sig(Conv::C, Variadic::No, &params, &rets);
+        self.b.set_signature(own);
+        let entry = self.create();
+        if let Some(slot) = self.reached.get_mut(entry.index()) {
+            *slot = true;
+        }
+        self.begin(entry);
+        let mut values = blaze_own::Vec::with_capacity_in(params.len(), self.alloc);
+        for p in params.iter() {
+            values.push(self.b.param(p.ty));
+        }
+        let mut next = values.iter().copied();
+        if let Pass::Ref | Pass::Memory { .. } = self.ret_pass {
+            self.sret = Some(next.next().ok_or(malformed("a result pointer without its value"))?);
+        }
+        self.scope_marks.push(0);
+
+        let V::Scalar(data_ptr) = self.take_passed(Repr::Ptr, shim_passes[0], &mut next)? else {
+            return Err(malformed("a vtable shim's data pointer not passed as a scalar"));
+        };
+        let self_repr = self.repr(self_ty).map_err(sig_err)?;
+        let self_pass = self.pass(self_ty, self_repr, callee_abi, callee_item)?;
+        match self_repr {
+            Repr::None => self.push_val(V::None, None),
+            Repr::Agg(_) => self.push_val(V::Place(data_ptr, 0), None),
+            scalar => {
+                let v = self.load(scalar, (data_ptr, 0));
+                self.push_val(v, None);
+            }
+        }
+        for (&repr, &pass) in arg_reprs.iter().zip(shim_passes.iter().skip(1)) {
+            let v = self.take_passed(repr, pass, &mut next)?;
+            self.push_val(v, None);
+        }
+        let loc = match callee_item {
+            Some(_) => self.reify_caller_arg(target)?,
+            None => None,
+        };
+        let extra = usize::from(loc.is_some());
+        let mut treprs = blaze_own::Vec::with_capacity_in(1 + n_args + extra, self.alloc);
+        let mut tpasses = blaze_own::Vec::with_capacity_in(1 + n_args + extra, self.alloc);
+        treprs.push(self_repr);
+        tpasses.push(self_pass);
+        treprs.extend_from_slice(&arg_reprs);
+        tpasses.extend_from_slice(&shim_passes[1..]);
+        if let Some(loc) = loc {
+            self.push_val(V::Scalar(loc), None);
+            treprs.push(Repr::Ptr);
+            tpasses.push(track_caller::PASS);
+        }
+        let callee_nounwind = callee_item.is_some_and(|item| self.adts.nounwind(item) == Some(true));
+        let place = self.ref_place(target);
+        let reference = self.b.reference(RefKind::Func, place);
+        let (rrepr, rpass) = (self.ret, self.ret_pass);
+        self.emit_call_from(Callee::Direct(reference), &treprs, &tpasses, None, callee_nounwind, rrepr, rpass)?;
+        let v = self.pop()?;
+        if let PNode::Never = self.ground_node(output).map_err(sig_err)? {
+            self.unreachable_of(TrapKind::AfterDivergingCall, None);
+        } else {
+            self.ret_value(v)?;
+        }
+        self.check_lir_error()
+    }
+
+    /// The test report shim of `#[test]` fn `test` (docs/v2/plan/design/test.md, piece 8;
+    /// lib.rs `build_test_report_shim`): has C `main`'s signature
+    /// `extern "C" fn(argc: i32, argv: *const *const c_char) -> i32`, ignores `argc`/`argv`,
+    /// calls `test()` -> `r: R`, calls `<R as Termination>::report(r)` -> `ExitCode`, and
+    /// returns the status byte zero-extended to `i32` (`0` = success, non-zero = failure).
+    fn run_test_report_shim(&mut self, test: ItemKey, test_sig: &FnSig<'_>, report_fn: ItemKey, report_sig: &FnSig<'_>) -> Result<(), BuildError> {
+        let sig_err = |error: TyErr| match error {
+            TyErr::Unsupported(what) => BuildError::UnsupportedSig { what },
+            TyErr::Malformed(what) => malformed(what),
+            TyErr::Other(error) => error,
+        };
+        let generics = test_sig.parent_count.checked_add(test_sig.own_count).ok_or(malformed("a generic count past u32"))?;
+        if generics != 0 || !self.args.is_empty() {
+            return Err(malformed("a test report shim whose test fn has generic parameters"));
+        }
+        if !test_sig.inputs.is_empty() {
+            return Err(malformed("a test report shim whose test fn takes parameters"));
+        }
+        let test_abi = self.adts.abi(test).ok_or(BuildError::NoAbi { item: test })?;
+        let output = self.ground_in(test_sig.types, test_sig.output).map_err(sig_err)?;
+        let output_repr = self.repr(output).map_err(sig_err)?;
+        let output_pass = self.pass(output, output_repr, test_abi, Some(test))?;
+
+        let own = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I32), Param::of(Ty::PTR)], &[Param::of(Ty::I32)]);
+        self.b.set_signature(own);
+        self.ret = Repr::Int { ty: Ty::I32, signed: true };
+        self.ret_pass = self.rust_pass(self.ret)?;
+
+        let entry = self.create();
+        if let Some(slot) = self.reached.get_mut(entry.index()) {
+            *slot = true;
+        }
+        self.begin(entry);
+        let _argc = self.b.param(Ty::I32);
+        let _argv = self.b.param(Ty::PTR);
+        self.scope_marks.push(0);
+
+        let test_inst = Instance { item: test, args: List::EMPTY };
+        let test_loc = self.reify_caller_arg(test_inst)?;
+        let test_nounwind = self.adts.nounwind(test) == Some(true);
+        let test_place = self.ref_place(test_inst);
+        let test_ref = Callee::Direct(self.b.reference(RefKind::Func, test_place));
+        if let Some(loc) = test_loc {
+            self.push_val(V::Scalar(loc), None);
+            self.emit_call_from(test_ref, &[Repr::Ptr], &[track_caller::PASS], None, test_nounwind, output_repr, output_pass)?;
+        } else {
+            self.emit_call_from(test_ref, &[], &[], None, test_nounwind, output_repr, output_pass)?;
+        }
+        let r_val = self.pop()?;
+        if let PNode::Never = self.ground_node(output).map_err(sig_err)? {
+            self.unreachable_of(TrapKind::AfterDivergingCall, None);
+            return self.check_lir_error();
+        }
+
+        let report_abi = self.adts.abi(report_fn).ok_or(BuildError::NoAbi { item: report_fn })?;
+        let report_self_pass = self.pass(output, output_repr, report_abi, Some(report_fn))?;
+        let exit_ty = crate::instance::ground(report_sig.types, report_sig.output, &[output], self.ground, self.scratch, self.adts.facts())
+            .map_err(ground_err)
+            .map_err(sig_err)?;
+        let exit_repr = self.repr(exit_ty).map_err(sig_err)?;
+        let exit_pass = self.pass(exit_ty, exit_repr, report_abi, Some(report_fn))?;
+
+        let report_args = self.ground.intern_list(&[output]).map_err(|_| malformed("the ground table is full"))?;
+        let report_inst = Instance { item: report_fn, args: report_args };
+        let report_loc = self.reify_caller_arg(report_inst)?;
+        let report_nounwind = self.adts.nounwind(report_fn) == Some(true);
+        let report_place = self.ref_place(report_inst);
+        let report_ref = Callee::Direct(self.b.reference(RefKind::Func, report_place));
+        self.push_val(r_val, None);
+        if let Some(loc) = report_loc {
+            self.push_val(V::Scalar(loc), None);
+            self.emit_call_from(
+                report_ref,
+                &[output_repr, Repr::Ptr],
+                &[report_self_pass, track_caller::PASS],
+                None,
+                report_nounwind,
+                exit_repr,
+                exit_pass,
+            )?;
+        } else {
+            self.emit_call_from(report_ref, &[output_repr], &[report_self_pass], None, report_nounwind, exit_repr, exit_pass)?;
+        }
+        let exit_val = self.pop()?;
+        if let PNode::Never = self.ground_node(exit_ty).map_err(sig_err)? {
+            self.unreachable_of(TrapKind::AfterDivergingCall, None);
+            return self.check_lir_error();
+        }
+
+        let status = match (exit_val, exit_repr) {
+            (V::Place(ptr, off), Repr::Agg(row)) => {
+                let row_idx = usize::try_from(row).map_err(|_| malformed("a layout row past usize"))?;
+                let layout_id = self.layouts.get(row_idx).ok_or(malformed("a layout row past the table"))?.id;
+                match self.ls.get(layout_id).size {
+                    1 => {
+                        let V::Scalar(byte) = self.load(Repr::Int { ty: Ty::I8, signed: false }, (ptr, off)) else {
+                            return Err(malformed("loading 1-byte `ExitCode` did not yield a scalar"));
+                        };
+                        self.b.convert(Op::Zext, Flags::NONE, Ty::I32, byte)
+                    }
+                    4 => {
+                        let V::Scalar(word) = self.load(Repr::Int { ty: Ty::I32, signed: true }, (ptr, off)) else {
+                            return Err(malformed("loading 4-byte `ExitCode` did not yield a scalar"));
+                        };
+                        word
+                    }
+                    _ => return Err(BuildError::UnsupportedSig { what: "a `Termination::report` return type whose size is neither 1 nor 4 bytes" }),
+                }
+            }
+            (V::Scalar(val), Repr::Int { ty: Ty::I8, .. } | Repr::Bool) => self.b.convert(Op::Zext, Flags::NONE, Ty::I32, val),
+            (V::Scalar(val), Repr::Int { ty: Ty::I32, .. }) => val,
+            (V::None, Repr::None) => self.b.iconst(Ty::I32, 0),
+            _ => return Err(BuildError::UnsupportedSig { what: "a `Termination::report` return type that is neither `ExitCode`, `u8`, nor `i32`" }),
+        };
+        self.b.ret(&[status]);
+        self.check_lir_error()
     }
 }
 
@@ -701,6 +1182,7 @@ pub(crate) fn empty_record(a: Alloc<'_>) -> Checked<'_> {
         const_args: blaze_own::Soa::new_in(a),
         pat_const_args: blaze_own::Soa::new_in(a),
         pat_defs: blaze_own::Soa::new_in(a),
+        union_pats: blaze_own::Soa::new_in(a),
         fields: blaze_own::Soa::new_in(a),
         captures: blaze_own::Soa::new_in(a),
         capture_places: blaze_own::Soa::new_in(a),
@@ -722,13 +1204,14 @@ pub(crate) fn empty_record(a: Alloc<'_>) -> Checked<'_> {
         index_mut: blaze_own::Vec::new_in(a),
         findings: blaze_own::Vec::new_in(a),
         undecided: blaze_own::Vec::new_in(a),
+        inferred_output: None,
     }
 }
 
 /// Builds the shim of fn item or fn pointer `callee` as `Fn*` method `which` at `[callee,
 /// tuple]` (lib.rs `build_fn_shim`, `Walk::run_fn_shim`). Its walk is given an empty body,
 /// named by the trait method, and an empty check record: neither is read.
-pub(crate) fn build_fn_shim<A: Allocator + Clone>(
+pub(crate) fn build_fn_shim<A: Allocator + Copy>(
     callee: PTy,
     tuple: PTy,
     which: FnTrait,
@@ -742,6 +1225,59 @@ pub(crate) fn build_fn_shim<A: Allocator + Clone>(
     let body = empty_view(owner, checked.types.view());
     let mut w = Walk::new(&body, &checked, subst, adts, alloc);
     w.run_fn_shim(callee, tuple, which, sig)?;
+    w.into_built()
+}
+
+/// Builds the `ReifyShim` of `#[track_caller]` fn `callee` (lib.rs `build_reify_shim`,
+/// `Walk::run_reify_shim`). Its walk is given an empty body named by `callee` and an empty check
+/// record: neither is read.
+pub(crate) fn build_reify_shim<A: Allocator + Copy>(
+    callee: ItemKey,
+    sig: &FnSig<'_>,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    let checked = empty_record(subst.scratch);
+    let body = empty_view(callee, checked.types.view());
+    let mut w = Walk::new(&body, &checked, subst, adts, alloc);
+    w.run_reify_shim(callee, sig)?;
+    w.into_built()
+}
+
+/// Builds the by-value `self` `VTableShim` for `target` (lib.rs `build_vtable_shim`,
+/// `Walk::run_vtable_shim`). Its walk is given an empty body named by `target.item` and an empty
+/// check record: neither is read.
+pub(crate) fn build_vtable_shim<A: Allocator + Copy>(
+    target: Instance,
+    sig: Option<&FnSig<'_>>,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    let checked = empty_record(subst.scratch);
+    let body = empty_view(target.item, checked.types.view());
+    let mut w = Walk::new(&body, &checked, subst, adts, alloc);
+    w.run_vtable_shim(target, sig)?;
+    w.into_built()
+}
+
+/// Builds the test report shim of `#[test]` fn `test` (lib.rs `build_test_report_shim`,
+/// `Walk::run_test_report_shim`). Its walk is given an empty body named by `test` and an empty
+/// check record: neither is read.
+pub(crate) fn build_test_report_shim<A: Allocator + Copy>(
+    test: ItemKey,
+    test_sig: &FnSig<'_>,
+    report_fn: ItemKey,
+    report_sig: &FnSig<'_>,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    let checked = empty_record(subst.scratch);
+    let body = empty_view(test, checked.types.view());
+    let mut w = Walk::new(&body, &checked, subst, adts, alloc);
+    w.run_test_report_shim(test, test_sig, report_fn, report_sig)?;
     w.into_built()
 }
 
@@ -784,5 +1320,8 @@ pub(crate) fn empty_view(owner: ItemKey, types: PTys<'_>) -> BodyView<'_> {
         unsafe_blocks: &[],
         expr_editions: &[],
         pat_editions: &[],
+        record_expr_schemas: &[],
+        closure_param_regions: &[],
+        loop_marks: &[],
     }
 }

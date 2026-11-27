@@ -56,7 +56,7 @@ use blaze_manifest::lock::{Lock, LockId, LockSource};
 use blaze_own::{AVec, Alloc, Erased};
 use blaze_proc_macro::native_unit::{NativeSetting, placed};
 use blaze_proc_macro::script::ScriptRuntime;
-use blaze_proc_macro::script_sandbox::{ScriptRoot, Tree, dir_tree, mem_tree};
+use blaze_proc_macro::script_sandbox::{ScriptRoot, Tree, dir_tree, mem_tree_with_submodules};
 use blaze_proc_macro::script_unit::{self, Setting, links_closure};
 use blaze_proc_macro::spawn_route::SpawnSetting;
 use blaze_unit_graph::{CfgAtom, Records, StoreSources, Unit, UnitGraph, UnitId, UnitKind};
@@ -272,6 +272,9 @@ pub(crate) struct Shared<'f> {
     table: Arc<std::vec::Vec<Row>>,
     macro_table: Arc<std::vec::Vec<Row>>,
     spawn: Arc<SpawnSetting>,
+    /// Hermetic pinned `clang-23` probe runner and CAS store, or retained refusal when the host
+    /// has no clang pin or unpacked shelf (fails only scripts that actually ask a C probe).
+    c_probes: blaze_proc_macro::probe_clang::CProbeSetting,
     /// The native setting, or why the command has none (its words, naming the path).
     native: Result<NativeSetting<'f>, &'f str>,
     /// The command resolved no macOS SDK (sdk.rs). A native run's key then holds "no SDK"
@@ -292,15 +295,19 @@ pub(crate) struct Scripts<'f> {
     /// The graph record's bytes, held in the request's frame for the workers (each run decodes
     /// them again in its own frame, [`run`]).
     graph_record: &'f [u8],
-    /// The unit graph the names world decoded (names.rs `Names::graph`): never decoded again here.
-    graph: &'static UnitGraph<'static>,
+    /// The decoded unit graph: either the names world's (`NamesWorld::graph`) or decoded once
+    /// into `frame` when no `Names` task ran yet ([`Scripts::open_light`]).
+    graph: &'f UnitGraph<'f>,
+    /// Lightweight toolchain + script-cfg world when `Names` has not built the full world yet.
+    script_world: Option<&'f blaze_world::ScriptWorld<'f>>,
     /// (subject, script unit, side), sorted: each run a crate of the world reads, by the world's
     /// own subject (names.rs `Names::script_runs`): the runs a `Script` part can name.
     by_subject: blaze_own::Vec<(ContentId, UnitId, Side), &'f Frame>,
     sources: StoreSources<'f, 'f, 'f, SourcesDir<'f>>,
     lock: &'f Lock<'f>,
-    /// Each member's lock entry and folder, checkout-relative, copied into the request's frame.
-    members: &'f [(LockId, &'f str)],
+    /// Each checkout path package's lock entry, folder (checkout-relative), and kind (member vs
+    /// external), copied into the request's frame.
+    members: &'f [blaze_world::CheckoutPath<'f>],
     /// Each fetched package's files as first located ([`files_of`]), sorted by lock id: a
     /// package's manifests are laid out once a command, not once for each job that runs its
     /// script or is served by it as a `links` producer (rule 77).
@@ -312,18 +319,18 @@ pub(crate) struct Scripts<'f> {
 /// Why the command's scripts could not be set up: every `Script` task fails with these
 /// words (a hole: a fact outside every key, asked again next command).
 #[derive(Debug)]
-pub(crate) enum SetupError {
+pub(crate) enum SetupError<'f> {
     NoHome,
     NoLock,
     NoMembers,
-    Runtime(std::string::String),
+    Runtime(&'f str),
     /// The shared setup (blaze-world `script_setting::ScriptSetupError`, rendered): a side's
     /// probe table (a toolchain crate's library features not listed) or the spawn setting.
-    Setting(std::string::String),
-    Sources(std::string::String),
+    Setting(&'f str),
+    Sources(&'f str),
 }
 
-impl core::fmt::Display for SetupError {
+impl core::fmt::Display for SetupError<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             SetupError::NoHome => f.write_str("HOME is not set: the build-script module store and the native setting are under it"),
@@ -357,7 +364,7 @@ impl<'f> Records<'f> for SourcesDir<'f> {
         // `SourceError`), named by its package and key: the same answer a missing one gets.
         let mapping = blaze_core::Mapping::map_file(std::path::Path::new(&path)).ok()?;
         // Kept for the command: the view over its bytes is read by every later job.
-        let mapping: &'f blaze_core::Mapping = blaze_own::Box::leak(blaze_own::Box::new_in(mapping, self.frame));
+        let mapping: &'f blaze_core::Mapping = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(mapping, self.frame));
         Some(mapping.bytes())
     }
 }
@@ -370,19 +377,21 @@ impl<'f> Records<'f> for SourcesDir<'f> {
 pub(crate) struct CommandFeatures<'c, 's, 'm> {
     pub(crate) cx: &'c Cx,
     pub(crate) store: &'s mut dyn Store<'m>,
-    /// The last record read: its bytes are lent for `'m` and answered from here.
-    pub(crate) held: Option<crate::store::Held<'m>>,
+    /// Owned copy of the last record read (`Store::get_into`), so reading an uncommitted
+    /// features record never pins its shared arena in `Lent::kept_arenas`.
+    pub(crate) held: bstd::mem::Bytes<'c>,
 }
 
 impl blaze_world::lib_features_record::FeatureRecords for CommandFeatures<'_, '_, '_> {
     type Error = CliError;
 
     fn get(&mut self, key: ContentId) -> Result<Option<&[u8]>, CliError> {
-        self.held = self.store.get(self.cx, blaze_drive::Key(key))?;
-        if self.held.is_some() {
-            self.store.keep_with_toolchain(blaze_drive::Key(key))?;
+        self.held = bstd::mem::Bytes::new_in(self.cx.frame(), "a library-features record");
+        if !self.store.get_into(self.cx, blaze_drive::Key(key), &mut self.held)? {
+            return Ok(None);
         }
-        Ok(self.held.as_ref().map(|held| held.bytes))
+        self.store.keep_with_toolchain(blaze_drive::Key(key))?;
+        Ok(Some(self.held.as_slice()))
     }
 
     fn put(&mut self, key: ContentId, bytes: &[u8]) -> Result<(), CliError> {
@@ -393,7 +402,7 @@ impl blaze_world::lib_features_record::FeatureRecords for CommandFeatures<'_, '_
 
 /// `bytes` copied into `frame`, held as long as it is.
 fn held_bytes<'f>(bytes: &[u8], frame: &'f Frame) -> &'f [u8] {
-    blaze_own::Vec::from_slice_in(bytes, frame).leak()
+    frame.alloc_slice_copy(bytes)
 }
 
 /// Words held in `frame`.
@@ -402,48 +411,128 @@ fn said<'f>(frame: &'f Frame, words: core::fmt::Arguments<'_>) -> &'f str {
     crate::work::held_str(text.as_str(), frame)
 }
 
+/// Empty checkout tree for [`blaze_world::script_world`]: toolchain packs never read tree 0.
+struct NoCheckout;
+
+impl blaze_world::Tree for NoCheckout {
+    fn file(&self, _path: &str) -> Option<&[u8]> {
+        None
+    }
+}
+
+static NO_CHECKOUT: NoCheckout = NoCheckout;
+
+/// Places only checkout path packages for [`blaze_world::open_list`], without touching any
+/// fetched registry or git package.
+struct MembersOnly<'f> {
+    members: &'f [blaze_world::CheckoutPath<'f>],
+    lock: &'f Lock<'f>,
+    bump: blaze_own::Bump<'f>,
+}
+
+impl<'f> blaze_world::Packages<'f> for MembersOnly<'f> {
+    fn place(&mut self, package: LockId) -> Result<blaze_world::Place<'f>, blaze_world::WorldError<'f>> {
+        match self.members.iter().find(|entry| entry.id == package) {
+            Some(blaze_world::CheckoutPath { dir, kind: blaze_world::PathKind::Member, .. }) => Ok(blaze_world::Place::Checkout { dir }),
+            Some(blaze_world::CheckoutPath { dir, kind: blaze_world::PathKind::External, .. }) => Ok(blaze_world::Place::Path { dir }),
+            None => Err(blaze_world::WorldError::PathNotPlaced { package: self.bump.alloc_str(&self.lock.package(package).name) }),
+        }
+    }
+}
+
 impl<'f> Scripts<'f> {
-    /// The command's scripts, made once at its first `Script` job: the graph record
-    /// `graph_record` (held in `frame`, for the workers), the names world `names` (its graph and
-    /// its runs: nothing decoded or walked again here), the lock, the members' folders and the
-    /// sources store under the home (`env`). What the pool shares (the probe answers, the spawn
-    /// setting, the native runner) is opened later, at the first job made ready to run
-    /// ([`Scripts::shared`]): planning a round of jobs that only ask for inputs, or whose runs
-    /// all stand, opens none of it.
+    /// The command's scripts, made once at its first `Script` job from an already-made names world.
     pub(crate) fn open(
         cx: &Cx,
         env: &FetchEnv<'_>,
         names: &crate::names::NamesWorld<'_>,
         graph_record: &'f [u8],
         lock: Option<&'f Lock<'static>>,
-        members: Option<&[(LockId, blaze_unit_graph::Text<'_>)]>,
+        members: Option<&[crate::graph::CheckoutDir]>,
         frame: &'f Frame,
-    ) -> Result<Scripts<'f>, SetupError> {
+    ) -> Result<Scripts<'f>, SetupError<'f>> {
+        let by_subject = {
+            let _cx = cx.span("scripts: the world's runs by subject");
+            names.script_runs(frame)
+        };
+        Self::finish_open(cx, env, names.graph(), None, by_subject, graph_record, lock, members, frame)
+    }
+
+    /// Lightweight scripts setup when no `Names` task has built the full world yet: decodes the
+    /// unit graph and opens only the toolchain shelf (for `ScriptSetup::open_recorded`) and
+    /// script-reading crates' `cfg`s, without mapping or laying out any fetched package.
+    pub(crate) fn open_light(
+        cx: &Cx,
+        env: &FetchEnv<'_>,
+        names: &crate::names::Names<'f>,
+        graph_record: &'f [u8],
+        lock: Option<&'f Lock<'static>>,
+        members: Option<&[crate::graph::CheckoutDir]>,
+        frame: &'f Frame,
+    ) -> Result<Scripts<'f>, SetupError<'f>> {
+        let home = env.home.ok_or(SetupError::NoHome)?;
+        let lock_ref: &'f Lock<'f> = lock.ok_or(SetupError::NoLock)?;
+        let listed_members = members.ok_or(SetupError::NoMembers)?;
+        let mut held_members = blaze_own::Vec::with_capacity_in(listed_members.len(), frame);
+        for entry in listed_members.iter() {
+            held_members.push(blaze_world::CheckoutPath { id: entry.id, dir: crate::work::held_str(entry.dir.as_str(), frame), kind: entry.kind });
+        }
+        let member_slice: &'f [blaze_world::CheckoutPath<'f>] = held_members.into_bump_slice();
+        let bump: blaze_own::Bump<'f> = frame.alloc(Erased::new(frame)).bump();
+        let decoded = {
+            let _cx = cx.span("scripts: unit graph decoded");
+            blaze_unit_graph::record::decode(graph_record, bump.alloc()).map_err(|e| SetupError::Setting(said(frame, format_args!("unit graph decode: {e}"))))?
+        };
+        let decoded: &'f blaze_unit_graph::record::Decoded<'f> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(decoded, frame));
+        let graph: &'f UnitGraph<'f> = &decoded.graph;
+        let mut shelf = {
+            let _cx = cx.span("scripts: toolchain shelf opened");
+            crate::toolchain::HomeShelf::open(cx, &env.fs, home, frame).map_err(|e| SetupError::Setting(said(frame, format_args!("toolchain shelf: {e}"))))?
+        };
+        let mut packages = MembersOnly { members: member_slice, lock: lock_ref, bump };
+        let listed = {
+            let _cx = cx.span("scripts: toolchain list opened");
+            blaze_world::open_list(&mut shelf, env.toolchain, crate::graph::TRIPLE, graph, lock_ref, &mut packages, bump)
+                .map_err(|e| SetupError::Setting(said(frame, format_args!("script list: {e}"))))?
+        };
+        let listed: &'f blaze_world::Listed<'f, crate::toolchain::Held<'f>> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(listed, frame));
+        let sw = {
+            let _cx = cx.span("scripts: toolchain world made");
+            blaze_world::script_world(graph, listed, &NO_CHECKOUT, bump).map_err(|e| SetupError::Setting(said(frame, format_args!("script world: {e}"))))?
+        };
+        let sw: &'f blaze_world::ScriptWorld<'f> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(sw, frame));
+        let by_subject = names.script_runs(frame);
+        Self::finish_open(cx, env, graph, Some(sw), by_subject, graph_record, lock, members, frame)
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "shared Scripts constructor")]
+    fn finish_open(
+        cx: &Cx,
+        env: &FetchEnv<'_>,
+        graph: &'f UnitGraph<'f>,
+        script_world: Option<&'f blaze_world::ScriptWorld<'f>>,
+        by_subject: blaze_own::Vec<(ContentId, UnitId, Side), &'f Frame>,
+        graph_record: &'f [u8],
+        lock: Option<&'f Lock<'static>>,
+        members: Option<&[crate::graph::CheckoutDir]>,
+        frame: &'f Frame,
+    ) -> Result<Scripts<'f>, SetupError<'f>> {
         if env.home.is_none() {
             return Err(SetupError::NoHome);
         }
         let lock: &'f Lock<'f> = lock.ok_or(SetupError::NoLock)?;
         let listed = members.ok_or(SetupError::NoMembers)?;
         let mut held = blaze_own::Vec::with_capacity_in(listed.len(), frame);
-        for (id, dir) in listed.iter() {
-            held.push((*id, crate::work::held_str(dir.as_str(), frame)));
+        for entry in listed.iter() {
+            held.push(blaze_world::CheckoutPath { id: entry.id, dir: crate::work::held_str(entry.dir.as_str(), frame), kind: entry.kind });
         }
-        let members: &'f [(LockId, &'f str)] = held.leak();
-        // The process's heap, handed from `main` (`FetchEnv::heap`), never the request's frame:
-        // the sources' lookup lays out a package's manifests on each call and frees them when it
-        // returns (blaze-unit-graph `StoreSources::locate`). In the request's bump frame, which
-        // never frees, those layouts grew with every job until the frame was full (tempo, 1,072
-        // crates: 49 MB at the 59th `Script` job, a panic in blaze-toml's parse).
+        let members: &'f [blaze_world::CheckoutPath<'f>] = held.into_bump_slice();
         let alloc: Alloc<'f> = env.heap.alloc();
-        let by_subject = {
-            let _cx = cx.span("scripts: the world's runs by subject");
-            names.script_runs(frame)
-        };
         let _cx = cx.span("scripts: the fetched sources");
         let folder = crate::fetch::sources_native(env, frame).ok_or(SetupError::NoHome)?;
         let dir = SourcesDir { folder: crate::work::held_str(folder.as_str(), frame), frame };
-        let sources = StoreSources::new(lock, dir, blaze_fetch::pack::PackView::open_source_put, alloc).map_err(|error| SetupError::Sources(std::format!("{error}")))?;
-        Ok(Scripts { shared: None, graph_record, graph: names.graph(), by_subject, sources, lock, members, files: std::vec::Vec::new_in(Global), setups_opened: 0 })
+        let sources = StoreSources::new(lock, dir, blaze_fetch::pack::PackView::open_source_put, alloc).map_err(|error| SetupError::Sources(said(frame, format_args!("{error}"))))?;
+        Ok(Scripts { shared: None, graph_record, graph, script_world, by_subject, sources, lock, members, files: std::vec::Vec::new_in(Global), setups_opened: 0 })
     }
 
     /// The shared setups opened this command: 1 once a job was made ready to run, else 0.
@@ -473,13 +562,13 @@ impl<'f> Scripts<'f> {
     /// `records` (the command's store) by its key, or walked once and put there ([`CommandFeatures`]); `tool` is the
     /// `Script` kind's tool, so a change of the walk's code moves the key (rule 52).
     #[expect(clippy::too_many_arguments, reason = "a task's edge: each argument one handle or fact of it")]
-    fn open_shared(cx: &Cx, env: &FetchEnv<'_>, records: &mut dyn Store<'_>, tool: blaze_drive::Tool, workers: u32, world: &blaze_world::World<'_>, graph_record: &'f [u8], frame: &'f Frame) -> Result<&'f Shared<'f>, SetupError> {
+    fn open_shared(cx: &Cx, env: &FetchEnv<'_>, records: &mut dyn Store<'_>, tool: blaze_drive::Tool, workers: u32, world: &blaze_world::World<'_>, graph_record: &'f [u8], frame: &'f Frame) -> Result<&'f Shared<'f>, SetupError<'f>> {
         let home = env.home.ok_or(SetupError::NoHome)?;
         // The heap, for the setting: it lives to the command's end ([`Scripts::open`]).
         let alloc: Alloc<'f> = env.heap.alloc();
         let mut store = PathBuf::from(home);
         store.push(STORE_UNDER_HOME);
-        let runtime = ScriptRuntime::new(&store).map_err(|error| SetupError::Runtime(std::format!("{error}")))?;
+        let runtime = ScriptRuntime::new(&store).map_err(|error| SetupError::Runtime(said(frame, format_args!("{error}"))))?;
         let host = crate::graph::TRIPLE;
         // The native setting: only a script `placed` native needs it; without it that script
         // fails naming why ([`pooled`]), never run as wasm (D112). What this edge read (the
@@ -501,20 +590,20 @@ impl<'f> Scripts<'f> {
         };
         let setup = {
             let _cx = cx.span("scripts: each side's probe answers (library features listed) and the native runner");
-            let mut features = CommandFeatures { cx, store: records, held: None };
+            let mut features = CommandFeatures { cx, store: records, held: bstd::mem::Bytes::new_in(cx.frame(), "a library-features record") };
             blaze_world::script_setting::ScriptSetup::open_recorded(
                 blaze_world::script_setting::ScriptSetupOpts { world, target: host, macro_target: MACRO_TARGET, native: native_opts, alloc: alloc.clone() },
                 tool.0,
                 &mut features,
             )
-            .map_err(|error| SetupError::Setting(std::format!("{error}")))?
+            .map_err(|error| SetupError::Setting(said(frame, format_args!("{error}"))))?
         };
         let blaze_world::script_setting::ScriptSetup { table, macro_table, spawn, native } = setup;
         // Held to the command's end; its jobserver is ended, its fifo removed, when `Scripts`
         // drops.
         let native: Result<NativeSetting<'f>, &'f str> = match native {
             Ok(run) => {
-                let run: &'f blaze_proc_macro::native_setting::NativeRun<'f> = blaze_own::Box::leak(blaze_own::Box::new_in(run, frame));
+                let run: &'f blaze_proc_macro::native_setting::NativeRun<'f> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(run, frame));
                 Ok(run.setting())
             }
             Err(blaze_world::script_setting::NativeRefused::Caller(words)) => Err(words),
@@ -524,7 +613,24 @@ impl<'f> Scripts<'f> {
         // resolved again here.
         let checkout = env.served.within(frame);
         let no_sdk = env.sdk.is_err();
-        let shared: &'f Shared<'f> = blaze_own::Box::leak(blaze_own::Box::new_in(Shared { result_alloc: env.heap.shared(), runtime, store, checkout, table, macro_table, spawn, native, no_sdk, graph_record }, frame));
+        let mut sdk_hex = [0u8; blaze_apple_sdk::SdkId::KEY_LEN * 2];
+        let sdk_pair = env.sdk.as_ref().ok().map(|sdk| {
+            let key = sdk.identity().key();
+            for (i, byte) in key.iter().enumerate() {
+                let hi = byte >> 4;
+                let lo = byte & 15;
+                if let Some(slot) = sdk_hex.get_mut(2 * i) {
+                    *slot = if hi < 10 { b'0' + hi } else { b'a' + (hi - 10) };
+                }
+                if let Some(slot) = sdk_hex.get_mut(2 * i + 1) {
+                    *slot = if lo < 10 { b'0' + lo } else { b'a' + (lo - 10) };
+                }
+            }
+            let id_str = core::str::from_utf8(&sdk_hex).unwrap_or("");
+            (sdk.folder(), id_str)
+        });
+        let c_probes = blaze_proc_macro::probe_clang::open_command_c_probes(cx, &env.fs, home, host, sdk_pair, alloc);
+        let shared: &'f Shared<'f> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(Shared { result_alloc: env.heap.shared(), runtime, store, checkout, table, macro_table, spawn, c_probes, native, no_sdk, graph_record }, frame));
         Ok(shared)
     }
 
@@ -558,6 +664,10 @@ fn end_jobs(jobs: &blaze_proc_macro::jobserver::Jobserver) {
 enum Files<'j> {
     /// A workspace member at `dir` (checkout-relative): its script sees `/workspace/<dir>`.
     Member { dir: &'j str },
+    /// An external checkout path package (`[patch.*]` or excluded path dep) at `dir`
+    /// (checkout-relative): its script is confined to `/package` (its own folder, never the whole
+    /// workspace).
+    External { dir: &'j str },
     /// A fetched package's record: its files under `dir`; a git source answers `git` from the
     /// lock's commit (D54).
     Pack { view: blaze_fetch::pack::PackView<'j>, dir: &'j str, git: Option<blaze_build_script::git::Oid> },
@@ -579,6 +689,9 @@ pub(crate) struct ScriptJob<'j> {
     /// What a member's run that read the checkout gives ([`CheckoutReads`]): a hole unless its
     /// caller keeps the reads as cells.
     pub(crate) checkout: CheckoutReads,
+    /// Transitive build-dependency digest (`deps <sha256>`, rule 21) when the build script has
+    /// build-dependencies; `None` when it has none.
+    deps_digest: Option<&'j str>,
 }
 
 /// What a member build script's reads of the checkout give (engine_scripts.rs sets it).
@@ -616,14 +729,17 @@ struct Producer<'j> {
 fn files_of<'f: 'j, 'j>(
     sources: &mut StoreSources<'f, 'f, 'f, SourcesDir<'f>>,
     found: &mut std::vec::Vec<(LockId, Files<'f>), Global>,
-    members: &'f [(LockId, &'f str)],
+    members: &'f [blaze_world::CheckoutPath<'f>],
     lock: &'f Lock<'f>,
     unit: &Unit<'_>,
     frame: &'f Frame,
     jobs: &'j Frame,
 ) -> Result<Files<'j>, Prepared<'j>> {
-    if let Some((_, dir)) = members.iter().find(|(id, _)| *id == unit.package) {
-        return Ok(Files::Member { dir });
+    if let Some(entry) = members.iter().find(|entry| entry.id == unit.package) {
+        return Ok(match entry.kind {
+            blaze_world::PathKind::Member => Files::Member { dir: entry.dir },
+            blaze_world::PathKind::External => Files::External { dir: entry.dir },
+        });
     }
     let at = match found.binary_search_by_key(&unit.package, |(id, _)| *id) {
         Ok(at) => return Ok(found[at].1),
@@ -661,14 +777,42 @@ pub(crate) fn checkout_path(checkout: &str) -> &Path {
 /// run's failure, naming the package and the folder.
 fn tree_of(files: &Files<'_>, checkout: crate::engine_script_reads::Served<'_>, package: &str) -> Result<(Tree, ScriptRoot), Ran> {
     match files {
-        Files::Member { dir } => match (ScriptRoot::member(dir), checkout) {
+        Files::Member { dir } | Files::External { dir } => match (ScriptRoot::member(dir), checkout) {
             (Ok(root), crate::engine_script_reads::Served::Root(checkout)) => Ok((dir_tree(checkout), root)),
             (Ok(_), crate::engine_script_reads::Served::Simulated) => {
-                Err(failed("a member's script with no served checkout", format_args!("the build script of {package}: its member folder `{dir}`: a simulated world serves no checkout on disk"), false))
+                Err(failed("a member's script with no served checkout", format_args!("the build script of {package}: its folder '{dir}': a simulated world serves no checkout on disk"), false))
             }
-            (Err(error), _) => Err(failed("a member folder a script cannot see", format_args!("the build script of {package}: its member folder `{dir}`: {error}"), false)),
+            (Err(error), _) => Err(failed("a member folder a script cannot see", format_args!("the build script of {package}: its folder '{dir}': {error}"), false)),
         },
-        Files::Pack { view, dir, git } => Ok((mem_tree(view.files().map(|f| (f.path, f.bytes)), dir, *git), ScriptRoot::package())),
+        Files::Pack { view, dir, git } => {
+            let Ok(frame) = bstd::mem::Frame::new(bstd::mem::Tag::Other) else {
+                return Err(failed("a build script's decode frame failed", format_args!("the build script of {package}: out of memory"), false));
+            };
+            let mut decoded: blaze_own::Vec<(&str, blaze_fetch::FileBytes<'_, &bstd::mem::Frame>), &bstd::mem::Frame> =
+                blaze_own::Vec::with_capacity_in(view.len(), &frame);
+            let mut submodules: blaze_own::Vec<(&str, [u8; 20]), &bstd::mem::Frame> = blaze_own::Vec::new_in(&frame);
+            for entry in view.entries() {
+                if entry.mode == blaze_fetch::Mode::Submodule {
+                    if let Some(commit) = entry.submodule_commit() {
+                        submodules.push((entry.path, commit));
+                    }
+                    continue;
+                }
+                let bytes = entry.read_in(&frame).map_err(|why| {
+                    failed("a build script's pack entry failed to decode", format_args!("the build script of {package}: {}: {}", entry.path, blaze_text::Shown(&why)), false)
+                })?;
+                decoded.push((entry.path, bytes));
+            }
+            Ok((
+                mem_tree_with_submodules(
+                    decoded.iter().map(|(p, b)| (*p, b.as_slice())),
+                    submodules.iter().copied(),
+                    dir,
+                    *git,
+                ),
+                ScriptRoot::package(),
+            ))
+        }
     }
 }
 
@@ -698,7 +842,7 @@ pub(crate) fn job<'f: 'j, 'j>(
     tool: blaze_drive::Tool,
     workers: u32,
     lock: Option<&'f Lock<'static>>,
-    members: Option<&[(LockId, blaze_unit_graph::Text<'_>)]>,
+    members: Option<&[crate::graph::CheckoutDir]>,
     task: &Task<'_>,
     frame: &'f Frame,
     jobs: &'j Frame,
@@ -733,13 +877,14 @@ pub(crate) fn job<'f: 'j, 'j>(
         if scripts.is_none() {
             let bytes: &'f [u8] = held_bytes(read.unit_graph(graph.name)?.graph, frame);
             let Some(listed) = names.as_ref() else { return Err(CliError::Text { what: "the names world, made above, is gone" }) };
-            // A script runs: the world is made now if no task made it yet (names.rs
-            // `made_or_make`, under "names: make the world (needed by a script job)").
-            let made = match listed.made_or_make(&cx, root, store, env, crate::names::NeededBy::ScriptJob)? {
-                Ok(made) => made,
-                Err(why) => return Ok(Prepared::Said { what: "the crates' inputs could not be made", words: said(jobs, format_args!("names not resolved: {why}")), hole: false }),
+            // Avoid building the full 1,200-crate world (mapping all fetched packages) when no
+            // `Names` task has needed it yet: `open_light` opens only the toolchain shelf and
+            // unit graph for script execution.
+            let opened = match listed.made().filter(|made| made.has_open_packs()) {
+                Some(made) => Scripts::open(&cx, env, made, bytes, lock, members, frame),
+                None => Scripts::open_light(&cx, env, listed, bytes, lock, members, frame),
             };
-            match Scripts::open(&cx, env, made, bytes, lock, members, frame) {
+            match opened {
                 Ok(opened) => *scripts = Some(Ok(opened)),
                 Err(error) => {
                     // Kept for the command: the next `Script` task says it, never opens again.
@@ -754,25 +899,46 @@ pub(crate) fn job<'f: 'j, 'j>(
     let Some((script, side)) = scripts.unit_of(task.name) else {
         return Ok(Prepared::Said { what: "a `Script` part names no build script of this command's graph", words: "a `Script` part names no build-script unit of this command's graph", hole: false });
     };
-    // The crate of the list that reads this run: the world row whose script is this subject,
-    // the row its part was named from (ruling D115 (2)). Its cfg is the run's side's.
-    let Some(world) = names.as_ref().and_then(|names| names.made()).map(|made| made.world()) else { return Err(CliError::Text { what: "the names world, made above, is gone" }) };
-    let wanted = blaze_world::Script::Read { subject: task.name.subject };
-    let Some(row) = world.crates.iter().find(|krate| krate.script == wanted) else {
-        return Ok(Prepared::Said { what: "a `Script` part that no crate of the world reads", words: "a `Script` part names a run that no crate of this command's world reads", hole: false });
+    // The crate of the list that reads this run: its cfg is the run's side's.
+    let script_world = scripts.script_world;
+    let (world, raw_cfg): (&blaze_world::World<'_>, &[(&str, Option<&str>)]) = match names.as_ref().and_then(|n| n.made()).filter(|made| made.has_open_packs()) {
+        Some(made) => {
+            let world = made.world();
+            let wanted = blaze_world::Script::Read { subject: task.name.subject };
+            let Some(row) = world.crates.iter().find(|krate| krate.script == wanted) else {
+                return Ok(Prepared::Said { what: "a `Script` part that no crate of the world reads", words: "a `Script` part names a run that no crate of this command's world reads", hole: false });
+            };
+            if row.side != side {
+                return Ok(Prepared::Said {
+                    what: "a `Script` part whose world row is of another side",
+                    words: said(jobs, format_args!("the build script run read by crate `{}` is of the {:?} side in the world and of the {side:?} side in the graph's subjects: one subject function names both (blaze_world::script_subject)", row.input.name, row.side)),
+                    hole: false,
+                });
+            }
+            (world, row.input.cfg)
+        }
+        None => {
+            let Some(sw) = script_world else {
+                return Err(CliError::Text { what: "neither the names world nor the lightweight script world is open" });
+            };
+            let Some((_, row_side, row_cfg)) = sw.script_cfgs.iter().find(|(subject, _, _)| *subject == task.name.subject) else {
+                return Ok(Prepared::Said { what: "a `Script` part that no crate of the world reads", words: "a `Script` part names a run that no crate of this command's world reads", hole: false });
+            };
+            if *row_side != side {
+                return Ok(Prepared::Said {
+                    what: "a `Script` part whose world row is of another side",
+                    words: said(jobs, format_args!("the build script run is of the {row_side:?} side in the world and of the {side:?} side in the graph's subjects")),
+                    hole: false,
+                });
+            }
+            (&sw.world, *row_cfg)
+        }
     };
-    if row.side != side {
-        return Ok(Prepared::Said {
-            what: "a `Script` part whose world row is of another side",
-            words: said(jobs, format_args!("the build script run read by crate `{}` is of the {:?} side in the world and of the {side:?} side in the graph's subjects: one subject function names both (blaze_world::script_subject)", row.input.name, row.side)),
-            hole: false,
-        });
-    }
-    let mut cfg: blaze_own::Vec<(&'j str, Option<&'j str>), &'j Frame> = blaze_own::Vec::with_capacity_in(row.input.cfg.len(), jobs);
-    for (name, value) in row.input.cfg.iter() {
+    let mut cfg: blaze_own::Vec<(&'j str, Option<&'j str>), &'j Frame> = blaze_own::Vec::with_capacity_in(raw_cfg.len(), jobs);
+    for (name, value) in raw_cfg.iter() {
         cfg.push((crate::work::held_str(name, jobs), value.map(|value| crate::work::held_str(value, jobs))));
     }
-    let cfg: &'j [(&'j str, Option<&'j str>)] = cfg.leak();
+    let cfg: &'j [(&'j str, Option<&'j str>)] = cfg.into_bump_slice();
     // Copied out of `scripts`, which the sources' lookup below borrows mutably.
     let (graph, members, lock) = (scripts.graph, scripts.members, scripts.lock);
     let unit = &graph.units[script.index()];
@@ -782,8 +948,7 @@ pub(crate) fn job<'f: 'j, 'j>(
     let mut wants = std::vec::Vec::new_in(Global);
     // Its module, looked up by its own task (script_modules.rs, ruling D115 (c)): read, so a
     // rebuilt module reruns this run alone and an equal one moves nothing.
-    let at = world.crates.iter().position(|krate| krate.script == wanted).ok_or(CliError::Text { what: "the world row found above is gone" })?;
-    let Some(module) = names.as_ref().and_then(|names| names.script_module_of(at)) else {
+    let Some(module) = names.as_ref().and_then(|n| n.script_readers(task.name).next().and_then(|at| n.script_module_of(at))) else {
         return Ok(Prepared::Said { what: "a build script with no module lookup", words: "the build script read here has no unit in the graph to name its module by", hole: false });
     };
     let module = crate::script_modules::name(module.subject);
@@ -823,7 +988,14 @@ pub(crate) fn job<'f: 'j, 'j>(
         Ok(shared) => shared,
         Err(words) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{words}")), hole: true }),
     };
-    Ok(Prepared::Ready(ScriptJob { name: task.name, shared, script, side, cfg, files, producers: producers.leak(), checkout: CheckoutReads::Hole }))
+    let deps_digest = blaze_proc_macro::script_unit::script_deps_digest(graph, lock, script, |dep_pkg| {
+        members
+            .iter()
+            .find(|m| m.id == dep_pkg)
+            .and_then(|m| crate::macro_files::package_files_digest_in_dir(&cx, &root.read_only(), m.dir, frame))
+    })
+    .map(|hex| crate::work::held_str(&hex, jobs));
+    Ok(Prepared::Ready(ScriptJob { name: task.name, shared, script, side, cfg, files, producers: producers.into_bump_slice(), checkout: CheckoutReads::Hole, deps_digest }))
 }
 
 /// What a script's run gave on its worker, in `Global` (its task frame ends with it): the
@@ -928,6 +1100,13 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
         (_, Ok(native)) => Some(*native),
         (Runner::Wasm, Err(_)) => None,
     };
+    let files_digest = match (&job.files, shared.checkout) {
+        (Files::Member { dir } | Files::External { dir }, crate::engine_script_reads::Served::Root(checkout)) => {
+            let pkg_dir = if dir.is_empty() { checkout.path().to_path_buf() } else { checkout.path().join(dir) };
+            script_unit::script_files_digest(&pkg_dir, unit.root.as_str()).ok()
+        }
+        _ => None,
+    };
     let setting = Setting {
         store: &shared.store,
         // Its crates' side's target (ruling D115 (2)); native zero-Wasm macro scripts run for host.
@@ -944,10 +1123,13 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
         // answers until the engine's checker has answered the real probes' ladder
         // (handoff p1-probe-checker.txt).
         probes: None,
+        c_probes: Some(blaze_own::Share::share(&shared.c_probes)),
         c_mode: C_MODE,
         mode: MODE,
         native,
         spawn_setting: Arc::clone(&shared.spawn),
+        files_digest: files_digest.as_deref(),
+        deps_digest: job.deps_digest,
     };
     // A macro-side run is made with its row's cfg (wasm32-wasip1's atoms); a target-side run
     // with the graph's, which its row copies (and a native target-side script may run).
@@ -955,18 +1137,26 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
         Side::Target => None,
         Side::Macro => Some(side_atoms(job.cfg, alloc.clone())),
     };
-    let member = matches!(job.files, Files::Member { .. });
-    // A kept member run's failure is a hole: the reads it made are not handed back with its
-    // error (`ScriptError`), so no read list makes it stand, and standing on its drive inputs
-    // alone would keep it failed past the edit that fixes it (rule 21). Under
-    // [`CheckoutReads::Hole`] its failure is filed.
-    let failed_hole = member && matches!(job.checkout, CheckoutReads::Kept { .. });
+    let checkout_prefix = match job.files {
+        Files::Member { .. } | Files::External { .. } => Some(""),
+        Files::Pack { .. } => None,
+    };
+    let is_checkout = checkout_prefix.is_some();
+    // A kept checkout-backed run's failure is a hole: the reads it made are not handed back with
+    // its error (`ScriptError`), so no read list makes it stand, and standing on its drive inputs
+    // alone would keep it failed past the edit that fixes it (rule 21). On Linux, wasm runs do
+    // not hash the C-probe table/answerer into `key::base` (probes are tracked per-probe in
+    // `ran.reads`), so a failed Linux wasm script that may have consumed a C probe must likewise
+    // stay a hole rather than filing a failure without `cc-probe` read dependencies.
+    let failed_hole = (is_checkout && matches!(job.checkout, CheckoutReads::Kept { .. }))
+        || (cfg!(target_os = "linux") && ran_as == RanAs::Wasm);
     let ran = match script_unit::outputs_given(&shared.runtime, &setting, graph, job.script, side_cfg.as_ref().map(|atoms| atoms.as_slice()), tree, root, &given, alloc) {
         Ok(ran) => ran,
         Err(error) => return failed("a build script failed", format_args!("the build script of {package} failed: {error}"), failed_hole),
     };
     if let Some(error) = ran.outputs.errors.first() {
-        return failed("a build script printed `cargo::error`", format_args!("the build script of {package} failed: cargo::error={}", error.as_str()), failed_hole);
+        let probed = ran.reads.iter().any(|read| blaze_build_script::facts::parse_cc_probe_subject(read.subject.as_str()).is_some());
+        return failed("a build script printed `cargo::error`", format_args!("the build script of {package} failed: cargo::error={}", error.as_str()), failed_hole || probed);
     }
     // The record's reads, in the run's frame until the record is made.
     let mut reads: blaze_own::Vec<(Name, ContentId), &Frame> = blaze_own::Vec::with_capacity_in(ran.reads.len() + job.producers.len(), scratch);
@@ -981,17 +1171,24 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
     // dependent. Under [`CheckoutReads::Hole`] every read of the checkout is a hole: its outputs
     // serve nothing and it runs again next command.
     match job.checkout {
-        CheckoutReads::Kept { plant, status } => match admit_reads(&ran.reads, ran_as, &shared.spawn, member, plant, status, checkout, alloc) {
+        CheckoutReads::Kept { plant, status } => match admit_reads_with_probes(&ran.reads, ran_as, &shared.spawn, shared.c_probes.ready(), checkout_prefix, plant, status, checkout, alloc) {
             Ok(()) => {
                 for read in checkout.iter() {
                     reads.push((read.name(), read.answer));
                 }
             }
-            Err(no_cell) => *unkept = Some(no_cell),
+            Err(AdmitError::Unkept(no_cell)) => *unkept = Some(no_cell),
+            Err(AdmitError::FactFailed(why)) => {
+                return failed(
+                    "a build script fact validation failed",
+                    format_args!("the build script of {package} failed to validate a compiler probe fact: {why}"),
+                    failed_hole,
+                );
+            }
         },
         // No cells planned: a hole.
         CheckoutReads::Hole => {
-            if member && let Some(read) = ran.reads.first() {
+            if is_checkout && let Some(read) = ran.reads.first() {
                 return failed(
                     "a member's build script read a checkout file the drive cannot name yet",
                     format_args!("the build script of {package} read `{}` of the checkout: a read of a checkout file is not a drive read on this path (engine_script_reads.rs keeps them on the engine's), so its outputs are not kept; it runs again next command", read.subject),
@@ -1012,52 +1209,123 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
 /// The fact mount is shared by members and fetched packages. A reply file is named by the
 /// whole question and followed under the next command's pins. The wasm answerer is part of
 /// the producer. A native reply additionally depends on the shim image the runner observed.
+/// Rebases a package-relative sandbox read subject (`file:`, `stat:`, `dir:`, `git:`) under
+/// `prefix` (checkout-relative external package dir) so `collect_reads` tracks the real checkout
+/// leaf path.
+fn rebase_read_subject<'a>(prefix: &str, subject: &str, alloc: Alloc<'a>) -> Option<blaze_own::AString<'a>> {
+    let mut out = blaze_own::AString::new_in(alloc);
+    if let Some((tag, rel)) = subject.split_once(':') {
+        match tag {
+            "file" | "stat" | "dir" => {
+                out.push_str(tag);
+                out.push(':');
+                out.push_str(prefix);
+                if !rel.is_empty() {
+                    out.push('/');
+                    out.push_str(rel);
+                }
+                return Some(out);
+            }
+            "git" => {
+                if let Some((folder, rest)) = rel.split_once('\n') {
+                    out.push_str("git:");
+                    out.push_str(prefix);
+                    if !folder.is_empty() {
+                        out.push('/');
+                        out.push_str(folder);
+                    }
+                    out.push('\n');
+                    out.push_str(rest);
+                    return Some(out);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+pub(crate) enum AdmitError<'a> {
+    Unkept(crate::engine_script_reads::NoCell),
+    FactFailed(blaze_own::AString<'a>),
+}
+
 pub(crate) fn admit_reads(
     observed: &[blaze_proc_macro::script_sandbox::Read],
     ran_as: RanAs,
     setting: &SpawnSetting,
-    member: bool,
+    checkout_prefix: Option<&str>,
     plant: crate::engine_script_reads::ReadsPlant,
     status: Option<crate::engine_script_reads::StatusView>,
     cells: &mut crate::engine_script_reads::ReadList,
     alloc: Alloc<'_>,
 ) -> Result<(), crate::engine_script_reads::NoCell> {
+    match admit_reads_with_probes(observed, ran_as, setting, None, checkout_prefix, plant, status, cells, alloc) {
+        Ok(()) => Ok(()),
+        Err(AdmitError::Unkept(no_cell)) => Err(no_cell),
+        Err(AdmitError::FactFailed(why)) => Err(crate::engine_script_reads::NoCell::Unobserved {
+            subject: crate::engine_script_reads::Subject::from_str_in(why.as_str(), *cells.allocator()),
+        }),
+    }
+}
+
+#[expect(clippy::too_many_arguments, reason = "build-script read admission: each input one capability or mode")]
+pub(crate) fn admit_reads_with_probes<'a>(
+    observed: &[blaze_proc_macro::script_sandbox::Read],
+    ran_as: RanAs,
+    setting: &SpawnSetting,
+    c_probes: Option<&blaze_proc_macro::probe_clang::CScriptProbes>,
+    checkout_prefix: Option<&str>,
+    plant: crate::engine_script_reads::ReadsPlant,
+    status: Option<crate::engine_script_reads::StatusView>,
+    cells: &mut crate::engine_script_reads::ReadList,
+    alloc: Alloc<'a>,
+) -> Result<(), AdmitError<'a>> {
     use crate::engine_script_reads::{self as reads, NoCell, READS_CAP, Subject};
 
     let result_alloc = *cells.allocator();
     if let Some(extra) = observed.get(READS_CAP) {
         let subject = extra.subject.strip_prefix("read-limit:").unwrap_or(&extra.subject);
-        return Err(NoCell::TooMany { reads: READS_CAP + 1, subject: Subject::from_str_in(subject, result_alloc) });
+        return Err(AdmitError::Unkept(NoCell::TooMany { reads: READS_CAP + 1, subject: Subject::from_str_in(subject, result_alloc) }));
     }
     let image_subject = blaze_proc_macro::native_facts::IMAGE_SUBJECT;
     let image = observed.iter().find(|read| read.subject == image_subject).and_then(|read| read.digest);
     if ran_as == RanAs::Native && image.is_none() {
         let missing = observed.iter().find(|read| read.subject.starts_with("pkg-config\n")).map_or(image_subject, |read| read.subject.as_str());
-        return Err(NoCell::Unobserved { subject: Subject::from_str_in(missing, result_alloc) });
+        return Err(AdmitError::Unkept(NoCell::Unobserved { subject: Subject::from_str_in(missing, result_alloc) }));
     }
     let mut receipts = blaze_own::BTreeMap::new_in(alloc);
     let mut file = |path: Subject, answer| cells.push(reads::CheckoutRead { kind: reads::ReadKind::File, path, answer });
     for read in observed {
         let subject = read.subject.as_str();
-        let rejected = || NoCell::Unobserved { subject: Subject::from_str_in(subject, result_alloc) };
+        let rejected = || AdmitError::Unkept(NoCell::Unobserved { subject: Subject::from_str_in(subject, result_alloc) });
         if ran_as == RanAs::Wasm && let Some((grant, key)) = blaze_build_script::host_tools::spawn_receipt(subject) {
             let pair = receipts.entry(key).or_insert([None; 2]);
             let digest = read.digest.ok_or_else(rejected)?;
             if pair[usize::from(grant)].replace(digest).is_some_and(|was| was != digest) {
-                return Err(NoCell::Conflicting { subject: Subject::from_str_in(subject, result_alloc) });
+                return Err(AdmitError::Unkept(NoCell::Conflicting { subject: Subject::from_str_in(subject, result_alloc) }));
             }
         } else if subject == image_subject && ran_as == RanAs::Native {
             let digest = read.digest.ok_or_else(rejected)?;
             if image != Some(digest) {
-                return Err(NoCell::Conflicting { subject: Subject::from_str_in(subject, result_alloc) });
+                return Err(AdmitError::Unkept(NoCell::Conflicting { subject: Subject::from_str_in(subject, result_alloc) }));
             }
             file(Subject::from_str_in(crate::sweep::SHIM_FILE, result_alloc), digest);
             file(Subject::from_str_in(crate::sweep::PINS_FILE, result_alloc), blaze_proc_macro::native_facts::pins_digest(setting.pins.as_ref(), alloc));
         } else if blaze_proc_macro::spawn_route::is_fact_reply(subject, alloc) {
-            // A derived fact (pkg-config, sw_vers, cc-version): its reply is a function of the
-            // pins, so it is a keyed read of a reply file the next command answers again.
+            // A derived fact (pkg-config, sw_vers, cc-version, cc-probe): its reply is a function
+            // of the pins or cached c-probe record, so it is a keyed read of a reply file the next
+            // command answers again.
             let digest = read.digest.ok_or_else(rejected)?;
-            if !blaze_proc_macro::spawn_route::fact_reply_matches(subject, Some(digest), setting.pins.as_ref(), alloc) {
+            let matched = blaze_proc_macro::spawn_route::fact_reply_matches_with_probes(
+                subject,
+                Some(digest),
+                setting.pins.as_ref(),
+                c_probes,
+                alloc,
+            )
+            .map_err(AdmitError::FactFailed)?;
+            if !matched {
                 return Err(rejected());
             }
             let mut path = Subject::from_str_in(crate::sweep::REPLY_FILES, result_alloc);
@@ -1074,7 +1342,7 @@ pub(crate) fn admit_reads(
             if reply.is_none() || grant.is_none() || *grant != context {
                 let mut subject = Subject::from_str_in("spawn:", result_alloc);
                 subject.push_str(key);
-                return Err(NoCell::Unobserved { subject });
+                return Err(AdmitError::Unkept(NoCell::Unobserved { subject }));
             }
         }
         file(Subject::from_str_in(crate::sweep::EXECUTOR_FILE, result_alloc), context.expect("validated every grant"));
@@ -1084,10 +1352,17 @@ pub(crate) fn admit_reads(
         let executor = ran_as == RanAs::Wasm && blaze_build_script::host_tools::spawn_receipt(subject).is_some();
         (!executor && !blaze_proc_macro::spawn_route::is_fact_reply(subject, alloc) && !(subject == image_subject && ran_as == RanAs::Native)).then_some((subject, read.digest))
     });
-    if member {
-        reads::collect_reads(tree_reads, plant, status, cells)
-    } else {
-        reads::pinned_reads(tree_reads, result_alloc)
+    match checkout_prefix {
+        Some("") => reads::collect_reads(tree_reads, plant, status, cells).map_err(AdmitError::Unkept),
+        Some(prefix) => {
+            let mut rebased: AVec<'_, (blaze_own::AString<'_>, Option<ContentId>)> = AVec::new_in(alloc);
+            for (subject, digest) in tree_reads {
+                let text = rebase_read_subject(prefix, subject, alloc).unwrap_or_else(|| blaze_own::AString::from_str_in(subject, alloc));
+                rebased.push((text, digest));
+            }
+            reads::collect_reads(rebased.iter().map(|(s, d)| (s.as_str(), *d)), plant, status, cells).map_err(AdmitError::Unkept)
+        }
+        None => reads::pinned_reads(tree_reads, result_alloc).map_err(AdmitError::Unkept),
     }
 }
 

@@ -28,7 +28,7 @@ use alloc::{string::String, vec::Vec};
 use core::{alloc::Allocator, fmt, time::Duration};
 
 pub use blaze_core::linked::{
-    channel::{CHILD_FD, ChannelError, Message, PREFIX, Read, whole_messages},
+    channel::{CHILD_FD, ChannelError, ChannelReady, Message, PREFIX, Read, Write, whole_messages},
     run::{Input, Output, ParentDeath, Streams},
 };
 use blaze_core::{
@@ -68,6 +68,56 @@ pub struct RunSpec<'a> {
     pub parent_death: ParentDeath,
 }
 
+/// Descriptor inherited by `blaze-launcher` on Linux for the launcher-owned unwind channel
+/// (never exposed as a filesystem path; set `FD_CLOEXEC` by the launcher before guest code runs).
+#[cfg(target_os = "linux")]
+pub const UNWOUND_FD: u32 = 4;
+
+/// The Linux test sandbox configuration ([`Spawner::start_served_test`]; test.md, piece 9):
+/// the test's own `$TMPDIR` (the sole writable subtree beside `/dev/null`) and whether to attach
+/// a launcher-owned unwind channel on [`UNWOUND_FD`] (for harnessed tests).
+#[cfg(target_os = "linux")]
+pub struct TestSandbox<'a> {
+    pub temp: &'a str,
+    pub unwound_channel: bool,
+}
+
+/// Parent end of the launcher-owned unwind channel (`UNWOUND_FD`), checked after a harnessed
+/// test exits with status 101 to distinguish an uncaught Rust panic unwind from `exit(101)`.
+#[cfg(target_os = "linux")]
+pub struct UnwoundChannel {
+    channel: Channel,
+}
+
+#[cfg(target_os = "linux")]
+impl UnwoundChannel {
+    /// Returns `true` iff the launcher wrote the unwind sentinel (`b"1"`) before exiting.
+    pub fn did_unwind<A: Allocator>(&mut self, alloc: A) -> bool {
+        struct ZeroClock;
+        impl blaze_core::wait::Clock for ZeroClock {
+            fn now(&self) -> Duration {
+                Duration::ZERO
+            }
+        }
+        let mut buf: Vec<u8, A> = Vec::new_in(alloc);
+        matches!(
+            self.channel.recv_message(&mut buf, 16, Deadline::PASSED, &ZeroClock),
+            Ok(Message::Whole { .. }) if buf.get(PREFIX..) == Some(b"1")
+        )
+    }
+}
+
+/// What to start detached in a new session ([`Spawner::start_detached`]): the program, its
+/// arguments, its whole environment (nothing of this process's is inherited), and its directory.
+/// Standard streams are `/dev/null` and every other descriptor is closed on exec, so the parent
+/// never blocks on it and the child outlives the parent.
+pub struct DetachedSpec<'a> {
+    pub program: &'a str,
+    pub args: &'a [&'a str],
+    pub env: &'a [(&'a str, &'a str)],
+    pub dir: &'a str,
+}
+
 /// What a step on a run child was.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RunStep {
@@ -84,8 +134,8 @@ pub enum RunStep {
 /// How a step on a run child failed.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
 pub enum RunFault {
-    /// blaze-core refused or failed it, saying this.
-    Host(&'static str),
+    /// blaze-core refused or failed it, saying `what`, with raw OS errno `os` (0 when none).
+    Host { what: &'static str, os: i32 },
     /// The channel: torn, too long, hung up, a write past its deadline, a system error.
     Channel(ChannelError),
     /// The task's deadline passed first, or the task was cancelled.
@@ -107,7 +157,8 @@ impl fmt::Display for RunError {
             None => write!(f, "bstd::procs run child, {:?}: ", self.step)?,
         }
         match &self.fault {
-            RunFault::Host(said) => write!(f, "the host refused: {said}"),
+            RunFault::Host { what, os: 0 } => write!(f, "the host refused: {what}"),
+            RunFault::Host { what, os } => write!(f, "the host refused: {what}: {}", blaze_core::linked::OsError(*os)),
             RunFault::Channel(error) => write!(f, "{error}"),
             RunFault::Stopped(stopped) => write!(f, "{stopped}"),
         }
@@ -151,6 +202,22 @@ pub trait RunChild: Sized {
 
     /// `bytes`, whole messages, all written by `deadline`.
     fn send(&mut self, bytes: &[u8], deadline: Deadline) -> Result<(), RunError>;
+
+    /// Writes as many bytes from `bytes` (already whole-message framed by the caller) as fit
+    /// before `deadline` without blocking past the first partial write; returns [`Write::Deadline`]
+    /// if the channel stayed full. Default delegates to [`RunChild::send`] for simulated children.
+    fn send_some(&mut self, bytes: &[u8], deadline: Deadline) -> Result<Write, RunError> {
+        if bytes.is_empty() {
+            return Ok(Write::Bytes(0));
+        }
+        self.send(bytes, deadline).map(|()| Write::Bytes(bytes.len()))
+    }
+
+    /// Waits up to `deadline` for the channel to become readable and/or writable. Default reports
+    /// requested directions ready immediately for simulated children.
+    fn wait_ready(&mut self, want_read: bool, want_write: bool, _deadline: Deadline) -> Result<ChannelReady, RunError> {
+        Ok(ChannelReady { readable: want_read, writable: want_write })
+    }
 
     /// How it ended, by `deadline` (it is reaped, and only what it left is given), or the child
     /// back, still running. A wait that fails drops the child (native: killed and reaped).
@@ -216,12 +283,40 @@ pub struct Started<C> {
     pub pipes: Pipes,
 }
 
+fn make_command(program: &str, args: &[&str], env: &[(&str, &str)], dir: &str) -> Command {
+    // blaze-core's `Command` holds std's path and string types, made here from text through
+    // `From<String>`: the allocator is the global one its fields name.
+    Command {
+        program: String::from(program).into(),
+        args: args.iter().map(|it| String::from(*it).into()).collect(),
+        env: env.iter().map(|(name, value)| (String::from(*name).into(), String::from(*value).into())).collect(),
+        dir: String::from(dir).into(),
+        stdin: Vec::new(),
+        sandbox: Sandbox::Off,
+        memory: None,
+    }
+}
+
 impl Spawner {
     /// `spec` started with no channel: its streams as named, its group its own where asked.
     /// Refused before it starts when the task's deadline has passed; what blaze-core refuses by
     /// name ([`blaze_core::linked::LinkOp`]) is [`RunFault::Host`].
     pub fn start(&self, cx: &Cx, spec: &RunSpec<'_>) -> Result<Started<Run>, RunError> {
         self.start_with(cx, spec, &[], None)
+    }
+
+    /// `spec` started detached in a new session (`setsid` on Linux, `POSIX_SPAWN_SETSID` on macOS)
+    /// with `/dev/null` stdio and every other descriptor closed on exec. Returns the started
+    /// process's [`ProcId`]; the child is not linked to this process and outlives it.
+    pub fn start_detached(&self, cx: &Cx, spec: &DetachedSpec<'_>) -> Result<ProcId, RunError> {
+        let refuse = |fault| RunError { step: RunStep::Start, proc: None, fault };
+        let task = cx.deadline();
+        if task.passed(self.io.now()) {
+            return Err(refuse(RunFault::Stopped(Stopped::Deadline { span: RUN_SPAN, at: task.get() })));
+        }
+        let command = make_command(spec.program, spec.args, spec.env, spec.dir);
+        let pid = blaze_core::linked::run::start_detached(&command).map_err(|error: LinkError| refuse(RunFault::Host { what: error.op.what(), os: error.os }))?;
+        Ok(ProcId(pid))
     }
 
     /// `spec` started confined: the child enters `confine` last before its program runs (D177;
@@ -250,6 +345,47 @@ impl Spawner {
         Ok(Started { child: Served { run, channel: parent }, pipes })
     }
 
+    /// `spec` started with its channel as [`CHILD_FD`] for a Linux sandboxed test.
+    ///
+    /// When `sandbox.unwound_channel` is true, also inherits a launcher-owned unwind channel on
+    /// [`UNWOUND_FD`] and returns its parent end. The launcher itself enters the Linux test
+    /// sandbox (`blaze_sys::linux::confine::enter_test_sandbox`: user/net/ipc/mount namespaces,
+    /// read-only root with writable `$TMPDIR`, capability drop, `RLIMIT_CORE=0`, Landlock ABI >= 6,
+    /// and seccomp) while single-threaded before starting its control thread or loading guest code
+    /// (`test.md`, piece 9). Refused steps fail closed; the test never runs unsandboxed (rule 9).
+    #[cfg(target_os = "linux")]
+    pub fn start_served_test(
+        &self,
+        cx: &Cx,
+        spec: &RunSpec<'_>,
+        sandbox: &TestSandbox<'_>,
+    ) -> Result<(Started<Served>, Option<UnwoundChannel>), RunError> {
+        let _ = sandbox.temp;
+        let refuse = |fault| RunError { step: RunStep::Start, proc: None, fault };
+        let (parent, child_end) = channel::pair().map_err(|error| refuse(RunFault::Channel(error)))?;
+        let unwound_pair = if sandbox.unwound_channel {
+            Some(channel::pair().map_err(|error| refuse(RunFault::Channel(error)))?)
+        } else {
+            None
+        };
+        let Started { child: run, pipes } = match &unwound_pair {
+            Some((_, unwound_child)) => {
+                let given = [(child_end.fd(), CHILD_FD), (unwound_child.fd(), UNWOUND_FD)];
+                self.start_with(cx, spec, &given, None)?
+            }
+            None => {
+                let given = [(child_end.fd(), CHILD_FD)];
+                self.start_with(cx, spec, &given, None)?
+            }
+        };
+        drop(child_end);
+        let unwound = unwound_pair.map(|(u_parent, u_child)| {
+            drop(u_child);
+            UnwoundChannel { channel: u_parent }
+        });
+        Ok((Started { child: Served { run, channel: parent }, pipes }, unwound))
+    }
+
     fn start_with(
         &self,
         cx: &Cx,
@@ -262,17 +398,7 @@ impl Spawner {
         if task.passed(self.io.now()) {
             return Err(refuse(RunFault::Stopped(Stopped::Deadline { span: RUN_SPAN, at: task.get() })));
         }
-        // blaze-core's `Command` holds std's path and string types, made here from text through
-        // `From<String>`: the allocator is the global one its fields name.
-        let command = Command {
-            program: String::from(spec.program).into(),
-            args: spec.args.iter().map(|it| String::from(*it).into()).collect(),
-            env: spec.env.iter().map(|(name, value)| (String::from(*name).into(), String::from(*value).into())).collect(),
-            dir: String::from(spec.dir).into(),
-            stdin: Vec::new(),
-            sandbox: Sandbox::Off,
-            memory: None,
-        };
+        let command = make_command(spec.program, spec.args, spec.env, spec.dir);
         let link = RunLink {
             inherit,
             own_group: spec.own_group,
@@ -281,14 +407,17 @@ impl Spawner {
             parent_death: spec.parent_death,
             confine,
         };
-        let started = start_run(&command, &link).map_err(|error: LinkError| refuse(RunFault::Host(error.op.what())))?;
+        let started = start_run(&command, &link).map_err(|error: LinkError| refuse(RunFault::Host { what: error.op.what(), os: error.os }))?;
         let proc = ProcId(started.child.pid());
         let pipe = |fd, what| match DeadlineFd::new(fd, what) {
             Ok(fd) => Ok(OutPipe { fd, proc, io: self.io.clone(), task }),
-            Err(_) => Err(RunError {
+            Err(error) => Err(RunError {
                 step: RunStep::ReadOutput,
                 proc: Some(proc),
-                fault: RunFault::Host("making the pipe non-blocking (fcntl O_NONBLOCK)"),
+                fault: RunFault::Host {
+                    what: "making the pipe non-blocking (fcntl O_NONBLOCK)",
+                    os: error.raw_os_error().unwrap_or(0),
+                },
             }),
         };
         // A pipe refused here drops the child: killed and reaped.
@@ -351,7 +480,7 @@ impl Run {
 
     /// `SIGTERM` to it (its group where it leads one). See [`RunChild::terminate`].
     pub fn terminate(&mut self) -> Result<(), RunError> {
-        self.child.terminate().map_err(|error| self.rest.error(RunStep::Terminate, RunFault::Host(error.op.what())))
+        self.child.terminate().map_err(|error| self.rest.error(RunStep::Terminate, RunFault::Host { what: error.op.what(), os: error.os }))
     }
 
     fn wait_rest(self, deadline: Deadline) -> Result<Waited<Run, (Exit, Rest)>, RunError> {
@@ -362,7 +491,7 @@ impl Run {
             Ok(Waited::Running(_)) if task_first => Err(rest.stopped(RunStep::Wait, until)),
             Ok(Waited::Running(child)) => Ok(Waited::Running(Run { child, own_group, rest })),
             Ok(Waited::Ended(exit)) => Ok(Waited::Ended((exit, rest))),
-            Err(error) => Err(rest.error(RunStep::Wait, RunFault::Host(error.op.what()))),
+            Err(error) => Err(rest.error(RunStep::Wait, RunFault::Host { what: error.op.what(), os: error.os })),
         }
     }
 
@@ -374,7 +503,7 @@ impl Run {
         };
         match killed {
             Ok(exit) => Ok((exit, rest)),
-            Err(error) => Err(rest.error(RunStep::Kill, RunFault::Host(error.op.what()))),
+            Err(error) => Err(rest.error(RunStep::Kill, RunFault::Host { what: error.op.what(), os: error.os })),
         }
     }
 }
@@ -409,6 +538,26 @@ impl RunChild for Served {
             Ok(()) => Ok(()),
             Err(ChannelError::WriteDeadline { .. }) if task_first => Err(rest.stopped(RunStep::Send, until)),
             Err(error) => Err(rest.error(RunStep::Send, RunFault::Channel(error))),
+        }
+    }
+
+    fn send_some(&mut self, bytes: &[u8], deadline: Deadline) -> Result<Write, RunError> {
+        let rest = &self.run.rest;
+        let (until, task_first) = rest.capped(deadline);
+        match self.channel.send_some(bytes, until, &DriverClock(&rest.io)) {
+            Ok(Write::Deadline) if task_first => Err(rest.stopped(RunStep::Send, until)),
+            Ok(write) => Ok(write),
+            Err(error) => Err(rest.error(RunStep::Send, RunFault::Channel(error))),
+        }
+    }
+
+    fn wait_ready(&mut self, want_read: bool, want_write: bool, deadline: Deadline) -> Result<ChannelReady, RunError> {
+        let rest = &self.run.rest;
+        let (until, task_first) = rest.capped(deadline);
+        match self.channel.wait_ready(want_read, want_write, until, &DriverClock(&rest.io)) {
+            Ok(ready) if !ready.readable && !ready.writable && task_first => Err(rest.stopped(RunStep::Recv, until)),
+            Ok(ready) => Ok(ready),
+            Err(error) => Err(rest.error(RunStep::Recv, RunFault::Channel(error))),
         }
     }
 

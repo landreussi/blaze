@@ -56,10 +56,21 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
             return Ok(Flow::Done(self.common.err));
         }
         let (steps, limit) = self.autoderef(base_ty, false)?;
+        let mut first_private: Option<(usize, crate::ids::ItemKey, crate::ty::TyList, usize)> = None;
         for (i, step) in steps.iter().enumerate() {
             let found = match self.view(step.ty) {
                 TyView::Tuple(l) if name.is_none() => {
                     if index < self.ty.list_len(l) { Some((self.ty.list_get(l, index), 0, index, false)) } else { None }
+                }
+                TyView::Record(schema, l) if name.is_some() => {
+                    if let Some(want) = name
+                        && let Some(at) = self.record_field_index(schema, want)
+                        && at < self.ty.list_len(l)
+                    {
+                        Some((self.ty.list_get(l, at), 0, at, false))
+                    } else {
+                        None
+                    }
                 }
                 TyView::Adt(k, args) => {
                     let Some(adt) = self.field_adt(k)? else { continue };
@@ -69,17 +80,29 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
                         let want = name.unwrap_or(Name::of_index(index));
                         let Some(v) = adt.variants.first() else { continue };
                         let fields = adt.fields.get(v.fields.range()).unwrap_or(&[]);
-                        match fields.iter().position(|fl| fl.name == want) {
+                        match self.find_adt_field(k, 0, fields, want).map(|idx| idx as usize) {
                             Some(at) => {
-                                let field = fields[at];
-                                let ty = self.lower(adt.types, field.ty, Lower::Args(args), Cause::Expr(e)).map_err(|err| match err {
-                                    Stop::Error(CheckError::Malformed(Malformed::Param { index, args, site: ParamSite::Lower { at: Some(at) } })) => {
-                                        let site = ParamSite::Field { owner: self.body.owner, expr: e, adt: k, field: field.name, at };
-                                        Stop::Error(CheckError::Malformed(Malformed::Param { index, args, site }))
+                                // Skip inaccessible fields of wrapper structs (e.g.
+                                // `ManuallyDrop<ScopeGuard<T, F>>::value` is private in `core`, so
+                                // autoderef must continue to `ScopeGuard::value: T`). Remember the
+                                // first private match as a fallback if no later deref step has a
+                                // visible field of that name.
+                                if !self.reads.member_visible(k, want)? {
+                                    if first_private.is_none() {
+                                        first_private = Some((i, k, args, at));
                                     }
-                                    other => other,
-                                })?;
-                                Some((ty, 0, at as u32, adt.kind == AdtKind::Union))
+                                    None
+                                } else {
+                                    let field = fields[at];
+                                    let ty = self.lower(adt.types, field.ty, Lower::Args(args), Cause::Expr(e)).map_err(|err| match err {
+                                        Stop::Error(CheckError::Malformed(Malformed::Param { index, args, site: ParamSite::Lower { at: Some(at) } })) => {
+                                            let site = ParamSite::Field { owner: self.body.owner, expr: e, adt: k, field: field.name, at };
+                                            Stop::Error(CheckError::Malformed(Malformed::Param { index, args, site }))
+                                        }
+                                        other => other,
+                                    })?;
+                                    Some((ty, 0, at as u32, adt.kind == AdtKind::Union))
+                                }
                             }
                             None => None,
                         }
@@ -98,7 +121,26 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
                 return Ok(Flow::Done(ty));
             }
         }
-        let primitive = !matches!(self.view(base_ty), TyView::Adt(..) | TyView::Ref(..) | TyView::Param(_));
+        if let Some((i, k, args, at)) = first_private
+            && let Some(adt) = self.field_adt(k)?
+            && let Some(v) = adt.variants.first()
+            && let Some(field) = adt.fields.get(v.fields.range()).and_then(|fs| fs.get(at)).copied()
+        {
+            let ty = self.lower(adt.types, field.ty, Lower::Args(args), Cause::Expr(e)).map_err(|err| match err {
+                Stop::Error(CheckError::Malformed(Malformed::Param { index, args, site: ParamSite::Lower { at: Some(at) } })) => {
+                    let site = ParamSite::Field { owner: self.body.owner, expr: e, adt: k, field: field.name, at };
+                    Stop::Error(CheckError::Malformed(Malformed::Param { index, args, site }))
+                }
+                other => other,
+            })?;
+            self.adjust_autoderef(base, &steps, i);
+            self.fields.push((e, 0, at as u32));
+            if adt.kind == AdtKind::Union {
+                self.union_fields.push(e);
+            }
+            return Ok(Flow::Done(ty));
+        }
+        let primitive = !matches!(self.view(base_ty), TyView::Adt(..) | TyView::Record(..) | TyView::Ref(..) | TyView::Param(_));
         let code = if limit {
             DiagCode::RecursionLimit
         } else if primitive && name.is_some() {
@@ -137,20 +179,26 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
                     let n = self.ty.list_len(l);
                     (0..n).find(|&i| Name::of_index(i) == want).map(|i| self.ty.list_get(l, i))
                 }
+                TyView::Record(schema, l) if variant.is_none() => {
+                    self.record_field_index(schema, want)
+                        .filter(|&i| i < self.ty.list_len(l))
+                        .map(|i| self.ty.list_get(l, i))
+                }
                 TyView::Adt(k, args) => match self.field_adt(k)? {
                     Some(adt) if adt.kind == AdtKind::Enum && variant.is_none() => {
-                        if let Some(i) = adt.variants.iter().position(|v| v.name == want) {
-                            variant = Some(i);
+                        if let Some(i) = self.find_adt_variant(k, adt.variants, want) {
+                            variant = Some(i as usize);
                             continue;
                         }
                         None
                     }
                     Some(adt) => {
-                        let fs = match adt.variants.get(variant.unwrap_or(0)) {
+                        let var_idx = variant.unwrap_or(0);
+                        let fs = match adt.variants.get(var_idx) {
                             Some(v) => adt.fields.get(v.fields.range()).unwrap_or(&[]),
                             None => &[],
                         };
-                        match fs.iter().position(|fl| fl.name == want) {
+                        match self.find_adt_field(k, var_idx as u32, fs, want).map(|i| i as usize) {
                             Some(i) => {
                                 variant = None;
                                 Some(self.lower(adt.types, fs[i].ty, Lower::Args(args), Cause::Expr(e))?)
@@ -218,7 +266,9 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
                         if self.ty.may_hold(Goal::Trait { trait_: tr, args }, &mut self.reads)? {
                             self.adjust_autoderef(base, &steps, i);
                             self.register_trait(tr, args, Cause::Expr(e))?;
-                            let out = self.project(tr, args, Name::of("Output"), Cause::Expr(e))?;
+                            let out_name = Name::of("Output");
+                            let out = self.project(tr, args, out_name, Cause::Expr(e))?;
+                            self.projected.push((e, tr, Some(out_name), args));
                             return Ok(Flow::Done(out));
                         }
                     }

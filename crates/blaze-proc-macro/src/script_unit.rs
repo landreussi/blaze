@@ -44,6 +44,8 @@ pub struct Setting<'s> {
     /// The probe checker and its records when the command's setting turns it on
     /// (script_probes.rs); `None`: the table answers the probes.
     pub probes: Option<crate::script_probes::ScriptProbes>,
+    /// The C compiler probe setting (`probe_clang.rs`: `Ready` or deferred `Unavailable`).
+    pub c_probes: Option<crate::probe_clang::CProbeSetting>,
     pub c_mode: CMode,
     /// What the command asked for: with each script's closure, where it runs (D69 (3),
     /// [`crate::native_unit::placed`]).
@@ -54,6 +56,16 @@ pub struct Setting<'s> {
     /// What the command's setting says about spawns, chosen once per command
     /// (`crate::fact_pins::command_spawn_setting`): every script of the graph gets it.
     pub spawn_setting: Arc<crate::spawn_route::SpawnSetting>,
+    /// For a workspace-member or external path package's build script: the `files <sha256>`
+    /// digest of its build-script files (`script_files_digest`), matched in module lookup so
+    /// edits invalidate and distinct path packages never collide (rule 21). `None` for
+    /// registry/git packages whose sources are already pinned by the lock.
+    pub files_digest: Option<&'s str>,
+    /// When the build script has transitive `build-dependencies`, the `deps <sha256>` digest
+    /// (`script_deps_digest`) covering every dependency's version, features, and source pin
+    /// (checksum, git commit, or path files digest) so edits to build-dependencies invalidate
+    /// cached modules (rule 21). `None` when the build script has no build-dependencies.
+    pub deps_digest: Option<&'s str>,
 }
 
 /// A script ready to run: its loaded module, its sandboxed inputs, its environment.
@@ -127,18 +139,176 @@ impl std::fmt::Display for UnitScriptError {
 impl std::error::Error for UnitScriptError {}
 
 /// The module record (`<store>/build-script/modules/<key>`) of `name version` compiled with
-/// exactly `features`: the one whose identity names all three. A native script's record (its
-/// identity has a `target` line, D69) is never it: that one holds `script.bin`, not a module.
-/// `Ok(None)`: the store holds no such record (no `modules` folder at all included).
+/// exactly `features`: the one whose identity names all three (and no `files` line, for a
+/// lock-pinned package). A native script's record (its identity has a `target` line, D69) is
+/// never it: that one holds `script.bin`, not a module. `Ok(None)`: the store holds no such
+/// record (no `modules` folder at all included).
 pub fn module_of(store: &Path, name: &str, version: &str, features: &[&str]) -> Result<Option<PathBuf>, ModuleLookupError> {
-    module_where(store, name, version, features, None)
+    module_where(store, name, version, features, None, None, None)
+}
+
+/// [`module_of`] for a package with optional `files <sha256>` identity line (workspace members
+/// and external path packages pass `Some(hex)`; lock-pinned packages pass `None`).
+pub fn module_of_files(store: &Path, name: &str, version: &str, features: &[&str], files: Option<&str>) -> Result<Option<PathBuf>, ModuleLookupError> {
+    module_where(store, name, version, features, None, files, None)
+}
+
+/// [`module_of_files`] with optional `deps <sha256>` identity line covering the build script's
+/// transitive build-dependencies (rule 21).
+pub fn module_of_files_and_deps(
+    store: &Path,
+    name: &str,
+    version: &str,
+    features: &[&str],
+    files: Option<&str>,
+    deps: Option<&str>,
+) -> Result<Option<PathBuf>, ModuleLookupError> {
+    module_where(store, name, version, features, None, files, deps)
 }
 
 /// The native binary record (`<store>/build-script/modules/<key>`, holding `script.bin`) of
 /// `name version` built for `host` with exactly `features` (D69: the interim builder's
 /// `native` mode, whose identity adds `target <host>`).
 pub fn module_of_native(store: &Path, name: &str, version: &str, features: &[&str], host: &str) -> Result<Option<PathBuf>, ModuleLookupError> {
-    module_where(store, name, version, features, Some(host))
+    module_where(store, name, version, features, Some(host), None, None)
+}
+
+/// [`module_of_native`] with optional `files <sha256>` identity line for path packages.
+/// Prefers an exact `files <sha256>` match when present; falls back to an untagged native
+/// bootstrap record (`blaze build-script module native 1`, which `placed_in_store` selects via
+/// `module_of_native`) when no `files`-tagged native record exists.
+pub fn module_of_native_files(store: &Path, name: &str, version: &str, features: &[&str], host: &str, files: Option<&str>) -> Result<Option<PathBuf>, ModuleLookupError> {
+    if let Some(found) = module_where(store, name, version, features, Some(host), files, None)? {
+        return Ok(Some(found));
+    }
+    if files.is_some() {
+        return module_where(store, name, version, features, Some(host), None, None);
+    }
+    Ok(None)
+}
+
+/// Canonical SHA-256 digest of a build-script unit's transitive `UnitKind::Lib | UnitKind::ProcMacro`
+/// build-dependencies (rule 21: covers version, kind, sorted features, and source pin — registry
+/// checksum, git commit, or path package `files_digest`). Returns `None` when the build script
+/// has no build-dependencies.
+pub fn script_deps_digest(
+    graph: &UnitGraph<'_>,
+    lock: &blaze_manifest::lock::Lock<'_>,
+    script: UnitId,
+    mut path_files: impl FnMut(blaze_manifest::lock::LockId) -> Option<String>,
+) -> Option<String> {
+    use blaze_manifest::lock::{Checksum, LockSource};
+    let mut visited = vec![false; graph.units.len()];
+    let mut stack: Vec<UnitId> = Vec::new();
+    let Some(root) = graph.units.get(script.index()) else { return None };
+    visited[script.index()] = true;
+    for dep in root.deps.iter() {
+        let idx = dep.unit.index();
+        if let Some(du) = graph.units.get(idx)
+            && matches!(du.kind, UnitKind::Lib | UnitKind::ProcMacro)
+            && !visited[idx]
+        {
+            visited[idx] = true;
+            stack.push(dep.unit);
+        }
+    }
+    let mut lines: Vec<String> = Vec::new();
+    while let Some(uid) = stack.pop() {
+        let u = &graph.units[uid.index()];
+        for dep in u.deps.iter() {
+            let idx = dep.unit.index();
+            if let Some(du) = graph.units.get(idx)
+                && matches!(du.kind, UnitKind::Lib | UnitKind::ProcMacro)
+                && !visited[idx]
+            {
+                visited[idx] = true;
+                stack.push(dep.unit);
+            }
+        }
+        let mut feats: Vec<&str> = u.features.iter().map(|f| f.as_str()).collect();
+        feats.sort_unstable();
+        feats.dedup();
+        let kind_word = match u.kind {
+            UnitKind::ProcMacro => "proc-macro",
+            _ => "lib",
+        };
+        let pkg = lock.package(u.package);
+        let pin = match (&pkg.checksum, &pkg.source) {
+            (Checksum::Sha256(sum), _) => format!("checksum:{}", sum.as_str()),
+            (Checksum::Absent, LockSource::Path) => match path_files(u.package) {
+                Some(hex) => format!("files:{hex}"),
+                None => String::from("path:unpinned"),
+            },
+            (Checksum::Absent, LockSource::Git { commit, .. }) => format!("git:{}", commit.as_str()),
+            (Checksum::Absent, LockSource::Registry { .. }) => format!("source:{}", pkg.source_text.as_str()),
+        };
+        lines.push(format!("{} {} {} {} {}", u.name.as_str(), u.version.as_str(), kind_word, feats.join(","), pin));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    lines.sort_unstable();
+    lines.dedup();
+    Some(crate::module::sha256_hex(lines.join("\n").as_bytes()))
+}
+
+/// Relative paths under a package directory that contribute to a workspace-member or path
+/// package's build script (`Cargo.toml`, `script_root`, top-level `*.rs`, and any `*.rs` under
+/// `script_root`'s parent directory when that directory is neither `""` nor `"src"`). Never
+/// descends into `src/`, `tests/`, `benches/`, or `examples/`, so ordinary edits to library or
+/// binary sources do not recompile `build.rs` (rule 60) while edits to `build.rs`, its helper
+/// modules, or `Cargo.toml` immediately invalidate the build-script module key (rule 21).
+pub fn script_files_digest(pkg_dir: &Path, script_root: &str) -> Result<String, std::io::Error> {
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut push_file = |rel: &str| -> Result<(), std::io::Error> {
+        let norm = rel.trim_start_matches("./");
+        if norm.is_empty() || !seen.insert(norm.to_owned()) {
+            return Ok(());
+        }
+        let full = pkg_dir.join(norm);
+        if full.is_file() {
+            let bytes = std::fs::read(&full)?;
+            files.push((norm.to_owned(), bytes));
+        }
+        Ok(())
+    };
+    push_file("Cargo.toml")?;
+    push_file(script_root)?;
+    if let Ok(entries) = std::fs::read_dir(pkg_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if let Some(s) = name.to_str()
+                && s.ends_with(".rs")
+                && entry.file_type().is_ok_and(|t| t.is_file())
+            {
+                push_file(s)?;
+            }
+        }
+    }
+    let script_rel = script_root.trim_start_matches("./");
+    if let Some((parent, _)) = script_rel.rsplit_once('/')
+        && !parent.is_empty()
+        && parent != "src"
+        && !parent.starts_with("src/")
+    {
+        let mut stack = vec![parent.to_owned()];
+        while let Some(dir_rel) = stack.pop() {
+            let full_dir = pkg_dir.join(&dir_rel);
+            let Ok(entries) = std::fs::read_dir(&full_dir) else { continue };
+            for entry in entries.flatten() {
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+                let child = format!("{dir_rel}/{name}");
+                let Ok(ft) = entry.file_type() else { continue };
+                if ft.is_dir() {
+                    stack.push(child);
+                } else if ft.is_file() && name.ends_with(".rs") {
+                    push_file(&child)?;
+                }
+            }
+        }
+    }
+    Ok(crate::module::files_digest(&mut files))
 }
 
 /// Why the module store could not answer a lookup: each names the path (rule 19), and none is
@@ -188,6 +358,14 @@ fn records(store: &Path) -> Result<Vec<(PathBuf, String)>, ModuleLookupError> {
     let mut found = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| ModuleLookupError::List { folder: folder.clone(), error })?;
+        // Skip dot-prefixed entries (staging directories like `.tmp.*` or OS metadata like `.DS_Store`)
+        // and non-directory files so concurrent publishers never race with a store scan.
+        if entry.file_name().to_str().is_some_and(|n| n.starts_with('.')) {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
         let path = entry.path().join("identity");
         let identity = std::fs::read_to_string(&path).map_err(|error| ModuleLookupError::Identity { path, error })?;
         found.push((entry.path(), identity));
@@ -219,11 +397,21 @@ pub fn shim_line() -> String {
 /// The record whose identity names `name`, `version`, `features` and, for `host`, `target
 /// <host>`; for `None`, one with no `target` line and this host's [`shim_line`] (a wasm module).
 /// Two such records are a typed refusal, never the first in the listing's order.
-fn module_where(store: &Path, name: &str, version: &str, features: &[&str], host: Option<&str>) -> Result<Option<PathBuf>, ModuleLookupError> {
+fn module_where(
+    store: &Path,
+    name: &str,
+    version: &str,
+    features: &[&str],
+    host: Option<&str>,
+    files: Option<&str>,
+    deps: Option<&str>,
+) -> Result<Option<PathBuf>, ModuleLookupError> {
     let mut sorted = features.to_vec();
     sorted.sort_unstable();
     let lines = [format!("name {name}"), format!("version {version}"), format!("features {}", sorted.join(","))];
     let target = host.map(|host| format!("target {host}"));
+    let files_line = files.map(|hex| format!("files {hex}"));
+    let deps_line = deps.map(|hex| format!("deps {hex}"));
     let shim = shim_line();
     let mut fits = records(store)?.into_iter().filter(|(_, identity)| {
         // A wasm module answers only with the shim this host speaks to: one built with another
@@ -234,7 +422,15 @@ fn module_where(store: &Path, name: &str, version: &str, features: &[&str], host
             Some(want) => identity.lines().any(|l| l == want),
             None => !identity.lines().any(|l| l.starts_with("target ")) && identity.lines().any(|l| l == shim),
         };
-        runner_fits && lines.iter().all(|want| identity.lines().any(|l| l == want))
+        let files_fits = match &files_line {
+            Some(want) => identity.lines().any(|l| l == want),
+            None => !identity.lines().any(|l| l.starts_with("files ")),
+        };
+        let deps_fits = match &deps_line {
+            Some(want) => identity.lines().any(|l| l == want),
+            None => !identity.lines().any(|l| l.starts_with("deps ")),
+        };
+        runner_fits && files_fits && deps_fits && lines.iter().all(|want| identity.lines().any(|l| l == want))
     });
     let Some((first, _)) = fits.next() else { return Ok(None) };
     match fits.next() {
@@ -327,7 +523,16 @@ pub fn prepare_viewing_on<'a>(
     let serves = served(graph, script).ok_or_else(|| UnitScriptError::ServesNothing { package: package.clone() })?;
     let serves = &graph.units[serves.index()];
     let features: Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
-    let module = module_of(setting.store, unit.name.as_str(), unit.version.as_str(), &features).map_err(UnitScriptError::Lookup)?.ok_or_else(|| UnitScriptError::NoModule {
+    let module = module_of_files_and_deps(
+        setting.store,
+        unit.name.as_str(),
+        unit.version.as_str(),
+        &features,
+        setting.files_digest,
+        setting.deps_digest,
+    )
+    .map_err(UnitScriptError::Lookup)?
+    .ok_or_else(|| UnitScriptError::NoModule {
         package: package.clone(),
         features: features.iter().map(|f| (*f).to_owned()).collect(),
         store: setting.store.to_owned(),
@@ -357,7 +562,8 @@ pub fn prepare_viewing_on<'a>(
         c_mode: setting.c_mode,
         limits: RunLimits::STANDARD,
         table: Arc::clone(&setting.table),
-        probes: setting.probes.clone(),
+        probes: setting.probes.as_ref().map(blaze_own::Share::share),
+        c_probes: setting.c_probes.as_ref().map(blaze_own::Share::share),
         spawner: None,
         step: blaze_ids::ContentId::default(),
         spawn_setting: Arc::clone(&setting.spawn_setting),
@@ -530,7 +736,7 @@ pub fn served_links<'g, 'r: 'g>(graph: &UnitGraph<'_>, script: UnitId, given: &'
         let ups: Vec<(&str, &DepProducer)> =
             links_inputs(graph, id).into_iter().filter_map(|(up, links)| made.iter().find(|(s, _)| *s == up).map(|(_, producer)| (links, producer))).collect();
         let upstream = DepProducer::closure(&ups);
-        made.push((id, DepProducer::of_record(run.tree.clone(), run.root.clone(), &run.outputs).with_upstream(upstream)));
+        made.push((id, DepProducer::of_record(blaze_own::Share::share(&run.tree), blaze_own::Share::share(&run.root), &run.outputs).with_upstream(upstream)));
     }
     let producers = given
         .iter()
@@ -676,7 +882,7 @@ pub fn outputs_by_served<'a>(
         };
         // Brief S1b: what is upstream of this script, for its readers (a forwarded path).
         let upstream = DepProducer::closure(&given);
-        let ran = outputs_viewing(runtime, setting, graph, script, tree.clone(), root.clone(), &deps, &given, alloc);
+        let ran = outputs_viewing(runtime, setting, graph, script, blaze_own::Share::share(&tree), blaze_own::Share::share(&root), &deps, &given, alloc);
         match ran {
             Ok(ran) => {
                 if graph.units[serves.index()].links.is_some() {

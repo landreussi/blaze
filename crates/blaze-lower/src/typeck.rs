@@ -167,6 +167,23 @@ pub trait Types {
         let _ = (view, path, position, arg, tys);
         Ok(None)
     }
+
+    /// Records explicitly written non-elided lifetimes (`'static` or a named enclosing lifetime)
+    /// of a closure parameter type `t` after expanding any type aliases (`Text<'a>` ->
+    /// `String<Alloc<'a>>`), in structural `(path, own)` order matching `lay_written_param`.
+    /// Returns `true` when handled; `false` falls back to syntactic `record_closure_param_regions`.
+    fn closure_param_regions(
+        &mut self,
+        view: &View<'_>,
+        t: TypeId,
+        tys: &mut PortableTys<'_>,
+        closure: tc::ExprId,
+        param: u32,
+        out: &mut dyn FnMut(tc::ClosureParamRegion),
+    ) -> bool {
+        let _ = (view, t, tys, closure, param, out);
+        false
+    }
 }
 
 impl ConstGapWhy {
@@ -411,6 +428,41 @@ pub struct TypeckBody<'a> {
     /// Every const term of the body left a hole ([`ConstGap`]), in the order met. Not empty:
     /// the body is checked, never checked clean.
     pub const_gaps: AVec<'a, ConstGap>,
+    /// Canonical lexicographically-sorted [`tc::RecordSchema`] for each anonymous `Expr::Record`,
+    /// ascending by [`ExprId`].
+    pub record_expr_schemas: AVec<'a, (ExprId, tc::RecordSchema)>,
+    /// Explicit written non-elided lifetimes in closure parameter type annotations
+    /// (`|lock: &'static str|`, `|t: Typed<'c>|`), sorted ascending by `(closure, param, slot)`.
+    pub closure_param_regions: AVec<'a, tc::ClosureParamRegion>,
+    /// Loop cost marks (`#[blaze::cost(bounded | amortized | reset)]`) on `Expr::Loop` nodes,
+    /// ascending by [`ExprId`] (`BodyView::loop_marks`, blaze-typeck rules/cost.rs).
+    pub loop_marks: AVec<'a, (ExprId, tc::LoopCost)>,
+    /// Unexpanded `inline for pat in iter { body }` sites lowered in this body (ascending by
+    /// [`ExprId`]); `front2` uses each site's checked `iter` type to unroll the body before
+    /// final checking and codegen.
+    pub inline_fors: AVec<'a, InlineForSite>,
+}
+
+/// Whether an `inline for` iterates over one aggregate, lockstep-zips two (`zip_fields(lhs, rhs)`),
+/// or iterates over the variants of an enum type (`variants::<T>()`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InlineForKind {
+    /// `inline for pat in iter { body }`.
+    Single { iter: ExprId },
+    /// `inline for pat in zip_fields(lhs, rhs) { body }`.
+    Zip { lhs: ExprId, rhs: ExprId },
+    /// `inline for pat in variants::<T>() { body }`.
+    Variants { ty: PTy, ty_arg: TypeId },
+}
+
+/// One lowered `inline for pat in iter { body }` expression recorded on [`TypeckBody`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InlineForSite {
+    pub expr: ExprId,
+    pub pat: PatId,
+    pub iter: ExprId,
+    pub body: ExprId,
+    pub kind: InlineForKind,
 }
 
 impl<'a> TypeckBody<'a> {
@@ -452,6 +504,9 @@ impl<'a> TypeckBody<'a> {
             unsafe_blocks: &self.unsafe_blocks,
             expr_editions: &self.expr_editions,
             pat_editions: &self.pat_editions,
+            record_expr_schemas: &self.record_expr_schemas,
+            closure_param_regions: &self.closure_param_regions,
+            loop_marks: &self.loop_marks,
         }
     }
 }
@@ -737,6 +792,232 @@ impl Conv<'_, '_, '_, '_, '_> {
 
     fn opt_ty(&mut self, t: Option<TypeId>) -> Result<Option<PTy>, Refused> {
         t.map(|t| self.ty(t)).transpose()
+    }
+
+    /// Walks a closure parameter's written type `root` by structural child-index path, recording
+    /// every explicitly written non-elided lifetime (`'static` or a named enclosing lifetime,
+    /// never `'_`, an omitted lifetime, or a lifetime bound by an inner `for<..>` binder).
+    /// Keying by structural `(path, own)` avoids depending on sibling types' lifetime slot counts
+    /// (e.g. `&mut Vec<(X64Loc, X64Loc), Alloc<'a>>`).
+    fn record_closure_param_regions(&mut self, closure: ExprId, param: u32, root: TypeId) -> Result<(), Refused> {
+        #[derive(Clone, Copy)]
+        enum Frame {
+            Visit(TypeId, u64),
+            PopBound(usize),
+        }
+        let classify = |v: &View<'_>, nm: NameIdx, bound: &[Name; 32], bound_len: usize| -> Result<Option<tc::WrittenRegion>, Refused> {
+            let text = v.name_text(nm)?;
+            if text == "'static" {
+                Ok(Some(tc::WrittenRegion::Static))
+            } else if text == "'_" {
+                Ok(None)
+            } else {
+                let name = Name(v.name(nm)?);
+                if bound.iter().take(bound_len).any(|&b| b == name) {
+                    Ok(None)
+                } else {
+                    Ok(Some(tc::WrittenRegion::Named))
+                }
+            }
+        };
+        let mut stack: [Frame; 64] = [Frame::PopBound(0); 64];
+        let mut sp = 1usize;
+        if let Some(slot) = stack.get_mut(0) {
+            *slot = Frame::Visit(root, tc::ClosureParamRegion::ROOT);
+        }
+        let mut bound: [Name; 32] = [Name(0); 32];
+        let mut bound_len = 0usize;
+        let mut steps = 0u32;
+        while let Some(top) = sp.checked_sub(1) {
+            sp = top;
+            let Some(&frame) = stack.get(top) else { break };
+            let (tid, path) = match frame {
+                Frame::PopBound(prev) => {
+                    bound_len = prev;
+                    continue;
+                }
+                Frame::Visit(tid, path) => (tid, path),
+            };
+            steps += 1;
+            if steps > 128 {
+                break;
+            }
+            match self.v.ty(tid)? {
+                TypeRef::Ref { lifetime, inner, .. } => {
+                    if let Some(nm) = lifetime
+                        && let Some(kind) = classify(self.v, nm, &bound, bound_len)?
+                    {
+                        self.out.closure_param_regions.push(tc::ClosureParamRegion {
+                            closure,
+                            param,
+                            path,
+                            own: 0,
+                            kind,
+                        });
+                    }
+                    if let Some(next) = tc::ClosureParamRegion::push_step(path, 0)
+                        && let Some(slot) = stack.get_mut(sp)
+                    {
+                        *slot = Frame::Visit(inner, next);
+                        sp += 1;
+                    }
+                }
+                TypeRef::Ptr { inner, .. }
+                | TypeRef::Array { elem: inner, .. }
+                | TypeRef::Slice(inner)
+                | TypeRef::Pat { base: inner, .. } => {
+                    if let Some(next) = tc::ClosureParamRegion::push_step(path, 0)
+                        && let Some(slot) = stack.get_mut(sp)
+                    {
+                        *slot = Frame::Visit(inner, next);
+                        sp += 1;
+                    }
+                }
+                TypeRef::Tuple(elems) => {
+                    let ids = self.v.ids(elems)?;
+                    for (ci, &id) in ids.iter().enumerate().rev() {
+                        if let Ok(ci_u32) = u32::try_from(ci)
+                            && let Some(next) = tc::ClosureParamRegion::push_step(path, ci_u32)
+                            && let Some(slot) = stack.get_mut(sp)
+                        {
+                            *slot = Frame::Visit(TypeId(id), next);
+                            sp += 1;
+                        }
+                    }
+                }
+                TypeRef::FnPtr { params, ret, .. } => {
+                    let mut children: [(TypeId, u32); 16] = [(TypeId(0), 0); 16];
+                    let mut clen = 0usize;
+                    let mut ci = 0u32;
+                    for &row in self.v.rows(params)? {
+                        let p = Param::decode(row)?;
+                        if p.variadic {
+                            continue;
+                        }
+                        if let Some(ty) = p.ty {
+                            if let Some(slot) = children.get_mut(clen) {
+                                *slot = (ty, ci);
+                                clen += 1;
+                            }
+                            ci += 1;
+                        }
+                    }
+                    if let Some(ret_ty) = ret
+                        && let Some(slot) = children.get_mut(clen)
+                    {
+                        *slot = (ret_ty, ci);
+                        clen += 1;
+                    }
+                    if let Some(slice) = children.get(..clen) {
+                        for &(t, child_idx) in slice.iter().rev() {
+                            if let Some(next) = tc::ClosureParamRegion::push_step(path, child_idx)
+                                && let Some(slot) = stack.get_mut(sp)
+                            {
+                                *slot = Frame::Visit(t, next);
+                                sp += 1;
+                            }
+                        }
+                    }
+                }
+                TypeRef::For { binder, inner } => {
+                    let prev_bound = bound_len;
+                    for &row in self.v.rows(binder)? {
+                        if let GenericParam::Lifetime { name, .. } = GenericParam::decode(row)? {
+                            let nm = self.name(name)?;
+                            if let Some(dst) = bound.get_mut(bound_len) {
+                                *dst = nm;
+                                bound_len += 1;
+                            }
+                        }
+                    }
+                    let pushed_pop = if bound_len != prev_bound {
+                        if let Some(slot) = stack.get_mut(sp) {
+                            *slot = Frame::PopBound(prev_bound);
+                            sp += 1;
+                            true
+                        } else {
+                            bound_len = prev_bound;
+                            continue;
+                        }
+                    } else {
+                        false
+                    };
+                    if let Some(slot) = stack.get_mut(sp) {
+                        *slot = Frame::Visit(inner, path);
+                        sp += 1;
+                    } else if pushed_pop {
+                        sp -= 1;
+                        bound_len = prev_bound;
+                    }
+                }
+                TypeRef::Path(path_idx) => {
+                    let p = self.v.path(path_idx)?;
+                    let segs = self.v.segments(p)?;
+                    let Some((&last, earlier)) = segs.split_last() else { continue };
+                    let mut earlier_has_args = false;
+                    for &n in earlier {
+                        let es = Segment::decode(n)?;
+                        if es.kind == SegKind::Anchor || es.has_args || es.parenthesized {
+                            earlier_has_args = true;
+                            break;
+                        }
+                    }
+                    if earlier_has_args {
+                        continue;
+                    }
+                    let s = Segment::decode(last)?;
+                    if s.kind == SegKind::SelfTy || s.kind == SegKind::Anchor || s.parenthesized || s.return_notation || !s.has_args {
+                        continue;
+                    }
+                    let rows = self.v.rows(s.args)?;
+                    let mut lt_idx = 0u32;
+                    let mut arg_idx = 0u32;
+                    let mut ty_args: [(TypeId, u32); 16] = [(TypeId(0), 0); 16];
+                    let mut ty_len = 0usize;
+                    for &row in rows {
+                        match GenericArg::decode(row)? {
+                            GenericArg::Lifetime(nm) => {
+                                if let Some(kind) = classify(self.v, nm, &bound, bound_len)? {
+                                    self.out.closure_param_regions.push(tc::ClosureParamRegion {
+                                        closure,
+                                        param,
+                                        path,
+                                        own: lt_idx,
+                                        kind,
+                                    });
+                                }
+                                lt_idx += 1;
+                            }
+                            GenericArg::Type(t) => {
+                                if let Some(slot) = ty_args.get_mut(ty_len) {
+                                    *slot = (t, arg_idx);
+                                    ty_len += 1;
+                                }
+                                arg_idx += 1;
+                            }
+                            GenericArg::Const(_) => {
+                                arg_idx += 1;
+                            }
+                            GenericArg::AssocType { .. }
+                            | GenericArg::AssocConst { .. }
+                            | GenericArg::AssocBound { .. } => {}
+                        }
+                    }
+                    if let Some(slice) = ty_args.get(..ty_len) {
+                        for &(t, ci) in slice.iter().rev() {
+                            if let Some(next) = tc::ClosureParamRegion::push_step(path, ci)
+                                && let Some(slot) = stack.get_mut(sp)
+                            {
+                                *slot = Frame::Visit(t, next);
+                                sp += 1;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Each of call arguments `args` that is an integer literal, or a `-` whose operand is one
@@ -1123,13 +1404,18 @@ impl Conv<'_, '_, '_, '_, '_> {
                 }
                 tc::Expr::Match { scrutinee, arms: List { start, len: arms.len } }
             }
-            Expr::Loop { body, .. } => tc::Expr::Loop { body },
+            Expr::Loop { body, cost, .. } => {
+                if cost != tc::LoopCost::Normal {
+                    self.out.loop_marks.push((e, cost));
+                }
+                tc::Expr::Loop { body }
+            }
             Expr::Break { value, target: Some(target) } => tc::Expr::Break { value, target },
             Expr::Break { target: None, .. } => return self.refuse("a break with no target", r),
             Expr::Continue { target: Some(target) } => tc::Expr::Continue { target },
             Expr::Continue { target: None } => return self.refuse("a continue with no target", r),
             Expr::Return { value } => tc::Expr::Return { value },
-            Expr::Become { .. } => return self.refuse("`become`", r),
+            Expr::Become { value } => tc::Expr::Become { value },
             Expr::Yield { .. } => return self.refuse("`yield`", r),
             Expr::Call { callee, args } => {
                 self.call_arg_ints(args)?;
@@ -1192,6 +1478,37 @@ impl Conv<'_, '_, '_, '_, '_> {
                 }
                 tc::Expr::Struct { path, fields: List { start, len: fields.len }, base }
             }
+            Expr::Record { fields, base } => {
+                let base = match base {
+                    StructBase::None => tc::StructBase::None,
+                    StructBase::Expr(b) => tc::StructBase::Expr(b),
+                    StructBase::Defaults => tc::StructBase::Defaults,
+                };
+                let start = len(self.out.field_inits.len());
+                let rows = self.v.rows(fields)?;
+                let alloc = self.tys.alloc();
+                let mut named = Vec::with_capacity_in(rows.len(), alloc);
+                for (i, &n) in rows.iter().enumerate() {
+                    let f = FieldInit::decode(n)?;
+                    let text = self.v.name_text(f.name)?;
+                    let name = self.name(f.name)?;
+                    self.out.field_inits.push(tc::FieldInit { name, expr: f.expr });
+                    named.push((text, i, name));
+                }
+                if matches!(base, tc::StructBase::None) {
+                    named.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+                    let mut sorted_names = Vec::with_capacity_in(named.len(), alloc);
+                    for &(_, _, nm) in named.iter() {
+                        sorted_names.push(nm);
+                    }
+                    let schema = tc::RecordSchema::of_sorted_names(&sorted_names);
+                    self.tys
+                        .register_record_schema(schema, &sorted_names)
+                        .map_err(|_| Refused::Check(tc::CheckError::Limit(tc::Limit::Table)))?;
+                    self.out.record_expr_schemas.push((e, schema));
+                }
+                tc::Expr::Record { fields: List { start, len: fields.len }, base }
+            }
             Expr::Index { base, index } => tc::Expr::Index { base, index },
             Expr::Closure { row } => {
                 let c = Closure::decode(self.v.row(row)?)?;
@@ -1208,10 +1525,21 @@ impl Conv<'_, '_, '_, '_, '_> {
                 };
                 let pstart = len(self.out.pat_lists.len());
                 let tstart = len(self.out.opt_types.len());
-                for &n in self.v.rows(c.params)? {
+                for (pi, &n) in self.v.rows(c.params)?.iter().enumerate() {
                     let p = Param::decode(n)?;
                     let Some(pat) = p.pat else { return self.refuse("a closure parameter with no pattern", r) };
                     let ty = self.opt_ty(p.ty)?;
+                    if let Some(tid) = p.ty {
+                        let p_idx = len(pi);
+                        let before = self.out.closure_param_regions.len();
+                        let handled = self.types.closure_param_regions(self.v, tid, self.tys, e, p_idx, &mut |r| {
+                            self.out.closure_param_regions.push(r);
+                        });
+                        if !handled {
+                            self.out.closure_param_regions.truncate(before);
+                            self.record_closure_param_regions(e, p_idx, tid)?;
+                        }
+                    }
                     self.out.pat_lists.push(pat);
                     self.out.opt_types.push(ty);
                 }
@@ -1240,6 +1568,18 @@ impl Conv<'_, '_, '_, '_, '_> {
             }
             Expr::Underscore => tc::Expr::Underscore,
             Expr::Await(e) => tc::Expr::Await(e),
+            Expr::InlineFor { pat, iter, body } => {
+                let kind = if let Some((lhs, rhs)) = zip_fields_call(self.v, iter)? {
+                    InlineForKind::Zip { lhs, rhs }
+                } else if let Some(ty_arg) = variants_call(self.v, iter)? {
+                    let ty = self.ty(ty_arg)?;
+                    InlineForKind::Variants { ty, ty_arg }
+                } else {
+                    InlineForKind::Single { iter }
+                };
+                self.out.inline_fors.push(InlineForSite { expr: e, pat, iter, body, kind });
+                tc::Expr::Missing
+            }
         })
     }
 
@@ -1308,7 +1648,7 @@ impl Conv<'_, '_, '_, '_, '_> {
         Ok(match self.v.pat(p)? {
             Pat::Missing => tc::Pat::Missing,
             Pat::Wild => tc::Pat::Wild,
-            Pat::Bind { ann, name, sub, .. } => tc::Pat::Bind { ann, name: self.name(name)?, sub },
+            Pat::Bind { ann, name, sub, ty, .. } => tc::Pat::Bind { ann, name: self.name(name)?, sub, ty: self.opt_ty(ty)? },
             Pat::Tuple { elems, rest } => tc::Pat::Tuple { elems: self.pats(elems)?, rest },
             Pat::Ref { mutbl, inner } => tc::Pat::Ref { mutbl, inner },
             Pat::Lit(l) => tc::Pat::Lit(self.lit(l, r)?),
@@ -1318,7 +1658,7 @@ impl Conv<'_, '_, '_, '_, '_> {
                 tc::Pat::TupleStruct { path: self.path(path, true, PathNs::Value)?, elems: self.pats(elems)?, rest }
             }
             Pat::Struct { path, fields, rest } => {
-                let path = self.path(path, false, PathNs::Type)?;
+                let path = self.path(path, true, PathNs::Type)?;
                 let start = len(self.out.field_pats.len());
                 for &n in self.v.rows(fields)? {
                     let f = FieldPat::decode(n)?;
@@ -1326,6 +1666,15 @@ impl Conv<'_, '_, '_, '_, '_> {
                     self.out.field_pats.push(tc::FieldPat { name, pat: f.pat });
                 }
                 tc::Pat::Struct { path, fields: List { start, len: fields.len }, rest }
+            }
+            Pat::Record { fields, rest } => {
+                let start = len(self.out.field_pats.len());
+                for &n in self.v.rows(fields)? {
+                    let f = FieldPat::decode(n)?;
+                    let name = self.name(f.name)?;
+                    self.out.field_pats.push(tc::FieldPat { name, pat: f.pat });
+                }
+                tc::Pat::Record { fields: List { start, len: fields.len }, rest }
             }
             Pat::Or { alts } => tc::Pat::Or { alts: self.pats(alts)? },
             Pat::Slice { elems, rest } => tc::Pat::Slice { elems: self.pats(elems)?, rest },
@@ -1419,6 +1768,10 @@ pub fn to_typeck<'a>(
         coroutine: None,
         super_lets: crate::super_let::super_lets(view, alloc),
         const_gaps: Vec::new_in(alloc),
+        record_expr_schemas: Vec::new_in(alloc),
+        closure_param_regions: Vec::new_in(alloc),
+        loop_marks: Vec::new_in(alloc),
+        inline_fors: Vec::new_in(alloc),
     };
     let mut slice_rest: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(view.pats.len(), alloc);
     slice_rest.resize(view.pats.len(), false);
@@ -1486,6 +1839,7 @@ pub fn to_typeck<'a>(
     // The same for the legacy arguments' terms (`BodyView::legacy_arg`); one argument is
     // one call's, so no id repeats.
     c.out.legacy_args.sort_unstable_by_key(|&(x, _)| x);
+    c.out.closure_param_regions.sort_unstable();
     for i in 0..view.pats.len() {
         let id = PatId(len(i));
         let ed = view.mark_of_pat(id)?.map_or(body_edition, |m| edition(m.edition));
@@ -1497,7 +1851,361 @@ pub fn to_typeck<'a>(
         let s = c.stmt(StmtId(len(i)))?;
         c.out.stmts.push(s);
     }
+    if !c.out.inline_fors.is_empty() {
+        wire_inline_fors(&mut c.out, alloc);
+    }
     Ok(c.out)
+}
+
+/// Recognizes `zip_fields(lhs, rhs)` as an `inline for` iterable, returning `(lhs, rhs)`.
+fn zip_fields_call(v: &View<'_>, iter: ExprId) -> Result<Option<(ExprId, ExprId)>, Refused> {
+    let Expr::Call { callee, args } = v.expr(iter)? else {
+        return Ok(None);
+    };
+    let Expr::Path(p) = v.expr(callee)? else {
+        return Ok(None);
+    };
+    let path = v.path(p)?;
+    if path.absolute || path.lang.is_some() {
+        return Ok(None);
+    }
+    let [seg] = v.segments(path)? else {
+        return Ok(None);
+    };
+    let s = Segment::decode(*seg)?;
+    if s.kind != SegKind::Ident || s.has_args || s.parenthesized {
+        return Ok(None);
+    }
+    let Some(name) = s.name else {
+        return Ok(None);
+    };
+    if v.name_text(name)? != "zip_fields" {
+        return Ok(None);
+    }
+    let [lhs, rhs] = *v.ids(args)? else {
+        return Ok(None);
+    };
+    Ok(Some((ExprId(lhs), ExprId(rhs))))
+}
+
+/// Recognizes `variants::<T>()` as an `inline for` iterable, returning `T`.
+fn variants_call(v: &View<'_>, iter: ExprId) -> Result<Option<TypeId>, Refused> {
+    let Expr::Call { callee, args } = v.expr(iter)? else {
+        return Ok(None);
+    };
+    if args.len != 0 {
+        return Ok(None);
+    }
+    let Expr::Path(p) = v.expr(callee)? else {
+        return Ok(None);
+    };
+    let path = v.path(p)?;
+    if path.absolute || path.lang.is_some() {
+        return Ok(None);
+    }
+    let [seg] = v.segments(path)? else {
+        return Ok(None);
+    };
+    let s = Segment::decode(*seg)?;
+    if s.kind != SegKind::Ident || !s.has_args || s.parenthesized {
+        return Ok(None);
+    }
+    let Some(name) = s.name else {
+        return Ok(None);
+    };
+    if v.name_text(name)? != "variants" {
+        return Ok(None);
+    }
+    let [arg_row] = *v.rows(s.args)? else {
+        return Ok(None);
+    };
+    let GenericArg::Type(ty_arg) = GenericArg::decode(arg_row)? else {
+        return Ok(None);
+    };
+    Ok(Some(ty_arg))
+}
+
+/// Prepares unexpanded `inline for pat in iter { body }` sites for the pre-unroll typeck pass:
+/// replaces each single site with `{ iter; }`, each `zip_fields(lhs, rhs)` site with
+/// `{ lhs; rhs; }` (blanking the synthetic `zip_fields` call and path callee so `blaze-typeck`
+/// infers and records `expr_ty` for each iterable without resolving `zip_fields`), and each
+/// `variants::<T>()` site with `{}` (blanking the synthetic `variants::<T>()` call and callee),
+/// and blanks every unreachable expression and pattern inside `body` and `pat` to `Missing` so
+/// writeback never reports `Unreached`.
+fn wire_inline_fors<'a>(out: &mut TypeckBody<'a>, alloc: Alloc<'a>) {
+    enum Work {
+        Expr(ExprId),
+        Pat(PatId),
+        Stmt(StmtId),
+    }
+
+    for i in 0..out.inline_fors.len() {
+        let Some(&site) = out.inline_fors.get(i) else { continue };
+        match site.kind {
+            InlineForKind::Single { iter } => {
+                let site_range = out.expr_ranges.get(site.expr.ix()).copied().unwrap_or_default();
+                let loop_body_id = ExprId(len(out.exprs.len()));
+                out.exprs.push(tc::Expr::Block {
+                    stmts: List::EMPTY,
+                    tail: None,
+                    scope: ScopeId(0),
+                });
+                out.expr_ranges.push(site_range);
+                let loop_id = ExprId(len(out.exprs.len()));
+                out.exprs.push(tc::Expr::Loop { body: loop_body_id });
+                out.expr_ranges.push(site_range);
+                let stmt_id = StmtId(len(out.stmts.len()));
+                out.stmts.push(tc::Stmt::Expr { expr: iter, semi: true });
+                let start = len(out.stmt_lists.len());
+                out.stmt_lists.push(stmt_id);
+                if let Some(slot) = out.exprs.get_mut(site.expr.ix()) {
+                    *slot = tc::Expr::Block {
+                        stmts: List { start, len: 1 },
+                        tail: Some(loop_id),
+                        scope: ScopeId(0),
+                    };
+                }
+            }
+            InlineForKind::Zip { lhs, rhs } => {
+                if let Some(call_slot) = out.exprs.get_mut(site.iter.ix()) {
+                    let prev = core::mem::replace(call_slot, tc::Expr::Missing);
+                    if let tc::Expr::Call { callee, .. } = prev
+                        && let Some(callee_slot) = out.exprs.get_mut(callee.ix())
+                    {
+                        *callee_slot = tc::Expr::Missing;
+                    }
+                }
+                let lhs_stmt = StmtId(len(out.stmts.len()));
+                out.stmts.push(tc::Stmt::Expr { expr: lhs, semi: true });
+                let rhs_stmt = StmtId(len(out.stmts.len()));
+                out.stmts.push(tc::Stmt::Expr { expr: rhs, semi: true });
+                let start = len(out.stmt_lists.len());
+                out.stmt_lists.push(lhs_stmt);
+                out.stmt_lists.push(rhs_stmt);
+                if let Some(slot) = out.exprs.get_mut(site.expr.ix()) {
+                    *slot = tc::Expr::Block {
+                        stmts: List { start, len: 2 },
+                        tail: None,
+                        scope: ScopeId(0),
+                    };
+                }
+            }
+            InlineForKind::Variants { .. } => {
+                if let Some(call_slot) = out.exprs.get_mut(site.iter.ix()) {
+                    let prev = core::mem::replace(call_slot, tc::Expr::Missing);
+                    if let tc::Expr::Call { callee, .. } = prev
+                        && let Some(callee_slot) = out.exprs.get_mut(callee.ix())
+                    {
+                        *callee_slot = tc::Expr::Missing;
+                    }
+                }
+                if let Some(slot) = out.exprs.get_mut(site.expr.ix()) {
+                    *slot = tc::Expr::Block {
+                        stmts: List::EMPTY,
+                        tail: None,
+                        scope: ScopeId(0),
+                    };
+                }
+            }
+        }
+    }
+
+    let mut work: Vec<Work, Alloc<'a>> = Vec::with_capacity_in(out.inline_fors.len().saturating_mul(2), alloc);
+    for site in out.inline_fors.iter() {
+        work.push(Work::Expr(site.body));
+        work.push(Work::Pat(site.pat));
+    }
+
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Expr(id) => {
+                let Some(slot) = out.exprs.get_mut(id.ix()) else { continue };
+                let expr = core::mem::replace(slot, tc::Expr::Missing);
+                match expr {
+                    tc::Expr::Missing
+                    | tc::Expr::Lit(_)
+                    | tc::Expr::Local(_)
+                    | tc::Expr::Path(_)
+                    | tc::Expr::Continue { .. }
+                    | tc::Expr::Underscore
+                    | tc::Expr::OffsetOf { .. } => {}
+                    tc::Expr::Paren(x)
+                    | tc::Expr::Loop { body: x }
+                    | tc::Expr::Field { base: x, .. }
+                    | tc::Expr::TupleField { base: x, .. }
+                    | tc::Expr::Unary { operand: x, .. }
+                    | tc::Expr::Ref { operand: x, .. }
+                    | tc::Expr::RawRef { operand: x, .. }
+                    | tc::Expr::Cast { operand: x, .. }
+                    | tc::Expr::Await(x)
+                    | tc::Expr::AsyncBlock { body: x, .. } => work.push(Work::Expr(x)),
+                    tc::Expr::Break { value, .. } | tc::Expr::Return { value } => {
+                        if let Some(x) = value {
+                            work.push(Work::Expr(x));
+                        }
+                    }
+                    tc::Expr::Become { value } => work.push(Work::Expr(value)),
+                    tc::Expr::Block { stmts, tail, .. } | tc::Expr::ConstBlock { stmts, tail, .. } => {
+                        if let Some(slice) = out.stmt_lists.get(stmts.range()) {
+                            for &s in slice {
+                                work.push(Work::Stmt(s));
+                            }
+                        }
+                        if let Some(t) = tail {
+                            work.push(Work::Expr(t));
+                        }
+                    }
+                    tc::Expr::If { cond, then, else_ } => {
+                        work.push(Work::Expr(cond));
+                        work.push(Work::Expr(then));
+                        if let Some(e) = else_ {
+                            work.push(Work::Expr(e));
+                        }
+                    }
+                    tc::Expr::Let { pat, init } => {
+                        work.push(Work::Pat(pat));
+                        work.push(Work::Expr(init));
+                    }
+                    tc::Expr::Match { scrutinee, arms } => {
+                        work.push(Work::Expr(scrutinee));
+                        if let Some(slice) = out.arms.get(arms.range()) {
+                            for arm in slice {
+                                work.push(Work::Pat(arm.pat));
+                                if let Some(g) = arm.guard {
+                                    work.push(Work::Expr(g));
+                                }
+                                work.push(Work::Expr(arm.body));
+                            }
+                        }
+                    }
+                    tc::Expr::Call { callee, args } => {
+                        work.push(Work::Expr(callee));
+                        if let Some(slice) = out.expr_lists.get(args.range()) {
+                            for &a in slice {
+                                work.push(Work::Expr(a));
+                            }
+                        }
+                    }
+                    tc::Expr::MethodCall { receiver, args, .. } => {
+                        work.push(Work::Expr(receiver));
+                        if let Some(slice) = out.expr_lists.get(args.range()) {
+                            for &a in slice {
+                                work.push(Work::Expr(a));
+                            }
+                        }
+                    }
+                    tc::Expr::Binary { lhs, rhs, .. }
+                    | tc::Expr::Assign { lhs, rhs }
+                    | tc::Expr::AssignOp { lhs, rhs, .. }
+                    | tc::Expr::Index { base: lhs, index: rhs } => {
+                        work.push(Work::Expr(lhs));
+                        work.push(Work::Expr(rhs));
+                    }
+                    tc::Expr::Tuple { elems }
+                    | tc::Expr::Array { elems }
+                    | tc::Expr::FormatArgs { args: elems, .. } => {
+                        if let Some(slice) = out.expr_lists.get(elems.range()) {
+                            for &x in slice {
+                                work.push(Work::Expr(x));
+                            }
+                        }
+                    }
+                    tc::Expr::Repeat { elem, count, .. } => {
+                        work.push(Work::Expr(elem));
+                        if let Some(c) = count {
+                            work.push(Work::Expr(c));
+                        }
+                    }
+                    tc::Expr::Struct { fields, base, .. } | tc::Expr::Record { fields, base } => {
+                        if let Some(slice) = out.field_inits.get(fields.range()) {
+                            for fi in slice {
+                                work.push(Work::Expr(fi.expr));
+                            }
+                        }
+                        if let Some(b) = base.expr() {
+                            work.push(Work::Expr(b));
+                        }
+                    }
+                    tc::Expr::Closure { params, body, .. } => {
+                        if let Some(slice) = out.pat_lists.get(params.range()) {
+                            for &p in slice {
+                                work.push(Work::Pat(p));
+                            }
+                        }
+                        work.push(Work::Expr(body));
+                    }
+                    tc::Expr::Asm { operands, .. } => {
+                        if let Some(slice) = out.asm_operands.get(operands.range()) {
+                            for op in slice {
+                                work.push(Work::Expr(op.expr));
+                                if let Some(o) = op.out_expr {
+                                    work.push(Work::Expr(o));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Work::Pat(id) => {
+                let Some(slot) = out.pats.get_mut(id.ix()) else { continue };
+                let pat = core::mem::replace(slot, tc::Pat::Missing);
+                match pat {
+                    tc::Pat::Missing
+                    | tc::Pat::Wild
+                    | tc::Pat::Lit(_)
+                    | tc::Pat::NegLit(_)
+                    | tc::Pat::Path(_) => {}
+                    tc::Pat::Bind { sub, .. } => {
+                        if let Some(s) = sub {
+                            work.push(Work::Pat(s));
+                        }
+                    }
+                    tc::Pat::Ref { inner, .. } => work.push(Work::Pat(inner)),
+                    tc::Pat::Tuple { elems, .. }
+                    | tc::Pat::TupleStruct { elems, .. }
+                    | tc::Pat::Or { alts: elems }
+                    | tc::Pat::Slice { elems, .. } => {
+                        if let Some(slice) = out.pat_lists.get(elems.range()) {
+                            for &p in slice {
+                                work.push(Work::Pat(p));
+                            }
+                        }
+                    }
+                    tc::Pat::Struct { fields, .. } | tc::Pat::Record { fields, .. } => {
+                        if let Some(slice) = out.field_pats.get(fields.range()) {
+                            for fp in slice {
+                                work.push(Work::Pat(fp.pat));
+                            }
+                        }
+                    }
+                    tc::Pat::Range { lo, hi, .. } => {
+                        if let Some(p) = lo {
+                            work.push(Work::Pat(p));
+                        }
+                        if let Some(p) = hi {
+                            work.push(Work::Pat(p));
+                        }
+                    }
+                }
+            }
+            Work::Stmt(id) => {
+                let Some(&stmt) = out.stmts.get(id.ix()) else { continue };
+                match stmt {
+                    tc::Stmt::Item => {}
+                    tc::Stmt::Expr { expr, .. } => work.push(Work::Expr(expr)),
+                    tc::Stmt::Let { pat, init, else_, .. } => {
+                        work.push(Work::Pat(pat));
+                        if let Some(x) = init {
+                            work.push(Work::Expr(x));
+                        }
+                        if let Some(x) = else_ {
+                            work.push(Work::Expr(x));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1524,19 +2232,21 @@ pub struct PatRange<'t> {
 }
 
 /// The input of `pattern_type!` read from its text: the base's text (the caller lowers it as a
-/// type) and the pattern, `!null` or an or of ranges (at most
-/// `blaze_typeck::MAX_PATTERN_RANGES`).
+/// type) and the pattern, `!null`, a finite const value set (`in CONST_SLICE`), or an or of
+/// ranges (at most `blaze_typeck::MAX_PATTERN_RANGES`).
 #[derive(Clone, Copy, Debug)]
 pub struct PatternTypeText<'t> {
     pub base: &'t str,
     pub not_null: bool,
+    pub in_const: Option<&'t str>,
     pub ranges: [Option<PatRange<'t>>; blaze_typeck::MAX_PATTERN_RANGES],
 }
 
 /// Reads `T is PAT`, the input of the pinned library's built-in `pattern_type!` (core/src/pat.rs;
 /// the forms core writes are in typeck.md, "Pattern types": integer and `char` ranges with
-/// literal or path ends, ors of them, and `!null`). A form outside these is
-/// `Refused::Form` naming it, at `range` (the macro call's).
+/// literal or path ends, ors of them, and `!null`) or Blaze's finite const value-set pattern type
+/// (`T is in CONST_SLICE`). A form outside these is `Refused::Form` naming it, at `range` (the
+/// macro call's).
 pub fn parse_pattern_type(input: &str, range: blaze_surface::Range) -> Result<PatternTypeText<'_>, Refused> {
     let refuse = |what: &'static str| Refused::Form { what, range };
     let at = word_at(input, "is").ok_or(refuse("a `pattern_type!` without `is`"))?;
@@ -1545,12 +2255,27 @@ pub fn parse_pattern_type(input: &str, range: blaze_surface::Range) -> Result<Pa
     if base.is_empty() {
         return Err(refuse("a `pattern_type!` without a base type"));
     }
-    let mut out = PatternTypeText { base, not_null: false, ranges: [None; blaze_typeck::MAX_PATTERN_RANGES] };
+    let mut out = PatternTypeText {
+        base,
+        not_null: false,
+        in_const: None,
+        ranges: [None; blaze_typeck::MAX_PATTERN_RANGES],
+    };
     if let Some(rest) = pat.strip_prefix('!') {
         if rest.trim() != "null" {
             return Err(refuse("a negated pattern other than `!null` in a pattern type"));
         }
         out.not_null = true;
+        return Ok(out);
+    }
+    if let Some(rest) = pat.strip_prefix("in")
+        && rest.as_bytes().first().is_none_or(|&c| !(c.is_ascii_alphanumeric() || c == b'_'))
+    {
+        let expr = rest.trim();
+        if expr.is_empty() {
+            return Err(refuse("a finite value-set pattern type without a const expression after `in`"));
+        }
+        out.in_const = Some(expr);
         return Ok(out);
     }
     for (i, alt) in pat.split('|').enumerate() {
@@ -1692,6 +2417,11 @@ pub fn pattern_type(
         (Some(IntTy::I128), _) | (_, Some(UintTy::U128)) => 128,
         _ => pointer_bits,
     };
+    if text.in_const.is_some() {
+        return Err(refuse(
+            "a finite const value-set pattern type (`T is in CONST_SLICE`) requires const-slice evaluation",
+        ));
+    }
     if text.not_null {
         // `!null` is every address but zero (pat.rs, non_null.rs `NonNull::pointer`).
         match tys.view().node(base)? {

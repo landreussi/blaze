@@ -2,7 +2,8 @@
 //! as it comes, branch and PC-relative fields patched once everything is placed from the list
 //! of patches the pass kept (no second walk of the input).
 
-use std::alloc::{Allocator, Global};
+use alloc::alloc::Allocator;
+use alloc::vec::Vec;
 
 use blaze_lir::{
     Block, Flags, IntCond, Op, Scalar, Ty, Value, View,
@@ -22,6 +23,7 @@ pub(crate) mod atomic;
 mod bulk;
 mod float;
 mod float_width;
+pub(crate) mod frame;
 mod int;
 pub(crate) mod probe;
 /// Branches and PC-relative references past a short field's reach: islands and long forms.
@@ -113,29 +115,33 @@ struct Pass<'a, 'c, A: Allocator> {
     /// The source position fields of the placed data rows, filled as the data is placed.
     positions: &'c mut Vec<PositionFix, A>,
     /// The literal words placement fills, other than the fixups': each once, in order.
-    words: Vec<RelocTo, Global>,
+    words: blaze_own::AVec<'c, RelocTo>,
     /// The `add`s that make an address in the stretch of the frame where a call's `byval`
     /// copies go, placed after the staging words once their count is known: (the first of
     /// the two words, its register, the offset in the stretch).
-    byval_fixes: Vec<(u32, Reg, u32), Global>,
+    byval_fixes: blaze_own::AVec<'c, (u32, Reg, u32)>,
     /// The most bytes one call's `byval` copies took.
     byval_most: u32,
     /// The function's own returns.
     rets: &'a [ParamRec],
-    patches: Vec<Patch, Global>,
+    patches: blaze_own::AVec<'c, Patch>,
     /// Per block, its first byte (`NONE` until placed).
-    block_at: Vec<u32, Global>,
+    block_at: blaze_own::AVec<'c, u32>,
     /// Per reference row, its literal's index (`NONE` until asked).
-    ref_literal: Vec<u32, Global>,
+    ref_literal: blaze_own::AVec<'c, u32>,
     /// Per data row, its index among `placed` (`NONE` until asked).
-    data_index: Vec<u32, Global>,
+    data_index: blaze_own::AVec<'c, u32>,
     /// The data rows `data_addr` reaches, in the order they are placed.
-    placed: Vec<u32, Global>,
+    placed: blaze_own::AVec<'c, u32>,
+    /// Per value, the offset from `sp` of its cell (`NONE` for `Ty::NONE` instructions).
+    cell_at: blaze_own::AVec<'c, u32>,
+    /// Total bytes occupied by all cells (past the last cell's end).
+    cells_end: u64,
     /// Per stack slot, its offset from `sp`.
-    slot_at: Vec<u32, Global>,
+    slot_at: blaze_own::AVec<'c, u32>,
     /// Per value, the offset from `sp` of the third word of a wide pair (lib.rs, "Pairs": an
     /// `i128` and a narrow integer, 24 bytes, past its 16-byte cell); `NONE` for any other.
-    wide_pair_at: Vec<u32, Global>,
+    wide_pair_at: blaze_own::AVec<'c, u32>,
     /// Where the staging words of a block's arguments start, from `sp`.
     staging_at: u32,
     /// The most staging words an edge took.
@@ -146,11 +152,17 @@ struct Pass<'a, 'c, A: Allocator> {
     /// The most alignment a slot asks (at least 16): the prologue rounds `sp` down to it.
     most_align: u64,
     /// Where each landing block's `sp` restore starts (pass/stack.rs), patched with the frame.
-    sp_fixes: Vec<u32, Global>,
+    sp_fixes: blaze_own::AVec<'c, u32>,
+    /// Per block, its sole empty-arg `Op::Switch` default terminator (`NONE` otherwise).
+    sole_switch_default: blaze_own::AVec<'c, u32>,
     /// The block being lowered.
     block: Block,
     /// The short fields still to be placed in reach, and the islands' rows (pass/reach.rs).
     far: reach::Far<'c>,
+    /// For a C-variadic fn definition on Apple arm64 (`Os::Mac`), the offset from `fp` to the
+    /// first stacked variadic argument (`16 + nsaa.end().next_multiple_of(8)`), read by
+    /// `blaze.va_start` (pass/target.rs). `None` for non-variadic functions.
+    va_start_offset: Option<u32>,
 }
 
 /// Runs the pass (see [`crate::emit`]).
@@ -172,55 +184,30 @@ pub(crate) fn run<A: Allocator>(
     }
     let sig = view.sigs.get(view.head.sig as usize).map(|_| view.sig(SigId(view.head.sig)));
     let Some(sig) = sig else { return Err(EmitError::Signature { why: "no signature row" }) };
-    if view.sigs[view.head.sig as usize].bits & SigRec::VARIADIC != 0 {
+    let is_variadic = view.sigs[view.head.sig as usize].bits & SigRec::VARIADIC != 0;
+    if is_variadic && isa.os != crate::Os::MacOs {
         return Err(EmitError::Signature { why: variadic::VARIADIC_DEFINITION });
     }
     check_sig(view, isa, view.sigs[view.head.sig as usize], sig.params, sig.rets)
         .map_err(|why| EmitError::Signature { why })?;
 
-    // The frame: a 16-byte cell per value, then the third word of each wide pair (in 16-byte
-    // steps, so every cell stays 16-aligned), then each slot at its alignment, then the
-    // staging words; `sp` aligned to the most any slot asks.
-    let cells = view.len() as u64 * 16;
-    let mut at = cells;
-    let mut wide_pair_at = Vec::with_capacity_in(view.len(), Global);
-    for value in 0..view.len() {
-        match wide::is_wide_pair(view, view.ty(Value(value as u32))) {
-            true => {
-                wide_pair_at.push(at as u32);
-                at += 16;
-                if at >= FRAME_LIMIT {
-                    return Err(EmitError::TooLarge { what: "the frame (16 MiB)" });
-                }
-            }
-            false => wide_pair_at.push(NONE),
-        }
-    }
-    let mut most_align: u64 = 16;
-    let mut slot_at = Vec::with_capacity_in(view.slots.len(), Global);
-    for slot in view.slots {
-        if slot.align > MOST_SLOT_ALIGN {
-            return Err(EmitError::TooLarge { what: "a stack slot's alignment (past 4 KiB)" });
-        }
-        let align = 1u64 << slot.align;
-        most_align = most_align.max(align);
-        at = at.next_multiple_of(align);
-        slot_at.push(at as u32);
-        at += u64::from(slot.size);
-        if at >= FRAME_LIMIT {
-            return Err(EmitError::TooLarge { what: "the frame (16 MiB)" });
-        }
-    }
-    let staging_at = at.next_multiple_of(8);
+    // The frame: lifetime-colored value cells (8/16/32 bytes by size class; 0 bytes for `Ty::NONE`),
+    // then lifetime-colored LIR stack slots at their alignment, then the staging words; `sp`
+    // aligned to the most any slot asks (pass/frame.rs).
+    let cells = frame::layout_cells(view, scratch)?;
+    let slots = frame::pack_slots(view, cells.end, scratch)?;
+    let staging_at = slots.end.next_multiple_of(8);
     if staging_at >= FRAME_LIMIT {
         return Err(EmitError::TooLarge { what: "the frame (16 MiB)" });
     }
+    let most_align = slots.most_align;
+    let sole_switch_default = frame::sole_switch_defaults(view, scratch);
 
-    let mut block_at = Vec::with_capacity_in(view.blocks(), Global);
+    let mut block_at = blaze_own::AVec::with_capacity_in(view.blocks(), scratch);
     block_at.resize(view.blocks(), NONE);
-    let mut ref_literal = Vec::with_capacity_in(view.refs.len(), Global);
+    let mut ref_literal = blaze_own::AVec::with_capacity_in(view.refs.len(), scratch);
     ref_literal.resize(view.refs.len(), NONE);
-    let mut data_index = Vec::with_capacity_in(view.datas.len(), Global);
+    let mut data_index = blaze_own::AVec::with_capacity_in(view.datas.len(), scratch);
     data_index.resize(view.datas.len(), NONE);
     let mut pass = Pass {
         view,
@@ -232,24 +219,28 @@ pub(crate) fn run<A: Allocator>(
         fixups,
         relocs,
         positions,
-        words: Vec::new_in(Global),
-        byval_fixes: Vec::new_in(Global),
+        words: blaze_own::AVec::new_in(scratch),
+        byval_fixes: blaze_own::AVec::new_in(scratch),
         byval_most: 0,
         rets: sig.rets,
-        patches: Vec::new_in(Global),
+        patches: blaze_own::AVec::new_in(scratch),
         block_at,
         ref_literal,
         data_index,
-        placed: Vec::new_in(Global),
-        slot_at,
-        wide_pair_at,
+        cell_at: cells.cell_at,
+        cells_end: cells.end,
+        placed: blaze_own::AVec::new_in(scratch),
+        slot_at: slots.slot_at,
+        wide_pair_at: cells.wide_pair_at,
         staging_at: staging_at as u32,
         staging: 0,
         record,
         most_align,
-        sp_fixes: Vec::new_in(Global),
+        sp_fixes: blaze_own::AVec::new_in(scratch),
+        sole_switch_default,
         block: Block(0),
         far: reach::Far::new(reach, view, scratch),
+        va_start_offset: None,
     };
 
     // The prologue; the frame's size is patched in at the end, when the staging is known.
@@ -302,6 +293,9 @@ pub(crate) fn run<A: Allocator>(
             }
             false => pass.st(reg, inst),
         }
+    }
+    if is_variadic {
+        pass.va_start_offset = Some(16 + nsaa.end().next_multiple_of(8));
     }
 
     pass.unwind_begin()?;
@@ -618,21 +612,30 @@ impl<A: Allocator> Pass<'_, '_, A> {
     /// nothing writes `x9`. Any other `unreachable` is `Unknown`, never a guess.
     fn held_at_unreachable(&self, inst: usize) -> blaze_code::record::Held {
         let first = self.view.block(self.block).start == inst;
-        match first && blaze_lir::verify::sole_switch_default(&self.view, self.block).is_some() {
+        let sole = self.sole_switch_default.get(self.block.index()).copied().unwrap_or(NONE);
+        match first && sole != NONE {
             true => blaze_code::record::Held::Reg(X9 as u8),
             false => blaze_code::record::Held::Unknown,
         }
     }
 
+    /// Byte offset from `sp` of value `value`'s cell.
+    #[inline]
+    pub(super) fn cell_of(&self, value: usize) -> u32 {
+        let off = self.cell_at.get(value).copied().unwrap_or(NONE);
+        debug_assert_ne!(off, NONE, "cell accessed for Ty::NONE instruction {value}");
+        off
+    }
+
     /// Loads `value`'s cell.
     fn ld(&mut self, rt: Reg, value: Value) {
-        self.ld_sp(rt, value.0 * 16);
+        self.ld_sp(rt, self.cell_of(value.index()));
     }
 
     /// Stores `rt` to instruction `inst`'s cell. `rt` holds the value as the cell invariant
     /// says (lib.rs, "Values").
     fn st(&mut self, rt: Reg, inst: usize) {
-        self.st_sp(rt, inst as u32 * 16);
+        self.st_sp(rt, self.cell_of(inst));
     }
 
     /// Zero-extends the low `width` bits of `reg` over it: the cell invariant.
@@ -763,10 +766,10 @@ impl<A: Allocator> Pass<'_, '_, A> {
     }
 
     /// The offset from `sp` of word `w` of value `value`: words 0 and 1 in its cell, word 2 (a
-    /// wide pair's member 1) past the cells.
+    /// wide pair's member 1) at `wide_pair_at[value]`.
     fn value_word_at(&self, value: usize, w: u32) -> u32 {
         match w {
-            0 | 1 => value as u32 * 16 + 8 * w,
+            0 | 1 => self.cell_of(value) + 8 * w,
             _ => self.wide_pair_at[value],
         }
     }
@@ -777,17 +780,23 @@ impl<A: Allocator> Pass<'_, '_, A> {
         let start = self.view.params(to.block).start;
         let n = to.args.len();
         // Parameter `j` is written at step `j`; argument `k` read at step `k` sees it overwritten
-        // when it is parameter `j < k`.
+        // whenever parameter `j < k`'s cell overlaps argument `k`'s cell.
         let clobbered = to.args.iter().enumerate().any(|(k, arg)| {
-            let at = arg.index();
-            at >= start && at < start + n && at - start < k
+            let a_off = self.cell_of(arg.index());
+            let a_end = a_off + 8 * self.words_of(arg);
+            (0..k).any(|j| {
+                let p = start + j;
+                let p_off = self.cell_of(p);
+                let p_end = p_off + 8 * self.words_of(Value(u32::try_from(p).unwrap_or(u32::MAX)));
+                a_off < p_end && p_off < a_end
+            })
         });
         // A pair moves both of its words, a wide pair all three; a parameter has its
         // argument's type, so its words are where the argument's are in its own cell.
         match clobbered {
             false => {
                 for (k, arg) in to.args.iter().enumerate() {
-                    if arg.index() != start + k {
+                    if self.cell_of(arg.index()) != self.cell_of(start + k) {
                         for w in 0..self.words_of(arg) {
                             self.ld_sp(X9, self.value_word_at(arg.index(), w));
                             self.st_sp(X9, self.value_word_at(start + k, w));
@@ -1097,7 +1106,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 if !self.is_pair(view.ty(pair)) || k > 1 {
                     return Err(unsupported(inst, op, "a member of a compound that is not a pair of integers or pointers"));
                 }
-                self.ld_sp(X9, pair.0 * 16 + 8 * k);
+                self.ld_sp(X9, self.cell_of(pair.index()) + 8 * k);
                 self.st(X9, inst);
             }
             Op::Rotl
@@ -1242,33 +1251,76 @@ impl<A: Allocator> Pass<'_, '_, A> {
             }
             Op::Switch => {
                 let scrutinee = o.value();
-                self.width_of(inst, op, scrutinee)?;
                 let default = o.target();
-                self.ld(X9, scrutinee);
-                for (words, to) in o.cases(scrutinee) {
-                    // A safe point between cases (pass/reach.rs): an island's fall-through
-                    // `b` leaves `x9`, the scrutinee, as it is.
-                    self.reach_point()?;
-                    let value = words.iter().rev().fold(0u64, |it, &word| (it << 32) | u64::from(word));
-                    match value < 4096 {
-                        true => self.put(enc::cmp_imm(X9, value as u32)),
-                        false => {
-                            self.mov_imm(X10, value);
-                            self.put(enc::cmp(X9, X10));
+                if Self::is_wide(self.view.ty(scrutinee)) {
+                    self.ld2(X9, X11, scrutinee);
+                    for (words, to) in o.cases(scrutinee) {
+                        // A safe point between cases (pass/reach.rs): an island's fall-through
+                        // `b` leaves `x9` and `x11`, the scrutinee halves, as they are.
+                        self.reach_point()?;
+                        if words.len() != 4 {
+                            return Err(unsupported(inst, op, "a 128-bit switch case of other than four words"));
+                        }
+                        let lo = u64::from(words[0]) | (u64::from(words[1]) << 32);
+                        let hi = u64::from(words[2]) | (u64::from(words[3]) << 32);
+                        let lo_diff = match lo {
+                            0 => X9,
+                            _ => {
+                                self.mov_imm(X10, lo);
+                                self.put(enc::eor(X10, X9, X10));
+                                X10
+                            }
+                        };
+                        let hi_diff = match hi {
+                            0 => X11,
+                            _ => {
+                                self.mov_imm(X8, hi);
+                                self.put(enc::eor(X8, X11, X8));
+                                X8
+                            }
+                        };
+                        self.put(enc::orr(X10, lo_diff, hi_diff));
+                        self.put(enc::cmp_imm(X10, 0));
+                        match to.args.is_empty() {
+                            // `b.ne +8; b to` when `to` is placed more than 1 MiB back.
+                            true => self.branch_if(enc::b_cond(Cond::Eq, 0), enc::b_cond(Cond::Ne, 2), to.block.0),
+                            false => {
+                                let at = self.here();
+                                self.put(enc::b_cond(Cond::Ne, 0));
+                                self.edge(to, None)?;
+                                self.land(at)?;
+                            }
                         }
                     }
-                    match to.args.is_empty() {
-                        // `b.ne +8; b to` when `to` is placed more than 1 MiB back.
-                        true => self.branch_if(enc::b_cond(Cond::Eq, 0), enc::b_cond(Cond::Ne, 2), to.block.0),
-                        false => {
-                            let at = self.here();
-                            self.put(enc::b_cond(Cond::Ne, 0));
-                            self.edge(to, None)?;
-                            self.land(at)?;
+                    self.edge(default, next)?;
+                } else {
+                    self.width_of(inst, op, scrutinee)?;
+                    self.ld(X9, scrutinee);
+                    for (words, to) in o.cases(scrutinee) {
+                        // A safe point between cases (pass/reach.rs): an island's fall-through
+                        // `b` leaves `x9`, the scrutinee, as it is.
+                        self.reach_point()?;
+                        let value = words.iter().rev().fold(0u64, |it, &word| (it << 32) | u64::from(word));
+                        match value < 4096 {
+                            true => self.put(enc::cmp_imm(X9, value as u32)),
+                            false => {
+                                self.mov_imm(X10, value);
+                                self.put(enc::cmp(X9, X10));
+                            }
+                        }
+                        match to.args.is_empty() {
+                            // `b.ne +8; b to` when `to` is placed more than 1 MiB back.
+                            true => self.branch_if(enc::b_cond(Cond::Eq, 0), enc::b_cond(Cond::Ne, 2), to.block.0),
+                            false => {
+                                let at = self.here();
+                                self.put(enc::b_cond(Cond::Ne, 0));
+                                self.edge(to, None)?;
+                                self.land(at)?;
+                            }
                         }
                     }
+                    self.edge(default, next)?;
                 }
-                self.edge(default, next)?;
             }
             Op::Return => {
                 let values = o.values();
@@ -1380,7 +1432,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
             | Op::Scatter => return Err(unsupported(inst, op, "a vector operation")),
             Op::Invoke | Op::InvokeIndirect => self.call(inst, op).map(|()| self.invoke_normal(inst, op, next))?,
             Op::Resume => self.resume(inst),
-            Op::TailCall | Op::TailCallIndirect => return Err(unsupported(inst, op, "a tail call")),
+            Op::TailCall | Op::TailCallIndirect => self.tail_call(inst, op)?,
             Op::Asm => self.asm(inst, op)?,
             Op::AsmBr => return Err(unsupported(inst, op, "an `asm!` block with `label` operands (`asm_br`)")),
             // A coroutine body is split by `blaze_lir::coroutine::split` before any backend
@@ -1441,7 +1493,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
             _ => None,
         };
         // The copies, each at its alignment in this call's stretch of the frame.
-        let mut copies: Vec<u32, Global> = Vec::new_in(Global);
+        let mut copies: blaze_own::AVec<'_, u32> = blaze_own::AVec::new_in(self.scratch);
         let mut area = 0u32;
         for (arg, param) in args.iter().zip(sig.params) {
             if param.kind != ParamKind::Byval as u8 {
@@ -1458,7 +1510,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
         self.byval_most = self.byval_most.max(area);
         let mut regs = Regs::new(isa.os);
         let mut nsaa = stack::Nsaa::new(isa.os);
-        let mut stacked: Vec<stack::StackedArg, Global> = Vec::new_in(Global);
+        let mut stacked: blaze_own::AVec<'_, stack::StackedArg> = blaze_own::AVec::new_in(self.scratch);
         let mut copy = copies.iter();
         for (arg, param) in args.iter().zip(sig.params) {
             if param.kind == ParamKind::Sret as u8 {
@@ -1519,7 +1571,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
                     self.put(enc::ldr(Size::X, X16, X16, 0));
                 }
             }
-            (None, Some(pointer)) => self.ld_sp(X16, pointer.0 * 16 + area),
+            (None, Some(pointer)) => self.ld_sp(X16, self.cell_of(pointer.index()) + area),
             (None, None) => match imported {
                 // A call site, which the `blr` below completes.
                 Some(place) => self.import_callee(RelocTo::Func(place)),
@@ -1537,13 +1589,96 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 Loc::X(reg) => {
                     let width = self.width(ty).ok_or(unsupported(inst, op, "a return wider than 64 bits"))?;
                     self.narrow(reg, width);
-                    self.st_sp(reg, inst as u32 * 16 + 8 * k as u32);
+                    self.st_sp(reg, self.cell_of(inst) + 8 * u32::try_from(k).unwrap_or(0));
                 }
                 Loc::Pair(reg) if sig.rets.len() == 1 => self.st2(reg, reg + 1, inst),
                 Loc::V(v, w) if sig.rets.len() == 1 => self.v_in(v, inst, w),
                 _ => return Err(unsupported(inst, op, "an `i128` or float return beside another return")),
             }
         }
+        Ok(())
+    }
+
+    /// A `tail_call` or `tail_call_indirect`: loads all register arguments and the callee address
+    /// into `x16` from the current frame, tears down the frame (`add sp, fp, #0; ldp fp, lr,
+    /// [sp], #16`), and branches directly to `x16` (`br x16`) in O(1) stack space.
+    fn tail_call(&mut self, inst: usize, op: Op) -> Result<(), EmitError> {
+        let view = self.view;
+        let mut o = view.operands(inst);
+        let (direct, indirect) = match op {
+            Op::TailCall => (Some(o.reference()), None),
+            _ => (None, Some(o.value())),
+        };
+        let sig_id = o.sig();
+        let args = o.values();
+        let sig = view.sig(sig_id);
+        let isa = self.isa;
+        let Some(&sig_rec) = view.sigs.get(sig_id.index()) else {
+            return Err(unsupported(inst, op, "a tail call whose signature index is out of range"));
+        };
+        check_sig(view, isa, sig_rec, sig.params, sig.rets).map_err(|why| unsupported(inst, op, why))?;
+        let variadic = sig_rec.bits & SigRec::VARIADIC != 0;
+        if variadic {
+            return Err(unsupported(inst, op, "a variadic tail call"));
+        }
+        if args.len() != sig.params.len() {
+            return Err(unsupported(inst, op, "arguments other than the signature's parameters"));
+        }
+        if sig.rets.len() != self.rets.len()
+            || !sig.rets.iter().zip(self.rets).all(|(a, b)| a.ty == b.ty && a.kind == b.kind && a.ext == b.ext)
+        {
+            return Err(unsupported(inst, op, "a tail call whose return signature differs from the caller"));
+        }
+        let imported = match direct {
+            Some(reference) if self.in_record() => Some(self.func_place(inst, op, reference)?),
+            _ => None,
+        };
+        let callee = match direct {
+            Some(reference) if imported.is_none() => Some(self.literal(inst, op, reference)?),
+            _ => None,
+        };
+        let mut regs = Regs::new(isa.os);
+        for (arg, param) in args.iter().zip(sig.params) {
+            match ParamKind::from_byte(param.kind) {
+                Some(ParamKind::Byval) => return Err(unsupported(inst, op, "a `byval` tail-call argument")),
+                Some(ParamKind::Sret) => {
+                    self.ld(X8, arg);
+                    continue;
+                }
+                _ => {}
+            }
+            let Some(at) = regs.next(Ty(param.ty)) else {
+                return Err(unsupported(inst, op, "a stacked tail-call argument"));
+            };
+            match at {
+                Loc::X(gpr) => {
+                    self.ld(gpr, arg);
+                    if Ext::from_byte(param.ext) == Some(Ext::Sext) {
+                        let width = self.width_of(inst, op, arg)?;
+                        self.widen_signed(gpr, width);
+                    }
+                }
+                Loc::Pair(gpr) => self.ld2(gpr, gpr + 1, arg),
+                Loc::V(v, w) => self.v_out(v, arg, w),
+            }
+        }
+        match (callee, indirect) {
+            (Some((literal, via)), _) => {
+                self.put_to(enc::ldr_lit(X16, 0), Field::Imm19, Label::Literal(literal));
+                if via == Via::Slot {
+                    self.put(enc::ldr(Size::X, X16, X16, 0));
+                }
+            }
+            (None, Some(pointer)) => self.ld(X16, pointer),
+            (None, None) => match imported {
+                // Load site (`call: false`): `br x16` follows the epilogue, not `blr x16`.
+                Some(place) => self.import_load(X16, RelocTo::Func(place)),
+                None => return Err(unsupported(inst, op, "a tail call that names no callee")),
+            },
+        }
+        self.put(enc::add_imm(SP, FP, 0, false));
+        self.put(enc::ldp_post(FP, LR, SP, 16));
+        self.put(enc::br(X16));
         Ok(())
     }
 
@@ -1588,9 +1723,9 @@ impl<A: Allocator> Pass<'_, '_, A> {
         }
         self.code.resize(self.code.len() + 8 * self.words.len(), 0);
         // Data rows, then the rows their relocations reach (the list grows as it is walked).
-        let mut data_at = Vec::with_capacity_in(self.placed.len(), Global);
+        let mut data_at = blaze_own::AVec::with_capacity_in(self.placed.len(), self.scratch);
         // (word, index of the data row it reaches, addend), resolved once every row is placed.
-        let mut inner: Vec<(u32, u32, i64), Global> = Vec::new_in(Global);
+        let mut inner: blaze_own::AVec<'_, (u32, u32, i64)> = blaze_own::AVec::new_in(self.scratch);
         let mut at = 0;
         while at < self.placed.len() {
             let row = self.placed[at];
@@ -1657,7 +1792,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
         if self.code.len() > u32::MAX as usize / 2 {
             return Err(EmitError::TooLarge { what: "the code (2 GiB)" });
         }
-        let patches = core::mem::replace(&mut self.patches, Vec::new_in(Global));
+        let patches = core::mem::replace(&mut self.patches, blaze_own::AVec::new_in(self.scratch));
         for patch in patches.iter() {
             let to = match patch.to {
                 Label::Block(block) => self.block_at[block as usize],
@@ -1683,7 +1818,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
         // The `byval` copies' stretch, after the staging words; under 16 MiB with the copies
         // (`frame_bytes` refused it otherwise, in `place_frame`, before this).
         let byval_at = self.byval_at();
-        let fixes = core::mem::replace(&mut self.byval_fixes, Vec::new_in(Global));
+        let fixes = core::mem::replace(&mut self.byval_fixes, blaze_own::AVec::new_in(self.scratch));
         for &(at, rd, off) in fixes.iter() {
             let to = byval_at as u32 + off;
             self.set(at, enc::add_imm(rd, SP, to >> 12, true));

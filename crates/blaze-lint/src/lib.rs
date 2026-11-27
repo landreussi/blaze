@@ -48,6 +48,7 @@
 extern crate std;
 
 mod allowed;
+mod autofix;
 pub mod dup;
 mod engine;
 mod fix;
@@ -256,6 +257,64 @@ pub enum Rule {
     /// macOS Seatbelt + Linux Landlock/seccomp from one sans-IO `Plan`.
     /// The lint `blaze::raw_sandbox_exec`.
     RawSandboxExec = 35,
+    /// Deprecated `&mut` / `ref mut` unique reference spelling (`docs/v2/plan/design/edition.md`,
+    /// change 10): Blaze spells unique references `&uniq` and `ref uniq`, with mechanical auto-fix.
+    /// Does not flag `let mut`, `*mut`, `&raw mut`, or `mut x` bindings.
+    /// The lint `blaze::mut_ref`.
+    MutRef = 36,
+    /// Hardcoded magic slice range length (`bytes.get(0..3) == Some(..)`, `bytes.get(at..at + 2)`,
+    /// `&s[..7] == b".."`, or `starts_with` followed by a hardcoded advance) where the length should
+    /// be derived via `strip_prefix`, `starts_with`, `.len()`, `size_of::<T>()`, or a named `const`.
+    /// The lint `blaze::magic_slice_len`.
+    MagicSliceLen = 37,
+    /// Boolean-to-integer `as` cast (`(a == b) as u32`, `x.is_some() as usize`) that should use
+    /// infallible `T::from(..)` (with mechanical auto-fix). The lint `blaze::bool_as_int`.
+    BoolAsInt = 38,
+    /// Manual slice length/index idioms (`x.len() == 0` / `x.len() > 0` -> `is_empty()`,
+    /// `for i in 0..xs.len()` indexing `xs[i]`, `.find(..)` followed by manual slicing instead of
+    /// `split_once`). The lint `blaze::manual_slice_idioms`.
+    ManualSliceIdioms = 39,
+    /// Test-code ambient leaks (`Alloc::global()` in tests and `#[cfg(test)] extern crate std;`)
+    /// that trip Blaze's `alloc_global_tests` and `std-alloc-tests` ratchets.
+    /// The lint `blaze::test_ambient_leak`.
+    TestAmbientLeak = 40,
+    /// `let mut x = ..;` where `x` is never rebound (`x = ..`) and only borrowed uniquely
+    /// (`&uniq x` / `&mut x`); under Blaze's edition `let x` permits `&uniq x` directly and
+    /// `mut` is reserved for local rebinding. The lint `blaze::mut_for_uniq_borrow`.
+    MutForUniqBorrow = 41,
+    /// Borrowed `&Io` / `&mut Io` / `&bstd::io::Io` capability bundle outside `blaze-std` and
+    /// tests: functions and structs should take only the narrow capabilities they actually use
+    /// (`&Out`, `&Fs`, `&Clock`, `&Host`, `&Args`, `CxSpawn`, ...).
+    /// The lint `blaze::io_ref`.
+    IoRef = 42,
+    /// Unused private `use` bindings or redundant braces (`use a::{X, Y};` -> `use a::Y;`,
+    /// `use a::{X};` -> `use a::X;`), with a mechanical fix minimizing imports.
+    /// The lint `blaze::unused_import`.
+    UnusedImport = 43,
+    /// Unnecessary `mut` on a `let mut x = ...;` binding or `fn` parameter that is never mutated,
+    /// with a mechanical fix removing `mut `.
+    /// The lint `blaze::unused_mut`.
+    UnusedMut = 44,
+    /// Calling `.leak()` / `Box::leak` / `Vec::leak` outside process-root initialization: bump
+    /// arenas should use `.into_bump_slice()` / `.into_bump_str()` / `frame.alloc_str()` (backed
+    /// by `BumpAlloc`), and intentional `'static` allocations should use `ProgramArena` or `const`.
+    /// The lint `blaze::heap_leak`.
+    HeapLeak = 45,
+    /// Three or more adjacent `Vec`/`AVec`/`StdVec` local declarations or struct fields where a
+    /// single-allocation `blaze_own::Soa` / `blaze_own::soa!` shares one length, capacity, and
+    /// backing block. The lint `blaze::parallel_vecs`.
+    ParallelVecs = 46,
+    /// Violation of an opt-in `#[blaze::cost(...)]` complexity contract (time, space, or sync):
+    /// a TYPED rule, decided by the body check (blaze-typeck rules/cost.rs), never by this
+    /// crate's token pass ([`Rule::typed`]). Error at every step ([`Step::levels`]) because the
+    /// user explicitly opted in with `#[blaze::cost(..)]`. The lint `blaze::cost_contract`.
+    CostContract = 47,
+    /// A `#[blaze::capability]` type stored (directly or transitively) as a field inside a type
+    /// defined in a `#![blaze::sans_io]` crate or module: a TYPED rule, decided by
+    /// `blaze-typeck` (`rules/capability.rs`), never by this crate's token pass
+    /// ([`Rule::typed`]). Error at every step ([`Step::levels`]). The lint
+    /// `blaze::capability_in_sans_io`.
+    CapabilityInSansIo = 48,
 }
 
 impl Rule {
@@ -299,6 +358,19 @@ impl Rule {
         Rule::ProcMacroDef,
         Rule::DoubleIndirectionArc,
         Rule::RawSandboxExec,
+        Rule::MutRef,
+        Rule::MagicSliceLen,
+        Rule::BoolAsInt,
+        Rule::ManualSliceIdioms,
+        Rule::TestAmbientLeak,
+        Rule::MutForUniqBorrow,
+        Rule::IoRef,
+        Rule::UnusedImport,
+        Rule::UnusedMut,
+        Rule::HeapLeak,
+        Rule::ParallelVecs,
+        Rule::CostContract,
+        Rule::CapabilityInSansIo,
     ];
 
     /// The ten rules ported from blaze's scripts: what [`Step::Strict`] runs. The rules after
@@ -358,6 +430,19 @@ impl Rule {
             Rule::ProcMacroDef => "proc-macro-def",
             Rule::DoubleIndirectionArc => "double-indirection-arc",
             Rule::RawSandboxExec => "raw-sandbox-exec",
+            Rule::MutRef => "mut-ref",
+            Rule::MagicSliceLen => "magic-slice-len",
+            Rule::BoolAsInt => "bool-as-int",
+            Rule::ManualSliceIdioms => "manual-slice-idioms",
+            Rule::TestAmbientLeak => "test-ambient-leak",
+            Rule::MutForUniqBorrow => "mut-for-uniq-borrow",
+            Rule::IoRef => "io-ref",
+            Rule::UnusedImport => "unused-import",
+            Rule::UnusedMut => "unused-mut",
+            Rule::HeapLeak => "heap-leak",
+            Rule::ParallelVecs => "parallel-vecs",
+            Rule::CostContract => "cost-contract",
+            Rule::CapabilityInSansIo => "capability-in-sans-io",
         }
     }
 
@@ -389,6 +474,19 @@ impl Rule {
             Rule::ProcMacroDef => Some("proc_macro_derive"),
             Rule::DoubleIndirectionArc => Some("double_indirection_arc"),
             Rule::RawSandboxExec => Some("raw_sandbox_exec"),
+            Rule::MutRef => Some("mut_ref"),
+            Rule::MagicSliceLen => Some("magic_slice_len"),
+            Rule::BoolAsInt => Some("bool_as_int"),
+            Rule::ManualSliceIdioms => Some("manual_slice_idioms"),
+            Rule::TestAmbientLeak => Some("test_ambient_leak"),
+            Rule::MutForUniqBorrow => Some("mut_for_uniq_borrow"),
+            Rule::IoRef => Some("io_ref"),
+            Rule::UnusedImport => Some("unused_import"),
+            Rule::UnusedMut => Some("unused_mut"),
+            Rule::HeapLeak => Some("heap_leak"),
+            Rule::ParallelVecs => Some("parallel_vecs"),
+            Rule::CostContract => Some("cost_contract"),
+            Rule::CapabilityInSansIo => Some("capability_in_sans_io"),
             _ => None,
         }
     }
@@ -403,7 +501,7 @@ impl Rule {
     /// A typed rule is in no [`RuleSet`] a step makes, so a token record's key never moves with
     /// it; the step turns it on through its level alone ([`Step::levels`]).
     pub const fn typed(self) -> bool {
-        matches!(self, Rule::ArgsInline | Rule::UnsafeOpInUnsafeFn)
+        matches!(self, Rule::ArgsInline | Rule::UnsafeOpInUnsafeFn | Rule::CostContract | Rule::CapabilityInSansIo)
     }
 
     /// The rule configuration names `name` ([`Rule::name`]'s spelling), if any.
@@ -433,7 +531,7 @@ impl Rule {
     pub const fn exempt(self) -> TestBits {
         match self {
             Rule::Allocs => TestBits::CFG,
-            Rule::UnsafeComment | Rule::VariantCount => TestBits::NONE,
+            Rule::UnsafeComment | Rule::VariantCount | Rule::MutRef | Rule::TestAmbientLeak | Rule::MutForUniqBorrow | Rule::UnusedImport | Rule::UnusedMut => TestBits::NONE,
             _ => TestBits::ANY,
         }
     }
@@ -599,6 +697,53 @@ pub enum Template {
     DoubleIndirectionArc = 300,
     /// Literal `"sandbox-exec"` or `"/usr/bin/sandbox-exec"` outside `bstd::procs::hermetic`.
     RawSandboxExec = 310,
+    /// Deprecated `&mut` (or `&'a mut`) unique reference; fixed mechanically to `&uniq` (`&'a uniq`).
+    MutRef = 320,
+    /// Deprecated `ref mut` binding mode; fixed mechanically to `ref uniq`.
+    RefMut = 321,
+    /// Hardcoded slice range compared to a prefix (`bytes.get(0..3) == Some(rhs)`,
+    /// `bytes.get(at..at + 2) == Some(rhs)`, `&s[..7] == rhs`); argument: `rhs` span.
+    /// Fixed mechanically to `.starts_with(..)` when the range starts at 0 and uses `== Some(..)`.
+    MagicSlicePrefix = 330,
+    /// Hardcoded slice range whose literal length does NOT match the compared literal prefix (bug!);
+    /// argument: `rhs` span.
+    MagicSlicePrefixMismatch = 331,
+    /// `x.starts_with(lit)` followed immediately by a hardcoded advance (`+= N`, `= N`, or `[N..]`);
+    /// argument: `lit` span.
+    MagicSliceAdvance = 332,
+    /// Hardcoded byte-width slice `.get(0..N)` / `.get(at..at + N)` feeding `.try_into()` or a
+    /// fixed-width integer decode (`2`, `4`, `8`, `16` bytes).
+    MagicSliceBytes = 333,
+    /// Standalone hardcoded magic slice range `.get(0..N)` / `.get(..N)` / `.get(at..at + N)`
+    /// where `N` is a bare integer literal instead of a derived length or named `const`.
+    MagicSliceRange = 334,
+    /// Boolean-to-integer `as` cast (`(a == b) as u32`, `x.is_some() as usize`); argument: target
+    /// integer type span. Fixed mechanically to `T::from(..)`.
+    BoolAsInt = 340,
+    /// `x.len() == 0` / `x.len() > 0` / `x.len() != 0` / `x.len() >= 1`; fixed mechanically to
+    /// `x.is_empty()` / `!x.is_empty()`.
+    LenZeroCheck = 350,
+    /// `for i in 0..xs.len()` indexing `xs[i]` in its body; argument: indexed slice span.
+    IndexLoop = 351,
+    /// `.find(pat)` followed by manual slice splitting `[..pos]` / `[pos + 1..]`; argument: `pat`.
+    ManualFindSplit = 352,
+    /// `Alloc::global()` inside test code (trips `alloc_global_tests`).
+    TestGlobalAlloc = 360,
+    /// `#[cfg(test)] extern crate std;` (trips `std-alloc-tests`).
+    TestExternStd = 361,
+    /// `let mut x = ..;` when `x` is never rebound and only uniquely borrowed (`&uniq x`/`&mut x`);
+    /// fixed mechanically by removing `mut`.
+    MutForUniqBorrow = 370,
+    /// Borrowed `&Io` / `&mut Io` / `&bstd::io::Io` capability bundle outside `blaze-std` and tests.
+    IoRef = 380,
+    /// Unused private `use` binding or redundant single-item braced import; argument: name span.
+    UnusedImport = 390,
+    /// Unnecessary `mut` on a `let mut` binding or `fn` parameter; argument: binding name span.
+    UnusedMut = 400,
+    /// `.leak()` / `Box::leak` / `Vec::leak` call outside `Root::leak` and tests.
+    HeapLeak = 410,
+    /// 3+ adjacent `Vec`/`AVec`/`StdVec` local bindings or struct fields; argument: count.
+    ParallelVecs = 420,
 }
 
 impl Template {
@@ -637,6 +782,17 @@ impl Template {
             290 => Rule::ProcMacroDef,
             300 => Rule::DoubleIndirectionArc,
             310 => Rule::RawSandboxExec,
+            320..=321 => Rule::MutRef,
+            330..=334 => Rule::MagicSliceLen,
+            340 => Rule::BoolAsInt,
+            350..=352 => Rule::ManualSliceIdioms,
+            360..=361 => Rule::TestAmbientLeak,
+            370 => Rule::MutForUniqBorrow,
+            380 => Rule::IoRef,
+            390 => Rule::UnusedImport,
+            400 => Rule::UnusedMut,
+            410 => Rule::HeapLeak,
+            420 => Rule::ParallelVecs,
             _ => Rule::VariantCount,
         }
     }
@@ -716,6 +872,25 @@ impl Template {
             Template::ProcMacroDef => "proc-macro-def",
             Template::DoubleIndirectionArc => "double-indirection-arc",
             Template::RawSandboxExec => "raw-sandbox-exec",
+            Template::MutRef => "mut-ref",
+            Template::RefMut => "ref-mut",
+            Template::MagicSlicePrefix => "magic-slice-prefix",
+            Template::MagicSlicePrefixMismatch => "magic-slice-prefix-mismatch",
+            Template::MagicSliceAdvance => "magic-slice-advance",
+            Template::MagicSliceBytes => "magic-slice-bytes",
+            Template::MagicSliceRange => "magic-slice-range",
+            Template::BoolAsInt => "bool-as-int",
+            Template::LenZeroCheck => "len-zero-check",
+            Template::IndexLoop => "index-loop",
+            Template::ManualFindSplit => "manual-find-split",
+            Template::TestGlobalAlloc => "test-global-alloc",
+            Template::TestExternStd => "test-extern-std",
+            Template::MutForUniqBorrow => "mut-for-uniq-borrow",
+            Template::IoRef => "io-ref",
+            Template::UnusedImport => "unused-import",
+            Template::UnusedMut => "unused-mut",
+            Template::HeapLeak => "heap-leak",
+            Template::ParallelVecs => "parallel-vecs",
         }
     }
 }
@@ -1278,8 +1453,21 @@ impl Step {
     /// toolchain has.
     pub const SUGGEST: [Rule; 4] = [Rule::UnsafeComment, Rule::Untyped, Rule::Recursion, Rule::VariantCount];
     /// The rules of [`Step::Edition`].
-    pub const EDITION: [Rule; 7] =
-        [Rule::UnsafeComment, Rule::Untyped, Rule::Recursion, Rule::VariantCount, Rule::Stops, Rule::Casts, Rule::Clones];
+    pub const EDITION: [Rule; 13] = [
+        Rule::UnsafeComment,
+        Rule::Untyped,
+        Rule::Recursion,
+        Rule::VariantCount,
+        Rule::Stops,
+        Rule::Casts,
+        Rule::Clones,
+        Rule::MutRef,
+        Rule::MagicSliceLen,
+        Rule::BoolAsInt,
+        Rule::ManualSliceIdioms,
+        Rule::TestAmbientLeak,
+        Rule::MutForUniqBorrow,
+    ];
 
     /// The step as configuration writes it (`rust`, `suggest`, `edition`, `strict`).
     pub fn from_name(name: &str) -> Option<Step> {
@@ -1324,6 +1512,8 @@ impl Step {
             Step::Edition => Level::Advice,
             Step::Strict => Level::Error,
         };
+        levels[Rule::CostContract as usize - 1] = Level::Error;
+        levels[Rule::CapabilityInSansIo as usize - 1] = Level::Error;
         Levels(levels)
     }
 }
@@ -1517,6 +1707,89 @@ pub fn lint_own_in<'a>(
 ) -> Result<Linted<'a>, LintError> {
     let mut scratch = Scratch::new_in(alloc);
     lint_own_with(rules, own, scope, at, variants, &mut scratch, out)
+}
+
+/// Runs [`Rule::UnusedImport`] over top-level `use` statements in `full_text` (a whole file),
+/// pushing findings and mechanical fixes into `out`. Separate from [`lint`] because top-level
+/// `use` statements are their own outline items whose references live in sibling items.
+pub fn lint_file_imports<'a>(
+    full_text: &str,
+    scope: Scope,
+    alloc: Alloc<'a>,
+    out: &mut Findings<'a>,
+) -> Result<Run, LintError> {
+    let mut scratch = Scratch::new_in(alloc);
+    let done = engine::run_file_imports(full_text, scope, &mut scratch, out)?;
+    Ok(done.findings)
+}
+
+/// Runs [`Rule::UnusedImport`] over top-level `use` statements in `full_text` and appends those
+/// whose range lies inside `base..end` (a leaf `use` unit with no holes) into `out`, subtracting
+/// `base` so every finding/arg span is unit-relative.
+pub fn unused_imports_for_range<'a>(
+    full_text: &str,
+    scope: Scope,
+    base: u32,
+    end: u32,
+    alloc: Alloc<'a>,
+    out: &mut Findings<'a>,
+    linted: &mut Linted<'a>,
+) -> Result<(), LintError> {
+    let mut scratch = Scratch::new_in(alloc);
+    let mut temp = Findings::new_in(alloc);
+    let done = engine::run_file_imports(full_text, scope, &mut scratch, &mut temp)?;
+    linted.cost.add_all(&done.cost);
+    let map_span = |s: Span| -> Option<Span> {
+        if s.start < base || s.end > end {
+            return None;
+        }
+        Some(Span::new(s.start - base, s.end - base))
+    };
+    for finding in temp.list.iter() {
+        let Some(range) = map_span(finding.range) else { continue };
+        let args_from = count(out.args.len())?;
+        for arg in temp.args_of(finding) {
+            match *arg {
+                Arg::Span(span) => {
+                    if let Some(mapped) = map_span(span) {
+                        out.args.push(Arg::Span(mapped));
+                    }
+                }
+                Arg::Int(v) => out.args.push(Arg::Int(v)),
+                Arg::Text(run) => {
+                    let from = count(out.text.len())?;
+                    out.text.extend_from_slice(temp.text_in(run).as_bytes());
+                    let to = count(out.text.len())?;
+                    out.args.push(Arg::Text(Run { from, to }));
+                }
+            }
+        }
+        let args = Run { from: args_from, to: count(out.args.len())? };
+        let fixes_from = count(out.fixes.len())?;
+        for fix in temp.fixes_of(finding) {
+            let edits_from = count(out.edits.len())?;
+            let mut ok = true;
+            for edit in temp.edits_of(fix) {
+                // Clamp line-delete trailing newline to unit end in unit-local storage;
+                // file-level `--fix` reconstructs the full-file edit directly.
+                let clamped = Span::new(edit.range.start.max(base), edit.range.end.min(end));
+                match map_span(clamped) {
+                    Some(mapped) => out.push_edit(mapped, temp.text_of(edit))?,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                out.fixes.push(Fix { edits: Run { from: edits_from, to: count(out.edits.len())? } });
+            }
+        }
+        let fixes = Run { from: fixes_from, to: count(out.fixes.len())? };
+        out.list.push(Finding { template: finding.template, range, args, fixes });
+    }
+    linted.findings.to = count(out.list.len())?;
+    Ok(())
 }
 
 /// The tokens of a whole text, counted: what the floor of a lint pass over it is (one lex). The

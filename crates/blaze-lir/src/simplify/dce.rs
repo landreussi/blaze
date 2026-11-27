@@ -128,15 +128,15 @@ pub(super) fn each(view: &View<'_>, inst: usize, mut f: impl FnMut(Item)) {
 }
 
 /// `len` copies of `item` in `alloc`.
-pub(super) fn filled<T: Clone, A: Allocator + Clone>(len: usize, item: T, alloc: &A) -> Vec<T, A> {
-    Vec::from_elem_in(item, len, alloc.clone())
+pub(super) fn filled<T: Clone, A: Allocator + Copy>(len: usize, item: T, alloc: &A) -> Vec<T, A> {
+    Vec::from_elem_in(item, len, *alloc)
 }
 
 /// Per block, whether an edge path from the entry reaches it; a terminator with a `jump`
 /// choice (`jump[inst] != NONE`) has only that target as an edge. A work list.
-pub(super) fn reachable<A: Allocator + Clone>(view: &View<'_>, jump: &[u32], alloc: &A) -> Vec<bool, A> {
+pub(super) fn reachable<A: Allocator + Copy>(view: &View<'_>, jump: &[u32], alloc: &A) -> Vec<bool, A> {
     let mut seen = filled(view.blocks(), false, alloc);
-    let mut work: Vec<u32, A> = Vec::with_capacity_in(view.blocks(), alloc.clone());
+    let mut work: Vec<u32, A> = Vec::with_capacity_in(view.blocks(), *alloc);
     seen[0] = true;
     work.push(0);
     while let Some(b) = work.pop() {
@@ -171,7 +171,7 @@ impl<A: Allocator> Incoming<A> {
     }
 }
 
-pub(super) fn incoming<A: Allocator + Clone>(
+pub(super) fn incoming<A: Allocator + Copy>(
     view: &View<'_>,
     reached: &[bool],
     jump: &[u32],
@@ -216,7 +216,7 @@ pub(super) fn incoming<A: Allocator + Clone>(
 }
 
 /// Per instruction, its block.
-pub(super) fn owners<A: Allocator + Clone>(view: &View<'_>, alloc: &A) -> Vec<u32, A> {
+pub(super) fn owners<A: Allocator + Copy>(view: &View<'_>, alloc: &A) -> Vec<u32, A> {
     let mut owner = filled(view.len(), NONE, alloc);
     for b in 0..view.blocks() {
         for inst in view.block(Block(b as u32)) {
@@ -265,16 +265,19 @@ pub(super) struct Edit<A: Allocator> {
     /// Per block: [`NONE`], or the sole-predecessor block `B` coalesced into this block across
     /// its `jump` terminator (dropping this block's `jump` and `B`'s parameters).
     pub(super) merge_next: Vec<u32, A>,
+    /// Per instruction: `Some([a, b, c])` when an `fadd(fmul(a, b), c)` with `Flags::CONTRACT`
+    /// is fused into a single hardware `Op::Fma(a, b, c)`.
+    pub(super) fma_fuse: Vec<Option<[u32; 3]>, A>,
 }
 
 /// The function `view` with `edit` made, in `alloc`, verified.
-pub(super) fn rebuild<A: Allocator + Clone>(view: View<'_>, edit: &Edit<A>, alloc: A) -> Result<Func<A>, SimplifyError> {
+pub(super) fn rebuild<A: Allocator + Copy>(view: View<'_>, edit: &Edit<A>, alloc: A) -> Result<Func<A>, SimplifyError> {
     if !edit.block_kept[0] {
         return Err(SimplifyError::Refused { inst: 0, what: "a rewrite without the entry block" });
     }
     let blocks = view.blocks();
     let len = view.len();
-    let mut func = view.to_func_in(alloc.clone());
+    let mut func = view.to_func_in(alloc);
     func.ops.clear();
     func.flags.clear();
     func.tys.clear();
@@ -313,13 +316,13 @@ pub(super) fn rebuild<A: Allocator + Clone>(view: View<'_>, edit: &Edit<A>, allo
             }
         }
         let func = out.func;
-        verify(func.view()).map_err(SimplifyError::Verify)?;
+        crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
         return Ok(func);
     }
 
     // Coalescing path: merge `A -> Jump(B, args)` chains into single blocks.
     let mut merged_into_pred = filled(blocks, false, &alloc);
-    let mut resolved_stands = Vec::with_capacity_in(len, alloc.clone());
+    let mut resolved_stands = Vec::with_capacity_in(len, alloc);
     resolved_stands.extend_from_slice(&edit.stands);
 
     for a in 0..blocks {
@@ -415,12 +418,12 @@ pub(super) fn rebuild<A: Allocator + Clone>(view: View<'_>, edit: &Edit<A>, allo
         }
     }
     let func = out.func;
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(func)
 }
 
 /// The output being made by [`rebuild`].
-struct Out<'v, 'e, A: Allocator + Clone> {
+struct Out<'v, 'e, A: Allocator + Copy> {
     view: View<'v>,
     edit: &'e Edit<A>,
     stands: &'e [u32],
@@ -429,7 +432,7 @@ struct Out<'v, 'e, A: Allocator + Clone> {
     func: Func<A>,
 }
 
-impl<A: Allocator + Clone> Out<'_, '_, A> {
+impl<A: Allocator + Copy> Out<'_, '_, A> {
     fn raw(&mut self, op: Op, flags: u8, ty: u16, data: u32, attrs: u32, loc: u32) {
         self.func.ops.push(op as u8);
         self.func.flags.push(flags);
@@ -563,9 +566,25 @@ impl<A: Allocator + Clone> Out<'_, '_, A> {
         Ok(())
     }
 
-    /// An integer constant `value` of scalar type `ty`, as [`crate::Builder::iconst`] encodes
-    /// one: in `data` when it fits `Op::Iconst`'s rule, else `iconst_wide`.
+    /// A scalar integer or float constant `value` of type `ty`, encoded as [`crate::Builder::iconst`]
+    /// / [`crate::Builder::fconst`] encode one.
     fn constant(&mut self, ty: Ty, value: u128, loc: u32) {
+        if ty.is_float() {
+            let bits = ty.bits(self.view.head.ptr_bits);
+            let le = value.to_le_bytes();
+            let word0 = u32::from_le_bytes([le[0], le[1], le[2], le[3]]);
+            if bits <= 32 {
+                return self.raw(Op::Fconst, 0, ty.0, word0, 0, loc);
+            }
+            let start = u32::try_from(self.func.extra.len()).unwrap_or(u32::MAX);
+            let words = usize::try_from(ty.const_words()).unwrap_or(0);
+            for chunk in le.chunks_exact(4).take(words) {
+                if let [b0, b1, b2, b3] = *chunk {
+                    self.func.extra.push(u32::from_le_bytes([b0, b1, b2, b3]));
+                }
+            }
+            return self.raw(Op::FconstWide, 0, ty.0, start, 0, loc);
+        }
         let bits = ty.bits(self.view.head.ptr_bits);
         if bits <= 32 {
             return self.raw(Op::Iconst, 0, ty.0, value as u32, 0, loc);
@@ -589,6 +608,19 @@ impl<A: Allocator + Clone> Out<'_, '_, A> {
         let (flags, ty, attrs, loc) = (view.flags[inst], view.tys[inst], view.attrs[inst], view.locs[inst]);
         if let Some(value) = self.edit.constant[inst] {
             self.constant(Ty(ty), value, loc);
+            return Ok(());
+        }
+        if let Some(&Some([a, b, c])) = self.edit.fma_fuse.get(inst) {
+            let va = self.value(inst, a)?;
+            let vb = self.value(inst, b)?;
+            let vc = self.value(inst, c)?;
+            let start = u32::try_from(self.func.extra.len()).unwrap_or(u32::MAX);
+            self.func.extra.push(va);
+            self.func.extra.push(vb);
+            self.func.extra.push(vc);
+            // `Flags::CONTRACT` has been consumed by emitting `Op::Fma`; dropping a promise refines the IR.
+            let fma_flags = Flags(flags).without(Flags::CONTRACT).bits();
+            self.raw(Op::Fma, fma_flags, ty, start, 0, loc);
             return Ok(());
         }
         let target_ref = self.edit.devirt[inst];
@@ -729,6 +761,70 @@ fn removable(op: Op) -> bool {
     )
 }
 
+/// Extracts `(value, width)` when `rhs_inst` is a scalar integer `Iconst` or `IconstWide`,
+/// with `value` masked to `width` bits via [`iconst_value`] / [`wide_value`].
+fn const_rhs_int(view: &View<'_>, rhs_inst: u32) -> Option<(u128, u32)> {
+    let at = usize::try_from(rhs_inst).ok()?;
+    let ty = view.tys.get(at).copied().map(Ty)?;
+    if !ty.is_scalar() || !ty.is_int() || view.flags.get(at).copied()? != 0 {
+        return None;
+    }
+    let width = ty.bits(view.head.ptr_bits);
+    if width == 0 {
+        return None;
+    }
+    match view.ops.get(at).copied().and_then(Op::from_byte)? {
+        Op::Iconst => {
+            let word = view.data.get(at).copied()?;
+            Some((iconst_value(word, width), width))
+        }
+        Op::IconstWide => {
+            let start = view.data.get(at).copied().and_then(|d| usize::try_from(d).ok())?;
+            let words = usize::try_from(ty.const_words()).ok()?;
+            let end = start.checked_add(words)?;
+            let slice = view.extra.get(start..end)?;
+            Some((wide_value(slice, width), width))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `inst` is a scalar integer division or remainder whose compile-time constant divisor
+/// cannot trap:
+/// - `Op::Udiv | Op::Urem`: `rhs != 0` (masked to type width)
+/// - `Op::Sdiv | Op::Srem`: signed `rhs != 0 && rhs != -1` (neither div-by-zero nor `INT_MIN / -1`)
+fn is_trap_free_div_rem(view: &View<'_>, inst: usize) -> bool {
+    let Some(op) = view.ops.get(inst).copied().and_then(Op::from_byte) else {
+        return false;
+    };
+    if !matches!(op, Op::Udiv | Op::Urem | Op::Sdiv | Op::Srem) {
+        return false;
+    }
+    let Some(ty) = view.tys.get(inst).copied().map(Ty) else {
+        return false;
+    };
+    if !ty.is_scalar() || !ty.is_int() {
+        return false;
+    }
+    let Some(at) = view.data.get(inst).copied().and_then(|d| usize::try_from(d).ok()) else {
+        return false;
+    };
+    let Some(rhs_inst) = at.checked_add(1).and_then(|i| view.extra.get(i).copied()) else {
+        return false;
+    };
+    let Some((rhs, width)) = const_rhs_int(view, rhs_inst) else {
+        return false;
+    };
+    match op {
+        Op::Udiv | Op::Urem => rhs != 0,
+        Op::Sdiv | Op::Srem => {
+            let signed = sext(rhs, width);
+            signed != 0 && signed != -1
+        }
+        _ => false,
+    }
+}
+
 /// The target a trivial terminator becomes a `jump` to, [`NONE`] if it is not trivial: a
 /// `br` on a constant, a `br` whose two targets are the same block with the same arguments,
 /// a `switch` on a constant (its matching case, else its default).
@@ -765,7 +861,7 @@ fn trivial(view: &View<'_>, inst: usize) -> u32 {
 
 /// The function `view` without its dead code and trivial branches, in `alloc`, verified:
 /// the module's [`dead`] pass.
-pub fn dead<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
+pub fn dead<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
     if view.blocks() == 0 {
         return Err(SimplifyError::Refused { inst: 0, what: "a function with no blocks" });
     }
@@ -785,7 +881,7 @@ pub fn dead<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, S
     let owner = owners(&view, &alloc);
     let mut live = filled(len, false, &alloc);
     let mut live_count = 0usize;
-    let mut work: Vec<u32, A> = Vec::with_capacity_in(len, alloc.clone());
+    let mut work: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
     let mark = |live: &mut Vec<bool, A>, work: &mut Vec<u32, A>, live_count: &mut usize, value: u32| {
         if !live[value as usize] {
             live[value as usize] = true;
@@ -799,7 +895,7 @@ pub fn dead<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, S
         for inst in view.block(block) {
             let root = match view.op(inst) {
                 Op::Param => !into.targets_only[b],
-                op => !removable(op),
+                op => !removable(op) && !is_trap_free_div_rem(&view, inst),
             };
             if root {
                 mark(&mut live, &mut work, &mut live_count, inst as u32);
@@ -852,10 +948,10 @@ pub fn dead<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, S
         }
     }
     if !any_jump && !any_merge && live_count == len && reached.iter().all(|&r| r) {
-        verify(view).map_err(SimplifyError::Verify)?;
+        crate::verify::verify_in(view, alloc).map_err(SimplifyError::Verify)?;
         return Ok(view.to_func_in(alloc));
     }
-    let mut stands = Vec::with_capacity_in(len, alloc.clone());
+    let mut stands = Vec::with_capacity_in(len, alloc);
     for value in 0..len as u32 {
         stands.push(value);
     }
@@ -867,13 +963,14 @@ pub fn dead<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, S
         jump,
         devirt: filled(len, NONE, &alloc),
         merge_next,
+        fma_fuse: filled(len, None, &alloc),
     };
     rebuild(view, &edit, alloc)
 }
 
 /// Coalesces single-predecessor `jump` chains (`A -> Jump(B, args)` when `B` has `A` as its
 /// sole reached predecessor) without altering any live computation, in `alloc`, verified.
-pub fn coalesce_cfg<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
+pub fn coalesce_cfg<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
     if view.blocks() == 0 {
         return Err(SimplifyError::Refused { inst: 0, what: "a function with no blocks" });
     }
@@ -906,21 +1003,161 @@ pub fn coalesce_cfg<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Fu
         }
     }
     if !any_merge && reached.iter().all(|&r| r) {
-        verify(view).map_err(SimplifyError::Verify)?;
+        crate::verify::verify_in(view, alloc).map_err(SimplifyError::Verify)?;
         return Ok(view.to_func_in(alloc));
     }
-    let mut stands = Vec::with_capacity_in(len, alloc.clone());
+    let mut stands = Vec::with_capacity_in(len, alloc);
     for value in 0..len as u32 {
         stands.push(value);
     }
+    let mut inst_kept = filled(len, false, &alloc);
+    for b in 0..blocks {
+        if reached.get(b).copied().unwrap_or(false)
+            && let Ok(b_u32) = u32::try_from(b)
+        {
+            for inst in view.block(Block(b_u32)) {
+                if let Some(slot) = inst_kept.get_mut(inst) {
+                    *slot = true;
+                }
+            }
+        }
+    }
     let edit = Edit {
         block_kept: reached,
-        inst_kept: filled(len, true, &alloc),
+        inst_kept,
         stands,
         constant: filled(len, None, &alloc),
         jump: no_jumps,
         devirt: filled(len, NONE, &alloc),
         merge_next,
+        fma_fuse: filled(len, None, &alloc),
     };
     rebuild(view, &edit, alloc)
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_own::testing::TestHeap;
+
+    use super::*;
+    use crate::{
+        builder::{Builder, Full, Param, Variadic},
+        eval::{self, Outcome, Trap, Val},
+        func::{BlockKind, Conv},
+    };
+
+    #[test]
+    fn dead_eliminates_trap_free_const_div_rem_and_preserves_trapping_div_rem() {
+        let alloc = TestHeap;
+
+        // 1. Dead trap-free constant divisors (`Udiv(x, 1)`, wide `Udiv(x, 1<<32)`, `Urem(x, 8)`,
+        //    `Sdiv(x, 1)`, `Sdiv(x, -2)`, `Srem(x, 4)`, including `Flags::EXACT | Flags::NONZERO`)
+        //    must all be eliminated by `dead()`.
+        let mut b = Builder::<TestHeap, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let x = b.param(Ty::I64);
+        let _y = b.param(Ty::I64);
+        let c1 = b.iconst(Ty::I64, 1);
+        let c4 = b.iconst(Ty::I64, 4);
+        let c8 = b.iconst(Ty::I64, 8);
+        let c_neg2 = b.iconst(Ty::I64, u128::from((-2_i64).cast_unsigned()));
+        let c_wide = b.iconst(Ty::I64, 1u128 << 32);
+        let _d1 = b.binary(Op::Udiv, Flags::EXACT | Flags::NONZERO, x, c1);
+        let _d2 = b.binary(Op::Udiv, Flags::NONE, x, c_wide);
+        let _d3 = b.binary(Op::Urem, Flags::NONE, x, c8);
+        let _d4 = b.binary(Op::Sdiv, Flags::NONE, x, c1);
+        let _d5 = b.binary(Op::Sdiv, Flags::NONE, x, c_neg2);
+        let _d6 = b.binary(Op::Srem, Flags::NONE, x, c4);
+        b.ret(&[x]);
+        let func = b.finish_checked().unwrap();
+
+        let cleaned = dead(func.view(), alloc).unwrap();
+        let v = cleaned.view();
+        for i in 0..v.len() {
+            assert!(
+                !matches!(v.op(i), Op::Udiv | Op::Urem | Op::Sdiv | Op::Srem),
+                "expected all dead trap-free div/rem removed, found {:?} at {i}",
+                v.op(i)
+            );
+        }
+        match eval::run_in(v, &[Val::Int(42), Val::Int(0)], 10_000, alloc).unwrap() {
+            Outcome::Returned(vals) => assert_eq!(vals.as_slice(), &[Val::Int(42)]),
+            other => panic!("expected Returned([42]), got {other:?}"),
+        }
+
+        // 2. Dead trapping or runtime-divisor ops MUST be preserved:
+        //    - `Udiv(x, 0)`, `Urem(x, 0)`, `Sdiv(x, 0)`, `Srem(x, 0)` (div-by-zero)
+        //    - `Sdiv(x, -1)`, `Srem(x, -1)` (signed MIN / -1 overflow hazard)
+        //    - `Udiv(x, y)` (unknown runtime divisor `y`)
+        let check_preserved = |op: Op, rhs_const: Option<u128>, test_x: u64, test_y: u64, expect_trap: Option<Trap>| {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let y = b.param(Ty::I64);
+            let rhs = match rhs_const {
+                Some(c) => b.iconst(Ty::I64, c),
+                None => y,
+            };
+            let _dead_div = b.binary(op, Flags::NONE, x, rhs);
+            b.ret(&[x]);
+            let f = b.finish_checked().unwrap();
+
+            let out = dead(f.view(), alloc).unwrap();
+            let count = (0..out.view().len()).filter(|&i| out.view().op(i) == op).count();
+            assert_eq!(count, 1, "expected potentially-trapping dead {op:?} (rhs={rhs_const:?}) preserved");
+
+            let args = [Val::Int(u128::from(test_x)), Val::Int(u128::from(test_y))];
+            let before = eval::run_in(f.view(), &args, 10_000, alloc).unwrap();
+            let after = eval::run_in(out.view(), &args, 10_000, alloc).unwrap();
+            assert_eq!(before, after);
+            if let Some(trap) = expect_trap {
+                assert_eq!(after, Outcome::<TestHeap>::Trapped(trap));
+            }
+        };
+
+        let neg1_u64 = u128::from(u64::MAX);
+        let smin_u64 = i64::MIN.cast_unsigned();
+        check_preserved(Op::Udiv, Some(0), 10, 1, Some(Trap::DivByZero));
+        check_preserved(Op::Urem, Some(0), 10, 1, Some(Trap::DivByZero));
+        check_preserved(Op::Sdiv, Some(0), 10, 1, Some(Trap::DivByZero));
+        check_preserved(Op::Srem, Some(0), 10, 1, Some(Trap::DivByZero));
+        check_preserved(Op::Sdiv, Some(neg1_u64), smin_u64, 1, Some(Trap::DivOverflow));
+        check_preserved(Op::Srem, Some(neg1_u64), smin_u64, 1, None);
+        check_preserved(Op::Udiv, None, 10, 0, Some(Trap::DivByZero));
+
+        // 3. `i1` edge case: in `i1`, `1` is signed `-1` (`MIN / -1` overflows for `sdiv`),
+        //    so dead `sdiv i1 x, 1` is preserved while dead `udiv i1 x, 1` is removed.
+        let mut bi1 = Builder::<TestHeap, Full>::new_in(64, alloc);
+        let sig_i1 = bi1.sig(Conv::C, Variadic::No, &[Param::of(Ty::I1)], &[Param::of(Ty::I1)]);
+        bi1.set_signature(sig_i1);
+        let e = bi1.create_block(BlockKind::Normal);
+        bi1.begin(e);
+        let x1 = bi1.param(Ty::I1);
+        let one1 = bi1.iconst(Ty::I1, 1);
+        let _u1 = bi1.binary(Op::Udiv, Flags::NONE, x1, one1);
+        let _s1 = bi1.binary(Op::Sdiv, Flags::NONE, x1, one1);
+        bi1.ret(&[x1]);
+        let fi1 = bi1.finish_checked().unwrap();
+        let out_i1 = dead(fi1.view(), alloc).unwrap();
+        let udiv_cnt = (0..out_i1.view().len()).filter(|&i| out_i1.view().op(i) == Op::Udiv).count();
+        let sdiv_cnt = (0..out_i1.view().len()).filter(|&i| out_i1.view().op(i) == Op::Sdiv).count();
+        assert_eq!(udiv_cnt, 0, "expected dead `udiv i1 x, 1` removed");
+        assert_eq!(sdiv_cnt, 1, "expected dead `sdiv i1 x, 1` (signed -1) preserved");
+    }
 }

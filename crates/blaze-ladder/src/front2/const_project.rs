@@ -139,7 +139,7 @@ impl<'w> ProjectAsk<'w> {
         };
         let Some(module) = keys.library_in(names, trait_) else { return refuse(ProjectionWhy::NoLibraryTrait) };
         let spell = Spelling::fixed();
-        let alloc = store.tys.alloc();
+        let alloc = store.work_alloc();
         let blocks = BlockTraits::module(alloc);
         let self_ = SelfTy::None;
         let world = BodyWorld {
@@ -164,9 +164,25 @@ impl<'w> ProjectAsk<'w> {
             // every opaque reached is its hidden type.
             reveal: super::opaque_auto::Reveal::All,
         };
+        let used_before = store.provisional_used.borrow().len();
         let out = tc::normalize_projection(&world, trait_, name, args, ground, alloc);
+        let pending_hit = {
+            let mut used = store.provisional_used.borrow_mut();
+            let hit = used.get(used_before..).is_some_and(|slice| {
+                slice.iter().any(|&ck| {
+                    store.provisional_impls.get(&ck).is_some_and(|p| {
+                        p.head.trait_ == Some(trait_) && p.pending_assoc.iter().any(|&n| n == name)
+                    })
+                })
+            });
+            used.truncate(used_before);
+            hit
+        };
         let fills = world.fills.into_inner();
         let gaps = world.gaps.into_inner();
+        if fills.is_empty() && gaps.is_empty() && pending_hit {
+            return refuse(ProjectionWhy::Solver(None));
+        }
         // Taken only when the world noted nothing to make or answer AND the answer is ground: while
         // a question is unanswered the solver leaves the goal pending and the term exports as
         // the projection itself, which `normalize_ground` would ask again until its round bound.

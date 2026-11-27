@@ -159,8 +159,8 @@ fn keep<'a>(names: &Names<'_>, frame: &'a Frame, alloc: blaze_own::Alloc<'a>) ->
         let file = &c.files[0];
         KeptCrate {
             key: c.key,
-            names: aligned(&names_record::encode(c, alloc).expect("names record"), alloc),
-            items: aligned(&items_record::encode_with(c, names, alloc).expect("items record"), alloc),
+            names: aligned(&names_record::encode(c, alloc).expect("names record"), blaze_own::testing::bump()),
+            items: aligned(&items_record::encode_with(c, names, alloc).expect("items record"), blaze_own::testing::bump()),
             path: frame.alloc_str(file.package.as_str()),
             text: frame.alloc_str(file.text),
             expansions: c.expansions.iter().filter_map(|(call, e)| {
@@ -238,7 +238,7 @@ fn with_programs<R: Send + 'static>(text: &'static str, inspect: impl for<'n> Fn
         let user = texts.user();
         let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("fixture inputs: {e}"));
         let crates = inputs.crates();
-        let names = inputs.resolve(&crates, a).unwrap_or_else(|e| panic!("fixture names: {e}"));
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("fixture names: {e}"));
         let whole = Front2Program::new(&names, frame, &files, a).unwrap_or_else(|e| panic!("whole program: {e}"));
         let entry = whole.function(whole.entry().expect("the fixture exports main")).key;
 
@@ -351,6 +351,20 @@ impl<'a> Make<'a> for Kept<'_> {
             if want.of == blaze_drive::key::crate_scope_name(&c.key) && want.cell.0 == items.key() {
                 return Ok(blaze_scope::names_cells::whole_digest(Section::Items, c.items));
             }
+            let syms = NameCell::InternalSymbols { krate: c.key.prefix() };
+            if want.of == blaze_drive::key::crate_scope_name(&c.key) && want.cell.0 == syms.key() {
+                let record = blaze_scope::names_record::NamesRecord::open(blaze_scope::names_record::Verified::check(c.names).expect("names record"));
+                let text = c.text;
+                let items_rec = blaze_scope::items_record::ItemsRecord::open_with_files(c.items, blaze_own::testing::heap().alloc(), move |index, _, _, edition| {
+                    if index != 0 { return Ok(None); }
+                    blaze_scope::items_record::CurrentFile::from_text(index, text, edition, blaze_own::testing::bump()).map(Some)
+                }).expect("items record");
+                let read = |of: blaze_scope::items_record::TextOf<'_>| match of {
+                    blaze_scope::items_record::TextOf::File { index: 0, .. } => Some(text),
+                    _ => None,
+                };
+                return Ok(blaze_scope::names_cells::seen_by_record(&record, Some((&items_rec, &read)), &[], syms).expect("internal symbols cell").unwrap_or(ABSENT));
+            }
         }
         Ok(ContentId::of("internal binding fixture cell", &want.cell.0))
     }
@@ -387,7 +401,7 @@ fn compare_binding(provider: &'static str, plant: bool) {
         ];
         let solve = |provider| {
             let roots = [(app.root, CALLER), (crates[1].root, provider)];
-            resolve_crates(&crates, Sysroot::default(), &FixtureFiles(&roots), &Serial, a).expect("fixture names")
+            resolve_crates(&crates, Sysroot::default(), &FixtureFiles(&roots), &Serial, blaze_own::testing::bump()).expect("fixture names")
         };
         let names = solve(provider);
         let lib = |krate, name| names.items(krate).map(|(k, _, _)| k).find(|&k| names.name_of(k) == Some(name)).expect("named fixture item");
@@ -418,18 +432,17 @@ fn compare_binding(provider: &'static str, plant: bool) {
             name: Name::new(Kind::BodyCheck, main.0), phase: Phase::new(Stage::Bodies, 0),
             source: ABSENT, file: Name::new(Kind::FileItems, ABSENT),
         };
-        let body = BodyFrame {
-            frame, alloc: a, plant_drop: None, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All,
-            heads: None, sources: None, goals: None, census: None,
-        };
+        let body = BodyFrame { frame, alloc: a, plant_drop: None, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All,
+        heads: None, sources: None, goals: None, prepared: None, front: None };
         let filed = check_body(view, &Task { planned, key: Key(ABSENT) }, &body, kept, blaze_own::testing::heap().shared())
             .expect("the caller's BodyCheck read list");
         let reads = recorder.finish().expect("binding reads");
         for c in crates {
+            let syms = TableRead::Names(NameCell::InternalSymbols { krate: c.key.prefix() });
             let items = TableRead::Names(NameCell::Whole { krate: c.key.prefix(), section: Section::Items });
-            assert!(lazy.internal_binding_reads(entry).contains(&items), "lazy main must record its lookup in {}", c.name);
+            assert!(lazy.internal_binding_reads(entry).contains(&syms), "lazy main must record its internal-symbol lookup in {}", c.name);
             assert!(reads.contains(&items), "lookup read {}'s items", c.name);
-            assert!(filed.reads.contains(&items), "the caller must retain the lookup's read of {}'s items", c.name);
+            assert!(filed.reads.contains(&syms), "the caller must retain the lookup's read of {}'s internal symbols", c.name);
         }
         assert!(records.errors().is_empty(), "record reads: {:?}", records.errors());
         if provider == DECOY {
@@ -453,12 +466,26 @@ fn compare_binding(provider: &'static str, plant: bool) {
         assert_eq!(l, (checker_of(target.expect("record definition")), List::EMPTY));
         if plant {
             assert_ne!(w, l, "the comparison must catch the other module's definition");
-            let original = items_record::encode_with(names.krate(1), &names, a).expect("original provider items");
-            let before = blaze_scope::names_cells::whole_digest(Section::Items, &original);
-            let after = blaze_scope::names_cells::whole_digest(Section::Items, kept.0[1].items);
-            assert_ne!(before, after, "moving the definition must change the recorded input");
-            let cell = NameCell::Whole { krate: crates[1].key.prefix(), section: Section::Items };
-            let id = CellId { of: blaze_drive::key::crate_scope_name(&crates[1].key), cell: blaze_drive::cells::Cell(cell.key()) };
+            let syms = NameCell::InternalSymbols { krate: crates[1].key.prefix() };
+            let bump = blaze_own::testing::bump();
+            let orig_names = blaze_scope::resolve::aligned(&blaze_scope::names_record::encode(names.krate(1), a).expect("original provider names"), bump);
+            let orig_items = blaze_scope::resolve::aligned(&items_record::encode_with(names.krate(1), &names, a).expect("original provider items"), bump);
+            let digest_of = |n_bytes: &[u8], i_bytes: &[u8], text: &'static str| {
+                let record = blaze_scope::names_record::NamesRecord::open(blaze_scope::names_record::Verified::check(n_bytes).expect("names record"));
+                let items_rec = blaze_scope::items_record::ItemsRecord::open_with_files(i_bytes, blaze_own::testing::heap().alloc(), move |index, _, _, edition| {
+                    if index != 0 { return Ok(None); }
+                    blaze_scope::items_record::CurrentFile::from_text(index, text, edition, blaze_own::testing::bump()).map(Some)
+                }).expect("items record");
+                let read = |of: blaze_scope::items_record::TextOf<'_>| match of {
+                    blaze_scope::items_record::TextOf::File { index: 0, .. } => Some(text),
+                    _ => None,
+                };
+                blaze_scope::names_cells::seen_by_record(&record, Some((&items_rec, &read)), &[], syms).expect("internal symbols").unwrap_or(ABSENT)
+            };
+            let before = digest_of(&orig_names, &orig_items, provider);
+            let after = digest_of(kept.0[1].names, kept.0[1].items, kept.0[1].text);
+            assert_ne!(before, after, "moving the definition must change the recorded internal-symbol cell");
+            let id = CellId { of: blaze_drive::key::crate_scope_name(&crates[1].key), cell: blaze_drive::cells::Cell(syms.key()) };
             assert!(filed.done.reads.contains(&(id, after)), "the body record must carry the changed provider digest");
         } else {
             assert_eq!(w, l);
@@ -533,7 +560,7 @@ pub extern "C" fn main() -> i32 {
                 runtime("panic_abort", "/panic_abort/src/lib.rs"),
             ];
             let roots = [(app.root, MAIN), (crates[1].root, RUNTIME), (crates[2].root, RUNTIME)];
-            let names = resolve_crates(&crates, Sysroot::default(), &FixtureFiles(&roots), &Serial, a).expect("fixture names");
+            let names = resolve_crates(&crates, Sysroot::default(), &FixtureFiles(&roots), &Serial, blaze_own::testing::bump()).expect("fixture names");
             let key = |krate, name: &str| {
                 let (lib, _, _) = names.items(krate).find(|(lib, _, _)| names.name_of(*lib) == Some(name)).expect("named fixture item");
                 checker_of(lib)

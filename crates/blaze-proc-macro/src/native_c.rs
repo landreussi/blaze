@@ -33,7 +33,6 @@ use core::time::Duration;
 use std::io::Read as _;
 
 use blaze_build_script::c_tasks::{Area, CCompiler, Compile, CompilerKind, Compiled, ERROR_LINES, FactError, FileRef, GuestRoots, Lang, Refused, StoreFailed, Today};
-use blaze_build_script::native::Grant;
 use blaze_build_script::outputs::{FileLimits, Outputs};
 use blaze_core::lock::Lock;
 use blaze_core::wait::Deadline;
@@ -260,7 +259,7 @@ impl Area for FileArea<'_> {
         let file = FileRef { sha256: sha.finish(), len: bytes.len() as u64 };
         let mut at = [0u8; PATH_MOST];
         let at = self.path(&file.sha256, "", &mut at)?;
-        if std::fs::metadata(at).is_ok() {
+        if std::fs::metadata(at).is_ok_and(|meta| meta.is_file() && meta.len() == file.len) {
             return Ok(file);
         }
         // Written beside its name, then renamed: a reader never sees part of it.
@@ -284,6 +283,14 @@ impl Area for FileArea<'_> {
             return Err(StoreFailed);
         }
         Ok(())
+    }
+
+    fn has(&self, file: FileRef) -> bool {
+        let mut at = [0u8; PATH_MOST];
+        let Ok(at) = self.path(&file.sha256, "", &mut at) else {
+            return false;
+        };
+        std::fs::metadata(at).is_ok_and(|meta| meta.is_file() && meta.len() == file.len)
     }
 }
 
@@ -586,11 +593,7 @@ impl CCompiler for ShelfClang<'_> {
         mounts.push(Mount { spelling: self.task_out.as_bytes(), root: output });
         let roots = Roots::new(&roots).map_err(|_| refused(alloc, &["the roots of a C task were refused"]))?;
 
-        // The grant checked as the Seatbelt profile would say it, before anything runs.
-        blaze_build_script::native::seatbelt_with(&Grant { program: self.clang, exec: &[], read: &folders, write: &[self.task_out] }, &[], alloc)
-            .map_err(|_| refused(alloc, &["the Seatbelt grant of a C task could not be said: ", self.clang]))?;
-
-        let files = CFiles { folders: &folders, out: OutDir { root: output, folder: self.task_out }, facts: self.facts };
+        let files = CFiles { folders: &folders, out: OutDir { root: output, folder: self.task_out, package_root: None }, facts: self.facts };
         files.clear_output().map_err(|_| refused(alloc, &["the task folder could not be emptied: ", self.task_out]))?;
         let env = [("SOURCE_DATE_EPOCH", "0")];
         let report = RelPath::new(DEPFILE, blaze_roots::Limits::SHIPPED.most_path).map_err(|_| refused(alloc, &["the depfile's name"]))?;

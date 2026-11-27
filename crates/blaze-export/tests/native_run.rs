@@ -233,9 +233,11 @@ fn cxx_throw_is_caught_inside_the_native_code() {
         entry: Entry::CMain { main: sym("main") },
         panic: Panic::Unwind,
         personality: None,
+        tls: None,
         profile: None,
         natives: Some(&image),
         exports: &[],
+        symbol_names: &[],
     };
     let status = export_and_run(&program, &dir);
     std::fs::remove_dir_all(&dir).unwrap();
@@ -341,9 +343,11 @@ fn run_callback_program(name: &str, without_rows: bool) -> ExitStatus {
         entry: Entry::CMain { main: sym("main") },
         panic: Panic::Unwind,
         personality: Some(sym("personality")),
+        tls: None,
         profile: None,
         natives: Some(&image),
         exports: &exports,
+        symbol_names: &[],
     };
     let status = export_and_run(&program, &dir);
     std::fs::remove_dir_all(&dir).unwrap();

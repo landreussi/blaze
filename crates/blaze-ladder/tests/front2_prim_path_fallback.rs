@@ -56,11 +56,11 @@ fn check_fns(text: &str, fns: &[&str]) -> Vec<(String, String)> {
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
     let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let (mut buckets, mut consts) = (None, Consts::default());
     let mut got = Vec::new();
@@ -99,9 +99,11 @@ fn a(v: Option<&'static str>) -> Option<String> { v.map(str::to_owned) }
 fn d(v: &str) -> String { str::to_ascii_lowercase(v) }
 fn c() { str::nothing() }
 fn b() -> bool { str::from_utf8(b\"x\").is_ok() }
+fn e(s: &str) -> Option<u8> { use std::u8; u8::from_str_radix(s, 16).ok() }
+fn f() { use std::u8; u8::nothing(); }
 fn main() {}
 ";
-    let got = check_fns(TEXT, &["a", "d", "c", "b"]);
+    let got = check_fns(TEXT, &["a", "d", "c", "b", "e", "f"]);
     let lines: Vec<String> = got.iter().map(|(n, o)| format!("prim path: {n}: {o}")).collect();
     for l in &lines {
         println!("{l}");
@@ -111,4 +113,6 @@ fn main() {}
     assert_eq!(outcome("d"), "clean", "{}", lines.join("\n"));
     assert!(outcome("c").contains("E0599") && !outcome("c").contains("E0425"), "{}", lines.join("\n"));
     assert_eq!(outcome("b"), "clean", "{}", lines.join("\n"));
+    assert_eq!(outcome("e"), "clean", "{}", lines.join("\n"));
+    assert!(outcome("f").contains("E0599") && !outcome("f").contains("E0425"), "{}", lines.join("\n"));
 }

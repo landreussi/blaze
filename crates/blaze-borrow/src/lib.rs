@@ -45,12 +45,12 @@ pub mod types;
 #[cfg(test)]
 mod tests;
 
-pub use call::call;
+pub use call::{CallScratch, call, call_in};
 pub use inst::{
-    Arg, Ask, Callee, Clause, ClauseIn, EnvId, Envs, GenericArgs, ImplHead, ImplValue, Inst, Late, NotSelected, Selected,
-    Selection, Side, Sig, Slots, Typed, ValueKind, instantiate, split_fn_col,
+    Arg, Ask, Callee, Clause, ClauseIn, EnvId, Envs, GenericArgs, ImplHead, ImplValue, Inst, Late, NotSelected, RpititTarget, Selected,
+    Selection, SelfShape, Side, Sig, Slots, Typed, ValueKind, instantiate, instantiate_into, split_fn_col, split_fn_col_into,
 };
-pub use relate::{Constraints, Cx, Kind, Owner, clauses, head_eq, relate, relate_sides, well_formed};
+pub use relate::{ClosureSig, Constraints, Cx, Kind, Owner, clauses, head_eq, relate, relate_sides, well_formed};
 pub use sink::FlowConstraints;
 pub use types::{Columns, Kids, Pos, RegionTypes, Slot, SlotCount, SlotRange, Unknown, Variances, Why};
 
@@ -172,6 +172,8 @@ pub enum Head {
     Str,
     Never,
     Tuple,
+    Record,
+    Union,
     Ref,
     Ptr,
     Array,
@@ -199,7 +201,7 @@ pub enum Head {
 }
 
 impl Head {
-    pub const ALL: [Head; 32] = [
+    pub const ALL: [Head; 34] = [
         Head::Bool,
         Head::Char,
         Head::Int,
@@ -208,6 +210,8 @@ impl Head {
         Head::Str,
         Head::Never,
         Head::Tuple,
+        Head::Record,
+        Head::Union,
         Head::Ref,
         Head::Ptr,
         Head::Array,
@@ -249,6 +253,8 @@ impl Head {
             N::Str => Head::Str,
             N::Never => Head::Never,
             N::Tuple(_) => Head::Tuple,
+            N::Record(..) => Head::Record,
+            N::Union(_) => Head::Union,
             N::Ref(..) => Head::Ref,
             N::Ptr(..) => Head::Ptr,
             N::Array(..) => Head::Array,
@@ -285,6 +291,8 @@ impl Head {
             Head::Str => "str",
             Head::Never => "never",
             Head::Tuple => "tuple",
+            Head::Record => "record",
+            Head::Union => "union",
             Head::Ref => "ref",
             Head::Ptr => "ptr",
             Head::Array => "array",

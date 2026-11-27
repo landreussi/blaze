@@ -230,6 +230,9 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
 
     fn cfg_atoms(self, krate: usize) -> Option<&'n [(&'n str, Option<&'n str>)]> {
         self.root(krate);
+        if let Some(prefix) = self.prefix(krate) {
+            self.cell(NameCell::CfgAtoms { krate: prefix });
+        }
         self.records.cfg_atoms(krate)
     }
 
@@ -253,14 +256,22 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.has_feature(krate, name)
     }
 
-    /// WHOLE: the link closure walks every module's scope of every crate it reaches; every
-    /// crate's names and items are recorded whole (the closure does not say which it reached).
-    fn linked<'a>(self, roots: &[usize], alloc: Alloc<'a>) -> Option<Result<super::super::linked::Linked<'a>, super::super::linked::RootsError>> {
-        for krate in 0..self.records.crate_count() {
-            self.whole(krate, Section::Names);
-            self.whole(krate, Section::Items);
+    fn blaze_extensions(self, krate: usize) -> parser::Extensions {
+        if let Some(prefix) = self.prefix(krate) {
+            self.cell(NameCell::Extensions { krate: prefix });
         }
-        self.records.linked(roots, alloc)
+        self.records.blaze_extensions(krate)
+    }
+
+    /// Each crate whose link facts (`proc_macro`, extern prelude, `Origin::ExternCrate` bindings)
+    /// are inspected by the link closure gets one [`NameCell::Links`] read, instead of recording
+    /// every crate's names and items sections whole.
+    fn linked<'a>(self, roots: &[usize], alloc: Alloc<'a>) -> Option<Result<super::super::linked::Linked<'a>, super::super::linked::RootsError>> {
+        self.records.linked_logged(roots, alloc, |krate| {
+            if let Some(prefix) = self.prefix(krate) {
+                self.cell(NameCell::Links { krate: prefix });
+            }
+        })
     }
 
     /// Reads every crate's name: every crate's root cell.
@@ -357,9 +368,12 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.item_start(key)
     }
 
-    /// WHOLE: the items record's file rows have no cell.
+    /// The crate's file paths cell ([`NameCell::Files`]): only the package and shown paths, never
+    /// the items or surfaces.
     fn file_paths(self, krate: usize, file: u32) -> Option<source::FilePaths<'n>> {
-        self.whole(krate, Section::Items);
+        if let Some(prefix) = self.prefix(krate) {
+            self.cell(NameCell::Files { krate: prefix });
+        }
         self.records.file_paths(krate, file)
     }
 
@@ -447,6 +461,16 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.each_member(owner, each)
     }
 
+    fn each_member_matching(
+        self,
+        owner: ItemKey,
+        want: &mut dyn FnMut(ItemKind, Option<&'n str>) -> crate::front2::source::MemberWant,
+        each: &mut dyn FnMut(MemberOf<'n>),
+    ) -> bool {
+        self.cell(NameCell::Members { owner });
+        self.records.each_member_matching(owner, want, each)
+    }
+
     /// The member's `MemberOf` cell on both paths: its digest is the answer (owner and name),
     /// and absent is "no named member of that key".
     fn member_owner(self, member: ItemKey) -> Option<(ItemKey, &'n str)> {
@@ -460,9 +484,11 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.each_impl(krate, each)
     }
 
-    /// WHOLE: every impl row of the crate.
+    /// The crate's impl rows cell ([`NameCell::ImplRows`]).
     fn each_impl_row(self, krate: usize, each: &mut dyn FnMut(blaze_scope::items_record::ImplRow<'n>)) -> bool {
-        self.whole(krate, Section::Items);
+        if let Some(prefix) = self.prefix(krate) {
+            self.cell(NameCell::ImplRows { krate: prefix });
+        }
         self.records.each_impl_row(krate, each)
     }
 
@@ -551,12 +577,12 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
     }
 
     /// WHOLE: the names record's failed-call rows have no cell (read only on an error's path).
-    fn failed_call<'b>(self, call: ItemKey, alloc: Alloc<'b>) -> Option<blaze_scope::names_record::FailedRow<'b>>
+    fn failed_call<'b>(self, call: ItemKey, bump: blaze_own::Bump<'b>) -> Option<blaze_scope::names_record::FailedRow<'b>>
     where
         'n: 'b,
     {
         self.whole_of(call, Section::Names);
-        self.records.failed_call(call, alloc)
+        self.records.failed_call(call, bump)
     }
 
     /// WHOLE: every item of the crate (a whole-crate walk, never one body's).

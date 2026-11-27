@@ -38,9 +38,10 @@ blaze-answer.workspace = true
 blaze-cas.workspace = true
 blaze-keyed.workspace = true
 blaze-hash.workspace = true
-# The checkout's journal helper (journal_ask.rs, journal_helper.rs): its session, its wire and
-# its places (blaze-watch helper.rs, since.rs).
+# The checkout's journal helper (journal_ask.rs, journal_helper.rs): wire, lifecycle core, and places.
 blaze-watch.workspace = true
+# Safe POSIX syscalls (`openat`, `fchmod`, `stat_at`, `kill`).
+blaze-sys.workspace = true
 # The system, reached only through bstd: the files, the output, the host's core count, frames.
 # `requests`: bstd's `Http` alone (blaze-h1 over `Net`), for the shared cache's http origin.
 blaze-std = { workspace = true, features = ["requests"] }
@@ -75,6 +76,11 @@ blaze-meter.workspace = true
 # `blaze run`'s program after its check: the walking skeleton's straight line, lower to call
 # (tests/ladder/README.md).
 blaze-ladder.workspace = true
+# `blaze build` (engine_export.rs): standalone native AArch64 executable writer (Mach-O on macOS,
+# ELF PIE on Linux), pure `#![no_std]` with zero third-party deps.
+blaze-export.workspace = true
+# Declarative CLI schema, argv parser, and help/usage renderer (single source of truth, rule 30).
+blaze-cli-spec = { path = "../blaze-cli-spec" }
 # The run parent (run_parent.rs): the run wire to the launcher's run mode, the records' ISA, and
 # the BLAKE3 a record's file is named by (blaze-launch-rt `run_mode::Folder`).
 blaze-launch.workspace = true
@@ -150,12 +156,15 @@ sandbox = ["blaze-proc-macro/runtime"]
 # set to a folder, and the command's store writes the toolchain's public records `PUBLIC`. Off by
 # default: a developer's blaze refuses `blaze store publish` by name and writes only `LOCAL`.
 publish = ["blaze-remote/sign"]
-# The call census (D190 step 2): `check` checks each body a second time under both call rules
-# and prints the comparison at the end of the bodies' profile lines. A measuring build only:
-# the census's own type check doubles the bodies' time.
-call-census = []
+
+[build-dependencies]
+blaze-ids.workspace = true
+blaze-own = { workspace = true, features = ["std"] }
+blaze-producers.workspace = true
 
 [dev-dependencies]
+# producers.rs: verifies compile-time `CODE_BUILDER_SOURCE` matches live workspace walk.
+blaze-producers.workspace = true
 # `blaze_meter::testing::stop`: the meter's readers off, for the on/off byte-equality test.
 blaze-meter = { workspace = true, features = ["testing"] }
 # The names fixture runs a real worker pool over its simulated filesystem.
@@ -166,10 +175,12 @@ blaze-sim.workspace = true
 blaze-wasi.workspace = true
 # `blaze_own::testing::heap()`: the tests' root allocator capability (D102).
 blaze-own = { workspace = true, features = ["std", "testing"] }
-# fetch_tests.rs: a `.crate` made in the test (a gzip of a tar) and its SHA-256, the lock's pin.
+# fetch_tests.rs: a `.crate` made in the test (a gzip of a tar) and its SHA-256, the lock's pin,
+# and a bare git packfile for cargo's `git/db` adoption (fetch.md piece 14).
 blaze-tar.workspace = true
 blaze-deflate.workspace = true
 blaze-sha256.workspace = true
+blaze-git-fetch.workspace = true
 # The HTTP origin's test publishes a signed origin (`read::publish`, behind `sign`) of segments
 # sealed by blaze-cas.
 blaze-remote = { workspace = true, default-features = false, features = ["sign"] }

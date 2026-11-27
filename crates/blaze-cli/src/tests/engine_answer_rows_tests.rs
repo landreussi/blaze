@@ -36,7 +36,10 @@ pub(super) fn with_store<R>(io: &Io, f: impl for<'m, 'r, 's> FnOnce(&bstd::Cx, &
     let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
     let err = io.need_err().expect("err");
     let phases = Phases::new(io.need_clock().expect("a clock"));
-    let opened = crate::store::open_for_command(&cx, io, opts.place.home, &root, opts.place.checkout, phases.clock(), &err, opts.heap).expect("the store opens");
+    let fs = io.need_fs().expect("files");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    let opened = crate::store::open_for_command(&cx, &fs, &host, &mut rng, opts.place.home, opts.place.max_store_bytes, &root, opts.place.checkout, phases.clock(), &err, opts.heap).expect("the store opens");
     let mut store = crate::store::CommandStore::new(&cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), &err, erased.handle()).expect("the command's store");
     let out = f(&cx, &mut store, &opts, &opened.lent);
     crate::store::Store::after_answer(&mut store, &cx, &mut blaze_drive::profile::Profile::default()).expect("the store commits");
@@ -609,6 +612,7 @@ fn payload_history(tape: &blaze_sim::Tape, omit_carried: bool) -> Result<(), bla
     Ok(())
 }
 
+/// The invariant: every acknowledged row payload and carried payload is pinned and reachable after a cut at any point of a rows-answer write.
 #[test]
 fn every_acknowledged_row_payload_is_reachable_after_a_cut() {
     blaze_sim::check(blaze_sim::Config::cases(32), |tape| payload_history(tape, false));

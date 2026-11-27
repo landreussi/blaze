@@ -47,6 +47,10 @@ pub struct Shown<'f> {
     pub view: View,
     /// `--fix`'s first check: its findings are listed, nothing is printed.
     pub quiet: bool,
+    /// `blaze run`'s check: when the check has zero errors, zero warnings, and zero unchecked
+    /// items, omit the stage-coverage note and closing summary so a clean run prints only its
+    /// program's output.
+    pub(crate) quiet_when_clean: bool,
     /// The caller consumes stdout and status alone. Other callers (including fixes)
     /// receive the placed listing even on a certificate hit.
     pub(crate) output_only: bool,
@@ -80,6 +84,10 @@ pub struct Shown<'f> {
     /// item or a body not checked) drawn one by one, as well as counted under its cause. Off,
     /// they are counted and grouped only, and never placed in their files.
     pub each: bool,
+    /// `--verbose` / `-v`: print verbose diagnostic notes (such as per-file `no unit checks this
+    /// file` plan notes for cfg-excluded modules). Off by default so normal cfg-gated files stay
+    /// quiet while still recorded in the profile.
+    pub verbose: bool,
     /// The items not checked because a task failed (not_checked/waited.rs), as the lines under
     /// the failures counted them, and how many failures' lines counted any: the summary line
     /// counts them beside the items not checked for their own causes (main.rs `close`), so it
@@ -96,6 +104,7 @@ impl<'f> Shown<'f> {
             counts: Counts::default(),
             view,
             quiet: false,
+            quiet_when_clean: false,
             output_only: false,
             replay_fixes: Vec::new_in(frame),
             listed: Vec::new_in(frame),
@@ -108,6 +117,7 @@ impl<'f> Shown<'f> {
             not_run: Vec::new_in(frame),
             lints: blaze_lint::Step::Rust,
             each: false,
+            verbose: false,
             behind: crate::not_checked::Behind::default(),
         }
     }
@@ -139,7 +149,7 @@ impl<'f> Shown<'f> {
             h.part(self.root.as_bytes());
         }
         h.part(self.lints.name().as_bytes())
-            .update(&[self.view as u8, self.each as u8, self.quiet as u8, caps.form as u8,
+            .update(&[self.view as u8, self.each as u8, self.verbose as u8, self.quiet as u8, caps.form as u8,
                 caps.colour as u8, caps.curly as u8, caps.underline_colour as u8,
                 caps.hyperlinks as u8, caps.unicode as u8, caps.background as u8])
             .update(&caps.width.to_le_bytes()).finish()
@@ -180,7 +190,7 @@ pub fn area_of(finding: &Print<'_>) -> Area {
 /// its bytes from that start (the finding's own `start..end`, or its token place's bytes today:
 /// [`Place::Tokens`]), `grammar` the file's outline when it is Rust, `read` the text's digest.
 #[expect(clippy::too_many_arguments, reason = "one finding's facts, each a different one")]
-fn placed_in<'f>(path: &'f str, text: &str, read: blaze_ids::ContentId, grammar: Option<&blaze_file_items::Outline<'_>>, place: u32, range: (u32, u32), message: &'f [u8], finding: &Print<'_>) -> Result<Listed<'f>, CliError> {
+fn placed_in<'f>(path: &'f str, text: &str, read: blaze_ids::ContentId, grammar: Option<&blaze_file_items::Outline<'_>>, place: u32, range: (u32, u32), message: &'f [u8], finding: &Print<'_>, frame: &'f Frame, scratch: &Frame) -> Result<Listed<'f>, CliError> {
     let area = area_of(finding);
     let code = code_of(area, finding.rule);
     let start = place.saturating_add(range.0).min(text.len() as u32);
@@ -192,6 +202,12 @@ fn placed_in<'f>(path: &'f str, text: &str, read: blaze_ids::ContentId, grammar:
             let name = core::str::from_utf8(message).map_err(|_| CliError::Text { what: "a finding's message is not UTF-8" })?;
             Some(Change { start, end, insert: "", reason: HelpKind::ToolchainLine, args: [name, ""], given: 1 })
         }
+        (Area::Cli, crate::unused_deps::UNUSED_DEPENDENCY) => {
+            crate::unused_deps::line_deletion_fix(text, start, end, message).map(|(line_start, line_end, dep_key)| {
+                Change { start: line_start, end: line_end, insert: "", reason: HelpKind::UnusedDependencyLine, args: [dep_key, ""], given: 1 }
+            })
+        }
+        (Area::Cli, rule) => crate::lints::rule_of(rule).and_then(|lint| crate::lints::fix_at(lint, text, start, end, frame, scratch)),
         _ => None,
     };
     Ok(Listed { path: Some(path), about: finding.name, read, area, rule: finding.rule, words: message, item, start, end, id, fix })
@@ -683,7 +699,7 @@ pub(crate) fn place_listed<'f>(cx: &Cx, root: &Dir<ReadWrite>, prints: &[Print<'
                     }
                 };
                 into[i] = match place {
-                    Some((place, range)) => placed_in(path, text, read, grammar.as_ref(), place, range, wanted[i].words, &prints[i])?,
+                    Some((place, range)) => placed_in(path, text, read, grammar.as_ref(), place, range, wanted[i].words, &prints[i], frame, one)?,
                     None => unplaced(wanted[i].words, &prints[i], no_text, one),
                 };
                 held.saw(file, one, (file_at, line_at), text.len());
@@ -821,10 +837,10 @@ fn finding_about<'f>(cx: &Cx, l: &Listed<'f>, text: &[u8], file: Option<&str>, s
     if borrows_unchecked {
         shown.borrows_unchecked += 1;
     }
-    // A borrow note is neither drawn nor counted for a person: untrusted, census 3 found every
-    // finding false; the closing line's "NOT checked: borrows" says the stage did not pass. The
-    // agent's and JSON views list each with its code, range and why.
-    if borrows_note && shown.view == View::Person {
+    // A borrow note is neither drawn nor counted for a person or a clean `blaze run`: untrusted,
+    // census 3 found every finding false; the closing line's "NOT checked: borrows" says the stage
+    // did not pass. The agent's and JSON views of `blaze check` list each with its code, range and why.
+    if borrows_note && (shown.view == View::Person || shown.quiet_when_clean) {
         return Ok(());
     }
     // Every view sees an item or a body not checked as its cause's line (main.rs `draw`), not a
@@ -1164,8 +1180,10 @@ mod tests {
             (Area::Cli, crate::units::UNREAD),
             (Area::Cli, crate::units::TOOLCHAIN_NAMED),
             (Area::Cli, crate::units::TARGET_REFUSED),
+            (Area::Cli, crate::units::STD_NOT_BSTD),
             (Area::Cli, crate::graph::TARGET_SKIPPED),
             (Area::Cli, crate::graph::RUSTFLAGS_NOT_APPLIED),
+            (Area::Cli, crate::unused_deps::UNUSED_DEPENDENCY),
             (Area::Cli, crate::work::MODULE_AT_BOTH),
             (Area::Cli, crate::work::FILE_NOT_TEXT),
             (Area::Cli, crate::names::UNRESOLVED),

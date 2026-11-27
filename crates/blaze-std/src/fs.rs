@@ -96,6 +96,7 @@ use core::{fmt, marker::PhantomData, num::NonZero};
 
 use blaze_core::{DirName, Done, Effect, FileName, Tag};
 use blaze_mem::Frame;
+use blaze_own::Share as _;
 
 use crate::{
     Plant, Stopped,
@@ -126,6 +127,9 @@ pub use read_sized::SizedError;
 
 // A whole file mapped read-only (`Dir::map_read`): a large plain array read in place.
 mod map_read;
+
+// Writing a large record once, in place (`Dir::reserve`): backed by `Effect::MapWrite`.
+mod reserve;
 
 // The boot the files are read in (`Fs::boot`): the files capability's own fact (D104 B1).
 mod boot;
@@ -292,7 +296,7 @@ pub use blaze_core::Kind as EntryKind;
 /// caller that wants one entry's path asks for that one ([`Entries::path`]).
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: a test keeping what it saw
 pub struct Entries {
-    listing: alloc::boxed::Box<blaze_core::Listing>,
+    listing: blaze_core::Listing,
     /// The folder listed, beneath the directory it was asked of; `None` for that directory.
     path: Option<Path>,
 }
@@ -333,6 +337,18 @@ impl Entries {
     #[track_caller]
     pub fn executable(&self, i: usize) -> bool {
         self.listing.stamp(i).executable()
+    }
+
+    /// Entry `i`'s full [`Look`] metadata from the directory listing (`getattrlistbulk` on macOS).
+    #[track_caller]
+    pub fn look(&self, i: usize) -> Look {
+        Look::of(&self.listing.stamp(i))
+    }
+
+    /// Entry `i`'s raw Unix mode bits from the directory listing (a link not followed).
+    #[track_caller]
+    pub fn mode(&self, i: usize) -> u32 {
+        self.listing.stamp(i).mode
     }
 
     /// The kinds, in the names' order: a walk that wants the folders reads a byte each.
@@ -414,6 +430,174 @@ impl Meta {
     }
 }
 
+
+/// An exclusive file lock acquired through [`Dir::lock_exclusive`]: call [`FileLock::unlock`] on
+/// the result-bearing path so unlock failures surface as typed [`FsError`]s; `Drop` performs a
+/// bounded fallback unlock only if the lock was dropped early (e.g. on error/unwind).
+enum FileLockKind {
+    Sim { io: Io, tag: blaze_core::Tag },
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Native(crate::rt::NativeLock),
+}
+
+/// Outcome of a bounded read performed through a held [`FileLock`]'s root capability.
+pub enum BoundedRead<'a> {
+    Absent,
+    Oversized,
+    Grew,
+    Whole(blaze_own::Vec<u8, blaze_own::Alloc<'a>>),
+}
+
+pub struct FileLock {
+    kind: FileLockKind,
+    dir: Dir<ReadWrite>,
+    name: FileName,
+    unlocked: bool,
+}
+
+impl FileLock {
+    /// Reads `path` (bounded at `max_bytes` before allocating) through the exact directory and
+    /// root capability that acquired this lock — eliminating both cross-world misuse and any
+    /// TOCTOU window if the root pathname is renamed or replaced while the lock is held.
+    pub fn read_bounded<'a>(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        max_bytes: u64,
+        single_read_plant: bool,
+        alloc: blaze_own::Alloc<'a>,
+    ) -> Result<BoundedRead<'a>, FsError> {
+        let name = self.dir.beneath(path);
+        match &self.kind {
+            FileLockKind::Sim { .. } => {
+                let file = match self.dir.open_read(cx, path) {
+                    Ok(file) => file,
+                    Err(error) if error.kind == FsKind::NotFound => return Ok(BoundedRead::Absent),
+                    Err(error) => return Err(error),
+                };
+                let len_u64 = match file.len(cx) {
+                    Ok(len) => len,
+                    Err(error) if error.kind == FsKind::NotFound => return Ok(BoundedRead::Absent),
+                    Err(error) => return Err(error),
+                };
+                if len_u64 > max_bytes {
+                    return Ok(BoundedRead::Oversized);
+                }
+                let len = usize::try_from(len_u64).map_err(|_| driver_error(FsOp::Read, &name, &"record length overflow"))?;
+                let cap = len.checked_add(1).ok_or_else(|| driver_error(FsOp::Read, &name, &"record capacity overflow"))?;
+                let mut bytes = blaze_own::Vec::with_capacity_in(cap, alloc);
+                bytes.resize(cap, 0u8);
+                let mut filled = 0usize;
+                while filled < cap {
+                    let step_off = u64::try_from(filled).map_err(|_| driver_error(FsOp::Read, &name, &"read offset overflow"))?;
+                    let Some(dst) = bytes.as_mut_slice().get_mut(filled..) else {
+                        break;
+                    };
+                    let n = file.read_into(dst, step_off).wait(cx)?;
+                    if n == 0 {
+                        break;
+                    }
+                    filled += n;
+                    if single_read_plant {
+                        break;
+                    }
+                }
+                if filled > len {
+                    return Ok(BoundedRead::Grew);
+                }
+                bytes.truncate(filled);
+                Ok(BoundedRead::Whole(bytes))
+            }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            FileLockKind::Native(native) => {
+                match crate::rt::read_bounded_under_lock_off_thread(cx, native, name.as_str(), max_bytes, single_read_plant, alloc) {
+                    Ok(crate::rt::NativeBoundedRead::Absent) => Ok(BoundedRead::Absent),
+                    Ok(crate::rt::NativeBoundedRead::Oversized) => Ok(BoundedRead::Oversized),
+                    Ok(crate::rt::NativeBoundedRead::Grew) => Ok(BoundedRead::Grew),
+                    Ok(crate::rt::NativeBoundedRead::Whole(bytes)) => Ok(BoundedRead::Whole(bytes)),
+                    Err(crate::rt::NativeLockErr::Stopped(s)) => Err(FsError::new(FsOp::Read, &name, FsKind::Stopped(s))),
+                    Err(crate::rt::NativeLockErr::Driver(msg)) => Err(driver_error(FsOp::Read, &name, &msg.as_str())),
+                }
+            }
+        }
+    }
+
+    /// Atomically publishes `whole` at `path` (unsynced, [`Durable::No`]) through the exact
+    /// directory and root capability that acquired this lock — never waiting for device flush and
+    /// eliminating both cross-world misuse and post-lock root-rename TOCTOU windows.
+    pub fn publish_unsynced(&self, cx: &Cx, path: &Path, whole: &[u8]) -> Result<(), FsError> {
+        match &self.kind {
+            FileLockKind::Sim { .. } => self.dir.publish(cx, path, Content::bytes(whole), Durable::No).map(|_| ()),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            FileLockKind::Native(native) => {
+                let name = self.dir.beneath(path);
+                crate::rt::publish_under_lock_off_thread(cx, native, name.as_str(), whole, false).map_err(|err| match err {
+                    crate::rt::NativeLockErr::Stopped(s) => FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)),
+                    crate::rt::NativeLockErr::Driver(msg) => driver_error(FsOp::Publish, &name, &msg.as_str()),
+                })
+            }
+        }
+    }
+
+    /// Atomically publishes `whole` at `path` (synced, [`Durable::Yes`]: file synced before rename
+    /// and parent directory synced after) through the exact directory and root capability that
+    /// acquired this lock.
+    pub fn publish_synced(&self, cx: &Cx, path: &Path, whole: &[u8]) -> Result<(), FsError> {
+        match &self.kind {
+            FileLockKind::Sim { .. } => self.dir.publish_synced(cx, path, Content::bytes(whole)).map(|_| ()),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            FileLockKind::Native(native) => {
+                let name = self.dir.beneath(path);
+                crate::rt::publish_under_lock_off_thread(cx, native, name.as_str(), whole, true).map_err(|err| match err {
+                    crate::rt::NativeLockErr::Stopped(s) => FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)),
+                    crate::rt::NativeLockErr::Driver(msg) => driver_error(FsOp::Publish, &name, &msg.as_str()),
+                })
+            }
+        }
+    }
+
+    /// Explicitly releases the file lock under `cx`, surfacing any `Done::Failed` or stop error.
+    /// Marks the lock released ONLY after receiving confirmation so `Drop` still performs its
+    /// bounded fallback unlock if an explicit unlock fails or times out.
+    pub fn unlock(mut self, cx: &Cx) -> Result<(), FsError> {
+        match &mut self.kind {
+            FileLockKind::Sim { io, tag } => {
+                let lock = *tag;
+                match call(io, cx, FsOp::Publish, &self.name, |t| Effect::Unlock { lock, tag: t })? {
+                    Done::Unlocked => {
+                        self.unlocked = true;
+                        Ok(())
+                    }
+                    Done::Failed(error) => Err(FsError::new(FsOp::Publish, &self.name, FsKind::Driver(error.0))),
+                    other => Err(unexpected(FsOp::Publish, &self.name, other)),
+                }
+            }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            FileLockKind::Native(native) => {
+                crate::rt::unlock_off_thread(cx, native).map_err(|err| match err {
+                    crate::rt::NativeLockErr::Stopped(s) => FsError::new(FsOp::Publish, &self.name, FsKind::Stopped(s)),
+                    crate::rt::NativeLockErr::Driver(msg) => driver_error(FsOp::Publish, &self.name, &msg.as_str()),
+                })?;
+                self.unlocked = true;
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        if self.unlocked {
+            return;
+        }
+        if let FileLockKind::Sim { io, tag } = &self.kind {
+            let lock = *tag;
+            let req = io.submit(|t| Effect::Unlock { lock, tag: t });
+            let until = blaze_core::wait::Deadline::after(io.now(), core::time::Duration::from_secs(5));
+            let _ = io.settle(req, until, "bstd::fs::FileLock unlock");
+        }
+    }
+}
 
 /// How durable a change must be when its call returns. A required argument: no file call has
 /// a default (docs/v2/plan/design/std.md, "Files").
@@ -840,6 +1024,16 @@ impl FsError {
     }
 }
 
+/// Builds an `FsError` carrying a formatted `Display` message as `FsKind::Driver`.
+fn driver_error(op: FsOp, path: &(impl Named + ?Sized), value: &dyn fmt::Display) -> FsError {
+    FsError::new(op, path, FsKind::Driver(format!("{value}")))
+}
+
+/// Builds an `FsError` carrying a formatted `Display` message as `FsKind::Answered`.
+fn answered_error(op: FsOp, path: &(impl Named + ?Sized), value: &dyn fmt::Display) -> FsError {
+    FsError::new(op, path, FsKind::Answered(format!("{value}")))
+}
+
 /// `done`, which was not what `op` expects, as its error.
 fn unexpected(op: FsOp, path: &(impl Named + ?Sized), done: Done) -> FsError {
     let kind = match done {
@@ -1071,15 +1265,37 @@ fn copy_file(
     }
 }
 
-/// A name beside `name`, in its directory, that no other call of this world was given: a
-/// publish's temporary file, `.<leaf>.<n>.bstd-new`.
+/// Formats the unique suffix of a publish temporary filename: `<nonce-hex>.<seq>` in a native
+/// world (preventing cross-process collisions across independent `Io` worlds sharing a directory)
+/// or `<seq>` in simulated/hosted worlds (preserving deterministic simulation names).
+struct TempTag(Option<u64>, u64);
+
+/// A staged sibling temporary file produced by [`Dir::stage_publish_if_absent`] awaiting atomic
+/// `Effect::Link` publication in [`Dir::finish_publish_if_absent`].
+pub struct StagedPublish {
+    name: FileName,
+    temp: FileName,
+    how: How,
+}
+
+impl core::fmt::Display for TempTag {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(nonce) => write!(f, "{nonce:016x}.{}", self.1),
+            None => write!(f, "{}", self.1),
+        }
+    }
+}
+
+/// A name beside `name`, in its directory, unique within this world and (on native worlds)
+/// across concurrent OS processes sharing the same directory: `.<leaf>.<tag>.bstd-new`.
 fn beside(io: &Io, name: &FileName) -> FileName {
-    let fresh = io.fresh();
+    let tag = TempTag(io.fresh_nonce(), io.fresh());
     let joined = match name.as_str().rsplit_once('/') {
         // alloc: once per publish, its temporary file's name.
-        Some((dir, leaf)) => format!("{dir}/.{leaf}.{fresh}.bstd-new"),
+        Some((dir, leaf)) => format!("{dir}/.{leaf}.{tag}.bstd-new"),
         // alloc: once per publish, its temporary file's name.
-        None => format!(".{name}.{fresh}.bstd-new"),
+        None => format!(".{name}.{tag}.bstd-new"),
     };
     FileName::new(&joined).expect("a name beside a name is a name")
 }
@@ -1207,6 +1423,8 @@ impl<#[blaze::linear] P: Rights, S: Scope> Clone for Dir<P, S> {
         Dir { io: self.io.clone(), base: self.base.clone(), quota: self.quota.clone(), rights: PhantomData, scope: PhantomData }
     }
 }
+
+impl<#[blaze::linear] P: Rights, S: Scope> blaze_own::Share for Dir<P, S> {}
 
 impl<#[blaze::linear] P: Rights, S: Scope> fmt::Debug for Dir<P, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1359,6 +1577,15 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
         Dir { io: self.io.clone(), base, quota: self.quota.clone(), rights: PhantomData, scope: PhantomData }
     }
 
+    /// The world it is in: for deriving sibling capabilities (clock, spawner, contexts) from an
+    /// already-open directory capability without creating a second native world outside a context.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn world(&self) -> &Io {
+        &self.io
+    }
+
     /// The world it is in: for a capability made from a directory ([`crate::local::Local`]).
     #[blaze::nopanic]
     #[blaze::noalloc]
@@ -1442,12 +1669,102 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
         self.list_one(cx, self.base.clone(), None)
     }
 
+    /// List many folders beneath this directory concurrently (`None` = this directory itself),
+    /// overlapping up to 128 `Effect::Entries` in flight at once without a serial `stat` before
+    /// each folder. A missing or non-directory folder returns `None` in its slot.
+    pub fn entries_many<'f>(
+        &self,
+        cx: &Cx,
+        dirs: &[Option<&Path>],
+        frame: &'f Frame,
+    ) -> Result<Vec<Option<Entries>, &'f Frame>, FsError> {
+        let mut out: Vec<Option<Entries>, &'f Frame> = Vec::new_in(frame);
+        out.try_reserve(dirs.len()).map_err(|_| {
+            FsError::new(
+                FsOp::Entries,
+                &self.base,
+                FsKind::Stopped(Stopped::OutOfMemory {
+                    arena: "bstd::fs::entries_many",
+                    asked: dirs.len() * size_of::<Option<Entries>>(),
+                }),
+            )
+        })?;
+        for _ in 0..dirs.len() {
+            out.push(None);
+        }
+        if dirs.is_empty() {
+            cx.check().map_err(|stopped| FsError::new(FsOp::Entries, &self.base, FsKind::Stopped(stopped)))?;
+            return Ok(out);
+        }
+        const WINDOW: usize = 128;
+        let cap = dirs.len().min(WINDOW);
+        let mut tags: Vec<Tag, &Frame> = Vec::new_in(frame);
+        let mut meta: Vec<(usize, DirName, Option<Path>), &Frame> = Vec::new_in(frame);
+        let _ = tags.try_reserve(cap);
+        let _ = meta.try_reserve(cap);
+
+        let submit_one = |io: &Io, base: &DirName, opt_path: Option<&Path>| {
+            let (dir_name, path_owned) = match opt_path {
+                Some(p) => (DirName::Named(self.beneath(p)), Some(p.clone())),
+                None => (base.clone(), None),
+            };
+            let asked = dir_name.clone();
+            let tag = io.submit(|tag| Effect::Entries { dir: asked, tag });
+            (tag, dir_name, path_owned)
+        };
+
+        let mut next = 0usize;
+        while next < dirs.len() && tags.len() < cap {
+            let (tag, dir_name, path_owned) = submit_one(&self.io, &self.base, dirs[next]);
+            tags.push(tag);
+            meta.push((next, dir_name, path_owned));
+            next += 1;
+        }
+
+        while !tags.is_empty() {
+            let (slot, done) = match cx.wait_any(&self.io, &tags) {
+                Ok(pair) => pair,
+                Err(stopped) => {
+                    for &t in &tags {
+                        self.io.forget(t, Ends::Once);
+                    }
+                    return Err(FsError::new(FsOp::Entries, &self.base, FsKind::Stopped(stopped)));
+                }
+            };
+            tags.swap_remove(slot);
+            let (idx, dir_name, path_owned) = meta.swap_remove(slot);
+            match done {
+                Done::Entries(listing) if listing.dir() == &dir_name => {
+                    if let Some(slot) = out.get_mut(idx) {
+                        *slot = Some(Entries { listing: *listing, path: path_owned });
+                    }
+                }
+                Done::Failed(_) => {
+                    // Missing folder or non-directory: leave `None`.
+                }
+                other => {
+                    for &t in &tags {
+                        self.io.forget(t, Ends::Once);
+                    }
+                    return Err(unexpected(FsOp::Entries, &dir_name, other));
+                }
+            }
+            if next < dirs.len() {
+                let (tag, dn, po) = submit_one(&self.io, &self.base, dirs[next]);
+                tags.push(tag);
+                meta.push((next, dn, po));
+                next += 1;
+            }
+        }
+        Ok(out)
+    }
+
     /// The one listing of `dir` (named `path` beneath this directory, or this one).
     fn list_one(&self, cx: &Cx, dir: DirName, path: Option<Path>) -> Result<Entries, FsError> {
         // clone: the effect's name, a refcount.
         let asked = dir.clone();
         let listing = match call(&self.io, cx, FsOp::Entries, &dir, |tag| Effect::Entries { dir: asked, tag })? {
-            Done::Entries(listing) => listing,
+            Done::Entries(listing) => *listing,
             done => return Err(unexpected(FsOp::Entries, &dir, done)),
         };
         if listing.dir() != &dir {
@@ -1525,6 +1842,103 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
         self.open_read(cx, path)?.read_all(cx, into)
     }
 
+    /// Target bytes of the symbolic link at `path` (not followed) added to `into`; how many bytes.
+    pub fn read_link(&self, cx: &Cx, path: &Path, into: &mut Bytes<'_>) -> Result<usize, FsError> {
+        let name = self.beneath(path);
+        let file = name.clone();
+        match call(&self.io, cx, FsOp::Read, &name, |tag| Effect::ReadLink { file, tag })? {
+            Done::Read(bytes) => {
+                into.try_extend(&bytes)
+                    .map_err(|stopped| FsError::new(FsOp::Read, &name, FsKind::Stopped(stopped)))?;
+                Ok(bytes.len())
+            }
+            other => Err(unexpected(FsOp::Read, &name, other)),
+        }
+    }
+
+    /// Simulation / non-inline helper: checks every parent component along `path` is a real
+    /// directory (never a symlink) and returns the leaf's [`EntryKind`].
+    fn check_confined_leaf(&self, cx: &Cx, op: FsOp, name: &FileName, path: &Path) -> Result<Option<EntryKind>, FsError> {
+        let raw_rel = path.as_str();
+        let mut prefixes = blaze_own::Vec::new_in(cx.frame());
+        for (idx, _) in raw_rel.match_indices('/') {
+            let Some(prefix) = raw_rel.get(..idx) else { continue };
+            let Ok(sub) = Path::new(prefix) else {
+                return Err(FsError::new(op, name, FsKind::Driver("invalid path prefix".into())));
+            };
+            prefixes.try_reserve(1).map_err(|_| {
+                let stopped = Stopped::OutOfMemory { arena: "bstd::fs confined prefixes", asked: size_of::<Path>() };
+                FsError::new(op, name, FsKind::Stopped(stopped))
+            })?;
+            prefixes.push(sub);
+        }
+        let looks = self.looks(cx, prefixes.iter().chain(core::iter::once(path)))?;
+        for (i, sub) in prefixes.iter().enumerate() {
+            match looks.get(i).map(|l| l.kind) {
+                Some(EntryKind::Dir) => {}
+                Some(EntryKind::Gone) => return Ok(Some(EntryKind::Gone)),
+                _ => return Err(FsError::new(op, &self.beneath(sub), FsKind::Driver("symbolic link refused in confined op".into()))),
+            }
+        }
+        Ok(looks.get(prefixes.len()).map(|l| l.kind))
+    }
+
+    /// Kernel-confined directory listing: opens `path` strictly beneath this directory without
+    /// following any symbolic link in any component (`openat2(O_DIRECTORY | RESOLVE_BENEATH |
+    /// RESOLVE_NO_SYMLINKS)` on Linux, component `openat(O_DIRECTORY | O_NOFOLLOW)` on Unix, or
+    /// component `looks` verification in simulations). Returns `Ok(None)` when absent.
+    pub fn entries_confined(&self, cx: &Cx, path: &Path) -> Result<Option<Entries>, FsError> {
+        let name = self.beneath(path);
+        let dir_name = DirName::Named(name.share());
+        let owned_path = Path::new(path.as_str()).ok();
+        if let Some(listed) = self.io.entries_confined(cx, &name, &dir_name) {
+            return match listed {
+                Ok(Ok(Some(listing))) => Ok(Some(Entries { listing, path: owned_path })),
+                Ok(Ok(None)) => Ok(None),
+                Ok(Err(error)) => Err(FsError::new(FsOp::Entries, &dir_name, FsKind::Driver(error.0))),
+                Err(stopped) => Err(FsError::new(FsOp::Entries, &dir_name, FsKind::Stopped(stopped))),
+            };
+        }
+        match self.check_confined_leaf(cx, FsOp::Entries, &name, path)? {
+            Some(EntryKind::Dir) => {}
+            Some(EntryKind::Gone) => return Ok(None),
+            Some(EntryKind::File) => return Err(FsError::new(FsOp::Entries, &dir_name, FsKind::NotADirectory)),
+            _ => return Err(FsError::new(FsOp::Entries, &dir_name, FsKind::Driver("symbolic link refused in confined entries".into()))),
+        }
+        self.list_one(cx, dir_name, owned_path).map(Some)
+    }
+
+    /// Kernel-confined positional range read: opens `path` strictly beneath this directory without
+    /// following any symbolic link in any directory component or final leaf, verifies it is a
+    /// regular file, and reads up to `len` bytes starting at `at` into `into`.
+    pub fn read_range_confined(&self, cx: &Cx, path: &Path, at: u64, len: usize, into: &mut Bytes<'_>) -> Result<usize, FsError> {
+        let name = self.beneath(path);
+        if let Some(lent) = self.io.read_range_confined(cx, &name, at, len, into) {
+            return match lent {
+                Ok(crate::io::ReadAllLent::Read(read)) => Ok(read),
+                Ok(crate::io::ReadAllLent::Moved { stated, read }) => Err(FsError::new(FsOp::Read, &name, FsKind::Moved { stated, read })),
+                Ok(crate::io::ReadAllLent::NotFound) => Err(FsError::new(FsOp::Read, &name, FsKind::NotFound)),
+                Ok(crate::io::ReadAllLent::Failed(error)) => Err(FsError::new(FsOp::Read, &name, FsKind::Driver(error.0))),
+                Err(stopped) => Err(FsError::new(FsOp::Read, &name, FsKind::Stopped(stopped))),
+            };
+        }
+        match self.check_confined_leaf(cx, FsOp::Read, &name, path)? {
+            Some(EntryKind::File) => {}
+            Some(EntryKind::Dir) => return Err(FsError::new(FsOp::Read, &name, FsKind::IsADirectory)),
+            Some(EntryKind::Gone) => return Err(FsError::new(FsOp::Read, &name, FsKind::NotFound)),
+            _ => return Err(FsError::new(FsOp::Read, &name, FsKind::Driver("symbolic link refused in confined read".into()))),
+        }
+        let file = name.share();
+        match call(&self.io, cx, FsOp::Read, &name, |tag| Effect::Read { file, at, len, tag })? {
+            Done::Read(bytes) if bytes.len() <= len => {
+                into.try_extend(&bytes)
+                    .map_err(|stopped| FsError::new(FsOp::Read, &name, FsKind::Stopped(stopped)))?;
+                Ok(bytes.len())
+            }
+            other => Err(unexpected(FsOp::Read, &name, other)),
+        }
+    }
+
     /// Kernel-confined whole-file read: opens `path` strictly beneath this directory without
     /// following any symbolic link in any directory component or final leaf (`openat`+`O_NOFOLLOW`
     /// on Unix, `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` on Linux; component `Lstat` check
@@ -1536,33 +1950,18 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
             return match lent {
                 Ok(crate::io::ReadAllLent::Read(len)) => Ok(len),
                 Ok(crate::io::ReadAllLent::Moved { stated, read }) => Err(FsError::new(FsOp::Read, &name, FsKind::Moved { stated, read })),
+                Ok(crate::io::ReadAllLent::NotFound) => Err(FsError::new(FsOp::Read, &name, FsKind::NotFound)),
                 Ok(crate::io::ReadAllLent::Failed(error)) => Err(FsError::new(FsOp::Read, &name, FsKind::Driver(error.0))),
                 Err(stopped) => Err(FsError::new(FsOp::Read, &name, FsKind::Stopped(stopped))),
             };
         }
-        // Simulation / guest fallback: verify no component along `path` is a symlink via batched `looks` (`Effect::Stamp`).
-        let raw_rel = path.as_str();
-        let mut prefixes: Vec<Path, &blaze_mem::Frame> = Vec::new_in(cx.frame());
-        for (idx, _) in raw_rel.match_indices('/') {
-            let sub = Path::new(&raw_rel[..idx]).expect("prefix of valid Path is valid");
-            let _ = prefixes.try_reserve(1);
-            prefixes.push(sub);
-        }
-        let looks = self.looks(cx, prefixes.iter().chain(core::iter::once(path)))?;
-        for (i, sub) in prefixes.iter().enumerate() {
-            match looks.get(i).map(|l| l.kind) {
-                Some(EntryKind::Dir) => {}
-                Some(EntryKind::Gone) => return Err(FsError::new(FsOp::Read, &name, FsKind::NotFound)),
-                _ => return Err(FsError::new(FsOp::Read, &self.beneath(sub), FsKind::Driver("symbolic link refused in confined read".into()))),
-            }
-        }
-        match looks.get(prefixes.len()).map(|l| l.kind) {
+        match self.check_confined_leaf(cx, FsOp::Read, &name, path)? {
             Some(EntryKind::File) => {}
             Some(EntryKind::Dir) => return Err(FsError::new(FsOp::Read, &name, FsKind::IsADirectory)),
             Some(EntryKind::Gone) => return Err(FsError::new(FsOp::Read, &name, FsKind::NotFound)),
             _ => return Err(FsError::new(FsOp::Read, &name, FsKind::Driver("symbolic link refused in confined read".into()))),
         }
-        let file = name.clone();
+        let file = name.share();
         match call(&self.io, cx, FsOp::Read, &name, |tag| Effect::ReadAll { file, tag })? {
             Done::Read(bytes) => {
                 into.try_extend(&bytes)
@@ -1897,6 +2296,150 @@ impl Dir<ReadWrite> {
         // and nothing changed them since.
         let seen = self.io.generation(&name);
         Ok(Published { file: Flushed::of(&self.io, name, seen), how })
+    }
+
+    /// A staged sibling temporary file ready to be linked into its target path by
+    /// [`Dir::finish_publish_if_absent`].
+    pub fn stage_publish_if_absent(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        content: Content<'_>,
+        durable: Durable,
+    ) -> Result<StagedPublish, FsError> {
+        self.stage_if_absent_inner(cx, path, content, durable)
+    }
+
+    /// Commits a [`StagedPublish`] created by [`Dir::stage_publish_if_absent`] via `Effect::Link`
+    /// only if the target path is still absent, removing the temporary file and syncing directory
+    /// names as requested by `durable`.
+    pub fn finish_publish_if_absent(
+        &self,
+        cx: &Cx,
+        staged: StagedPublish,
+        durable: Durable,
+    ) -> Result<bool, FsError> {
+        self.finish_if_absent_inner(cx, staged, durable)
+    }
+
+    fn stage_if_absent_inner(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        content: Content<'_>,
+        durable: Durable,
+    ) -> Result<StagedPublish, FsError> {
+        let name = self.beneath(path);
+        let (temp, how) = self.place(cx, &name, content)?;
+        if durable == Durable::Yes {
+            let _ = Written::of(&self.io, temp.share()).flush(cx)?;
+        }
+        Ok(StagedPublish { name, temp, how })
+    }
+
+    fn finish_if_absent_inner(
+        &self,
+        cx: &Cx,
+        staged: StagedPublish,
+        durable: Durable,
+    ) -> Result<bool, FsError> {
+        let StagedPublish { name, temp, how } = staged;
+        let from = temp.share();
+        let to = name.share();
+        let linked = match call(&self.io, cx, FsOp::Publish, &name, |tag| Effect::Link { from, to, tag })? {
+            Done::Linked => true,
+            Done::Failed(error) => {
+                let exists = stat(&self.io, cx, FsOp::Publish, &name)?;
+                remove(&self.io, cx, FsOp::Publish, &temp)?;
+                return match exists {
+                    Some(_) => Ok(false),
+                    None => Err(FsError::new(FsOp::Publish, &name, FsKind::Driver(error.0))),
+                };
+            }
+            done => {
+                let _ = remove(&self.io, cx, FsOp::Publish, &temp);
+                return Err(unexpected(FsOp::Publish, &name, done));
+            }
+        };
+        remove(&self.io, cx, FsOp::Publish, &temp)?;
+        match durable.unsynced() {
+            Some(unsynced) => {
+                started(&self.io, &name, unsynced);
+                names_started(&self.io, &name, unsynced);
+            }
+            None => {
+                sync_names(&self.io, cx, FsOp::Publish, &name, None)?;
+            }
+        }
+        cx.event(how.says());
+        Ok(linked)
+    }
+
+    /// `path` made to hold `content` atomically ONLY if nothing exists at `path` yet (via
+    /// `Effect::Link` from a sibling temporary file): returns `Ok(true)` when this call created
+    /// `path`, or `Ok(false)` when another entry already occupied `path` (never overwriting it).
+    pub fn publish_if_absent(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        content: Content<'_>,
+        durable: Durable,
+    ) -> Result<bool, FsError> {
+        let staged = self.stage_if_absent_inner(cx, path, content, durable)?;
+        self.finish_if_absent_inner(cx, staged, durable)
+    }
+
+    /// Acquires an exclusive advisory file lock at `path` (creating the lock file if absent),
+    /// keeping native filesystem lock I/O off the driver's polling thread (cancellable/reapable
+    /// under `cx` deadline/cancellation) and using `Effect::Lock` in simulated worlds. Call
+    /// [`FileLock::unlock`] on the result-bearing path.
+    pub fn lock_exclusive(&self, cx: &Cx, path: &Path) -> Result<FileLock, FsError> {
+        let name = self.beneath(path);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if self.io.is_native_driver() {
+            let root_dir = self.io.native_root_dir().ok_or_else(|| {
+                driver_error(FsOp::Publish, &name, &"native world missing opened root directory descriptor")
+            })?;
+            let native = crate::rt::lock_exclusive_off_thread(cx, root_dir, name.as_str()).map_err(|err| match err {
+                crate::rt::NativeLockErr::Stopped(s) => FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)),
+                crate::rt::NativeLockErr::Driver(msg) => driver_error(FsOp::Publish, &name, &msg.as_str()),
+            })?;
+            return Ok(FileLock { kind: FileLockKind::Native(native), dir: self.share(), name, unlocked: false });
+        }
+        let backoff = core::time::Duration::from_millis(2);
+        loop {
+            cx.stopped_by(self.io.now())
+                .map_err(|s| FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)))?;
+            let lock_file = name.share();
+            let mut acquired_tag = blaze_core::Tag(0);
+            let done = self
+                .io
+                .call(cx, |tag| {
+                    acquired_tag = tag;
+                    Effect::Lock { file: lock_file, mode: blaze_core::LockMode::Exclusive, tag }
+                })
+                .map_err(|s| FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)))?;
+            match done {
+                Done::Locked => {
+                    return Ok(FileLock {
+                        kind: FileLockKind::Sim { io: self.io.share(), tag: acquired_tag },
+                        dir: self.share(),
+                        name,
+                        unlocked: false,
+                    });
+                }
+                Done::Contended => {
+                    let _ = self
+                        .io
+                        .call(cx, |tag| Effect::Timer { after: backoff, tag })
+                        .map_err(|s| FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)))?;
+                }
+                Done::Failed(error) => {
+                    return Err(FsError::new(FsOp::Publish, &name, FsKind::Driver(error.0)));
+                }
+                other => return Err(unexpected(FsOp::Publish, &name, other)),
+            }
+        }
     }
 
     /// The file at `path` gone, as durably as `durable` says; gone already is done.
@@ -2251,6 +2794,7 @@ impl<#[blaze::linear] P: Rights> File<P> {
             return match lent {
                 Ok(crate::io::ReadAllLent::Read(len)) => Ok(len),
                 Ok(crate::io::ReadAllLent::Moved { stated, read }) => Err(FsError::new(FsOp::Read, &self.name, FsKind::Moved { stated, read })),
+                Ok(crate::io::ReadAllLent::NotFound) => Ok(0),
                 // alloc: an error's message.
                 Ok(crate::io::ReadAllLent::Failed(error)) => Err(FsError::new(FsOp::Read, &self.name, FsKind::Driver(error.0))),
                 Err(stopped) => Err(FsError::new(FsOp::Read, &self.name, FsKind::Stopped(stopped))),

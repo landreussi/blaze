@@ -269,9 +269,6 @@ fn tables<'a>(
     outside: Option<&Outside<'_, '_>>,
     alloc: Alloc<'a>,
 ) -> Result<EhSections<'a>, ExportError> {
-    if outside.is_some() && platform == Platform::LinuxArm64 {
-        return Err(ExportError::Native(MergeError::ElfNotBuilt));
-    }
     // The LSDAs first: their bytes do not depend on where anything is.
     let mut except: AVec<'a, u8> = Vec::new_in(alloc);
     let mut given: AVec<'_, Given> = Vec::with_capacity_in(covered.len(), alloc);
@@ -294,16 +291,26 @@ fn tables<'a>(
     }
 
     // `eh_frame`, its pc-relative fields filled once every table's place is known.
+    // On Mach-O, every framed Rust function without an LSDA uses `COMPACT_FRAME` directly in
+    // `__unwind_info` and never references `__eh_frame` (matching Apple `ld64`/`lld`), so only
+    // landing functions emit a Rust FDE. Skipping dead FDEs keeps `__eh_frame` compact so
+    // DWARF-mode FDE offsets stay within `__unwind_info`'s 24-bit field even on large binaries.
     let mut f: AVec<'a, u8> = Vec::new_in(alloc);
     let mut patches: AVec<'_, (usize, PatchTo)> = Vec::new_in(alloc);
-    let plain_cie = f.len();
-    cie(&mut f, None, &mut patches)?;
+    let plain_cie = match platform {
+        Platform::MacosArm64 => None,
+        Platform::LinuxArm64 | Platform::Wasm64 => {
+            let offset = f.len();
+            cie(&mut f, None, &mut patches)?;
+            Some(offset)
+        }
+    };
     let landing_cie = match (landing, personality_at) {
         (0, _) | (_, None) => plain_cie,
         (_, Some(routine)) => {
             let offset = f.len();
             cie(&mut f, Some(routine), &mut patches)?;
-            offset
+            Some(offset)
         }
     };
     let mut functions = 0u32;
@@ -311,12 +318,18 @@ fn tables<'a>(
         let Some(frame) = c.unwind.frame() else {
             continue;
         };
-        let start = f.len();
-        f.extend_from_slice(&[0; 4]);
-        let cie_at = match given[k].lsda {
+        functions += 1;
+        if platform == Platform::MacosArm64 && given[k].lsda.is_none() {
+            continue;
+        }
+        let Some(cie_at) = (match given[k].lsda {
             Some(_) => landing_cie,
             None => plain_cie,
+        }) else {
+            continue;
         };
+        let start = f.len();
+        f.extend_from_slice(&[0; 4]);
         let back = u32_of((f.len() - cie_at) as u64, "an FDE's CIE pointer")?;
         f.extend_from_slice(&back.to_le_bytes());
         patches.push((f.len(), PatchTo::Image(c.at)));
@@ -333,7 +346,6 @@ fn tables<'a>(
         eh::frame_program(frame, &mut f);
         finish(&mut f, start)?;
         given[k].fde = Some(u32_of(start as u64, "an FDE's offset in eh_frame")?);
-        functions += 1;
     }
     // The native image's CIEs and FDEs, after Rust's, before the one terminator.
     let native_at = f.len();
@@ -380,7 +392,7 @@ fn tables<'a>(
     let mut eh_frame_hdr: AVec<'a, u8> = Vec::new_in(alloc);
     match platform {
         Platform::MacosArm64 => write_unwind_info(covered, &given, outside, native_at, alloc, &mut unwind_info)?,
-        Platform::LinuxArm64 => write_eh_frame_hdr(covered, &given, eh_frame_at, index_at, functions, &mut eh_frame_hdr)?,
+        Platform::LinuxArm64 => write_eh_frame_hdr(covered, &given, outside, native_at, eh_frame_at, index_at, functions, &mut eh_frame_hdr)?,
         Platform::Wasm64 => return Err(ExportError::Wasm64RequiresWasmProgram),
     }
     Ok(EhSections {
@@ -400,17 +412,16 @@ fn tables<'a>(
 
 /// The `unwind_info` encoding of one function (the module's doc says which form when).
 fn encoding(c: &Covered<'_>, given: Given) -> Result<u32, ExportError> {
-    let Some(fde) = given.fde else {
+    let Some(frame) = c.unwind.frame() else {
         return Ok(0);
     };
-    let compact_word = match given.lsda {
-        Some(_) => None,
-        None => c.unwind.frame().map(compact),
-    };
-    match compact_word {
-        Some(word) => Ok(word),
-        None if fde & !DWARF_OFFSET == 0 => Ok(COMPACT_DWARF | fde),
-        None => Err(ExportError::TooLarge { what: "an FDE's offset in __unwind_info's DWARF mode (24 bits)", len: u64::from(fde) }),
+    match given.lsda {
+        None => Ok(compact(frame)),
+        Some(_) => match given.fde {
+            Some(fde) if fde & !DWARF_OFFSET == 0 => Ok(COMPACT_DWARF | fde),
+            Some(fde) => Err(ExportError::TooLarge { what: "an FDE's offset in __unwind_info's DWARF mode (24 bits)", len: u64::from(fde) }),
+            None => Ok(0),
+        },
     }
 }
 
@@ -463,20 +474,53 @@ fn write_unwind_info(
 }
 
 /// ELF's `.eh_frame_hdr` at image offset `hdr_at`, for the `functions` FDEs of `eh_frame` at
-/// `eh_frame_at`.
-fn write_eh_frame_hdr(covered: &[Covered<'_>], given: &[Given], eh_frame_at: u64, hdr_at: u64, functions: u32, out: &mut AVec<'_, u8>) -> Result<(), ExportError> {
+/// `eh_frame_at` (both the program's FDEs and any merged native image's FDEs, sorted by initial
+/// location as LSB 5.0 requires for binary search).
+#[allow(clippy::too_many_arguments)]
+fn write_eh_frame_hdr(
+    covered: &[Covered<'_>],
+    given: &[Given],
+    outside: Option<&Outside<'_, '_>>,
+    native_at: usize,
+    eh_frame_at: u64,
+    hdr_at: u64,
+    functions: u32,
+    out: &mut AVec<'_, u8>,
+) -> Result<(), ExportError> {
     out.push(1);
     out.push(PCREL_SDATA4);
     out.push(UDATA4);
     out.push(DATAREL_SDATA4);
     out.extend_from_slice(&rel32(eh_frame_at, hdr_at + 4, "eh_frame_hdr's eh_frame_ptr")?);
     out.extend_from_slice(&functions.to_le_bytes());
+    let table_start = out.len();
     for (k, c) in covered.iter().enumerate() {
         let Some(fde) = given[k].fde else {
             continue;
         };
         out.extend_from_slice(&rel32(c.at, hdr_at, "an initial location in eh_frame_hdr")?);
         out.extend_from_slice(&rel32(eh_frame_at + u64::from(fde), hdr_at, "an FDE address in eh_frame_hdr")?);
+    }
+    if let Some(o) = outside {
+        let (was, _) = o.eh_frame()?;
+        let native_off = u64::try_from(native_at).map_err(|_| ExportError::TooLarge { what: "native eh_frame offset", len: u64::MAX })?;
+        let native_base = eh_frame_at + native_off;
+        for frame in o.image.frames.iter() {
+            let fde_off = frame.at.checked_sub(was).ok_or(ExportError::Native(MergeError::NoRegion { region: NativeRegion::EhFrame }))?;
+            let fde_at = native_base + fde_off;
+            let initial = frame.start + o.shift;
+            out.extend_from_slice(&rel32(initial, hdr_at, "a native initial location in eh_frame_hdr")?);
+            out.extend_from_slice(&rel32(fde_at, hdr_at, "a native FDE address in eh_frame_hdr")?);
+        }
+        if let Some(slice) = out.get_mut(table_start..) {
+            let (table, _) = slice.as_chunks_mut::<8>();
+            table.sort_unstable_by_key(|pair| {
+                (
+                    i32::from_le_bytes([pair[0], pair[1], pair[2], pair[3]]),
+                    i32::from_le_bytes([pair[4], pair[5], pair[6], pair[7]]),
+                )
+            });
+        }
     }
     Ok(())
 }
@@ -512,7 +556,11 @@ pub fn eh_room_with<'a>(functions: &[Member<'_>], personality: Option<Symbol>, p
     }
     let base = up(at, TABLES_ALIGN);
     let personality_at = personality.map(|_| 0);
-    let standin = natives.map(|image| Outside { image, shift: up(base, NATIVE_PAGE) + NATIVE_PAGE });
+    let page = match platform {
+        Platform::MacosArm64 | Platform::Wasm64 => NATIVE_PAGE,
+        Platform::LinuxArm64 => crate::elf::PAGE,
+    };
+    let standin = natives.map(|image| Outside { image, shift: up(base, page) + page });
     let measured = tables(&covered, personality_at, base, platform, standin.as_ref(), alloc)?;
     Ok(measured.end() - base + ROOM_SLACK)
 }

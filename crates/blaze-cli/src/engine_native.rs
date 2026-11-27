@@ -45,7 +45,7 @@
 use core::fmt;
 
 use blaze_drive::record::Stored;
-use blaze_drive::{Input, Key, Name};
+use blaze_drive::{Input, Key, Kind, Name};
 use blaze_id::CrateItemKey;
 use blaze_ids::ContentId;
 use blaze_ids::producer::{ProducerId, Whole};
@@ -65,15 +65,55 @@ use crate::store::Store;
 /// The rule a refusal here names.
 const RULE: &str = "engine_native.rs";
 
-/// The domain of [`image_key`]. 3: the fields its doc lists, in that order, the SDK's identity
-/// (its version and build, blaze-apple-sdk `SdkId::key`) last (2 held the version alone; 1 had
-/// none, and named frameworks from a table).
-const KEY_FORM: &str = "blaze-cli engine native image key 3";
+/// The domain of [`image_key`]. 4: content-addressed by native link inputs only (excludes
+/// `program` and pure-Rust crates with an empty link table and no build script, so binaries/tests
+/// sharing a native closure share one store record and one dylib file). 3 hashed `program` and
+/// every closure crate; 2 held the SDK version alone; 1 had no SDK identity.
+const KEY_FORM: &str = "blaze-cli engine native image key 4";
+
+/// Canonical 20-byte encoding of an empty valid state-0 link table (`native_links::write_table`
+/// with 0 decls, 0 foreign names, 0 exports). A crate with no build script and this exact table
+/// contributes nothing to the native link closure.
+const EMPTY_LINK_TABLE: [u8; 20] = [
+    native_links::TABLE_MAGIC[0],
+    native_links::TABLE_MAGIC[1],
+    native_links::TABLE_MAGIC[2],
+    native_links::TABLE_MAGIC[3],
+    native_links::TABLE_FORM.to_le_bytes()[0],
+    native_links::TABLE_FORM.to_le_bytes()[1],
+    0, 0, // state = 0 (table), reserved = 0
+    0, 0, 0, 0, // decls = 0
+    0, 0, 0, 0, // foreign = 0
+    0, 0, 0, 0, // exports = 0
+];
+
+/// Whether `c` contributes to the native image: a build script, or a link table other than the
+/// canonical empty state-0 table (decls, foreign roots, Rust exports, a refusal, or malformed
+/// bytes that `open_table` must still refuse).
+#[inline]
+fn contributes_native(c: &CrateIn<'_>) -> bool {
+    c.script.is_some() || c.table != EMPTY_LINK_TABLE
+}
 
 /// The reserve of the image's scratch frame: the tables opened, the link line, the plan, the
 /// layout and the image's bytes (a native script's archive is mapped, never copied here).
 /// Virtual until touched; dropped when [`image_for`] returns.
 const NATIVE_FRAME: usize = 4 << 30;
+
+/// Maximum uncompressed `BNL2` native image size accepted when decoding a `BZR1` envelope
+/// (256 MiB, bounded well inside [`NATIVE_FRAME`] and `u32::MAX`, rule 18).
+const NATIVE_IMAGE_MAX_BYTES: usize = 256 << 20;
+
+/// Decodes a stored `BNL2` native image payload: zero-copy borrow when raw/small, or `BZR1`
+/// Level::Fast zstd decompressed into `scratch` when compressed.
+fn decode_image_payload<'a, 's, 'w>(
+    key: Key,
+    payload: &'a [u8],
+    scratch: &'s Frame,
+) -> Result<crate::store::record_codec::Decoded<'a, &'s Frame>, NativeError<'w>> {
+    crate::store::record_codec::decode_if_envelope_in(payload, NATIVE_IMAGE_MAX_BYTES, scratch)
+        .map_err(|_| NativeError::Damaged { key, why: "its BZR1 native image envelope did not decode" })
+}
 
 /// What the image needs beyond the check's records, handed down from the command's edge (R1 puts
 /// it in `Standing::native`).
@@ -168,6 +208,22 @@ pub(crate) enum NativeError<'w> {
     Send { words: &'w str },
 }
 
+/// Whether a suite's native library can be loaded lazily on first foreign symbol reference,
+/// or must be loaded eagerly before the entry runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NativeLoadMode {
+    /// Must be loaded before entry: defines/overrides a symbol in
+    /// `test_cache::classify_outside_symbol`'s pure allowlist (e.g. a custom `malloc`), so even
+    /// pure Rust code calling that symbol must bind through the native library.
+    Eager,
+    /// Safe to load lazily on demand: exports no pure-allowlist symbol, so a pure Rust test that
+    /// never references an impure/foreign `Space::Outside` target never `dlopen`s the library
+    /// and never runs its C initializers. When a test does reference an impure/foreign target,
+    /// `Down::Native` is sent lazily before placement and any C initializers run on the waking
+    /// main thread before entering that function.
+    Lazy,
+}
+
 /// What a program's start is handed of its native image (blaze-launch wire/run.rs
 /// `Down::Native`'s rule): sent exactly when the image holds native code of its crates.
 #[derive(Clone, Copy, Debug)]
@@ -186,6 +242,9 @@ pub(crate) struct NativeSend<'w> {
     /// Each word's export by its library item, in word order: what the run's roots root
     /// (blaze-ladder run/special.rs `run_roots`'s `exports`), as no Rust record need call it.
     pub(crate) items: &'w [blaze_id::ItemKey],
+    /// Whether this image can be loaded lazily for pure `blaze test` runs (`Lazy`) or must be
+    /// loaded eagerly before entry (`Eager`).
+    pub(crate) load_mode: NativeLoadMode,
 }
 
 /// The program's image as `blaze run` hands it on: its key (the start list is rooted beside
@@ -196,8 +255,138 @@ pub(crate) struct ProgramImage<'w> {
     pub(crate) send: Option<NativeSend<'w>>,
 }
 
+/// The program's laid-out native image and Rust C exports for `blaze export`
+/// (`engine_export.rs`, `blaze_export::ProgramIn::natives` and `exports`).
+pub(crate) struct ExportNative<'a> {
+    pub(crate) image: blaze_native::image::Image<'a>,
+    /// Sorted by `name`, for `blaze_export::ProgramIn::exports`.
+    pub(crate) exports: AVec<'a, blaze_export::CExport<'a>>,
+    /// The library items of the Rust functions the native image's C words call, for `run_roots`.
+    pub(crate) items: AVec<'a, blaze_id::ItemKey>,
+}
+
 /// The install name every image links and the launcher has already loaded.
 const LIB_SYSTEM: &[u8] = b"/usr/lib/libSystem.B.dylib";
+/// The base C library soname every Linux image links and the launcher has already loaded.
+const LIBC_LINUX: &[u8] = b"libc.so.6";
+
+/// Why an ELF shared object's headers could not be inspected by [`elf_holds_native`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ElfNativeRead {
+    NotElf,
+    Bounds(&'static str),
+    BadPhEntSize,
+    StrtabOutsideLoads,
+}
+
+impl fmt::Display for ElfNativeRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            ElfNativeRead::NotElf => f.write_str("the record is not a 64-bit little-endian ELF file"),
+            ElfNativeRead::Bounds(what) => write!(f, "{what} runs past the ELF file's end"),
+            ElfNativeRead::BadPhEntSize => f.write_str("unexpected e_phentsize in ELF header"),
+            ElfNativeRead::StrtabOutsideLoads => f.write_str("DT_STRTAB lies outside every PT_LOAD"),
+        }
+    }
+}
+
+/// Whether the arm64 ELF shared object `file` holds native code of the program's crates: a byte
+/// of `.text`, or a `DT_NEEDED` library besides `libc.so.6` (which the launcher already has).
+fn elf_holds_native(file: &[u8]) -> Result<bool, ElfNativeRead> {
+    let u16_at = |at: usize| file.get(at..at + 2).and_then(|b| b.try_into().ok()).map(u16::from_le_bytes).ok_or(ElfNativeRead::Bounds("an ELF header field"));
+    let u32_at = |at: usize| file.get(at..at + 4).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes).ok_or(ElfNativeRead::Bounds("an ELF field"));
+    let u64_at = |at: usize| file.get(at..at + 8).and_then(|b| b.try_into().ok()).map(u64::from_le_bytes).ok_or(ElfNativeRead::Bounds("an ELF field"));
+    if file.get(0..6) != Some(&[0x7F, b'E', b'L', b'F', 2, 1][..]) {
+        return Err(ElfNativeRead::NotElf);
+    }
+    // Check `.text` section size via section headers (native_so.rs always emits them).
+    let shoff = usize::try_from(u64_at(40)?).map_err(|_| ElfNativeRead::Bounds("e_shoff"))?;
+    let shentsize = usize::from(u16_at(58)?);
+    let shnum = usize::from(u16_at(60)?);
+    let shstrndx = usize::from(u16_at(62)?);
+    if shoff > 0 && shnum > 0 && shentsize == 64 && shstrndx < shnum {
+        let shstr_hdr = shoff + shstrndx * 64;
+        let shstr_off = usize::try_from(u64_at(shstr_hdr + 24)?).map_err(|_| ElfNativeRead::Bounds(".shstrtab offset"))?;
+        let shstr_len = usize::try_from(u64_at(shstr_hdr + 32)?).map_err(|_| ElfNativeRead::Bounds(".shstrtab size"))?;
+        let shstr = file.get(shstr_off..shstr_off.saturating_add(shstr_len)).ok_or(ElfNativeRead::Bounds(".shstrtab"))?;
+        for k in 0..shnum {
+            let s = shoff + k * 64;
+            let name_off = usize::try_from(u32_at(s)?).map_err(|_| ElfNativeRead::Bounds("sh_name"))?;
+            if let Some(rest) = shstr.get(name_off..) {
+                let name = rest.split(|b| *b == 0).next().unwrap_or(rest);
+                if name == b".text" && u64_at(s + 32)? > 0 {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    // Check `DT_NEEDED` entries via `PT_DYNAMIC` and `PT_LOAD`.
+    let phoff = usize::try_from(u64_at(32)?).map_err(|_| ElfNativeRead::Bounds("e_phoff"))?;
+    let phentsize = usize::from(u16_at(54)?);
+    let phnum = usize::from(u16_at(56)?);
+    if phentsize != 56 {
+        return Err(ElfNativeRead::BadPhEntSize);
+    }
+    let mut dynamic: Option<(usize, usize)> = None;
+    for k in 0..phnum {
+        let p = phoff + k * 56;
+        if u32_at(p)? == 2 {
+            let off = usize::try_from(u64_at(p + 8)?).map_err(|_| ElfNativeRead::Bounds("PT_DYNAMIC offset"))?;
+            let len = usize::try_from(u64_at(p + 32)?).map_err(|_| ElfNativeRead::Bounds("PT_DYNAMIC size"))?;
+            dynamic = Some((off, len));
+            break;
+        }
+    }
+    let Some((dyn_off, dyn_len)) = dynamic else { return Ok(false) };
+    let (mut strtab_va, mut strsz) = (None, None);
+    let mut off = 0usize;
+    while off + 16 <= dyn_len {
+        let tag = u64_at(dyn_off + off)?;
+        let val = u64_at(dyn_off + off + 8)?;
+        match tag {
+            0 => break,
+            5 => strtab_va = Some(val),
+            10 => strsz = Some(val),
+            _ => {}
+        }
+        off += 16;
+    }
+    let (Some(strtab_va), Some(strsz)) = (strtab_va, strsz) else { return Ok(false) };
+    let mut strtab_off = None;
+    for k in 0..phnum {
+        let p = phoff + k * 56;
+        if u32_at(p)? == 1 {
+            let p_off = u64_at(p + 8)?;
+            let p_vaddr = u64_at(p + 16)?;
+            let p_filesz = u64_at(p + 32)?;
+            if strtab_va >= p_vaddr && strtab_va.saturating_add(strsz) <= p_vaddr.saturating_add(p_filesz) {
+                strtab_off = Some(usize::try_from(p_off + (strtab_va - p_vaddr)).map_err(|_| ElfNativeRead::Bounds("DT_STRTAB offset"))?);
+                break;
+            }
+        }
+    }
+    let Some(strtab_off) = strtab_off else { return Err(ElfNativeRead::StrtabOutsideLoads) };
+    let strsz_usize = usize::try_from(strsz).map_err(|_| ElfNativeRead::Bounds("DT_STRSZ"))?;
+    let strtab = file.get(strtab_off..strtab_off.saturating_add(strsz_usize)).ok_or(ElfNativeRead::Bounds("DT_STRTAB"))?;
+    let mut off = 0usize;
+    while off + 16 <= dyn_len {
+        let tag = u64_at(dyn_off + off)?;
+        let val = u64_at(dyn_off + off + 8)?;
+        if tag == 0 {
+            break;
+        }
+        if tag == 1 {
+            let name_off = usize::try_from(val).map_err(|_| ElfNativeRead::Bounds("DT_NEEDED offset"))?;
+            let rest = strtab.get(name_off..).ok_or(ElfNativeRead::Bounds("DT_NEEDED"))?;
+            let name = rest.split(|b| *b == 0).next().unwrap_or(rest);
+            if name != LIBC_LINUX {
+                return Ok(true);
+            }
+        }
+        off += 16;
+    }
+    Ok(false)
+}
 
 /// Whether the arm64 Mach-O image `file` holds native code of the program's crates: a byte of
 /// `__TEXT,__text`, or a library besides libSystem (which the launcher has). The words and the
@@ -243,28 +432,166 @@ fn macho_holds_native(file: &[u8]) -> Result<bool, &'static str> {
     Ok(false)
 }
 
+/// Whether a Mach-O dylib exports any defined external symbol that shadows a symbol in
+/// `test_cache::classify_outside_symbol`'s pure allowlist (e.g., a custom C `malloc` or `memcpy`).
+/// Fails closed (`true`, forcing eager loading) on truncated headers or absent `LC_SYMTAB`.
+fn macho_exports_pure_symbol(file: &[u8]) -> bool {
+    let u32_at = |at: usize| {
+        file.get(at..at.saturating_add(4))
+            .and_then(|b| b.try_into().ok())
+            .map(u32::from_le_bytes)
+    };
+    if u32_at(0) != Some(0xfeed_facf) {
+        return true;
+    }
+    let Some(ncmds) = u32_at(16).and_then(|v| usize::try_from(v).ok()) else {
+        return true;
+    };
+    let mut at = 32usize;
+    let mut saw_symtab = false;
+    for _ in 0..ncmds {
+        let Some(cmd) = u32_at(at) else { return true };
+        let Some(size) = u32_at(at + 4).and_then(|v| usize::try_from(v).ok()) else { return true };
+        if size < 8 {
+            return true;
+        }
+        // LC_SYMTAB (0x2): symoff (+8), nsyms (+12), stroff (+16), strsize (+20).
+        if cmd == 0x2 {
+            saw_symtab = true;
+            let Some(symoff) = u32_at(at + 8).and_then(|v| usize::try_from(v).ok()) else { return true };
+            let Some(nsyms) = u32_at(at + 12).and_then(|v| usize::try_from(v).ok()) else { return true };
+            let Some(stroff) = u32_at(at + 16).and_then(|v| usize::try_from(v).ok()) else { return true };
+            let Some(strsize) = u32_at(at + 20).and_then(|v| usize::try_from(v).ok()) else { return true };
+            let Some(str_end) = stroff.checked_add(strsize) else { return true };
+            let Some(strtab) = file.get(stroff..str_end) else { return true };
+            for k in 0..nsyms {
+                let Some(row) = k.checked_mul(16).and_then(|off| symoff.checked_add(off)) else {
+                    return true;
+                };
+                let Some(n_strx) = u32_at(row).and_then(|v| usize::try_from(v).ok()) else { return true };
+                let Some(&n_type) = file.get(row + 4) else { return true };
+                // Non-STAB (`n_type & 0xe0 == 0`), defined in a section (`N_SECT = 0x0e`), external (`N_EXT = 0x01`).
+                if (n_type & 0xef) == 0x0f
+                    && let Some(rest) = strtab.get(n_strx..)
+                {
+                    let raw = rest.split(|&b| b == 0).next().unwrap_or(rest);
+                    let unmangled = raw.strip_prefix(b"_").unwrap_or(raw);
+                    if let Ok(name) = core::str::from_utf8(unmangled)
+                        && crate::test_cache::classify_outside_symbol(name).is_ok()
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        let Some(next) = at.checked_add(size) else { return true };
+        at = next;
+    }
+    !saw_symtab
+}
+
+/// Whether an arm64 ELF shared object exports any defined global/weak symbol in `.dynsym` that
+/// shadows a pure allowlist symbol. Fails closed (`true`, forcing eager loading) on truncated
+/// headers or absent `.dynsym`/`.dynstr`.
+fn elf_exports_pure_symbol(file: &[u8]) -> bool {
+    let u16_at = |at: usize| {
+        file.get(at..at.saturating_add(2))
+            .and_then(|b| b.try_into().ok())
+            .map(u16::from_le_bytes)
+    };
+    let u32_at = |at: usize| {
+        file.get(at..at.saturating_add(4))
+            .and_then(|b| b.try_into().ok())
+            .map(u32::from_le_bytes)
+    };
+    let u64_at = |at: usize| {
+        file.get(at..at.saturating_add(8))
+            .and_then(|b| b.try_into().ok())
+            .map(u64::from_le_bytes)
+    };
+    if file.get(0..6) != Some(&[0x7F, b'E', b'L', b'F', 2, 1][..]) {
+        return true;
+    }
+    let Some(shoff) = u64_at(40).and_then(|v| usize::try_from(v).ok()) else { return true };
+    let Some(shentsize) = u16_at(58).map(usize::from) else { return true };
+    let Some(shnum) = u16_at(60).map(usize::from) else { return true };
+    if shoff == 0 || shnum == 0 || shentsize != 64 {
+        return true;
+    }
+    for k in 0..shnum {
+        let Some(s) = k.checked_mul(64).and_then(|off| shoff.checked_add(off)) else { return true };
+        let Some(sh_type) = u32_at(s + 4) else { return true };
+        // SHT_DYNSYM == 11
+        if sh_type != 11 {
+            continue;
+        }
+        let Some(dynsym_off) = u64_at(s + 24).and_then(|v| usize::try_from(v).ok()) else { return true };
+        let Some(dynsym_size) = u64_at(s + 32).and_then(|v| usize::try_from(v).ok()) else { return true };
+        let Some(link) = u32_at(s + 40).and_then(|v| usize::try_from(v).ok()) else { return true };
+        let Some(entsize) = u64_at(s + 56).and_then(|v| usize::try_from(v).ok()) else { return true };
+        if link >= shnum || entsize < 24 {
+            return true;
+        }
+        let Some(str_sh) = link.checked_mul(64).and_then(|off| shoff.checked_add(off)) else { return true };
+        let Some(str_off) = u64_at(str_sh + 24).and_then(|v| usize::try_from(v).ok()) else { return true };
+        let Some(str_size) = u64_at(str_sh + 32).and_then(|v| usize::try_from(v).ok()) else { return true };
+        let Some(str_end) = str_off.checked_add(str_size) else { return true };
+        let Some(dynstr) = file.get(str_off..str_end) else { return true };
+        let nsyms = dynsym_size / entsize;
+        for i in 0..nsyms {
+            let Some(row) = i.checked_mul(entsize).and_then(|off| dynsym_off.checked_add(off)) else {
+                return true;
+            };
+            let Some(st_name) = u32_at(row).and_then(|v| usize::try_from(v).ok()) else { return true };
+            let Some(&st_info) = file.get(row + 4) else { return true };
+            let Some(st_shndx) = u16_at(row + 6) else { return true };
+            // Defined (`st_shndx != SHN_UNDEF`) and global/weak (`bind != STB_LOCAL`).
+            if st_shndx != 0 && (st_info >> 4) != 0
+                && let Some(rest) = dynstr.get(st_name..)
+            {
+                let raw = rest.split(|&b| b == 0).next().unwrap_or(rest);
+                if let Ok(name) = core::str::from_utf8(raw)
+                    && crate::test_cache::classify_outside_symbol(name).is_ok()
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    true
+}
+
 /// What the start of the program whose image is `payload` is sent ([`NativeSend`]), `None`
 /// when the image holds no native code: on macOS by its Mach-O headers
-/// ([`macho_holds_native`]); on Linux by its descriptor (a Rust word, an initializer or a
-/// pointer row; the ELF text is not read yet, so a Linux image whose C only Rust calls is not
-/// sent and its first call is refused by name in the child, `RunModeError::Outside`). The file
-/// is put at `<HOME>/` [`crate::run_parent::RECORDS`]`/<the key's hex>` when it is not there.
+/// ([`macho_holds_native`]); on Linux by its descriptor and ELF headers ([`elf_holds_native`]).
+/// The file is put at `<HOME>/` [`crate::run_parent::RECORDS`]`/<the key's hex>` when it is not
+/// there.
 fn send_of<'w>(cx: &Cx, key: Key, payload: &[u8], crates: &[CrateIn<'_>], platform: Platform, ask: &NativeAsk<'w>, scratch: &Frame) -> Result<Option<NativeSend<'w>>, NativeError<'w>> {
     let refused = |words: &str| NativeError::Send { words: held(words, ask) };
     let (descriptor, names) = blaze_native::descriptor::read(payload, platform).map_err(|why| refused(bstd::mem::format_in!(scratch, "its descriptor: {why:?}").as_str()))?;
     let described = descriptor.words > 0 || descriptor.inits > 0 || descriptor.pointers > 0;
     let holds = match platform {
         Platform::MacosArm64 => described || macho_holds_native(payload).map_err(refused)?,
-        Platform::LinuxArm64 => described,
+        Platform::LinuxArm64 => described || elf_holds_native(payload).map_err(|why| refused(bstd::mem::format_in!(scratch, "{why}").as_str()))?,
     };
     if !holds {
         return Ok(None);
     }
+    let shadows_pure = match platform {
+        Platform::MacosArm64 => macho_exports_pure_symbol(payload),
+        Platform::LinuxArm64 => elf_exports_pure_symbol(payload),
+    };
+    let load_mode = if descriptor.inits > 0 || shadows_pure {
+        NativeLoadMode::Eager
+    } else {
+        NativeLoadMode::Lazy
+    };
     // Each word's Rust function: the export of that name among the crates' tables.
     let erased = blaze_own::Erased::new(scratch);
     let alloc = erased.handle();
     // Every crate's exports, each by its platform spelling (the names table's), read once.
-    let mut exports: Vec<(&[u8], blaze_id::ItemKey), &Frame> = Vec::new_in(scratch);
+    let mut exports: Vec<(AVec<'_, u8>, blaze_id::ItemKey), &Frame> = Vec::new_in(scratch);
     for c in crates.iter() {
         let links = match native_links::open_table(c.table, alloc) {
             Ok(Table::Links(links)) => links,
@@ -273,14 +600,14 @@ fn send_of<'w>(cx: &Cx, key: Key, payload: &[u8], crates: &[CrateIn<'_>], platfo
         };
         for export in links.exports.iter() {
             let mangled = blaze_native::resolve::mangle(platform, export.name, alloc).map_err(|why| refused(bstd::mem::format_in!(scratch, "the export `{}`: {why:?}", export.name).as_str()))?;
-            exports.push((mangled.leak(), export.item));
+            exports.push((mangled, export.item));
         }
     }
     let mut words: Vec<blaze_launch::wire::run::Symbol, &'w Frame> = Vec::with_capacity_in(names.len(), ask.words);
     let mut items: Vec<blaze_id::ItemKey, &'w Frame> = Vec::with_capacity_in(names.len(), ask.words);
     for i in 0..names.len() {
         let Some(name) = names.get(i) else { return Err(refused("a word's name is past its table")) };
-        let found = exports.iter().find(|(spelled, _)| *spelled == name).map(|(_, item)| *item);
+        let found = exports.iter().find(|(spelled, _)| spelled.as_slice() == name).map(|(_, item)| *item);
         let Some(item) = found else {
             return Err(refused(bstd::mem::format_in!(scratch, "word {i} `{}` is no crate's export", core::str::from_utf8(name).unwrap_or("(not UTF-8)")).as_str()));
         };
@@ -299,7 +626,7 @@ fn send_of<'w>(cx: &Cx, key: Key, payload: &[u8], crates: &[CrateIn<'_>], platfo
     if dir.stat(cx, &name).map_err(|why| refused(bstd::mem::format_in!(scratch, "{why}").as_str()))?.is_none() {
         dir.publish(cx, &name, bstd::fs::Content::bytes(payload), bstd::fs::Durable::No).map_err(|why| refused(bstd::mem::format_in!(scratch, "the library's file: {why}").as_str()))?;
     }
-    Ok(Some(NativeSend { library: blaze_launch::wire::RecordId(key.0.0), hex: held(hex.as_str(), ask), words: words.leak(), items: items.leak() }))
+    Ok(Some(NativeSend { library: blaze_launch::wire::RecordId(key.0.0), hex: held(hex.as_str(), ask), words: words.into_bump_slice(), items: items.into_bump_slice(), load_mode }))
 }
 
 /// 32 bytes as 64 lowercase hex digits.
@@ -383,15 +710,22 @@ fn platform_code(platform: Platform) -> u8 {
     }
 }
 
-/// The store key of the image of `program` linking `crates` (the module's THE KEY): from the
-/// inputs alone, before the work. `sdk`: the macOS SDK's identity (`None` on Linux), whose
-/// stubs state the libraries' install names.
-pub(crate) fn image_key(program: Name, platform: Platform, producer: &ProducerId<Whole>, crates: &[CrateIn<'_>], sdk: Option<blaze_apple_sdk::SdkId>) -> Key {
+/// The store key of the native image linking `crates` (content-addressed by native link inputs
+/// alone, before the work): excludes the program's identity and pure-Rust crates with empty link
+/// tables and no build script so binaries/tests sharing a native closure share one store record
+/// and one dylib file (`v2/run/records/<key>`). `sdk`: the macOS SDK's identity (`None` on Linux),
+/// whose stubs state the libraries' install names.
+pub(crate) fn image_key(platform: Platform, producer: &ProducerId<Whole>, crates: &[CrateIn<'_>], sdk: Option<blaze_apple_sdk::SdkId>) -> Key {
     let mut h = blaze_ids::Hasher::new(KEY_FORM);
-    h.update(&[program.kind as u8]).update(&program.subject.0);
     h.update(&[platform_code(platform)]).update(&producer.id().0);
-    h.update(&(crates.len() as u64).to_le_bytes());
-    for c in crates.iter() {
+    let contributing = crates.iter().filter(|c| contributes_native(c)).count();
+    h.update(&u64::try_from(contributing).unwrap_or(u64::MAX).to_le_bytes());
+    for (idx, c) in crates.iter().enumerate() {
+        if !contributes_native(c) {
+            continue;
+        }
+        // Only the root crate's own build script has `rustc-link-arg` validated (natives.rs `link_line`).
+        h.update(&[u8::from(idx == 0 && c.script.is_some())]);
         h.update(&(c.package.len() as u64).to_le_bytes()).update(c.package.as_bytes());
         h.update(&[c.links.kind as u8]).update(&c.links.subject.0).update(&native_links::table_digest(c.table).0);
         match c.script {
@@ -441,39 +775,51 @@ fn held<'w>(text: &str, ask: &NativeAsk<'w>) -> &'w str {
     crate::work::held_str(text, ask.words)
 }
 
-/// THE CONTRACT OF E3: the native image of the program whose crates are `closure`, found by its
-/// key ([`image_key`]), else made now from each crate's link table and its build script's
-/// record and put. A program with no C input has a real image that links the system library.
-///
-/// `closure[0]` is the program's crate; the rest is the set of crates it may link, in any order
-/// (engine_seeds.rs `crates_of` with the program's first will do). The link order is the unit
-/// graph's (native_image.rs `closure`), never the caller's, and a crate the program links that is
-/// not in `closure` is refused by name ([`NativeError::NotHanded`]). Each crate's records are
-/// read through `Standing::names`, the one reader of the check's records (rule 30).
-pub(crate) fn image_for<'r>(cx: &Cx, standing: &mut Standing<'r, '_>, closure: &[CrateAt]) -> Result<ProgramImage<'r>, NativeError<'r>> {
-    let cx = cx.span("native: the program's image by key");
+struct PreparedCrates<'r, 's> {
+    platform: Platform,
+    sdk: Option<blaze_apple_sdk::Sdk<'r>>,
+    crates: Vec<CrateIn<'s>, &'s Frame>,
+}
+
+/// Gathers the program's link-closure crates in link order, runs any deferred C tasks on macOS,
+/// and reads each crate's link table into `scratch`. Shared by [`image_for`] (`run`/`test`) and
+/// [`export_native_for`] (`export`).
+fn prepare_crates<'r, 'm: 's, 's>(
+    cx: &Cx,
+    standing: &mut Standing<'r, 'm>,
+    closure: &[CrateAt],
+    watch: &dyn blaze_screen::Watch,
+    scratch: &'s Frame,
+) -> Result<PreparedCrates<'r, 's>, NativeError<'r>> {
     let Some(platform) = native_image::platform() else {
         return Err(NativeError::Platform { triple: crate::graph::TRIPLE });
     };
     let Some(first) = closure.first() else { return Err(NativeError::NoProgram) };
-    let scratch = Frame::with_reserve(NATIVE_FRAME, bstd::mem::Tag::Other).map_err(|_| NativeError::Frame)?;
+    // macOS: each library's install name is the SDK's stub's, so resolve the SDK lazily on demand
+    // here (at most once per command via `Standing::resolve_sdk`, reusing the open `~/.blaze` dir)
+    // instead of eagerly during `Standing` construction.
+    let sdk = match platform {
+        Platform::MacosArm64 => match standing.resolve_sdk(cx) {
+            Ok(sdk) => Some(sdk),
+            Err(why) => {
+                let ask = &standing.native;
+                return Err(NativeError::Sdk { words: held(bstd::mem::format_in!(scratch, "{why}").as_str(), ask) });
+            }
+        },
+        Platform::LinuxArm64 => None,
+    };
     // Disjoint fields: the ask and the readers are shared, the store is the one mutable borrow.
     let (ask, names, graph) = (&standing.native, standing.names, standing.graph);
-    // macOS: each library's install name is the SDK's stub's, so the image needs the SDK.
-    let sdk = match (platform, standing.place.sdk) {
-        (Platform::MacosArm64, Ok(sdk)) => Some(sdk),
-        (Platform::MacosArm64, Err(why)) => return Err(NativeError::Sdk { words: held(bstd::mem::format_in!(&scratch, "{why}").as_str(), ask) }),
-        (Platform::LinuxArm64, _) => None,
-    };
-    let store: &mut dyn Store<'_> = &mut *standing.store;
+    let store: &mut dyn Store<'m> = &mut *standing.store;
     let err = standing.err;
+    let checkout_root = standing.place.served.root_text();
     // A crate whose script deferred C requests: run here, before the link (native_runner_c.rs;
     // macOS only, where the pinned clang and the SDK are; elsewhere the link refuses the record
     // by name, natives.rs `DeferredC`).
-    let mut c_tasks = sdk.map(|sdk| crate::native_runner_c::CTasks::new(ask.home, sdk, &ask.fs, standing.workers.get(), standing.heap));
+    let mut c_tasks = sdk.map(|sdk| crate::native_runner_c::CTasks::new(ask.home, checkout_root, sdk, &ask.fs, standing.workers.get(), standing.heap));
 
     // The crate list, in place from the unit graph's record.
-    let payload = native_image::payload_in_place(&cx, store, &graph).map_err(NativeError::Store)?;
+    let payload = native_image::payload_in_place(cx, store, &graph).map_err(NativeError::Store)?;
     let sections = crate::graph_payload::sections(payload).map_err(|why| NativeError::Graph { name: graph.name, why })?;
     let Some(list) = sections.crates().map_err(|why| NativeError::Graph { name: graph.name, why })? else {
         return Err(NativeError::NoWorld { name: graph.name });
@@ -481,21 +827,21 @@ pub(crate) fn image_for<'r>(cx: &Cx, standing: &mut Standing<'r, '_>, closure: &
     let Some(root) = (0..list.len()).find(|r| list.key(*r) == first.key) else {
         return Err(NativeError::NotListed { krate: first.key });
     };
-    let program = match list.root(root).strip_prefix("/0/") {
+    let _program = match list.root(root).strip_prefix("/0/") {
         Some(path) if native_image::linked(&list, root) => native_image::program_name(path),
         _ => return Err(NativeError::NotAProgram { package: held(list.name(root), ask) }),
     };
 
     // The crates handed in, by key, to check each crate the walk reaches against.
-    let mut handed: Vec<[u8; 32], &Frame> = Vec::with_capacity_in(closure.len(), &scratch);
+    let mut handed: Vec<[u8; 32], &Frame> = Vec::with_capacity_in(closure.len(), scratch);
     handed.extend(closure.iter().map(|c| c.key.0.0));
     handed.sort_unstable();
 
-    let order = native_image::closure(&list, root, &handed, &scratch);
+    let order = native_image::closure(&list, root, &handed, scratch);
     // Each crate's script as it ran (the deferred record, when its C was deferred), read in
     // place before any crate's C runs: a reader's `OUT_DIR` spellings are found among them
     // (native_runner_c.rs `dep_out`).
-    let mut ran: Vec<(usize, ScriptIn<'_>), &Frame> = Vec::with_capacity_in(order.len(), &scratch);
+    let mut ran: Vec<(usize, ScriptIn<'m>), &'s Frame> = Vec::with_capacity_in(order.len(), scratch);
     for r in order.iter().copied() {
         let package = list.name(r);
         if handed.binary_search(&list.key(r).0.0).is_err() {
@@ -504,32 +850,25 @@ pub(crate) fn image_for<'r>(cx: &Cx, standing: &mut Standing<'r, '_>, closure: &
         let Some(bytes) = list.script(r) else { continue };
         let Some(name) = native_image::script_name(bytes) else { return Err(NativeError::ScriptKind { package: held(package, ask) }) };
         let Some(run) = names(name) else { return Err(NativeError::NoScript { package: held(package, ask), script: name }) };
-        let payload = native_image::payload_in_place(&cx, store, &run).map_err(NativeError::Store)?;
+        let payload = native_image::payload_in_place(cx, store, &run).map_err(NativeError::Store)?;
         ran.push((r, ScriptIn { name, out: run.out, payload }));
     }
-    // THE C STEP, dependencies first: `order` reversed is a post-order of the crate list's
-    // dependency edges (native_image.rs `closure`), so a `links` producer's C (jemalloc's
-    // configure and make, zstd-sys's compiles) has run, and its `OUT_DIR` is what that left,
-    // before any crate that depends on it asks for it (native_runner_c.rs `Producers`). The
-    // built record's in place of one whose C requests were deferred: its out is the built key,
-    // so the image's key moves with the compiles' inputs.
-    //
-    // A crate whose C step is refused costs only the code that calls it (stop 1 of the first
-    // real run: aws-lc's `.S` made EVERY test NOT RUN): the refusal is said here, naming the
-    // crate, and the crate is linked with no script outputs, so its archives are not in the
-    // image. Its C names then bind nowhere: blaze-native resolve.rs takes a root nothing defines
-    // as no import ("Rust binds it at run through the image handle"), and the child binds a C
-    // name when the code record that names it is placed (blaze-launch-rt native_lib.rs `bind`),
-    // that is at the first call of a Rust function that calls it. So exactly the tests (and the
-    // `run`) whose code reaches one of its C names stop, naming that name; the rest run. The
-    // image's key moves with it (the crate's script is absent from its inputs), and the next
-    // command asks the C step again (a built record is found by its key, never a refusal kept).
-    // A crate with deferred C that depends on a refused one is refused too (its C may call the
-    // refused archive's symbols, an import no library gives, which `dlopen`'s `RTLD_NOW` would
-    // refuse for the whole image); one that reads its `OUT_DIR` is refused by name
-    // (native_runner_c.rs `DepOut::Refused`).
-    let mut done: Vec<(usize, ScriptIn<'_>), &Frame> = Vec::with_capacity_in(ran.len(), &scratch);
-    let mut refused: Vec<usize, &Frame> = Vec::new_in(&scratch);
+    let mut done: Vec<(usize, ScriptIn<'s>), &'s Frame> = Vec::with_capacity_in(ran.len(), scratch);
+    let mut refused: Vec<usize, &Frame> = Vec::new_in(scratch);
+    let deferred_total: u32 = if c_tasks.is_some() {
+        let count = ran
+            .iter()
+            .filter(|(_, script)| {
+                crate::scripts::payload_parts(script.payload)
+                    .and_then(|(_, record)| blaze_build_script::outputs::OutputsRef::open(record).ok())
+                    .is_some_and(|o| o.c_requests().next().is_some())
+            })
+            .count();
+        u32::try_from(count).unwrap_or(u32::MAX)
+    } else {
+        0
+    };
+    let mut deferred_done = 0u32;
     for r in order.iter().rev().copied() {
         let Some(script) = ran.iter().find(|(at, _)| *at == r).map(|(_, script)| *script) else { continue };
         let script = match c_tasks.as_mut() {
@@ -538,22 +877,49 @@ pub(crate) fn image_for<'r>(cx: &Cx, standing: &mut Standing<'r, '_>, closure: &
                 let package = list.name(r);
                 let defers = crate::scripts::payload_parts(script.payload).and_then(|(_, record)| blaze_build_script::outputs::OutputsRef::open(record).ok()).is_some_and(|o| o.c_requests().next().is_some());
                 if defers && let Some(dep) = list.deps(r).find(|d| refused.contains(d)) {
-                    err.line(&cx, format_args!("the C of {package}: not built, as the C of {} it depends on was refused (said above); a call into either stops naming its C name ({RULE} `image_for`)", list.name(dep)))
+                    watch.see(blaze_screen::Step::Says);
+                    err.line(cx, format_args!("the C of {package}: not built, as the C of {} it depends on was refused (said above); a call into either stops naming its C name ({RULE} `image_for`)", list.name(dep)))
                         .map_err(|e| NativeError::Store(CliError::Out(e)))?;
                     refused.push(r);
+                    deferred_done = deferred_done.saturating_add(1);
                     continue;
                 }
+                if defers {
+                    use core::fmt::Write as _;
+                    let mut label = blaze_own::FixedString::<{ blaze_screen::ITEM_LABEL_BYTES }>::new();
+                    let _ = write!(label, "{package} · cc/c++");
+                    let items = [blaze_screen::ActiveItemRef { label: label.as_str(), elapsed_ms: 0 }];
+                    let remaining = deferred_total.saturating_sub(deferred_done).saturating_sub(1);
+                    let groups = [blaze_screen::ActiveGroupRef {
+                        kind: blaze_screen::WorkKind::BuildScript,
+                        items: &items,
+                        extra: u16::try_from(remaining).unwrap_or(u16::MAX),
+                    }];
+                    watch.see(blaze_screen::Step::Activity(blaze_screen::Activity {
+                        verb: "building",
+                        progress: (deferred_total > 0).then_some((deferred_done, deferred_total)),
+                        active: 1,
+                        hint: None,
+                        groups: &groups,
+                    }));
+                }
                 let producers = crate::native_runner_c::Producers { scripts: &ran, done: &done, refused: &refused, graph: sections.graph };
-                match crate::native_runner_c::built_for(&cx, c, store, &list, r, package, script, &producers, &scratch) {
+                let built = crate::native_runner_c::built_for(cx, c, store, &list, r, package, script, &producers, scratch);
+                if defers {
+                    deferred_done = deferred_done.saturating_add(1);
+                }
+                match built {
                     Ok((script, report)) => {
                         if let Some(report) = report {
-                            err.line(&cx, format_args!("{}", crate::native_runner_c::Said { package, report: &report })).map_err(|e| NativeError::Store(CliError::Out(e)))?;
+                            watch.see(blaze_screen::Step::Says);
+                            err.line(cx, format_args!("{}", crate::native_runner_c::Said { package, report: &report })).map_err(|e| NativeError::Store(CliError::Out(e)))?;
                         }
                         script
                     }
                     Err(why) => {
-                        let refusal = NativeError::CTasks { package: held(package, ask), words: held(bstd::mem::format_in!(&scratch, "{why}").as_str(), ask) };
-                        err.line(&cx, format_args!("{refusal}; its archives are left out of this image, and only code that calls one of its C names stops, naming it"))
+                        watch.see(blaze_screen::Step::Says);
+                        let refusal = NativeError::CTasks { package: held(package, ask), words: held(bstd::mem::format_in!(scratch, "{why}").as_str(), ask) };
+                        err.line(cx, format_args!("{refusal}; its archives are left out of this image, and only code that calls one of its C names stops, naming it"))
                             .map_err(|e| NativeError::Store(CliError::Out(e)))?;
                         refused.push(r);
                         continue;
@@ -563,22 +929,151 @@ pub(crate) fn image_for<'r>(cx: &Cx, standing: &mut Standing<'r, '_>, closure: &
         };
         done.push((r, script));
     }
-    let mut crates: Vec<CrateIn<'_>, &Frame> = Vec::with_capacity_in(order.len(), &scratch);
+    let mut crates: Vec<CrateIn<'s>, &'s Frame> = Vec::with_capacity_in(order.len(), scratch);
     for r in order.iter().copied() {
         let (package, key) = (list.name(r), list.key(r));
         let scope = blaze_drive::key::crate_scope_name(&key);
         let Some(scope_in) = names(scope) else { return Err(NativeError::NoNames { package: held(package, ask) }) };
-        let table = table_of(&cx, store, &scope_in, package, ask)?;
+        let table = table_of(cx, store, &scope_in, package, ask)?;
         let script = done.iter().find(|(at, _)| *at == r).map(|(_, script)| *script);
         crates.push(CrateIn { package, links: Name::links_of(scope), table, script });
     }
-    let image = image_in(&cx, &mut OnStore(store), program, &crates, platform, sdk, ask, &scratch)?;
+    {
+        let root_pkg = list.name(root);
+        let items = [blaze_screen::ActiveItemRef { label: root_pkg, elapsed_ms: 0 }];
+        let groups = [blaze_screen::ActiveGroupRef {
+            kind: blaze_screen::WorkKind::Blaze,
+            items: &items,
+            extra: 0,
+        }];
+        watch.see(blaze_screen::Step::Activity(blaze_screen::Activity {
+            verb: "linking",
+            progress: None,
+            active: 1,
+            hint: None,
+            groups: &groups,
+        }));
+    }
+    Ok(PreparedCrates { platform, sdk, crates })
+}
+
+/// THE CONTRACT OF E3: the native image of the program whose crates are `closure`, found by its
+/// key ([`image_key`]), else made now from each crate's link table and its build script's
+/// record and put. A program with no C input has a real image that links the system library.
+///
+/// `closure[0]` is the program's crate; the rest is the set of crates it may link, in any order
+/// (engine_seeds.rs `crates_of` with the program's first will do). The link order is the unit
+/// graph's (native_image.rs `closure`), never the caller's, and a crate the program links that is
+/// not in `closure` is refused by name ([`NativeError::NotHanded`]). Each crate's records are
+/// read through `Standing::names`, the one reader of the check's records (rule 30).
+pub(crate) fn image_for<'r>(
+    cx: &Cx,
+    standing: &mut Standing<'r, '_>,
+    closure: &[CrateAt],
+    watch: &dyn blaze_screen::Watch,
+) -> Result<ProgramImage<'r>, NativeError<'r>> {
+    let cx = cx.span("native: the program's image by key");
+    let scratch = Frame::with_reserve(NATIVE_FRAME, bstd::mem::Tag::Other).map_err(|_| NativeError::Frame)?;
+    let prepared = prepare_crates(&cx, standing, closure, watch, &scratch)?;
+    let ask = &standing.native;
+    let store: &mut dyn Store<'_> = &mut *standing.store;
+    let image = image_in(&cx, &mut OnStore(store), &prepared.crates, prepared.platform, prepared.sdk, ask, &scratch)?;
     // Read back in place (found or just put: the store lends its own puts), for its start.
     let gone = || NativeError::Send { words: "the image's record does not read back from the store just after `image_in`" };
     let bytes = OnStore(store).get(&cx, image.key).map_err(NativeError::Store)?.ok_or_else(gone)?;
     let Ok(Stored::Whole(view)) = blaze_drive::record::open(bytes) else { return Err(NativeError::Damaged { key: image.key, why: "it does not open as the whole record `image_in` checked" }) };
-    let send = send_of(&cx, image.key, view.payload, &crates, platform, ask, &scratch)?;
+    let decoded = decode_image_payload(image.key, view.payload, &scratch)?;
+    let send = send_of(&cx, image.key, decoded.as_slice(), &prepared.crates, prepared.platform, ask, &scratch)?;
     Ok(ProgramImage { key: image.key, send })
+}
+
+/// The laid-out native image (`blaze_native::image::Image`) and sorted Rust C exports for
+/// `blaze export`, allocated in `out_bump`. Returns `Ok(None)` when the program links no native
+/// objects, initializers, Rust words, or libraries beyond libSystem/libc.
+pub(crate) fn export_native_for<'r, 'm: 's, 's>(
+    cx: &Cx,
+    standing: &mut Standing<'r, 'm>,
+    closure: &[CrateAt],
+    watch: &dyn blaze_screen::Watch,
+    out_frame: &'s Frame,
+    out_bump: blaze_own::Bump<'s>,
+) -> Result<Option<ExportNative<'s>>, NativeError<'r>> {
+    let cx = cx.span("native: layout for export");
+    let prepared = prepare_crates(&cx, standing, closure, watch, out_frame)?;
+    let ask = &standing.native;
+    let alloc = out_bump.alloc();
+    let crates = &prepared.crates;
+    let mut tables = Vec::with_capacity_in(crates.len(), out_frame);
+    let mut outputs = Vec::with_capacity_in(crates.len(), out_frame);
+    for c in crates.iter() {
+        match native_links::open_table(c.table, alloc) {
+            Ok(Table::Links(links)) => tables.push(links),
+            Ok(Table::Refused(words)) => return Err(NativeError::TableRefused { package: held(c.package, ask), words: held(words, ask) }),
+            Err(why) => return Err(NativeError::TableForm { package: held(c.package, ask), why }),
+        }
+        match c.script {
+            None => outputs.push(None),
+            Some(script) => match native_image::script_outputs(script.payload, ask.home) {
+                Ok((opened, area)) => {
+                    let area: &blaze_world::StoredFiles = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(area, out_frame));
+                    outputs.push(Some((script.out, opened.with_area(area))));
+                }
+                Err(why) => return Err(NativeError::Script { package: held(c.package, ask), script: script.name, why }),
+            },
+        }
+    }
+    let tables = tables.into_bump_slice();
+    let outputs = outputs.into_bump_slice();
+    let mut linked = Vec::with_capacity_in(crates.len(), out_frame);
+    for (c, (table, output)) in crates.iter().zip(tables.iter().zip(outputs.iter().copied())) {
+        linked.push(ProgramCrate { package: c.package, outputs: output, links: table });
+    }
+    let linked: &'s [ProgramCrate<'s>] = linked.into_bump_slice();
+    let producer: &'s ProducerId<Whole> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(ask.producer, out_frame));
+    let installs = match native_links::program_libraries(linked, prepared.platform, producer, alloc) {
+        Ok(asked) => stubs_read(&cx, &asked, prepared.sdk, ask, out_frame)?,
+        Err(error) => return Err(NativeError::Link { what: "the program's libraries", words: held(bstd::mem::format_in!(out_frame, "{error:?}").as_str(), ask) }),
+    };
+    let installs: &'s [Linked<'s>] = installs.into_bump_slice();
+    let image = match native_links::program_layout(linked, installs, prepared.platform, producer, blaze_hash::FixedState, out_bump) {
+        Ok(image) => image,
+        Err(error) => return Err(NativeError::Link { what: "the program's native image", words: held(bstd::mem::format_in!(out_frame, "{error:?}").as_str(), ask) }),
+    };
+    let has_text = image.region(blaze_native::image::Region::Text).is_some_and(|r| r.len > 0);
+    let has_extra_lib = image.libraries.iter().any(|l| l.install().as_bytes() != LIB_SYSTEM && l.install().as_bytes() != LIBC_LINUX);
+    if !has_text && image.words.is_empty() && image.inits == 0 && image.tls.is_empty() && !has_extra_lib {
+        return Ok(None);
+    }
+    // Collect only the Rust C exports referenced by `image.words` (matching `send_of`), sorted by
+    // name for `native_merge`. Unreferenced `#[no_mangle]` items in the closure (such as Linux
+    // `compiler_builtins` outline-atomic helpers like `__aarch64_cas16_acq`) are never called by
+    // the native image and must not be forced as mandatory export roots.
+    let strip_underscore = prepared.platform == Platform::MacosArm64;
+    let mut exports: AVec<'s, blaze_export::CExport<'s>> = Vec::new_in(alloc);
+    let mut items: AVec<'s, blaze_id::ItemKey> = Vec::new_in(alloc);
+    if !image.words.is_empty() {
+        for table in tables.iter() {
+            for export in table.exports.iter() {
+                let raw_name = export.name.as_bytes();
+                let needed = image.words.iter().any(|&word| {
+                    let word = if strip_underscore { word.strip_prefix(b"_").unwrap_or(word) } else { word };
+                    word == raw_name
+                });
+                if !needed {
+                    continue;
+                }
+                let checker = blaze_ladder::front2::keys::checker_of(export.item);
+                let symbol = blaze_ladder::symbols::fn_symbol(checker, blaze_typeck::List::EMPTY, blaze_typeck::PTys::EMPTY, alloc)
+                    .map_err(|why| NativeError::Send { words: held(bstd::mem::format_in!(out_frame, "export `{}` symbol: {why:?}", export.name).as_str(), ask) })?;
+                exports.push(blaze_export::CExport { name: raw_name, symbol });
+                if items.scan_for(&export.item).is_none() {
+                    items.push(export.item);
+                }
+            }
+        }
+    }
+    exports.sort_unstable_by(|a, b| a.name.cmp(b.name));
+    Ok(Some(ExportNative { image, exports, items }))
 }
 
 /// The link table of the crate whose `CrateScope` record `scope` names: that record's `links`
@@ -595,15 +1090,15 @@ fn table_of<'m, 'w>(cx: &Cx, store: &mut dyn Store<'m>, scope: &Input, package: 
     }
 }
 
-/// The image of `program` linking `crates` (link order, the program's crate first): found at
-/// [`image_key`] in `store`, else made in `scratch` and put there. The record found is checked
-/// once to be this program's and these inputs' (its name and source), never made again over.
-/// `sdk`: the macOS SDK whose stubs name the libraries (`None` on Linux).
+/// The native image linking `crates` (link order, the program's crate first): found at
+/// [`image_key`] in `store`, else made in `scratch` and put there. Content-addressed by native
+/// link inputs only (never the program name), so binaries and tests sharing a native closure
+/// share one record and one dylib file. `sdk`: the macOS SDK whose stubs name the libraries
+/// (`None` on Linux).
 #[expect(clippy::too_many_arguments, reason = "each is one input of the image or of its key, named at the call")]
 pub(crate) fn image_in<'w>(
     cx: &Cx,
     store: &mut dyn ImageStore<'_>,
-    program: Name,
     crates: &[CrateIn<'_>],
     platform: Platform,
     sdk: Option<blaze_apple_sdk::Sdk<'_>>,
@@ -619,20 +1114,25 @@ pub(crate) fn image_in<'w>(
         (Platform::MacosArm64, None) => return Err(NativeError::Sdk { words: "none was handed to the image (engine_native.rs `image_in`)" }),
         (Platform::LinuxArm64, _) => None,
     };
-    let key = image_key(program, platform, &ask.producer, crates, sdk.map(|sdk| sdk.identity()));
+    let key = image_key(platform, &ask.producer, crates, sdk.map(|sdk| sdk.identity()));
+    let record_name = Name::new(Kind::Native, key.0);
     if let Some(bytes) = store.get(&cx, key).map_err(NativeError::Store)? {
         let view = match blaze_drive::record::open(bytes) {
             Ok(Stored::Whole(view)) => view,
             Ok(Stored::Shape(_)) => return Err(NativeError::Damaged { key, why: "a shape record, which holds no image" }),
             Err(_) => return Err(NativeError::Damaged { key, why: "bytes that are no drive record" }),
         };
-        if view.name != program || view.source != key.0 {
-            return Err(NativeError::Damaged { key, why: "the record of another program or of other inputs" });
+        if view.name != record_name || view.source != key.0 {
+            return Err(NativeError::Damaged { key, why: "the record of another native image or of other inputs" });
         }
         if view.payload.is_empty() {
             return Err(NativeError::Damaged { key, why: "an empty image (a program with no C input still has one)" });
         }
-        return Ok(Image { key, made: false, bytes: view.payload.len() });
+        let decoded = decode_image_payload(key, view.payload, scratch)?;
+        if decoded.as_slice().is_empty() {
+            return Err(NativeError::Damaged { key, why: "an empty image (a program with no C input still has one)" });
+        }
+        return Ok(Image { key, made: false, bytes: decoded.as_slice().len() });
     }
 
     // Made now: each crate's table and its script's outputs opened, in the scratch frame.
@@ -651,7 +1151,7 @@ pub(crate) fn image_in<'w>(
             Some(script) => match native_image::script_outputs(script.payload, ask.home) {
                 Ok((opened, area)) => {
                     // Held in the scratch frame for as long as the link reads the outputs.
-                    let area: &blaze_world::StoredFiles = blaze_own::Box::leak(blaze_own::Box::new_in(area, scratch));
+                    let area: &blaze_world::StoredFiles = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(area, scratch));
                     outputs.push(Some((script.out, opened.with_area(area))));
                 }
                 Err(why) => return Err(NativeError::Script { package: held(c.package, ask), script: script.name, why }),
@@ -671,19 +1171,25 @@ pub(crate) fn image_in<'w>(
         Err(error) => return Err(NativeError::Link { what: "the program's native key", words: held(bstd::mem::format_in!(scratch, "{error:?}").as_str(), ask) }),
     };
     let mut image = AVec::new_in(alloc);
-    if let Err(error) = native_links::program_image(&linked, &installs, platform, &ask.producer, blaze_hash::FixedState, &mut image, alloc) {
+    if let Err(error) = native_links::program_image(&linked, &installs, platform, &ask.producer, blaze_hash::FixedState, &mut image, erased.bump()) {
         return Err(NativeError::Link { what: "the program's native image", words: held(bstd::mem::format_in!(scratch, "{error:?}").as_str(), ask) });
     }
-    // What it read, in link order: each crate's table (by its digest) and its script's run.
+    // What it read, in link order: each native-contributing crate's table (by its digest) and
+    // its script's run. Pure-Rust crates with empty link tables and no build script are omitted
+    // so two programs sharing a native closure write identical record bytes under one key
+    // (rule 21, rule 25).
     let mut reads = Vec::with_capacity_in(crates.len() * 2, scratch);
-    for c in crates.iter() {
+    for c in crates.iter().filter(|c| contributes_native(c)) {
         reads.push((c.links, native_links::table_digest(c.table)));
         if let Some(script) = c.script {
             reads.push((script.name, script.out));
         }
     }
-    let head = blaze_drive::record::write_plain_head(program, key.0, out, &reads, image.len(), alloc);
-    store.put_parts(&cx, key, &[head.as_slice(), image.as_slice()]).map_err(NativeError::Store)?;
+    let encoded = crate::store::record_codec::encode_selective_in(image.as_slice(), scratch)
+        .map_err(|why| NativeError::Link { what: "compressing the program's native image", words: held(bstd::mem::format_in!(scratch, "{why}").as_str(), ask) })?;
+    let stored_payload = encoded.as_slice();
+    let head = blaze_drive::record::write_plain_head(record_name, key.0, out, &reads, stored_payload.len(), alloc);
+    store.put_parts(&cx, key, &[head.as_slice(), stored_payload]).map_err(NativeError::Store)?;
     Ok(Image { key, made: true, bytes: image.len() })
 }
 
@@ -715,7 +1221,7 @@ fn stubs_read<'s, 'w>(cx: &Cx, asked: &[Asked<'s>], sdk: Option<blaze_apple_sdk:
             Err(error) => return Err(unread(bstd::mem::format_in!(scratch, "{error}").as_str())),
         }
         // Held in the scratch frame for as long as the link reads the install name.
-        let bytes: &'s bstd::mem::Bytes<'s> = blaze_own::Box::leak(blaze_own::Box::new_in(bytes, scratch));
+        let bytes: &'s bstd::mem::Bytes<'s> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(bytes, scratch));
         installs.push(at.linked(bytes.as_slice()).map_err(|why| refused(StubWhy::Form(why)))?);
     }
     Ok(installs)
@@ -732,7 +1238,6 @@ mod tests {
 
     use blaze_build_script::instr::OutputLimits;
     use blaze_build_script::outputs::Outputs;
-    use blaze_drive::Kind;
     use blaze_ids::producer::Producers;
     use bstd::io::{Io, Limits, SimWorld};
 
@@ -765,12 +1270,24 @@ mod tests {
     }
 
     impl Model {
-        /// The image's bytes (the payload of the record at `key`).
-        fn image(&self, key: Key) -> &'static [u8] {
+        /// The raw stored payload bytes inside the `Whole` record at `key` (may be `BZR1`-compressed).
+        fn raw_payload(&self, key: Key) -> &'static [u8] {
             let (_, bytes) = self.held.iter().find(|(at, _)| *at == key).unwrap_or_else(|| panic!("no record at {key:?}"));
             match blaze_drive::record::open(bytes) {
                 Ok(Stored::Whole(view)) => view.payload,
                 _ => panic!("the record at {key:?} is no whole record"),
+            }
+        }
+
+        /// The decoded image bytes (transparently unwrapping `BZR1` when compressed).
+        fn image(&self, key: Key) -> &'static [u8] {
+            let raw = self.raw_payload(key);
+            let alloc = blaze_own::testing::heap().alloc();
+            match crate::store::record_codec::decode_if_envelope_in(raw, NATIVE_IMAGE_MAX_BYTES, alloc)
+                .unwrap_or_else(|why| panic!("the record at {key:?} failed BZR1 decode: {why}"))
+            {
+                crate::store::record_codec::Decoded::Borrowed(bytes) => bytes,
+                crate::store::record_codec::Decoded::Owned(bytes) => leak(bytes.as_slice().to_vec()),
             }
         }
     }
@@ -880,7 +1397,10 @@ mod tests {
             words: Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("the words' frame"),
             scratch: Frame::with_reserve(256 << 20, bstd::mem::Tag::Other).expect("the image's frame"),
             producer: Producers::for_tests(producer).get::<Whole>(),
-            platform: native_image::platform().expect("this host's target has an image form (arm64 macOS or Linux)"),
+            // The fixture constructs a simulated Apple SDK at `/sdk` (`SDK_STUBS`) and exercises
+            // Mach-O image writing purely over simulated IO, so pin the target platform rather than
+            // reading the host OS (otherwise Linux CI fails with `Write(NotMac)`).
+            platform: Platform::MacosArm64,
             sdk: sdk_at("/sdk", r#"{"Version":"27.2"}"#, BUILD_26B118),
         }
     }
@@ -896,7 +1416,7 @@ mod tests {
     fn try_image<'f>(f: &'f Fixture, store: &mut Model, crates: &[CrateIn<'_>]) -> Result<Image, NativeError<'f>> {
         let cx = f.io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("a root context");
         let ask = NativeAsk { producer: f.producer, home: None, words: &f.words, fs: f.io.need_fs().expect("files") };
-        image_in(&cx, store, native_image::program_name("src/main.rs"), crates, f.platform, Some(f.sdk), &ask, &f.scratch)
+        image_in(&cx, store, crates, f.platform, Some(f.sdk), &ask, &f.scratch)
     }
 
     fn image(f: &Fixture, store: &mut Model, crates: &[CrateIn<'_>]) -> Image {
@@ -1002,7 +1522,7 @@ mod tests {
         let hit = image(&f, &mut two, &crates);
         assert!(!hit.made && hit.key == a.key && two.image(hit.key) == one.image(a.key), "the hit's image is not the fresh one");
         let other = fixture(b"engine_native restore: another producer");
-        assert_ne!(image_key(native_image::program_name("src/main.rs"), other.platform, &other.producer, &crates, sdk_key(&other)), a.key, "control: the producer is not in the key");
+        assert_ne!(image_key(other.platform, &other.producer, &crates, sdk_key(&other)), a.key, "control: the producer is not in the key");
         std::println!("engine_native: two homes, one key, equal bytes ({})", a.bytes);
     }
 
@@ -1012,7 +1532,7 @@ mod tests {
     fn a_damaged_record_is_refused_by_its_key() {
         let f = fixture(b"engine_native damaged");
         let crates = [CrateIn { package: "app", links: links(1), table: leak(table(&[])), script: None }];
-        let key = image_key(native_image::program_name("src/main.rs"), f.platform, &f.producer, &crates, sdk_key(&f));
+        let key = image_key(f.platform, &f.producer, &crates, sdk_key(&f));
         let mut store = Model::default();
         store.held.push((key, &b"not a record"[..]));
         match try_image(&f, &mut store, &crates) {
@@ -1086,8 +1606,7 @@ mod tests {
             Err(NativeError::Stub { package: "app", library: "`-lz`", why: StubWhy::Form(_), .. }) => {}
             other => panic!("a stub of no form was not refused: {:?}", other.map(|image| image.key)),
         }
-        let program = native_image::program_name("src/main.rs");
-        let key = |sdk: blaze_apple_sdk::Sdk<'static>| image_key(program, f.platform, &f.producer, &crates, Some(sdk.identity()));
+        let key = |sdk: blaze_apple_sdk::Sdk<'static>| image_key(f.platform, &f.producer, &crates, Some(sdk.identity()));
         let tools = sdk_at("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk", r#"{"Version":"27.2"}"#, BUILD_26B118);
         let older = sdk_at("/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk", r#"{"Version":"26.5"}"#, "<key>ProductBuildVersion</key><string>25F70</string>");
         let beta = sdk_at("/Library/Developer/CommandLineTools/SDKs/MacOSX27.2.sdk", r#"{"Version":"27.2"}"#, "<key>ProductBuildVersion</key><string>26B5044k</string>");
@@ -1095,5 +1614,195 @@ mod tests {
         assert_ne!(key(f.sdk), key(older), "two SDK versions keyed one image");
         assert_ne!(key(f.sdk), key(beta), "two builds of one SDK version keyed one image");
         std::println!("engine_native: a stub's install name moves the image's own key; the SDK's version and build move its key, its folder does not");
+    }
+
+    /// Linux ELF shared objects: `elf_holds_native` reports `false` for a bare `libc.so.6`-only
+    /// image with empty `.text`, and `true` when the image links an extra library (`libm.so.6`).
+    #[test]
+    fn elf_holds_native_detects_extra_libraries_and_empty_text() {
+        let f = fixture(b"engine_native elf holds");
+        let cx = f.io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("a root context");
+        let ask = NativeAsk { producer: f.producer, home: None, words: &f.words, fs: f.io.need_fs().expect("files") };
+        let empty = leak(table(&[]));
+        let with_m = leak(table(&["m"]));
+        let mut store = Model::default();
+        let bare = image_in(
+            &cx,
+            &mut store,
+            &[CrateIn { package: "app", links: links(1), table: empty, script: None }],
+            Platform::LinuxArm64,
+            None,
+            &ask,
+            &f.scratch,
+        )
+        .expect("bare linux image");
+        assert_eq!(elf_holds_native(store.image(bare.key)), Ok(false), "empty .text + libc.so.6 alone holds no native code");
+        let linked_m = image_in(
+            &cx,
+            &mut store,
+            &[CrateIn { package: "app", links: links(1), table: with_m, script: None }],
+            Platform::LinuxArm64,
+            None,
+            &ask,
+            &f.scratch,
+        )
+        .expect("linux image linking libm");
+        assert_eq!(elf_holds_native(store.image(linked_m.key)), Ok(true), "DT_NEEDED libm.so.6 holds native dependency");
+    }
+
+    #[test]
+    fn macho_exports_pure_symbol_flags_libc_overrides_and_allows_c_libraries() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let build_macho = |exports: &[&[u8]], include_symtab: bool| {
+            let mut strtab = Vec::new_in(alloc);
+            strtab.push(0u8);
+            let mut nlists = Vec::new_in(alloc);
+            for name in exports {
+                let strx = u32::try_from(strtab.len()).expect("strx");
+                strtab.extend_from_slice(name);
+                strtab.push(0u8);
+                // nlist_64: n_strx (4), n_type (1 = N_SECT | N_EXT = 0x0f), n_sect (1), n_desc (2), n_value (8)
+                nlists.extend_from_slice(&strx.to_le_bytes());
+                nlists.push(0x0f);
+                nlists.push(1);
+                nlists.extend_from_slice(&0u16.to_le_bytes());
+                nlists.extend_from_slice(&0x4000u64.to_le_bytes());
+            }
+            let ncmds: u32 = if include_symtab { 1 } else { 0 };
+            let symoff: u32 = 32 + if include_symtab { 24 } else { 0 };
+            let stroff: u32 = symoff + u32::try_from(nlists.len()).expect("nlists len");
+            let mut file = Vec::new_in(alloc);
+            file.extend_from_slice(&0xfeed_facfu32.to_le_bytes());
+            file.extend_from_slice(&0x0100_000cu32.to_le_bytes());
+            file.extend_from_slice(&0u32.to_le_bytes());
+            file.extend_from_slice(&6u32.to_le_bytes()); // MH_DYLIB
+            file.extend_from_slice(&ncmds.to_le_bytes());
+            file.extend_from_slice(&(ncmds * 24).to_le_bytes());
+            file.extend_from_slice(&0u32.to_le_bytes());
+            file.extend_from_slice(&0u32.to_le_bytes());
+            if include_symtab {
+                file.extend_from_slice(&0x2u32.to_le_bytes()); // LC_SYMTAB
+                file.extend_from_slice(&24u32.to_le_bytes());
+                file.extend_from_slice(&symoff.to_le_bytes());
+                file.extend_from_slice(&u32::try_from(exports.len()).expect("nsyms").to_le_bytes());
+                file.extend_from_slice(&stroff.to_le_bytes());
+                file.extend_from_slice(&u32::try_from(strtab.len()).expect("strsize").to_le_bytes());
+                file.extend_from_slice(&nlists);
+                file.extend_from_slice(&strtab);
+            }
+            file
+        };
+
+        let safe = build_macho(&[b"___blaze_native_v1", b"_blst_p1_mult", b"_secp256k1_ecdsa_verify"], true);
+        assert!(!macho_exports_pure_symbol(&safe), "regular C library exports allow lazy loading");
+
+        let overriding = build_macho(&[b"___blaze_native_v1", b"_malloc"], true);
+        assert!(macho_exports_pure_symbol(&overriding), "dylib overriding malloc must stay eager");
+
+        let no_symtab = build_macho(&[], false);
+        assert!(macho_exports_pure_symbol(&no_symtab), "missing LC_SYMTAB fails closed to eager");
+    }
+
+    #[test]
+    fn bnl2_record_compresses_large_images_with_bzr1_round_trips_and_rejects_corruption() {
+        let f = fixture(b"engine_native bzr1 roundtrip");
+        let crates = [CrateIn { package: "app", links: links(1), table: leak(table(&["z"])), script: None }];
+        let mut store = Model::default();
+
+        // 1. Real Mach-O BNL2 image (>= 4 KiB) compresses into BZR1 envelope and round-trips byte-exact.
+        let made = image(&f, &mut store, &crates);
+        assert!(made.made && made.bytes >= crate::store::record_codec::COMPRESS_MIN_BYTES);
+        let stored_payload = store.raw_payload(made.key);
+        assert!(
+            crate::store::record_codec::is_envelope(stored_payload),
+            "large BNL2 native image must be wrapped in BZR1 envelope"
+        );
+        assert!(
+            stored_payload.len() * 4 < made.bytes,
+            "expected >4x BZR1 compression on page-aligned BNL2 image: {} -> {} bytes",
+            made.bytes,
+            stored_payload.len()
+        );
+        let decoded_bytes = store.image(made.key);
+        assert_eq!(decoded_bytes.len(), made.bytes);
+        assert_eq!(&decoded_bytes[..4], &0xfeed_facfu32.to_le_bytes());
+        assert!(contains(decoded_bytes, b"libz"));
+
+        // Cache hit validates BZR1 envelope and returns exact uncompressed byte length.
+        let hit = image(&f, &mut store, &crates);
+        assert_eq!((hit.key, hit.made, hit.bytes, store.puts), (made.key, false, made.bytes, 1));
+
+        // 2. Small (< 4 KiB) raw payload stays zero-copy (Decoded::Borrowed, not compressed).
+        let mut small_raw = std::vec![0xcf, 0xfa, 0xed, 0xfe];
+        small_raw.resize(1024, 0xab);
+        let enc_small = crate::store::record_codec::encode_selective_in(&small_raw, &f.scratch).expect("encode small");
+        assert!(!enc_small.is_compressed(), "small payloads stay raw");
+        let dec_small = decode_image_payload(made.key, enc_small.as_slice(), &f.scratch).expect("decode small");
+        assert!(!dec_small.was_compressed(), "raw payloads borrow zero-copy");
+        assert_eq!(dec_small.as_slice(), small_raw.as_slice());
+
+        // 3. Corrupted BZR1 envelope is refused loudly as NativeError::Damaged with 0 re-puts.
+        let mut corrupted_store = Model::default();
+        let (_, whole_bytes) = store.held.iter().find(|(at, _)| *at == made.key).expect("stored record");
+        let mut flipped = whole_bytes.to_vec();
+        let last = flipped.len() - 1;
+        flipped[last] ^= 0x01;
+        corrupted_store.held.push((made.key, leak(flipped)));
+        match try_image(&f, &mut corrupted_store, &crates) {
+            Err(NativeError::Damaged { key, .. }) => assert_eq!(key, made.key),
+            other => panic!("corrupted BZR1 BNL2 record must be refused as Damaged, got {:?}", other.map(|img| img.key)),
+        }
+        assert_eq!(corrupted_store.puts, 0, "must not overwrite corrupted record");
+    }
+
+    /// Two distinct binaries/tests with different program crates and pure-Rust intermediate deps
+    /// but identical native link inputs produce the exact same `image_key`, share one store record
+    /// (zero duplicate links or dylibs), and write byte-identical records across fresh stores.
+    /// CONTROL: a program crate that itself contributes native `#[link]` or a build script moves
+    /// `image_key`.
+    #[test]
+    fn different_programs_with_identical_native_closure_share_one_key_and_image() {
+        let f = fixture(b"engine_native dedup by native inputs");
+        let empty = leak(table(&[]));
+        let with_z = leak(table(&["z"]));
+        let run = script(3, leak(script_payload(b"cargo::rustc-link-lib=z\n")));
+        let crates_a = [
+            CrateIn { package: "bin_alpha@0.1.0", links: links(10), table: empty, script: None },
+            CrateIn { package: "pure_helper_a@0.1.0", links: links(11), table: empty, script: None },
+            CrateIn { package: "zsys@1.0.0", links: links(2), table: with_z, script: Some(run) },
+        ];
+        let crates_b = [
+            CrateIn { package: "test_beta@0.1.0", links: links(20), table: empty, script: None },
+            CrateIn { package: "zsys@1.0.0", links: links(2), table: with_z, script: Some(run) },
+        ];
+
+        let key_a = image_key(f.platform, &f.producer, &crates_a, sdk_key(&f));
+        let key_b = image_key(f.platform, &f.producer, &crates_b, sdk_key(&f));
+        assert_eq!(key_a, key_b, "two programs with identical native link closure must share one image_key");
+
+        // Shared store: second program hits the first program's record with 0 new puts.
+        let mut shared = Model::default();
+        let first = image(&f, &mut shared, &crates_a);
+        assert!(first.made && shared.puts == 1);
+        let second = image(&f, &mut shared, &crates_b);
+        assert_eq!((second.key, second.made, second.bytes, shared.puts), (first.key, false, first.bytes, 1));
+
+        // Fresh store rule 21/25: both programs emit byte-identical records (header + LC_ID_DYLIB + payload).
+        let mut fresh_b = Model::default();
+        let made_b = image(&f, &mut fresh_b, &crates_b);
+        assert_eq!(made_b.key, first.key);
+        assert_eq!(shared.held[0].1, fresh_b.held[0].1, "records under one native key must be byte-equal");
+        assert_eq!(shared.image(first.key), fresh_b.image(made_b.key), "dylib bytes including LC_ID_DYLIB must be identical");
+
+        // CONTROL: a program crate that itself contributes a native link decl or build script moves the key.
+        let crates_native_prog = [
+            CrateIn { package: "bin_gamma@0.1.0", links: links(30), table: with_z, script: None },
+            CrateIn { package: "zsys@1.0.0", links: links(2), table: with_z, script: Some(run) },
+        ];
+        assert_ne!(
+            image_key(f.platform, &f.producer, &crates_native_prog, sdk_key(&f)),
+            key_a,
+            "control: a program crate with its own native link table must produce a distinct image_key"
+        );
     }
 }

@@ -2,7 +2,7 @@
 //! and stores, the LSE atomics when the core has them ([`crate::Isa::lse`]), else (and for
 //! `nand`) an exclusive load and store retried until the store keeps its reservation.
 
-use std::alloc::Allocator;
+use alloc::alloc::Allocator;
 
 use blaze_lir::{AtomicRmw, Op, Ordering, Value, func::NONE};
 
@@ -129,7 +129,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 self.put(enc::cmp(X12, X10));
                 self.put(enc::cset(X13, Cond::Eq));
                 self.st(X12, inst);
-                self.st_sp(X13, inst as u32 * 16 + 8);
+                self.st_sp(X13, self.cell_of(inst) + 8);
             }
         }
         Ok(())

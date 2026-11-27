@@ -338,17 +338,17 @@ pub fn encode_with<'a>(world: &World<'_>, facts: &dyn ListFacts, alloc: Alloc<'a
     let n = crates.len();
     u32_of(n, "row count")?;
     // Row `r` is the world's crate `r`; the by-key table lists the rows sorted by key.
-    let mut order: AVec<'_, usize> = AVec::with_capacity_in(n, alloc.clone());
+    let mut order: AVec<'_, usize> = AVec::with_capacity_in(n, alloc);
     order.extend(0..n);
     order.sort_unstable_by_key(|at| crates[*at].input.key.0.0);
     if let Some(pair) = order.windows(2).find(|pair| crates[pair[0]].input.key == crates[pair[1]].input.key) {
         return Err(ListError::SameKey { first: pair[0].min(pair[1]), second: pair[0].max(pair[1]) });
     }
-    let mut row_of: AVec<'_, u32> = AVec::with_capacity_in(n, alloc.clone());
+    let mut row_of: AVec<'_, u32> = AVec::with_capacity_in(n, alloc);
     row_of.extend((0..n).map(|at| at as u32));
-    let mut heap: AVec<'_, u8> = AVec::new_in(alloc.clone());
-    let mut rows: AVec<'_, u8> = AVec::with_capacity_in(n * ROW, alloc.clone());
-    let mut deps: AVec<'_, u8> = AVec::new_in(alloc.clone());
+    let mut heap: AVec<'_, u8> = AVec::new_in(alloc);
+    let mut rows: AVec<'_, u8> = AVec::with_capacity_in(n * ROW, alloc);
+    let mut deps: AVec<'_, u8> = AVec::new_in(alloc);
     let mut d = 0usize;
     for at in 0..n {
         let c = &crates[at];
@@ -374,7 +374,7 @@ pub fn encode_with<'a>(world: &World<'_>, facts: &dyn ListFacts, alloc: Alloc<'a
         if matches!(c.origin, Origin::Toolchain(_)) {
             flags |= TOOLCHAIN;
         }
-        if c.input.root.starts_with("/0/") {
+        if c.member {
             flags |= MEMBER;
         }
         if world.refusal(at).is_some() {
@@ -444,7 +444,7 @@ pub fn encode_with<'a>(world: &World<'_>, facts: &dyn ListFacts, alloc: Alloc<'a
     if packs.len() != origins.len() {
         return Err(ListError::Origins { packs: packs.len(), origins: origins.len() });
     }
-    let mut trees: AVec<'_, u8> = AVec::with_capacity_in(packs.len() * TREE, alloc.clone());
+    let mut trees: AVec<'_, u8> = AVec::with_capacity_in(packs.len() * TREE, alloc);
     for (pack, origin) in packs.iter().zip(origins.iter()) {
         let (kind, name) = match origin {
             PackOrigin::Shelf { digest } => (SHELF, *digest),
@@ -455,18 +455,18 @@ pub fn encode_with<'a>(world: &World<'_>, facts: &dyn ListFacts, alloc: Alloc<'a
         trees.extend_from_slice(&pack.tree().0);
     }
     let corrected_files = world.texts.corrected();
-    let mut corrected: AVec<'_, u8> = AVec::with_capacity_in(corrected_files.len() * CORRECTED, alloc.clone());
+    let mut corrected: AVec<'_, u8> = AVec::with_capacity_in(corrected_files.len() * CORRECTED, alloc);
     for (tree, path, text_of) in corrected_files.iter() {
         corrected.extend_from_slice(&tree.to_le_bytes());
         corrected.extend_from_slice(&text(path, &mut heap)?);
         corrected.extend_from_slice(&text(text_of, &mut heap)?);
     }
-    let mut by_key: AVec<'_, u8> = AVec::with_capacity_in(n * 4, alloc.clone());
+    let mut by_key: AVec<'_, u8> = AVec::with_capacity_in(n * 4, alloc);
     for at in order.iter() {
         by_key.extend_from_slice(&(*at as u32).to_le_bytes());
     }
     // The modules, by (subject, row): a module two crates' packages share is two entries.
-    let mut found: AVec<'_, (usize, Module<'_>)> = AVec::new_in(alloc.clone());
+    let mut found: AVec<'_, (usize, Module<'_>)> = AVec::new_in(alloc);
     for at in 0..n {
         if let Some(module) = facts.module(at) {
             if module.ran_as == 0 {
@@ -476,15 +476,15 @@ pub fn encode_with<'a>(world: &World<'_>, facts: &dyn ListFacts, alloc: Alloc<'a
         }
     }
     found.sort_unstable_by(|a, b| (a.1.subject, a.0).cmp(&(b.1.subject, b.0)));
-    let mut modules: AVec<'_, u8> = AVec::with_capacity_in(found.len() * MODULE, alloc.clone());
+    let mut modules: AVec<'_, u8> = AVec::with_capacity_in(found.len() * MODULE, alloc);
     for (at, module) in found.iter() {
         modules.extend_from_slice(&(*at as u32).to_le_bytes());
         modules.extend_from_slice(&[module.ran_as, 0, 0, 0]);
         modules.extend_from_slice(&module.subject);
         modules.extend_from_slice(&text(module.root, &mut heap)?);
     }
-    let mut runs: AVec<'_, u8> = AVec::new_in(alloc.clone());
-    let mut producers: AVec<'_, u8> = AVec::new_in(alloc.clone());
+    let mut runs: AVec<'_, u8> = AVec::new_in(alloc);
+    let mut producers: AVec<'_, u8> = AVec::new_in(alloc);
     let mut last: Option<[u8; 32]> = None;
     let mut bad: Result<(), ListError> = Ok(());
     facts.runs(&mut |run| {
@@ -512,7 +512,7 @@ pub fn encode_with<'a>(world: &World<'_>, facts: &dyn ListFacts, alloc: Alloc<'a
         bad = one;
     });
     bad?;
-    let mut macros: AVec<'_, u8> = AVec::new_in(alloc.clone());
+    let mut macros: AVec<'_, u8> = AVec::new_in(alloc);
     let mut last: Option<[u8; 32]> = None;
     let mut unsorted = false;
     facts.macros(&mut |subject| {
@@ -1003,6 +1003,16 @@ impl<'b> CrateGraph<'b> for CrateList<'b> {
 /// shown_from, side, proc_macro, toolchain, member, refused, the environment's facts, sysroot, each dependency's name and
 /// key, each tree's origin and files, and each corrected file.
 pub fn differences(world: &World<'_>, list: &CrateList<'_>) -> usize {
+    differences_inner(world, list, true)
+}
+
+/// As [`differences`], skipping the pack/origin table comparison for worlds constructed lazily
+/// via [`crate::world_from_list`] whose packs are opened on demand rather than eagerly mapped.
+pub fn differences_without_packs(world: &World<'_>, list: &CrateList<'_>) -> usize {
+    differences_inner(world, list, false)
+}
+
+fn differences_inner(world: &World<'_>, list: &CrateList<'_>, check_packs: bool) -> usize {
     let mut differ = 0;
     if list.len() != world.crates.len() {
         differ += 1;
@@ -1023,7 +1033,7 @@ pub fn differences(world: &World<'_>, list: &CrateList<'_>) -> usize {
             + usize::from(list.side(r) != c.side)
             + usize::from(list.proc_macro(r) != c.proc_macro)
             + usize::from(list.toolchain(r) != world.toolchain(at))
-            + usize::from(list.member(r) != c.input.root.starts_with("/0/"))
+            + usize::from(list.member(r) != c.member)
             + usize::from(list.refused(r) != world.refused(at))
             + usize::from(!world.texts.crate_env(at).is_some_and(|env| same_facts(&env.facts(), &list.env_facts(r))));
         let mut deps = list.deps_named(r);
@@ -1042,11 +1052,13 @@ pub fn differences(world: &World<'_>, list: &CrateList<'_>) -> usize {
             differ += 1;
         }
     }
-    let (packs, origins) = (world.texts.packs(), world.texts.origins());
-    differ += packs.len().abs_diff(list.trees());
-    for (k, (pack, origin)) in packs.iter().zip(origins.iter()).enumerate() {
-        if list.tree(k + 1) != Some(TreeRow { origin: *origin, kind: pack.kind(), files: pack.tree().0 }) {
-            differ += 1;
+    if check_packs {
+        let (packs, origins) = (world.texts.packs(), world.texts.origins());
+        differ += packs.len().abs_diff(list.trees());
+        for (k, (pack, origin)) in packs.iter().zip(origins.iter()).enumerate() {
+            if list.tree(k + 1) != Some(TreeRow { origin: *origin, kind: pack.kind(), files: pack.tree().0 }) {
+                differ += 1;
+            }
         }
     }
     let mut corrected = list.corrected();

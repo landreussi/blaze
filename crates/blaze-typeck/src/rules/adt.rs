@@ -22,8 +22,8 @@ use blaze_own::Alloc;
 use crate::body::Segment;
 use crate::diag::{About, At, DiagCode};
 use crate::error::{CheckError, Stop};
-use crate::ids::{ExprId, ItemKey, List, Name, PathIdx};
-use crate::machine::{Expectation, Flow, Frame, Lower, Machine, Then};
+use crate::ids::{ExprId, ItemKey, List, Name, PathIdx, RecordSchema};
+use crate::machine::{Expectation, FieldNameSet, Flow, Frame, Lower, Machine, Then};
 use crate::portable::PTy;
 use crate::ty::{Ty, TyList, TyView, TypeCtx};
 use crate::world::{AdtKind, Def, PathRes, World};
@@ -160,6 +160,36 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             names.push(s.name);
         }
         let last = segs.last().map(|s| s.name);
+        // Anchored struct pattern `<T>::Variant { .. }`: resolve `T` directly as an enum type.
+        if let Some(anchor) = bp.anchor {
+            if anchor.trait_.is_some() {
+                self.diag(DiagCode::NotAStruct, at, About::path(last));
+                return Ok(None);
+            }
+            let [v] = segs else {
+                self.diag(DiagCode::NotAStruct, at, About::path(last));
+                return Ok(None);
+            };
+            let self_ty = self.lower_body_ty(anchor.ty, at)?;
+            let self_ty = self.try_structurally_resolve(self_ty)?;
+            let TyView::Adt(k, args) = self.view(self_ty) else {
+                self.diag(DiagCode::NotAStruct, at, About::path(last));
+                return Ok(None);
+            };
+            let Some(adt) = self.reads.adt(k)? else {
+                self.diag(DiagCode::NotAStruct, at, About::path(last));
+                return Ok(None);
+            };
+            if adt.kind != AdtKind::Enum {
+                self.diag(DiagCode::NotAStruct, at, About::path(last));
+                return Ok(None);
+            }
+            let Some((variant, def)) = self.struct_variant(at, k, *v)? else {
+                return Ok(None);
+            };
+            self.defs.push((at, def));
+            return Ok(Some((k, variant, args)));
+        }
         let res = self.path_res(bp, path, &names, at)?;
         // The segments the world consumed: the last of them names the type.
         let consumed = match &res {
@@ -284,7 +314,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// an enum before its associated types).
     fn names_variant(&mut self, k: ItemKey, name: Name) -> Result<bool, Stop> {
         Ok(match self.reads.adt(k)? {
-            Some(adt) => adt.kind == AdtKind::Enum && adt.variants.iter().any(|v| v.name == name),
+            Some(adt) => adt.kind == AdtKind::Enum && self.find_adt_variant(k, adt.variants, name).is_some(),
             None => false,
         })
     }
@@ -357,7 +387,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             return Ok(None);
         };
         let found = match adt.kind {
-            AdtKind::Enum => adt.variants.iter().enumerate().find(|(_, v)| v.name == seg.name).map(|(i, v)| (i as u32, v.ctor)),
+            AdtKind::Enum => self.find_adt_variant(k, adt.variants, seg.name).map(|i| (i, adt.variants[i as usize].ctor)),
             AdtKind::Struct | AdtKind::Union => None,
         };
         let Some((i, ctor)) = found else {
@@ -455,6 +485,261 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         Ok(Flow::Done(f.t))
     }
 
+    /// Structural record literal `{ b: 1u8, a: 2i32 }` and record update `{ a: 9, ..base }`.
+    /// States:
+    /// - 0: dispatch `StructBase::Expr` (push base -> state 1) vs `StructBase::None`/`Defaults`
+    ///   (expected record -> state 3, inferred anonymous record -> state 4).
+    /// - 1: base finished; resolve base record type, fall through to state 2.
+    /// - 2: check written fields against base record type, then record `fru_fields` and finish.
+    /// - 3: check written fields against expected record type, check missing fields, finish.
+    /// - 4: check written fields with no expectation, assemble canonical `TyView::Record`.
+    pub(crate) fn expr_record(
+        &mut self,
+        mut f: Frame,
+        e: ExprId,
+        fields: List,
+        base: crate::body::StructBase,
+    ) -> Result<Flow, Stop> {
+        use crate::body::StructBase;
+        let inits = self.body.field_init_list(fields)?;
+        if f.state == 0 {
+            let exp_rec = match f.expect.only_has_type() {
+                Some(t) => {
+                    let r = self.try_structurally_resolve(t)?;
+                    match self.view(r) {
+                        TyView::Record(_, l) => Some((r, l)),
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+            match base {
+                StructBase::Expr(base_expr) => {
+                    let base_expect = match exp_rec {
+                        Some((r, _)) => Expectation::HasType(r),
+                        None => Expectation::None,
+                    };
+                    self.resume(f, 1)?;
+                    self.push_expr(base_expr, base_expect, Then::Nothing)?;
+                    return Ok(Flow::Wait);
+                }
+                StructBase::None | StructBase::Defaults => {
+                    f.a = 0;
+                    if let Some((rec_ty, field_tys)) = exp_rec {
+                        let is_wider = base == StructBase::None
+                            && if let TyView::Record(exp_schema, _) = self.view(rec_ty)
+                                && let Some(exp_names) = self.record_names(exp_schema)
+                            {
+                                if inits.len() > exp_names.len() {
+                                    let init_set = FieldNameSet::new(inits, self.alloc);
+                                    exp_names.iter().all(|&en| init_set.contains(en))
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+                        f.t = rec_ty;
+                        f.l = field_tys;
+                        if is_wider {
+                            f.b = 3;
+                            f.state = 4;
+                        } else {
+                            f.b = 0;
+                            f.state = 3;
+                        }
+                    } else {
+                        f.b = 2;
+                        f.state = 4;
+                    }
+                }
+            }
+        }
+        if f.state == 1 {
+            let base_expr = base.expr().unwrap_or(e);
+            let base_ty = self.structurally_resolve(self.ret, At::Expr(base_expr))?;
+            match self.view(base_ty) {
+                TyView::Record(_, field_tys) => {
+                    if let Some(hint) = f.expect.only_has_type() {
+                        self.commit_if(|m| -> Result<Option<()>, Stop> {
+                            Ok(if m.unify(base_ty, hint)? { Some(()) } else { None })
+                        })?;
+                    }
+                    f.t = base_ty;
+                    f.l = field_tys;
+                    f.b = 0;
+                }
+                TyView::Error => {
+                    f.t = self.common.err;
+                    f.b = 1;
+                }
+                _ => {
+                    self.diag(DiagCode::Mismatch, At::Expr(base_expr), About::found(base_ty));
+                    f.t = self.common.err;
+                    f.b = 1;
+                }
+            }
+            f.a = 0;
+            f.state = 2;
+        }
+        if f.state == 2 || f.state == 3 {
+            let cur_state = f.state;
+            if let Some(init) = usize::try_from(f.a).ok().and_then(|i| inits.get(i)).copied() {
+                f.a += 1;
+                let to = if f.b == 0
+                    && let TyView::Record(schema, field_tys) = self.view(f.t)
+                    && let Some(idx) = self.record_field_index(schema, init.name)
+                    && idx < self.ty.list_len(field_tys)
+                {
+                    Some(self.ty.list_get(field_tys, idx))
+                } else {
+                    None
+                };
+                self.resume(f, cur_state)?;
+                match to {
+                    Some(t) => self.push_coercible(init.expr, t)?,
+                    None => {
+                        if f.b == 0 {
+                            self.diag(DiagCode::NoField, At::Expr(init.expr), About::found_named(f.t, init.name));
+                        }
+                        self.push_expr(init.expr, Expectation::None, Then::Nothing)?;
+                    }
+                }
+                return Ok(Flow::Wait);
+            }
+            if f.b == 0
+                && let TyView::Record(schema, field_tys) = self.view(f.t)
+            {
+                if cur_state == 2 {
+                    let n = self.ty.list_len(field_tys);
+                    let mut unwritten: blaze_own::Vec<u32, Alloc<'a>> = blaze_own::Vec::new_in(self.alloc);
+                    if let Some(names) = self.record_names(schema) {
+                        let init_set = FieldNameSet::new(inits, self.alloc);
+                        for (i, &nm) in names.iter().enumerate() {
+                            if !init_set.contains(nm)
+                                && let Ok(idx) = u32::try_from(i)
+                            {
+                                unwritten.push(idx);
+                            }
+                        }
+                    }
+                    for idx in unwritten {
+                        if idx < n {
+                            let t = self.ty.list_get(field_tys, idx);
+                            self.fru_fields.push((e, idx, t));
+                        }
+                    }
+                } else {
+                    let init_set = FieldNameSet::new(inits, self.alloc);
+                    let has_omitted = self.record_names(schema).is_some_and(|names| {
+                        names.iter().any(|&nm| !init_set.contains(nm))
+                    });
+                    if has_omitted {
+                        let n = self.ty.list_len(field_tys);
+                        let mut missing: Option<Name> = None;
+                        let mut unwritten: blaze_own::Vec<(u32, ItemKey), Alloc<'a>> = blaze_own::Vec::new_in(self.alloc);
+                        {
+                            let defaults = self.reads.field_defaults(schema.defaults_key())?;
+                            if let Some(names) = self.record_names(schema) {
+                                for (i, &nm) in names.iter().enumerate() {
+                                    if init_set.contains(nm) {
+                                        continue;
+                                    }
+                                    match defaults.get(i).copied().flatten() {
+                                        Some(key) => {
+                                            if let Ok(idx) = u32::try_from(i) {
+                                                unwritten.push((idx, key));
+                                            }
+                                        }
+                                        None => {
+                                            if missing.is_none() {
+                                                missing = Some(nm);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(nm) = missing {
+                            self.diag(DiagCode::MissingFields, At::Expr(e), About::found_named(f.t, nm));
+                        } else {
+                            for (idx, key) in unwritten {
+                                if idx < n {
+                                    let t = self.ty.list_get(field_tys, idx);
+                                    self.fru_fields.push((e, idx, t));
+                                    self.default_fields.push((e, idx, key));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(Flow::Done(f.t));
+        }
+        // State 4: inferred anonymous record literal `{ b: 1u8, a: 2i32 }` (or wider record
+        // literal coerced via width-subtyping when `f.b == 3`).
+        if let Some(init) = usize::try_from(f.a).ok().and_then(|i| inits.get(i)).copied() {
+            f.a += 1;
+            let hint = if f.b == 3
+                && let TyView::Record(exp_schema, field_tys) = self.view(f.t)
+                && let Some(idx) = self.record_field_index(exp_schema, init.name)
+                && idx < self.ty.list_len(field_tys)
+            {
+                Expectation::HasType(self.ty.list_get(field_tys, idx))
+            } else {
+                Expectation::None
+            };
+            self.resume(f, 4)?;
+            self.push_expr(init.expr, hint, Then::Nothing)?;
+            return Ok(Flow::Wait);
+        }
+        let schema = match self.body.record_expr_schema(e) {
+            Some(s) => s,
+            None => self.infer_record_schema(inits)?,
+        };
+        let field_count = self.record_names(schema).map_or(inits.len(), |ns| ns.len());
+        let mut canonical: blaze_own::Vec<Ty, Alloc<'a>> = blaze_own::Vec::with_capacity_in(field_count, self.alloc);
+        canonical.resize(field_count, self.common.err);
+        for init in inits {
+            if let Some(idx) = self.record_field_index(schema, init.name)
+                && let Some(ix) = usize::try_from(idx).ok()
+                && let Some(slot) = canonical.get_mut(ix)
+                && let Some(&ety) = self.expr_ty.get(init.expr.ix())
+            {
+                *slot = ety;
+            }
+        }
+        let list = self.mk_list(&canonical)?;
+        Ok(Flow::Done(self.mk(TyView::Record(schema, list))?))
+    }
+
+    /// Fallback canonical schema lookup/creation for hand-built unit-test bodies without
+    /// `BodyView::record_expr_schemas`: reuses any already-registered schema matching the exact
+    /// set of field names, otherwise sorts by `Name` and registers a fresh schema.
+    fn infer_record_schema(&mut self, inits: &[crate::body::FieldInit]) -> Result<RecordSchema, Stop> {
+        if inits.is_empty() {
+            self.register_record_schema(RecordSchema::EMPTY, &[])?;
+            return Ok(RecordSchema::EMPTY);
+        }
+        let init_set = FieldNameSet::new(inits, self.alloc);
+        for &(schema, list) in self.record_schemas.iter() {
+            let Some(names) = self.record_names.get(list.range()) else { continue };
+            if names.len() == inits.len() && names.iter().all(|&nm| init_set.contains(nm)) {
+                return Ok(schema);
+            }
+        }
+        drop(init_set);
+        let mut names: blaze_own::Vec<Name, Alloc<'a>> = blaze_own::Vec::with_capacity_in(inits.len(), self.alloc);
+        for init in inits {
+            names.push(init.name);
+        }
+        names.sort_unstable();
+        names.dedup();
+        let schema = RecordSchema::of_sorted_names(&names);
+        self.register_record_schema(schema, &names)?;
+        Ok(schema)
+    }
+
     /// `fru_field_types`: after the base of `S { a: x, ..base }` unified with `S<args>`, one
     /// row per field the update takes from the base (every field not written), in declaration
     /// order, with its declared type at `args`. The flow lowering moves or copies each
@@ -470,8 +755,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         let Some(v) = adt.variants.first() else { return Ok(()) };
         let declared = adt.fields.get(v.fields.range()).unwrap_or(&[]);
+        let init_set = FieldNameSet::new(inits, self.alloc);
         for (i, d) in declared.iter().enumerate() {
-            if inits.iter().any(|w| w.name == d.name) {
+            if init_set.contains(d.name) {
                 continue;
             }
             let t = self.lower(adt.types, d.ty, Lower::Args(args), crate::ty::Cause::Expr(e))?;
@@ -493,7 +779,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let Some(adt) = self.reads.adt(k)? else { return Ok(None) };
         let Some(v) = adt.variants.get(variant as usize) else { return Ok(None) };
         let declared = adt.fields.get(v.fields.range()).unwrap_or(&[]);
-        match declared.iter().find(|d| d.name == name) {
+        match self.find_adt_field(k, variant, declared, name).and_then(|i| declared.get(i as usize)) {
             Some(d) => Ok(Some(self.lower(adt.types, d.ty, Lower::Args(args), cause)?)),
             None => Ok(None),
         }
@@ -516,8 +802,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let range = v.fields.range();
         let first = range.start;
         let declared = adt.fields.get(range).unwrap_or(&[]);
+        let init_set = FieldNameSet::new(inits, self.alloc);
         for (i, d) in declared.iter().enumerate() {
-            if inits.iter().any(|w| w.name == d.name) {
+            if init_set.contains(d.name) {
                 continue;
             }
             match defaults.get(first + i).copied().flatten() {
@@ -537,13 +824,141 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let TyView::Adt(k, _) = self.view(adt_ty) else { return Ok(()) };
         let Some(adt) = self.reads.adt(k)? else { return Ok(()) };
         let Some(v) = adt.variants.get(variant as usize) else { return Ok(()) };
-        let declared = adt.fields.get(v.fields.range()).unwrap_or(&[]);
-        let missing = declared.iter().find(|d| !inits.iter().any(|i| i.name == d.name));
         if adt.kind != AdtKind::Union {
-            if let Some(d) = missing {
+            let declared = adt.fields.get(v.fields.range()).unwrap_or(&[]);
+            let init_set = FieldNameSet::new(inits, self.alloc);
+            if let Some(d) = declared.iter().find(|d| !init_set.contains(d.name)) {
                 self.diag(DiagCode::MissingFields, At::Expr(e), About::found_named(adt_ty, d.name));
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::format;
+    use std::string::String;
+    use std::vec::Vec;
+
+    use blaze_own::Alloc;
+
+    use crate::body::{Expr, IntSuffix};
+    use crate::diag::DiagCode;
+    use crate::fixture::{Bb, Fx};
+    use crate::ids::{ExprId, ItemKey, Name, UintTy};
+    use crate::infer::InferCtx;
+    use crate::portable::PNode;
+
+    fn run_check(fx: &Fx, b: &Bb, owner: ItemKey, root: ExprId) -> crate::Checked<'static> {
+        let alloc = Alloc::global();
+        let mut cx = InferCtx::new_in(alloc);
+        match crate::check_with(&b.view(owner, root), fx, &mut cx, &crate::world::Needs::new_in(alloc), crate::machine::Plant::None, alloc).expect("check") {
+            crate::Outcome::Done(c) => c,
+            crate::Outcome::Need(n) => panic!("unexpected need: {n:?}"),
+        }
+    }
+
+    #[test]
+    fn large_struct_literal_200_fields_fru_and_accesses_are_exact_and_deterministic() {
+        const N: usize = 200;
+        let names: Vec<String> = (0..N).map(|i| format!("f{i}")).collect();
+        let mut fx = Fx::new();
+        let u8_ = fx.ty(PNode::Uint(UintTy::U8));
+        let u16_ = fx.ty(PNode::Uint(UintTy::U16));
+        let u32_ = fx.ty(PNode::Uint(UintTy::U32));
+        let unit = fx.unit();
+        let field_defs: Vec<(&str, crate::portable::PTy)> = names
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.as_str(), match i % 3 { 0 => u8_, 1 => u16_, _ => u32_ }))
+            .collect();
+        fx.strukt("Big", 0, &field_defs);
+        let main = fx.func("main", 0, &[], unit, Vec::new());
+        let missing_fn = fx.func("missing_fn", 0, &[], unit, Vec::new());
+        fx.finish();
+
+        // Body 1: construct 200-field struct in reverse order, update half via `..s`, and read all 200 fields.
+        let mut b = Bb::new();
+        let mut inits: Vec<(&str, ExprId)> = Vec::with_capacity(N);
+        for i in (0..N).rev() {
+            let v = match i % 3 {
+                0 => b.int(Some(IntSuffix::Uint(UintTy::U8))),
+                1 => b.int(Some(IntSuffix::Uint(UintTy::U16))),
+                _ => b.int(Some(IntSuffix::Uint(UintTy::U32))),
+            };
+            inits.push((names[i].as_str(), v));
+        }
+        let lit = b.struct_lit(&["Big"], &inits, None);
+        let s_pat = b.bind("s");
+        let mut stmts = Vec::with_capacity(N + 2);
+        stmts.push(b.let_(s_pat, None, lit));
+
+        let mut fru_inits: Vec<(&str, ExprId)> = Vec::with_capacity(N / 2);
+        for i in (0..N).step_by(2) {
+            let v = match i % 3 {
+                0 => b.int(Some(IntSuffix::Uint(UintTy::U8))),
+                1 => b.int(Some(IntSuffix::Uint(UintTy::U16))),
+                _ => b.int(Some(IntSuffix::Uint(UintTy::U32))),
+            };
+            fru_inits.push((names[i].as_str(), v));
+        }
+        let s_base = b.local(s_pat);
+        let fru_expr = b.struct_lit(&["Big"], &fru_inits, Some(s_base));
+        let s2_pat = b.bind("s2");
+        stmts.push(b.let_(s2_pat, None, fru_expr));
+
+        let mut field_exprs = Vec::with_capacity(N);
+        for name in &names {
+            let recv = b.local(s2_pat);
+            let fe = b.e(Expr::Field { base: recv, name: Name::of(name.as_str()) });
+            field_exprs.push(fe);
+            stmts.push(b.semi(fe));
+        }
+        let root = b.block(&stmts, None);
+
+        let c1 = run_check(&fx, &b, main, root);
+        let c2 = run_check(&fx, &b, main, root);
+        assert!(c1.diags.is_empty(), "expected no diags, got {:?}", c1.diags);
+        // Every odd field index (1, 3, ..., 199) must be recorded in declaration order as an FRU field.
+        assert_eq!(c1.fru_fields.len(), N / 2);
+        for (k, &idx) in c1.fru_fields.column::<1>().iter().enumerate() {
+            assert_eq!(idx, (k * 2 + 1) as u32);
+        }
+        // Every field access resolves to its exact declared type.
+        let view = c1.types.view();
+        for (i, &fe) in field_exprs.iter().enumerate() {
+            let want = match i % 3 {
+                0 => PNode::Uint(UintTy::U8),
+                1 => PNode::Uint(UintTy::U16),
+                _ => PNode::Uint(UintTy::U32),
+            };
+            assert_eq!(view.node(c1.expr_ty[fe.ix()]), Ok(want));
+        }
+        // Deterministic across independent runs.
+        assert_eq!(c1.fields.column::<2>(), c2.fields.column::<2>());
+        assert_eq!(c1.fru_fields.column::<1>(), c2.fru_fields.column::<1>());
+
+        // Body 2: omit field `f137` and verify `MissingFields` names `f137` deterministically.
+        let mut b2 = Bb::new();
+        let mut partial: Vec<(&str, ExprId)> = Vec::with_capacity(N - 1);
+        for i in 0..N {
+            if i == 137 {
+                continue;
+            }
+            let v = match i % 3 {
+                0 => b2.int(Some(IntSuffix::Uint(UintTy::U8))),
+                1 => b2.int(Some(IntSuffix::Uint(UintTy::U16))),
+                _ => b2.int(Some(IntSuffix::Uint(UintTy::U32))),
+            };
+            partial.push((names[i].as_str(), v));
+        }
+        let bad_lit = b2.struct_lit(&["Big"], &partial, None);
+        let st = b2.semi(bad_lit);
+        let root2 = b2.block(&[st], None);
+        let c_missing = run_check(&fx, &b2, missing_fn, root2);
+        assert_eq!(c_missing.diags.len(), 1);
+        assert_eq!(c_missing.diags[0].code, DiagCode::MissingFields);
+        assert_eq!(c_missing.diags[0].name, Some(Name::of("f137")));
     }
 }

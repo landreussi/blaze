@@ -7,7 +7,7 @@ use core::alloc::Allocator;
 use std::alloc::Global;
 
 use blaze_lir::builder::{MemAttrs, Param, Variadic};
-use blaze_lir::func::{BlockKind, Conv, Ext, RefId, RefKind, SlotId, SlotKind};
+use blaze_lir::func::{BlockKind, Conv, Ext, ParamFactsRec, RefId, RefKind, SlotId, SlotKind};
 use blaze_lir::{Block, Builder, Flags, Full, IntCond, Op, Ty, Value};
 use blaze_code::record::{SUBJECT_SHOWN, Subject, TrapKind, TrapSource};
 use blaze_own::Alloc;
@@ -26,7 +26,7 @@ use crate::{Abi, Adts, BuildError, Built, Instance, Intrinsic, Subst, ground};
 
 #[path = "closure.rs"]
 mod closure;
-pub(crate) use closure::{build_builtin_clone, build_ctor_fn, build_fn_shim, closures_in};
+pub(crate) use closure::{build_builtin_clone, build_builtin_fn_ptr, build_builtin_from, build_ctor_fn, build_fn_shim, build_reify_shim, build_test_report_shim, build_vtable_shim, closures_in};
 #[cfg(test)]
 pub(crate) use closure::{empty_record as empty_record_for_tests, empty_view as empty_view_for_tests};
 #[path = "coroutine.rs"]
@@ -35,6 +35,7 @@ pub(crate) mod coroutine;
 pub(crate) mod arith_checks;
 mod asm;
 mod c_variadic;
+mod tail_call;
 mod casts;
 mod const_scalar;
 mod fmt;
@@ -231,13 +232,38 @@ struct Owned {
     rest: Option<SlotId>,
 }
 
+/// Ownership state of a binding in this body: dropping bindings live in `scope_pats`, while
+/// non-dropping owned bindings (`!needs_drop`, e.g. `ManuallyDrop<T>`) never drop at scope end
+/// yet own their place and may hold a field-flags word for `assign_over` when a dropping part
+/// moves out (`partial`).
+#[derive(Clone, Copy)]
+enum LocalOwn {
+    /// Not owned by this body (not yet bound, or a borrowed / non-`FnOnce` capture).
+    None,
+    /// Owned by this body and its type needs drop (lives in `scope_pats`).
+    Drop(Owned),
+    /// Owned by this body, its type needs no drop, no field flags needed.
+    Kept,
+    /// Owned by this body, its type needs no drop, with field-flags word `SlotId`.
+    KeptFlags(SlotId),
+}
+
+impl LocalOwn {
+    fn as_drop(self) -> Option<Owned> {
+        match self {
+            LocalOwn::Drop(o) => Some(o),
+            LocalOwn::None | LocalOwn::Kept | LocalOwn::KeptFlags(_) => None,
+        }
+    }
+}
+
 /// An entry of a drop scope: a binding, or what an arm of a `match` by value on a temporary
 /// left of it (`variant` the arm's, `moved` the `field_bit`s it moved out; `None`: nothing
 /// moved, the whole value), dropped at the arm's end, after the arm's bindings.
 #[derive(Clone, Copy)]
 enum Held {
     Pat(PatId),
-    Rest { at: (Value, i32), l: u32, variant: Option<u32>, moved: u64 },
+    Rest { at: (Value, i32), l: u32, variant: Option<u32>, moved: moves::FieldBits },
     /// A temporary scrutinee of a match by tests that moves out of it (walk/moves.rs): of
     /// ground type `g` at `at`, what its word `mask` says is held, dropped at its statement's
     /// end like `Rest`.
@@ -281,20 +307,21 @@ enum Shape {
 enum Home {
     Slot(SlotId),
     At(Value, i32),
+    /// A capture-by-reference home in a coroutine/closure environment: `(env, off)` holds the
+    /// immutable pointer to the captured variable, reloaded on demand so it never crosses a
+    /// coroutine suspension point.
+    Indirect(Value, i32),
 }
 
-/// One step of an aggregate copy (`Walk::copy`).
+/// Saved path-sensitive `definitely_uninit` slices in `Walk::du_pool` for an open `if` or `match`.
 #[derive(Clone, Copy)]
-enum CopyStep {
-    Copy { repr: Repr, from: (Value, i32), to: (Value, i32) },
-    /// The end of a loop's body over an array: the next element, or out.
-    Next { i: Value, header: Block, exit: Block },
-    /// Start building into a block (an enum variant's copy, or the copy's join).
-    Begin(Block),
-    /// The end of an enum variant's copy: on to the join.
-    Jump(Block),
-    /// Write variant `variant`'s tag of enum layout `id` at `to` (after its fields).
-    Tag { id: LayoutId, variant: u32, to: (Value, i32) },
+struct BranchDu {
+    /// Start index in `Walk::du_pool` of the branch-entry snapshot (`body.pats.len()` bools).
+    entry: usize,
+    /// Start index in `Walk::du_pool` of the running join intersection (`body.pats.len()` bools).
+    join: usize,
+    /// Whether at least one live branch has folded into `join`.
+    any_live: bool,
 }
 
 /// What `break` and `continue` reach: a loop, or a block a `break` leaves.
@@ -305,8 +332,13 @@ struct Target {
     header: Option<Block>,
     exit: Block,
     repr: Repr,
+    /// Shared result slot for an aggregate exit (instead of a pointer block param).
+    res: Option<SlotId>,
     /// The drop scopes open outside it: leaving it drops every scope from this depth on.
     depth: u32,
+    /// The temporary scopes open outside it: leaving it also drops every temporary scope
+    /// opened inside it (a `loop` body's temporary scope opens before its block's drop scope).
+    temp_depth: u32,
 }
 
 /// A match being built: its arms' blocks are `arm_blocks[first..first + arms + 1]`, the last
@@ -322,14 +354,18 @@ struct MatchState {
     of_enum: Option<((Value, i32), u32, LayoutId)>,
     join: Block,
     repr: Repr,
+    /// Shared result slot for an aggregate join (instead of a pointer block param).
+    res: Option<SlotId>,
     first: u32,
     arms: u32,
     /// Some arm has a guard: the arms are tested in turn rather than by one `switch`.
     guarded: bool,
     /// The scrutinee was a reference the arms' patterns matched through (the reference's
-    /// "Binding modes": the default binding mode becomes `ref`): each binding takes its
-    /// part's address, nothing is moved or dropped.
-    by_ref: bool,
+    /// "Binding modes": the default binding mode becomes `ref`): `Some(raw)` holds the
+    /// original un-dereferenced reference scalar (so a top-level catch-all `other => ..` arm
+    /// binds that reference directly, while variant arms bind fields by address without moving
+    /// or dropping).
+    by_ref: Option<Value>,
     /// By value on an enum that needs drop: who holds what the arms do not move.
     owner: Owner,
     /// A match by tests (walk/matches.rs): the scrutinee's place each arm tests and binds from.
@@ -377,8 +413,8 @@ enum Task {
     Let(PatId, Option<ExprId>),
     BlockExit(ExprId),
     If { expr: ExprId, then: ExprId, else_: Option<ExprId> },
-    IfThen { expr: ExprId, else_: Option<ExprId>, else_block: Block, join: Block },
-    IfElse { expr: ExprId, join: Block },
+    IfThen { expr: ExprId, else_: Option<ExprId>, else_block: Block, join: Block, res: Option<SlotId> },
+    IfElse { expr: ExprId, join: Block, res: Option<SlotId> },
     /// A `let` link of an `if` condition (walk/lets.rs): `let` expression `expr`, its
     /// scrutinee on top; a failed test to `fail`.
     LetLink { expr: ExprId, fail: Block },
@@ -406,6 +442,9 @@ enum Task {
     ArmEnd { m: u32 },
     MatchEnd,
     Call(ExprId),
+    /// `become <call_expr>` (RFC 3407): emits `Op::TailCall` / `Op::TailCallIndirect` when
+    /// eligible (after running all scope drops), or falls back to a normal call + return.
+    BecomeCall(ExprId),
     /// The call of an operator the check recorded a callee for, its operands on the value
     /// stack (walk/operators.rs).
     OpCall(ExprId),
@@ -422,6 +461,10 @@ enum Task {
     /// Every part of the aggregate literal on top (laid out as row `l`) is stored: it is one
     /// value from now on, owned whole (walk/val_stack.rs `literal_built`).
     LitBuilt { l: u32 },
+    /// Builds an aggregate ctor call / struct / tuple / array after all its operands have been
+    /// evaluated onto the value stack (in coroutine bodies, so the aggregate's own slot is never
+    /// allocated before an operand's `.await`).
+    BuildAgg { expr: ExprId, l: u32, variant: u32 },
     /// Base-less struct expression `e` (`S { a: 1, .. }`, RFC 3681), its place on top, every
     /// written field stored: each unwritten field stored from its default's value.
     InitDefaults(ExprId),
@@ -458,7 +501,17 @@ enum Task {
     AsmJoin(Block),
 }
 
-struct Walk<'x, 'c, 't, A: Allocator + Clone> {
+/// A pre-allocated aggregate destination slot for an expression constructed directly in place,
+/// keyed by the exact [`ExprId`] so nested sub-expressions can never consume it.
+#[derive(Clone, Copy)]
+struct DestSlot {
+    expr: ExprId,
+    slot: SlotId,
+    off: i32,
+    repr: Repr,
+}
+
+struct Walk<'x, 'c, 't, A: Allocator + Copy> {
     body: &'x BodyView<'x>,
     checked: &'x Checked<'c>,
     /// The record's types: generic, read only to be grounded (and for the shape of a node,
@@ -504,6 +557,9 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     unsized_tails: Vec<u32, A>,
     /// Per pattern: the binding's home and how its value is held.
     slots: Vec<Option<(Home, Repr)>, A>,
+    /// Pending in-place destination slots for fresh aggregate initializers (LIFO stack, keyed by
+    /// the exact `ExprId` of the constructor expression).
+    dest_slots: blaze_own::Vec<DestSlot, A>,
     /// Per block made: whether a reachable edge leads to it.
     reached: Vec<bool, A>,
     /// Whether the code being built is reachable.
@@ -526,12 +582,19 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     ret_pass: Pass,
     /// The hidden result pointer of a fn returning an aggregate.
     sret: Option<Value>,
+    /// Incoming caller-owned `Pass::Ref` parameter buffers `(ptr, size, align_log2)`: reusable
+    /// as outgoing `Pass::Ref` argument buffers in `Op::TailCall` / `Op::TailCallIndirect` once
+    /// the current frame's locals have been dropped.
+    ref_params: blaze_own::Vec<(Value, u32, u8), A>,
     /// Per pattern: the binding's state changes under a branch or loop of its scope, so it
     /// gets a drop flag if its type needs drop (`scan_flags`).
     needs_flag: Vec<bool, A>,
     /// Per pattern: a `match` on the binding may move fields out of it, so it gets field
     /// flags if its type needs drop (`scan_flags`).
     partial: Vec<bool, A>,
+    /// Per pattern: whether the binding appears on the left-hand side of any `Expr::Assign` /
+    /// `Expr::AssignOp` in the body (`scan_flags`), so a loop back-edge could re-initialize it.
+    assigned: Vec<bool, A>,
     /// Per expression: its parent (`NO_EXPR` for none) and whether the edge to it is
     /// conditional, from `scan_flags` (walk/temps.rs finds a temporary's scope by it).
     expr_parent: Vec<(u32, bool), A>,
@@ -546,16 +609,39 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     /// Per open temporary scope, beside `temp_marks`: the expression it is of and how many
     /// drop scopes were open when it began (walk/temps.rs).
     temp_scopes: Vec<(u32, u32), A>,
+    /// Non-dropping temporary slots (`SlotKind::Temp`) whose storage ends when their temporary
+    /// scope closes (`(temp_scope_index, slot, expr)`, walk/temps.rs). `expr` is `Some(e)` for
+    /// `hold_copy_temp` temporaries (which `end_dead_slots_before_await` may end early when
+    /// unsaved by the flow), and `None` for `super let` binding slots.
+    temp_slots: blaze_own::Vec<(usize, SlotId, Option<ExprId>), A>,
+    /// Extended non-dropping temporary and local slots whose storage ends when their block's drop
+    /// scope closes (`(scope_depth, slot, expr)`, walk/temps.rs).
+    scope_slots: blaze_own::Vec<(usize, SlotId, Option<ExprId>), A>,
     /// Per extending borrow under a branch, of a `let` being built: its temporary's drop flag
     /// (walk/temps.rs `ext_flags_for`).
     ext_flags: Vec<(u32, SlotId), A>,
     /// `super let` bindings owned by a temporary scope (not extended): `temp_end` drops them
     /// (walk/super_let.rs).
     super_temps: Vec<PatId, A>,
-    /// Per pattern: the binding, if its type needs drop.
-    owned: Vec<Option<Owned>, A>,
+    /// Per pattern: ownership state of the binding (`Drop` when its type needs drop, `Kept*`
+    /// when owned by this body without needing drop).
+    owned: Vec<LocalOwn, A>,
     /// Per pattern: whether a binding without a flag is initialized here.
     init: Vec<bool, A>,
+    /// Per pattern: whether a flagged binding is definitely uninitialized on every path reaching
+    /// the current block (path-sensitively saved/restored/intersected across branches, matches,
+    /// short-circuits, `let`-`else`, and break targets, and cleared at loop headers), so
+    /// subsequent drops and `.await`s skip redundant flag checks and end dead slots.
+    definitely_uninit: blaze_own::Vec<bool, A>,
+    /// Flat LIFO backing pool for path-sensitive `definitely_uninit` snapshots.
+    du_pool: blaze_own::Vec<bool, A>,
+    if_du: blaze_own::Vec<BranchDu, A>,
+    match_du: blaze_own::Vec<BranchDu, A>,
+    short_du: blaze_own::Vec<usize, A>,
+    let_else_du: blaze_own::Vec<(usize, usize), A>,
+    /// Parallel to `targets`: running intersection of `definitely_uninit` across `break` edges
+    /// reaching `targets[i].exit` (`None` until a live `break` jumps to that target).
+    target_du: blaze_own::Vec<Option<blaze_own::Vec<bool, A>>, A>,
     /// What needs drop, in declaration order, of every open drop scope.
     scope_pats: Vec<Held, A>,
     /// Per open drop scope (a fn's parameters first, then each block): where its bindings
@@ -601,7 +687,10 @@ fn malformed(what: &'static str) -> BuildError {
 /// Unwinding permission is separate from the machine signature of a C-family pointer.
 fn pointer_abi(abi: blaze_typeck::Abi) -> Option<Abi> {
     match abi {
-        blaze_typeck::Abi::Rust => Some(Abi::Rust),
+        blaze_typeck::Abi::Rust
+        | blaze_typeck::Abi::RustCold
+        | blaze_typeck::Abi::RustPreserveNone
+        | blaze_typeck::Abi::RustTail => Some(Abi::Rust),
         blaze_typeck::Abi::C | blaze_typeck::Abi::CUnwind => Some(Abi::C),
         blaze_typeck::Abi::RustCall => Some(Abi::RustCall),
         _ => None,
@@ -662,7 +751,7 @@ pub(crate) enum Kind {
     Closure(ExprId, crate::FnTrait),
 }
 
-pub(crate) fn build<A: Allocator + Clone>(
+pub(crate) fn build<A: Allocator + Copy>(
     body: &BodyView<'_>,
     checked: &Checked<'_>,
     sig: &FnSig<'_>,
@@ -690,7 +779,7 @@ pub(crate) fn build<A: Allocator + Clone>(
 /// (the enum an enum copy's switch read the discriminant of).
 type TrapMark = (u32, TrapKind, Option<(u128, u32)>, Option<Subject>);
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// An `unreachable` ending the construct of `kind` at expression `at`, and its row of the
     /// trap table: its site is `at`'s first byte from its item's (`Adts::caller_site`, for one
     /// in a macro's expansion its outermost call's; rule 71), `None` when the world does not
@@ -754,7 +843,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 
 /// The walk's marks as the trap table: each `unreachable`'s ordinal among the function's
 /// `unreachable` instructions in layout order (what the emitter counts them by).
-fn trap_sources<A: Allocator + Clone>(func: &blaze_lir::Func<A>, marks: &[TrapMark], alloc: A) -> Result<Vec<TrapSource, A>, BuildError> {
+fn trap_sources<A: Allocator + Copy>(func: &blaze_lir::Func<A>, marks: &[TrapMark], alloc: A) -> Result<Vec<TrapSource, A>, BuildError> {
     let unreachable = Op::Unreachable as u8;
     let mut out = Vec::with_capacity_in(marks.len(), alloc);
     let (mut ordinal, mut next) = (0u32, 0usize);
@@ -778,27 +867,36 @@ struct UnsizeEnds {
     to: PTy,
 }
 
+/// A dynamic call's vtable slot: the principal trait, the slot index (after the header), and
+/// whether the slot holds a by-value `self` `VTableShim` (`MethodDispatch::ByValueShim`).
+#[derive(Clone, Copy)]
+struct DynSlot {
+    principal: ItemKey,
+    slot: u32,
+    by_value: bool,
+}
+
 /// What the instance `subst` names of `body` reads of trait shapes, in expression order: the
 /// part of its record's key the world's trait facts give ([`crate::vtable::record_key`]). Walks
 /// the checked body's calls and unsizings without building code.
-pub(crate) fn object_reads<A: Allocator + Clone>(
+pub(crate) fn object_reads<A: Allocator + Copy>(
     body: &BodyView<'_>,
     checked: &Checked<'_>,
     subst: &mut Subst<'_, '_>,
     adts: &dyn Adts,
     alloc: A,
 ) -> Result<Vec<ObjectRead, A>, BuildError> {
-    let mut out = Vec::new_in(alloc.clone());
+    let mut out = Vec::new_in(alloc);
     let mut w = Walk::new(body, checked, subst, adts, alloc);
     w.object_reads(&mut out)?;
     Ok(out)
 }
 
-impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
+impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     fn new(body: &'x BodyView<'x>, checked: &'x Checked<'c>, subst: &'x mut Subst<'_, 't>, adts: &'x dyn Adts, alloc: A) -> Self {
-    let mut grounded = Vec::with_capacity_in(checked.types.len(), alloc.clone());
+    let mut grounded = Vec::with_capacity_in(checked.types.len(), alloc);
     grounded.resize(checked.types.len(), UNGROUNDED);
-    let mut break_target = Vec::with_capacity_in(body.exprs.len(), alloc.clone());
+    let mut break_target = Vec::with_capacity_in(body.exprs.len(), alloc);
     break_target.resize(body.exprs.len(), false);
     for e in body.exprs {
         if let Expr::Break { target, .. } = *e
@@ -807,15 +905,17 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             break_target[target.ix()] = true;
         }
     }
-    let mut slots = Vec::with_capacity_in(body.pats.len(), alloc.clone());
+    let mut slots = Vec::with_capacity_in(body.pats.len(), alloc);
     slots.resize(body.pats.len(), None);
-    let mut needs_flag = Vec::with_capacity_in(body.pats.len(), alloc.clone());
+    let mut needs_flag = Vec::with_capacity_in(body.pats.len(), alloc);
     needs_flag.resize(body.pats.len(), false);
-    let mut partial = Vec::with_capacity_in(body.pats.len(), alloc.clone());
+    let mut partial = Vec::with_capacity_in(body.pats.len(), alloc);
     partial.resize(body.pats.len(), false);
-    let mut owned = Vec::with_capacity_in(body.pats.len(), alloc.clone());
-    owned.resize(body.pats.len(), None);
-    let mut init = Vec::with_capacity_in(body.pats.len(), alloc.clone());
+    let mut assigned = Vec::with_capacity_in(body.pats.len(), alloc);
+    assigned.resize(body.pats.len(), false);
+    let mut owned = Vec::with_capacity_in(body.pats.len(), alloc);
+    owned.resize(body.pats.len(), LocalOwn::None);
+    let mut init = Vec::with_capacity_in(body.pats.len(), alloc);
     init.resize(body.pats.len(), false);
     Walk {
         body,
@@ -826,61 +926,77 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         scratch: subst.scratch,
         grounded,
         adts,
-        alloc: alloc.clone(),
-        b: Builder::new_in(PTR_BITS, alloc.clone()),
-        refs: Vec::new_in(alloc.clone()),
-        statics: Vec::new_in(alloc.clone()),
-        thread_locals: Vec::new_in(alloc.clone()),
-        vtables: Vec::new_in(alloc.clone()),
-        trap_marks: Vec::new_in(alloc.clone()),
+        alloc,
+        b: Builder::new_in(PTR_BITS, alloc),
+        refs: Vec::new_in(alloc),
+        statics: Vec::new_in(alloc),
+        thread_locals: Vec::new_in(alloc),
+        vtables: Vec::new_in(alloc),
+        trap_marks: Vec::new_in(alloc),
         copy_insts: 0,
         task_at: None,
-        ls: Layouts::new_in(alloc.clone()),
-        layouts: Vec::new_in(alloc.clone()),
-        layout_fields: Vec::new_in(alloc.clone()),
-        layout_field_tys: Vec::new_in(alloc.clone()),
-        layout_variants: Vec::new_in(alloc.clone()),
-        unsized_tails: Vec::new_in(alloc.clone()),
+        ls: Layouts::new_in(alloc),
+        layouts: Vec::new_in(alloc),
+        layout_fields: Vec::new_in(alloc),
+        layout_field_tys: Vec::new_in(alloc),
+        layout_variants: Vec::new_in(alloc),
+        unsized_tails: Vec::new_in(alloc),
         slots,
-        reached: Vec::new_in(alloc.clone()),
+        dest_slots: blaze_own::Vec::new_in(alloc),
+        reached: Vec::new_in(alloc),
         live: true,
         break_target,
-        work: Vec::new_in(alloc.clone()),
-        vals: Vec::new_in(alloc.clone()),
-        val_tys: Vec::new_in(alloc.clone()),
-        lit_parts: Vec::new_in(alloc.clone()),
-        targets: Vec::new_in(alloc.clone()),
-        matches: Vec::new_in(alloc.clone()),
-        arm_blocks: Vec::new_in(alloc.clone()),
+        work: Vec::new_in(alloc),
+        vals: Vec::new_in(alloc),
+        val_tys: Vec::new_in(alloc),
+        lit_parts: Vec::new_in(alloc),
+        targets: Vec::new_in(alloc),
+        matches: Vec::new_in(alloc),
+        arm_blocks: Vec::new_in(alloc),
         ret: Repr::None,
         ret_pass: Pass::Ignore,
         sret: None,
+        ref_params: blaze_own::Vec::new_in(alloc),
         needs_flag,
         partial,
-        expr_parent: Vec::new_in(alloc.clone()),
-        temp_marks: Vec::new_in(alloc.clone()),
-        let_else_held: Vec::new_in(alloc.clone()),
+        assigned,
+        expr_parent: Vec::new_in(alloc),
+        temp_marks: Vec::new_in(alloc),
+        let_else_held: Vec::new_in(alloc),
         temp_here: {
-            let mut here = Vec::with_capacity_in(body.exprs.len(), alloc.clone());
+            let mut here = Vec::with_capacity_in(body.exprs.len(), alloc);
             here.resize(body.exprs.len(), temps::NOT_SCOPE);
             here
         },
-        temp_scopes: Vec::new_in(alloc.clone()),
-        ext_flags: Vec::new_in(alloc.clone()),
-        super_temps: Vec::new_in(alloc.clone()),
+        temp_scopes: Vec::new_in(alloc),
+        temp_slots: blaze_own::Vec::new_in(alloc),
+        scope_slots: blaze_own::Vec::new_in(alloc),
+        ext_flags: Vec::new_in(alloc),
+        super_temps: Vec::new_in(alloc),
         owned,
         init,
-        scope_pats: Vec::new_in(alloc.clone()),
-        scope_marks: Vec::new_in(alloc.clone()),
-        moves: moves::Moves::new_in(alloc.clone()),
-        env_places: moves::env_places::EnvPlaces::new_in(alloc.clone()),
-        captured: Vec::new_in(alloc.clone()),
+        definitely_uninit: {
+            let mut du = blaze_own::Vec::with_capacity_in(body.pats.len(), alloc);
+            du.resize(body.pats.len(), false);
+            du
+        },
+        du_pool: blaze_own::Vec::new_in(alloc),
+        if_du: blaze_own::Vec::new_in(alloc),
+        match_du: blaze_own::Vec::new_in(alloc),
+        short_du: blaze_own::Vec::new_in(alloc),
+        let_else_du: blaze_own::Vec::new_in(alloc),
+        target_du: blaze_own::Vec::new_in(alloc),
+        scope_pats: Vec::new_in(alloc),
+        scope_marks: Vec::new_in(alloc),
+        moves: moves::Moves::new_in(alloc),
+        env_places: moves::env_places::EnvPlaces::new_in(alloc),
+        captured: Vec::new_in(alloc),
         co: None,
         names: None,
         cleanup: false,
         nounwind: false,
         terminate: None,
-        owed: Vec::new_in(alloc.clone()),
+        owed: Vec::new_in(alloc),
         rung: unwind_ladder::Rung::Off,
         track: track_caller::Track::No,
     }
@@ -897,6 +1013,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     let t = self.adjusted_ty(callee)?;
                     match self.node_at(callee, t)? {
                         PNode::FnDef(item, args) => Some(Instance { item, args }),
+                        _ if self.checked.callees.column::<0>().contains(&e) => Some(self.method_callee(e)?),
                         _ => None,
                     }
                 }
@@ -904,7 +1021,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 _ => None,
             };
             if let Some(instance) = instance
-                && let Some((principal, slot)) = self.dyn_slot(e, instance)?
+                && let Some(DynSlot { principal, slot, .. }) = self.dyn_slot(e, instance)?
             {
                 out.push(ObjectRead::Call { principal, method: instance.item, slot });
             }
@@ -924,7 +1041,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 if a == b {
                     continue;
                 }
-                let shape = crate::vtable::Shape::of(a, |t| self.adts.object_trait(t), self.alloc.clone())
+                let shape = crate::vtable::Shape::of(a, |t| self.adts.object_trait(t), self.scratch)
                     .map_err(|error| BuildError::Vtable { at: Some(e), error })?;
                 let slot = match shape.upcast(b) {
                     Some(crate::vtable::Upcast::Prefix) => None,
@@ -938,7 +1055,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     }
 }
 
-impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
+impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     // Types.
 
     /// `t` of table `from` (a signature's, a struct's), grounded at the instance's arguments.
@@ -996,15 +1113,33 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     }
 
     /// How ground type `g` is held.
-    fn repr(&mut self, g: PTy) -> Result<Repr, TyErr> {
-        let g = self.pattern_base(g)?;
-        Ok(match self.ground_node(g)? {
+    fn repr(&mut self, mut g: PTy) -> Result<Repr, TyErr> {
+        let node = loop {
+            g = self.pattern_base(g)?;
+            match self.ground_node(g)? {
+                PNode::Union(l) if l.len == 1 => {
+                    let only = self
+                        .ground
+                        .view()
+                        .list(l)
+                        .ok()
+                        .and_then(|xs| xs.first().copied())
+                        .ok_or(TyErr::Malformed("a union list past the ground table"))?;
+                    if only.0 >= g.0 {
+                        return Err(TyErr::Malformed("a cycle in a single-member union"));
+                    }
+                    g = only;
+                }
+                other => break other,
+            }
+        };
+        Ok(match node {
             PNode::Pat(..) => return Err(TyErr::Malformed("a pattern type still wrapped after finding its base")),
             PNode::Bool => Repr::Bool,
             PNode::Int(i) => Repr::Int { ty: int_ty(i)?, signed: true },
             PNode::Uint(u) => Repr::Int { ty: uint_ty(u)?, signed: false },
             PNode::Never | PNode::FnDef(..) => Repr::None,
-            PNode::Tuple(l) if l.len == 0 => Repr::None,
+            PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) if l.len == 0 => Repr::None,
             PNode::Future(..) => {
                 return Err(TyErr::Unsupported(
                     "an async block's future named by its expression in a ground type (only its identity, `PNode::Coroutine`, crosses a body: coroutine.rs)",
@@ -1012,7 +1147,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             // A closure: a struct of one field, its environment (closure.rs). A coroutine: its
             // state, whose first bytes are its upvars (coroutine.rs).
-            PNode::Adt(..) | PNode::Tuple(_) | PNode::Array(..) | PNode::Closure { .. } | PNode::Coroutine { .. } => {
+            PNode::Adt(..) | PNode::Tuple(_) | PNode::Record(..) | PNode::Union(_) | PNode::Array(..) | PNode::Closure { .. } | PNode::Coroutine { .. } => {
                 let l = self.layout(g)?;
                 // An unsized tail's struct is only ever behind a pointer (walk/unsized_tail.rs).
                 if self.has_unsized_tail(l) {
@@ -1090,11 +1225,29 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
 
     /// Whether ground type `g` is laid out as an aggregate: an ADT, an array, a non-empty
     /// tuple, or a wide pointer (a pointer `ls` lays out as an address and a length).
-    fn is_agg(&mut self, g: PTy) -> Result<bool, TyErr> {
-        Ok(match self.ground_node(g)? {
+    fn is_agg(&mut self, mut g: PTy) -> Result<bool, TyErr> {
+        let node = loop {
+            match self.ground_node(g)? {
+                PNode::Union(l) if l.len == 1 => {
+                    let only = self
+                        .ground
+                        .view()
+                        .list(l)
+                        .ok()
+                        .and_then(|xs| xs.first().copied())
+                        .ok_or(TyErr::Malformed("a union list past the ground table"))?;
+                    if only.0 >= g.0 {
+                        return Err(TyErr::Malformed("a cycle in a single-member union"));
+                    }
+                    g = only;
+                }
+                other => break other,
+            }
+        };
+        Ok(match node {
             // A coroutine's state holds its tag at least (coroutine.rs).
             PNode::Adt(..) | PNode::Array(..) | PNode::Coroutine { .. } => true,
-            PNode::Tuple(l) => l.len > 0,
+            PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => l.len > 0,
             // Its environment is a tuple: an aggregate when it captures something.
             PNode::Closure { .. } => {
                 let env = self.closure_parts(g)?.env;
@@ -1114,7 +1267,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// The layout of an enum variant `variant` of enum layout `l`: its fields' range of
     /// `layout_fields`, and the enum's layout in `ls` (whose `tag_write` makes the variant). A
     /// struct or tuple is its own variant 0, with no tag.
-    fn variant_rows(&self, l: u32, variant: u32) -> Result<(u32, u32, Option<LayoutId>), BuildError> {
+    pub(super) fn variant_rows(&self, l: u32, variant: u32) -> Result<(u32, u32, Option<LayoutId>), BuildError> {
         match self.layouts[l as usize].shape {
             Shape::Fields { first, len } if variant == 0 => Ok((first, len, None)),
             Shape::Enum { id, first, len } if variant < len => {
@@ -1149,6 +1302,15 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let fields = adt.fields.get(v.fields.range()).ok_or(malformed("an ADT's fields past their column"))?;
                 fields.get(j as usize).ok_or(malformed("a field past its ADT's fields"))?.name
             }
+            PNode::Record(schema, _) => {
+                let idx = usize::try_from(j).ok();
+                self.ground
+                    .view()
+                    .record_names(schema)
+                    .or_else(|| self.checked.types.view().record_names(schema))
+                    .and_then(|ns| idx.and_then(|i| ns.get(i).copied()))
+                    .unwrap_or(Name(u64::from(j)))
+            }
             _ => Name(u64::from(j)),
         };
         if found != declared {
@@ -1160,7 +1322,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// Makes variant `variant` of the enum of layout `id` at `at`: stores what `ls.tag_write`
     /// says (nothing for a struct, an enum of one present variant, or a niche encoding's
     /// untagged variant, whose own fields hold valid values there).
-    fn write_tag(&mut self, id: Option<LayoutId>, variant: u32, at: (Value, i32)) {
+    pub(super) fn write_tag(&mut self, id: Option<LayoutId>, variant: u32, at: (Value, i32)) {
         let Some(w) = id.and_then(|id| self.ls.tag_write(id, variant)) else { return };
         let v = match w.scalar.prim {
             // A pointer niche: null, or an address that is no allocation's.
@@ -1197,12 +1359,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             return Ok(found);
         }
         let too_big = || TyErr::Unsupported("an aggregate of 2 GiB or more");
-        let mut todo = Vec::new_in(self.alloc.clone());
-        let mut args: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut todo = Vec::new_in(self.alloc);
+        let mut args: Vec<PTy, A> = Vec::new_in(self.alloc);
         // The parts: a struct's or tuple's fields, or an array's element.
-        let mut parts: Vec<(Name, PTy), A> = Vec::new_in(self.alloc.clone());
+        let mut parts: Vec<(Name, PTy), A> = Vec::new_in(self.alloc);
         // An enum's variants: where each one's fields end in `parts`.
-        let mut variant_ends: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let mut variant_ends: Vec<u32, A> = Vec::new_in(self.alloc);
         todo.push(g);
         while let Some(&t) = todo.last() {
             if self.find_layout(t).is_some() {
@@ -1279,7 +1441,31 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 PNode::Tuple(l) => {
                     let elems = self.ground.view().list(l).map_err(|_| TyErr::Malformed("a list past the ground table"))?;
                     for (i, &et) in elems.iter().enumerate() {
-                        parts.push((Name(i as u64), et));
+                        parts.push((Name(u64::try_from(i).map_err(|_| TyErr::Malformed("too many fields"))?), et));
+                    }
+                }
+                PNode::Record(schema, l) => {
+                    let elems = self.ground.view().list(l).map_err(|_| TyErr::Malformed("a list past the ground table"))?;
+                    let names = self
+                        .ground
+                        .view()
+                        .record_names(schema)
+                        .or_else(|| self.checked.types.view().record_names(schema));
+                    for (i, &et) in elems.iter().enumerate() {
+                        let nm = match names.and_then(|ns| ns.get(i).copied()) {
+                            Some(nm) => nm,
+                            None => Name(u64::try_from(i).map_err(|_| TyErr::Malformed("too many fields"))?),
+                        };
+                        parts.push((nm, et));
+                    }
+                }
+                PNode::Union(l) => {
+                    let elems = self.ground.view().list(l).map_err(|_| TyErr::Malformed("a list past the ground table"))?;
+                    is_enum = true;
+                    for &et in elems.iter() {
+                        parts.push((Name(0), et));
+                        let end = u32::try_from(parts.len()).map_err(|_| TyErr::Malformed("too many union variants"))?;
+                        variant_ends.push(end);
                     }
                 }
                 PNode::Array(et, n) => {
@@ -1542,7 +1728,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     }
 
     /// The rows of `e`'s adjustments: `start..end` of the record's `adjusts`.
-    fn adjust_rows(&self, e: ExprId) -> core::ops::Range<usize> {
+    pub(super) fn adjust_rows(&self, e: ExprId) -> core::ops::Range<usize> {
         let col = self.checked.adjusts.column::<0>();
         let start = col.partition_point(|&x| x < e);
         let len = col[start..].iter().take_while(|&&x| x == e).count();
@@ -1679,6 +1865,52 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         }
     }
 
+    /// Allocates a shared temporary slot for an aggregate join (`match`, `if`, labeled block,
+    /// `loop`), so each branch copies into it and ends its own temporary slot, and the join
+    /// produces a real `SlotAddr` instead of hiding the slot behind a block parameter.
+    fn join_slot(&mut self, repr: Repr) -> Option<SlotId> {
+        let Repr::Agg(_) = repr else { return None };
+        let (size, align) = self.size_align(repr);
+        let slot = self.b.slot(size, align, SlotKind::Temp);
+        self.name_temp(slot);
+        Some(slot)
+    }
+
+    /// Jumps to join block `join` with branch value `v` (of `repr`), copying into shared slot
+    /// `res` and ending `v`'s temporary slot for aggregate joins. In unreachable code
+    /// (`!self.live`), emits `unreachable` instead of allocating a dummy slot or adding a dead
+    /// edge to `join`.
+    fn join_jump(&mut self, v: V, repr: Repr, res: Option<SlotId>, join: Block) -> Result<(), BuildError> {
+        if !self.live {
+            self.b.unreachable();
+            return Ok(());
+        }
+        match res {
+            Some(slot) => {
+                let to = (self.b.slot_addr(slot), 0);
+                self.store(v, repr, to)?;
+                self.end_temp_val(v);
+                self.jump(join, &[]);
+            }
+            None => {
+                let arg = self.arg(v, repr)?;
+                self.jump(join, arg.as_slice());
+            }
+        }
+        Ok(())
+    }
+
+    /// The value at a join block after `self.begin(join)`.
+    fn join_value(&mut self, repr: Repr, res: Option<SlotId>) -> V {
+        if !self.live {
+            return V::None;
+        }
+        match res {
+            Some(slot) => V::Place(self.b.slot_addr(slot), 0),
+            None => self.join_param(repr),
+        }
+    }
+
     fn mem(&self, repr: Repr) -> MemAttrs {
         MemAttrs::aligned(self.size_align(repr).1)
     }
@@ -1694,12 +1926,20 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         }
     }
 
+    /// Whether two places name the exact same `(slot, offset)` or `(value, offset)`.
+    fn same_place(&self, a: (Value, i32), b: (Value, i32)) -> bool {
+        if a == b {
+            return true;
+        }
+        a.1 == b.1 && self.value_slot(a.0).is_some_and(|s| self.value_slot(b.0) == Some(s))
+    }
+
     fn store(&mut self, v: V, repr: Repr, to: (Value, i32)) -> Result<(), BuildError> {
         match repr {
             Repr::None => Ok(()),
             Repr::Agg(_) => {
                 let from = self.place(v, repr)?;
-                if from != to {
+                if !self.same_place(from, to) {
                     self.copy(repr, from, to)?;
                 }
                 Ok(())
@@ -1714,153 +1954,67 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         }
     }
 
+    /// Whether `[from, from + size)` and `[to, to + size)` are statically provably disjoint.
+    fn copy_disjoint(&self, from: (Value, i32), to: (Value, i32), size: u32) -> bool {
+        let view = self.b.func().view();
+        let slot_of = |v: Value| {
+            let ix = v.index();
+            (ix < view.len() && view.op(ix) == Op::SlotAddr).then(|| view.operands(ix).slot())
+        };
+        let is_non_slot_disjoint = |v: Value| {
+            let ix = v.index();
+            self.sret == Some(v) || (ix < view.len() && matches!(view.op(ix), Op::DataAddr | Op::TlsAddr))
+        };
+        match (slot_of(from.0), slot_of(to.0)) {
+            (Some(a), Some(b)) => a != b || i64::from(from.1).abs_diff(i64::from(to.1)) >= u64::from(size),
+            (Some(_), None) => is_non_slot_disjoint(to.0),
+            (None, Some(_)) => is_non_slot_disjoint(from.0),
+            (None, None) => false,
+        }
+    }
+
     /// Copies layout `l`'s `size` bytes from one place to another, whatever they hold, as one
-    /// `memcpy`. A union's bytes may be uninitialised past the field written, and may carry a
-    /// pointer's provenance: LIR's `memcpy` keeps both ("Bytes keep their provenance"), while
-    /// an integer load of an uninitialised byte is undefined and an integer drops provenance.
-    /// The backends lower a small `memcpy` of a known length to loads and stores themselves.
+    /// `memcpy` (when statically disjoint) or `memmove` (otherwise). LIR's bulk copy preserves
+    /// both uninitialised/padding bytes and pointer provenance ("Bytes keep their provenance"),
+    /// avoids exploding nested enums into exponential per-variant switch trees, and lets LIR's
+    /// `sroa`/`memopt` and the backends lower small constant-length copies to loads and stores.
     fn copy_bytes(&mut self, l: u32, from: (Value, i32), to: (Value, i32)) {
         // The walk's `Layout::size` is a `u32`; its `align` and `MemAttrs::align` are both log2
         // of the alignment in bytes.
         let (size, align) = (self.layouts[l as usize].size, self.layouts[l as usize].align);
-        if size == 0 {
+        if size == 0 || self.same_place(from, to) {
             return;
         }
+        let op = if self.copy_disjoint(from, to, size) { Op::Memcpy } else { Op::Memmove };
         let (src, dst) = (self.address(from), self.address(to));
         let len = self.b.iconst(Ty::I64, u128::from(size));
         let mut attrs = MemAttrs::aligned(align);
         attrs.src_align = align;
-        self.b.bulk(Op::Memcpy, Flags::NONE, dst, src, len, attrs);
+        self.b.bulk(op, Flags::NONE, dst, src, len, attrs);
     }
 
-    /// Copies a value of `repr` from one place to another, scalar leaf by scalar leaf (never
-    /// the padding), by a work list: a struct's or tuple's fields in turn, an array's elements
-    /// unrolled up to `UNROLL_LEAVES` leaves and in a loop beyond.
+    /// Copies a value of `repr` from one place to another: scalars as load+store, aggregates as
+    /// one byte-and-provenance-preserving bulk copy (`Op::Memcpy` / `Op::Memmove`).
     fn copy(&mut self, repr: Repr, from: (Value, i32), to: (Value, i32)) -> Result<(), BuildError> {
         let before = self.b.func().ops.len();
-        let copied = self.copy_leaves(repr, from, to);
-        self.copy_insts += (self.b.func().ops.len() - before) as u64;
-        copied
-    }
-
-    /// [`Walk::copy`]'s work, counted by it.
-    fn copy_leaves(&mut self, repr: Repr, from: (Value, i32), to: (Value, i32)) -> Result<(), BuildError> {
-        let mut stack = Vec::new_in(self.alloc.clone());
-        stack.push(CopyStep::Copy { repr, from, to });
-        while let Some(step) = stack.pop() {
-            let (repr, from, to) = match step {
-                CopyStep::Copy { repr, from, to } => (repr, from, to),
-                CopyStep::Next { i, header, exit } => {
-                    let one = self.b.iconst(Ty::I64, 1);
-                    let next = self.b.binary(Op::Add, Flags::NONE, i, one);
-                    self.jump(header, &[next]);
-                    self.begin(exit);
-                    continue;
-                }
-                CopyStep::Begin(block) => {
-                    self.begin(block);
-                    continue;
-                }
-                CopyStep::Jump(block) => {
-                    self.jump(block, &[]);
-                    continue;
-                }
-                CopyStep::Tag { id, variant, to } => {
-                    self.write_tag(Some(id), variant, to);
-                    continue;
-                }
-            };
-            let l = match repr.kept() {
-                Kept::None => continue,
-                Kept::Agg(l) => l,
-                Kept::Scalar(ty) => {
+        match repr.kept() {
+            Kept::None => {}
+            Kept::Scalar(ty) => {
+                if from != to {
                     let attrs = self.mem(repr);
                     let x = self.b.load(ty, Flags::NONE, from.0, from.1, attrs);
                     self.b.store(Flags::NONE, x, to.0, to.1, attrs);
-                    continue;
-                }
-            };
-            // A coroutine's state is copied whole: what the pass keeps in it and its tag are no
-            // field of its row (coroutine.rs `copy_state`).
-            if self.copy_state(l, from, to) {
-                continue;
-            }
-            // A union is copied as its bytes, never by its fields and never switching on a tag:
-            // the layout does not know which field is live (the Reference, "Unions": reading a
-            // field reinterprets the bytes; the copy keeps every byte, uninitialised ones too).
-            // `MaybeUninit<T>` is one: `uninit()` leaves `value: ManuallyDrop<T>`'s bytes unwritten.
-            if self.layouts[l as usize].is_union {
-                self.copy_bytes(l, from, to);
-                continue;
-            }
-            match self.layouts[l as usize].shape {
-                Shape::Fields { first, len } => {
-                    for i in (first..first + len).rev() {
-                        let (_, off, repr) = self.layout_fields[i as usize];
-                        let off = off as i32;
-                        stack.push(CopyStep::Copy { repr, from: (from.0, from.1 + off), to: (to.0, to.1 + off) });
-                    }
-                }
-                Shape::Array { elem, len, stride } => {
-                    if self.layouts[l as usize].leaves <= UNROLL_LEAVES {
-                        for i in (0..len).rev() {
-                            let off = (i * stride) as i32;
-                            stack.push(CopyStep::Copy { repr: elem, from: (from.0, from.1 + off), to: (to.0, to.1 + off) });
-                        }
-                        continue;
-                    }
-                    let (i, fp, tp, header, exit) = self.array_loop(len, stride, from, to);
-                    stack.push(CopyStep::Next { i, header, exit });
-                    stack.push(CopyStep::Copy { repr: elem, from: (fp, 0), to: (tp, 0) });
-                }
-                // Switch on the variant, copy its fields alone, write its tag (lib.rs, "Enums"):
-                // a copy never reads a byte the value's variant leaves undefined.
-                Shape::Enum { id, first, len } => {
-                    if self.layouts[l as usize].leaves == 0 {
-                        continue;
-                    }
-                    let fields = |w: &Self, v: u32, stack: &mut Vec<CopyStep, A>| {
-                        let (f, n) = w.layout_variants[(first + v) as usize];
-                        for i in (f..f + n).rev() {
-                            let (_, off, repr) = w.layout_fields[i as usize];
-                            let off = off as i32;
-                            stack.push(CopyStep::Copy { repr, from: (from.0, from.1 + off), to: (to.0, to.1 + off) });
-                        }
-                    };
-                    match self.ls.get(id).variants {
-                        // One present variant and no tag: its fields.
-                        Variants::Single { index } if index < len => fields(self, index, &mut stack),
-                        Variants::Single { .. } => {}
-                        Variants::Multiple { .. } => {
-                            let d = self.read_discriminant(id, from)?;
-                            let join = self.create();
-                            let none = self.create();
-                            stack.push(CopyStep::Begin(join));
-                            let mut cases = Vec::new_in(self.alloc.clone());
-                            for v in (0..len).rev() {
-                                let case = self.discriminant_case(id, v)?;
-                                let block = self.create();
-                                cases.push((case, block));
-                                stack.push(CopyStep::Jump(join));
-                                stack.push(CopyStep::Tag { id, variant: v, to });
-                                fields(self, v, &mut stack);
-                                stack.push(CopyStep::Begin(block));
-                            }
-                            self.switch(d, none, &cases);
-                            // No variant has another discriminant: holding one is UB.
-                            self.begin(none);
-                            self.unreachable_of_enum(id, len, self.task_at)?;
-                        }
-                    }
                 }
             }
+            Kept::Agg(l) => self.copy_bytes(l, from, to),
         }
+        self.copy_insts += (self.b.func().ops.len() - before) as u64;
         Ok(())
     }
 
     /// Ends the block with a switch on `x`: to each case's block on its value, else `default`.
     fn switch(&mut self, x: Value, default: Block, cases: &[(u128, Block)]) {
-        let mut tos = Vec::with_capacity_in(cases.len(), self.alloc.clone());
+        let mut tos = Vec::with_capacity_in(cases.len(), self.alloc);
         for &(v, block) in cases {
             self.reach(block);
             tos.push((v, (block, &[] as &[Value])));
@@ -1906,6 +2060,163 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         (self.b.slot_addr(slot), 0)
     }
 
+    /// Consumes the pending in-place destination slot registered for exact expression `e` and
+    /// representation `repr`, returning `(slot_addr, off)` in the current block.
+    fn take_dest(&mut self, e: ExprId, repr: Repr) -> Option<(Value, i32)> {
+        let i = self.dest_slots.iter().rposition(|d| d.expr == e)?;
+        let dest = self.dest_slots.remove_shift(i);
+        if dest.repr != repr {
+            return None;
+        }
+        Some((self.b.slot_addr(dest.slot), dest.off))
+    }
+
+    /// Removes any unconsumed destination slot entries targeting `slot`.
+    fn clear_dest_slot(&mut self, slot: SlotId) {
+        let mut i = self.dest_slots.len();
+        while i > 0 {
+            i -= 1;
+            if self.dest_slots.get(i).is_some_and(|d| d.slot == slot) {
+                self.dest_slots.remove_shift(i);
+            }
+        }
+    }
+
+    /// Returns the exact inner constructor [`ExprId`] of `e` when `e` can be safely constructed
+    /// directly in place into a fresh, uninitialized destination of `repr` (`Repr::Agg(l)` with
+    /// `size > 0`):
+    /// - `Expr::Repeat { .. }` is always safe into a fresh uninitialized slot (its element
+    ///   evaluates first and cannot read the uninitialized binding),
+    /// - `Expr::Array`, `Expr::Tuple`, `Expr::Struct`/`Expr::Record` (without `..base`), and
+    ///   tuple struct/variant ctors are safe when the aggregate has no drop glue (`!needs_drop &&
+    ///   !placed`), so a mid-construction panic cannot leak partially initialized elements.
+    fn dest_target(&mut self, e: ExprId, repr: Repr) -> Result<Option<ExprId>, BuildError> {
+        if !self.live || self.co.is_some() {
+            return Ok(None);
+        }
+        let Repr::Agg(l) = repr else {
+            return Ok(None);
+        };
+        let Ok(l_ix) = usize::try_from(l) else {
+            return Ok(None);
+        };
+        let Some(layout) = self.layouts.get(l_ix) else {
+            return Ok(None);
+        };
+        let (size, no_drop) = (layout.size, !layout.needs_drop && !layout.placed);
+        if size == 0 {
+            return Ok(None);
+        }
+        let mut cur = e;
+        loop {
+            if !self.adjust_rows(cur).is_empty() {
+                return Ok(None);
+            }
+            if let Expr::Paren(inner) = self.expr(cur)? {
+                cur = inner;
+                continue;
+            }
+            break;
+        }
+        if self.expr_repr(cur)? != repr {
+            return Ok(None);
+        }
+        match self.expr(cur)? {
+            Expr::Repeat { .. } => Ok(Some(cur)),
+            Expr::Array { .. }
+            | Expr::Tuple { .. }
+            | Expr::Struct { base: blaze_typeck::StructBase::None | blaze_typeck::StructBase::Defaults, .. }
+            | Expr::Record { base: blaze_typeck::StructBase::None | blaze_typeck::StructBase::Defaults, .. }
+                if no_drop =>
+            {
+                Ok(Some(cur))
+            }
+            Expr::Call { callee, .. } if no_drop => {
+                if matches!(self.expr_def(callee), Some(Def::Ctor { kind: CtorKind::Tuple, .. })) {
+                    let t = self.adjusted_ty(callee)?;
+                    if matches!(self.node_at(callee, t)?, PNode::FnDef(..)) {
+                        return Ok(Some(cur));
+                    }
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Pre-allocates the named local slot for a fresh uninitialized `Stmt::Let` binding `pat` and
+    /// registers it as the in-place destination for `init` when `init` is a supported direct
+    /// constructor, eliminating the intermediate `SlotKind::Temp` and `Op::Memcpy`.
+    fn try_let_dest(&mut self, pat: PatId, init: ExprId) -> Result<(), BuildError> {
+        if !self.live || self.co.is_some() {
+            return Ok(());
+        }
+        let Pat::Bind { ann, sub: None, .. } = self.pat(pat)? else {
+            return Ok(());
+        };
+        if ann.by_ref.is_some() {
+            return Ok(());
+        }
+        if self.slots.get(pat.ix()).copied().flatten().is_some() {
+            return Ok(());
+        }
+        let local_repr = self.local_repr(pat)?;
+        let Some(target) = self.dest_target(init, local_repr)? else {
+            return Ok(());
+        };
+        let (Home::Slot(slot), _) = self.bind(pat)? else {
+            return Ok(());
+        };
+        self.b.slot_live(slot);
+        self.dest_slots.push(DestSlot { expr: target, slot, off: 0, repr: local_repr });
+        Ok(())
+    }
+
+    /// Registers a sub-field/element destination `(slot, base_off + field_off)` for `expr` inside
+    /// a freshly constructed non-dropping aggregate when `expr` is a direct in-place constructor
+    /// and the sub-place satisfies alignment and bounds within `slot`.
+    fn try_sub_dest(
+        &mut self,
+        expr: ExprId,
+        slot: SlotId,
+        base_off: i32,
+        field_off: u32,
+        frepr: Repr,
+    ) -> Result<(), BuildError> {
+        let Some(target) = self.dest_target(expr, frepr)? else {
+            return Ok(());
+        };
+        let Ok(field_off_i32) = i32::try_from(field_off) else {
+            return Ok(());
+        };
+        let Some(total_off) = base_off.checked_add(field_off_i32) else {
+            return Ok(());
+        };
+        if total_off < 0 {
+            return Ok(());
+        }
+        let (fsize, falign) = self.size_align(frepr);
+        let Ok(fsize_i32) = i32::try_from(fsize) else {
+            return Ok(());
+        };
+        if total_off.checked_add(fsize_i32).is_none() {
+            return Ok(());
+        }
+        let Ok(total_off_u32) = u32::try_from(total_off) else {
+            return Ok(());
+        };
+        let aligned = self.b.func().view().slots.get(slot.index()).is_some_and(|s| {
+            falign <= s.align
+                && total_off_u32.trailing_zeros() >= u32::from(falign)
+                && total_off_u32.checked_add(fsize).is_some_and(|end| end <= s.size)
+        });
+        if !aligned {
+            return Ok(());
+        }
+        self.dest_slots.push(DestSlot { expr: target, slot, off: total_off, repr: frepr });
+        Ok(())
+    }
+
     /// A `bool` (`i8`) as an `i1` to branch on.
     fn cond(&mut self, v: V) -> Result<Value, BuildError> {
         let x = self.scalar(v, Ty::I8)?;
@@ -1920,6 +2231,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         match home {
             Home::Slot(slot) => (self.b.slot_addr(slot), 0),
             Home::At(p, off) => (p, off),
+            Home::Indirect(env, off) => {
+                let ptr = self.b.load(Ty::PTR, Flags::NONE, env, off, MemAttrs::aligned(3));
+                (ptr, 0)
+            }
         }
     }
 
@@ -1953,7 +2268,14 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             return Err(malformed("a binding bound twice"));
         }
         let repr = self.local_repr(p)?;
-        self.slots[p.ix()] = Some((Home::At(at.0, at.1), repr));
+        let home = match self.whole_slot(at) {
+            Some(slot) => Home::Slot(slot),
+            None => Home::At(at.0, at.1),
+        };
+        if let Some(entry) = self.slots.get_mut(p.ix()) {
+            *entry = Some((home, repr));
+        }
+        self.name_at(at, blaze_flow_lower::identity::Identity::Binding(p));
         Ok(())
     }
 
@@ -1974,6 +2296,25 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         Ok(())
     }
 
+    /// Captured variable `p` held by reference at environment field `at`: the pointer stored in
+    /// `at` is reloaded on demand ([`Home::Indirect`]) so the pointer value never crosses a
+    /// coroutine suspension point.
+    fn bind_capture_indirect(&mut self, p: PatId, at: (Value, i32)) -> Result<(), BuildError> {
+        if !matches!(self.pat(p)?, Pat::Bind { .. }) {
+            return Err(malformed("a capture of other than a binding"));
+        }
+        if self.slots.get(p.ix()).copied().flatten().is_some() {
+            return Err(malformed("a binding bound twice"));
+        }
+        let repr = self.local_repr(p)?;
+        let Some(slot) = self.slots.get_mut(p.ix()) else {
+            return Err(malformed("a capture past `slots`"));
+        };
+        *slot = Some((Home::Indirect(at.0, at.1), repr));
+        self.captured.push(p);
+        Ok(())
+    }
+
     /// The slot of binding pattern `p`, made on first use.
     fn bind(&mut self, p: PatId) -> Result<(Home, Repr), BuildError> {
         self.plain_binding(p)?;
@@ -1985,6 +2326,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let slot = self.b.slot(size, align, SlotKind::Named);
         self.name_slot(slot, blaze_flow_lower::identity::Identity::Binding(p));
         self.slots[p.ix()] = Some((Home::Slot(slot), repr));
+        self.track_local_slot(p);
         Ok((Home::Slot(slot), repr))
     }
 
@@ -2014,8 +2356,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// by a work list; every other irrefutable pattern (a struct or only-variant pattern, `&p`,
     /// an array with `..`, a tuple over a reference) by walk/matches/irrefutable.rs.
     fn bind_value(&mut self, p: PatId, v: V) -> Result<(), BuildError> {
-        let mut todo = Vec::new_in(self.alloc.clone());
-        let mut parts = Vec::new_in(self.alloc.clone());
+        let mut todo = Vec::new_in(self.alloc);
+        let mut parts = Vec::new_in(self.alloc);
         todo.push((p, v));
         while let Some((p, v)) = todo.pop() {
             let (elems, rest) = match self.pat(p)? {
@@ -2037,7 +2379,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 Pat::Slice { elems, rest: None } => (elems, None),
                 // An array with `..`, a struct or only-variant pattern, `&p`: the irrefutable
                 // binder, by the match builder's projection.
-                Pat::Slice { rest: Some(_), .. } | Pat::Struct { .. } | Pat::TupleStruct { .. } | Pat::Ref { .. } | Pat::Path(_) => {
+                Pat::Slice { rest: Some(_), .. }
+                | Pat::Struct { .. }
+                | Pat::Record { .. }
+                | Pat::TupleStruct { .. }
+                | Pat::Ref { .. }
+                | Pat::Path(_) => {
                     self.bind_irrefutable(p, v)?;
                     continue;
                 }
@@ -2156,6 +2503,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
 
     /// Whether ground type `g` needs drop.
     fn needs_drop(&mut self, g: PTy) -> Result<bool, TyErr> {
+        // A trait object's concrete destructor is only known at run time (drop_facts.rs).
+        if matches!(self.ground_node(g)?, PNode::Dynamic(_)) {
+            return Ok(true);
+        }
         if !self.is_agg(g)? {
             return Ok(false);
         }
@@ -2198,6 +2549,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let t = *self.checked.local_ty.get(p.ix()).ok_or(malformed("a binding without a type in the record"))?;
         let g = self.ground_ty(t).map_err(|error| Self::pat_ty_err(p, error))?;
         if !self.needs_drop(g).map_err(|error| Self::pat_ty_err(p, error))? {
+            self.own_kept(p, init);
             return Ok(());
         }
         let (_, repr) = self.slots[p.ix()].ok_or(malformed("a binding owned before it has a home"))?;
@@ -2205,7 +2557,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         if repr == Repr::None {
             return Err(malformed("a binding whose type needs drop held as no value"));
         }
-        if self.owned[p.ix()].is_some() {
+        if self.owned.get(p.ix()).copied().and_then(LocalOwn::as_drop).is_some() {
             return Err(malformed("a binding owned twice"));
         }
         let flag = if self.needs_flag[p.ix()] {
@@ -2219,36 +2571,122 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             None
         };
         let rest = if self.partial[p.ix()] {
-            let slot = self.b.slot(8, 3, SlotKind::Named);
+            let slot = self.alloc_mask_slot();
+            self.name_rest(slot, blaze_flow_lower::identity::Identity::Binding(p));
+            self.record_mask_decl_loop(slot);
             Some(slot)
         } else {
             None
         };
-        self.owned[p.ix()] = Some(Owned { ty: g, flag, rest });
+        self.owned[p.ix()] = LocalOwn::Drop(Owned { ty: g, flag, rest });
+        if let Some(slot) = rest {
+            self.preregister_local_parts(p, g, slot);
+        }
         self.hold_all(p);
         self.init[p.ix()] = init;
+        if let Some(du) = self.definitely_uninit.get_mut(p.ix()) {
+            *du = !init;
+        }
         self.scope_pats.push(Held::Pat(p));
         Ok(())
+    }
+
+    /// Registers a non-dropping local binding `p`'s slot (if any) in `scope_slots` at the
+    /// current drop scope depth so coroutine lowering ends its storage when the scope closes.
+    pub(in crate::walk) fn track_local_slot(&mut self, p: PatId) {
+        if self.co.is_none() || self.captured_whole(p) {
+            return;
+        }
+        let depth = self.scope_marks.len();
+        if depth == 0 {
+            return;
+        }
+        let Some((home, _)) = self.slots.get(p.ix()).copied().flatten() else { return };
+        let slot = match home {
+            Home::Slot(s) => Some(s),
+            Home::At(v, off) => self.whole_slot((v, off)),
+            Home::Indirect(..) => None,
+        };
+        if let Some(s) = slot
+            && self.scope_slots.scan_for(&(depth, s, None)).is_none()
+        {
+            self.scope_slots.push((depth, s, None));
+        }
+    }
+
+    /// Marks binding `p` whose type needs no drop (e.g. `ManuallyDrop<T>`) as owned by this body,
+    /// allocating its field-flags word when a dropping part moves out of it (`partial`).
+    fn own_kept(&mut self, p: PatId, init: bool) {
+        self.track_local_slot(p);
+        let Some(&existing) = self.owned.get(p.ix()) else { return };
+        if !self.partial.get(p.ix()).copied().unwrap_or(false) {
+            self.owned[p.ix()] = LocalOwn::Kept;
+            return;
+        }
+        let slot = match existing {
+            LocalOwn::KeptFlags(slot) => slot,
+            LocalOwn::None | LocalOwn::Kept | LocalOwn::Drop(_) => {
+                let slot = self.alloc_mask_slot();
+                self.owned[p.ix()] = LocalOwn::KeptFlags(slot);
+                self.record_mask_decl_loop(slot);
+                slot
+            }
+        };
+        self.name_rest(slot, blaze_flow_lower::identity::Identity::Binding(p));
+        if self.co.is_some() {
+            let depth = self.scope_marks.len();
+            if depth > 0 && self.scope_slots.scan_for(&(depth, slot, None)).is_none() {
+                self.scope_slots.push((depth, slot, None));
+            }
+        }
+        self.store_mask_words(slot, if init { u64::MAX } else { 0 });
+    }
+
+    /// The field-flags word of binding `p`, whether its type needs drop (`Owned::rest`) or not
+    /// (`LocalOwn::KeptFlags`, e.g. `ManuallyDrop<T>`).
+    fn field_mask(&self, p: PatId) -> Option<SlotId> {
+        match self.owned.get(p.ix()).copied() {
+            Some(LocalOwn::Drop(o)) => o.rest,
+            Some(LocalOwn::KeptFlags(slot)) => Some(slot),
+            Some(LocalOwn::None | LocalOwn::Kept) | None => None,
+        }
+    }
+
+    /// Whether binding `p` is owned by this body (not a borrowed or non-`FnOnce` capture),
+    /// whether its own type needs drop or not (`ManuallyDrop<T>`).
+    fn local_is_owned(&self, p: PatId) -> bool {
+        !matches!(self.owned.get(p.ix()).copied(), None | Some(LocalOwn::None))
+    }
+
+    /// Whether binding `p` is owned by this body and its type needs drop.
+    fn local_drops(&self, p: PatId) -> bool {
+        self.owned.get(p.ix()).copied().and_then(LocalOwn::as_drop).is_some()
     }
 
     /// Sets every field flag of binding `p`, if it has them: it holds all of its value again
     /// (its `let`, an assignment over it).
     fn hold_all(&mut self, p: PatId) {
-        if let Some(Owned { rest: Some(slot), .. }) = self.owned[p.ix()] {
-            let at = self.b.slot_addr(slot);
-            let all = self.b.iconst(Ty::I64, u128::from(u64::MAX));
-            self.b.store(Flags::NONE, all, at, 0, MemAttrs::aligned(3));
+        if let Some(slot) = self.field_mask(p) {
+            self.store_mask_words(slot, u64::MAX);
         }
     }
 
-    /// The bit of field `j` of variant `variant` of enum layout `l` in a field-flag word: the
-    /// fields of every variant before it, then `j`; `None` past 64 fields.
+    /// The bit of field `j` of variant `variant` of enum layout `l` in a field-flag bitset:
+    /// variants share `0..max_variant_fields` because an enum holds one active variant at runtime
+    /// (switched on by discriminant before testing bits, and `hold_all` resets on overwrite);
+    /// `None` at or past `REST_BITS`.
     fn field_bit(&self, l: u32, variant: u32, j: u32) -> Result<Option<u32>, BuildError> {
-        let Shape::Enum { first, .. } = self.layouts[l as usize].shape else {
+        let Shape::Enum { first, len, .. } = self.layouts[l as usize].shape else {
             return Err(malformed("field flags of other than an enum"));
         };
-        let before: u32 = (0..variant).map(|v| self.layout_variants[(first + v) as usize].1).sum();
-        Ok(Some(before + j).filter(|&b| b < 64))
+        if variant >= len {
+            return Err(malformed("a variant index past its enum's variants"));
+        }
+        let fl = self.layout_variants[(first + variant) as usize].1;
+        if j >= fl {
+            return Err(malformed("a field index past its variant's fields"));
+        }
+        Ok(Some(j).filter(|&b| b < crate::coroutine_state::REST_BITS))
     }
 
     /// Drops what the binding of ground type `g` at `at` holds: all of it, or with field flags
@@ -2263,11 +2701,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let Shape::Enum { id, first, len } = self.layouts[l as usize].shape else {
             return Err(malformed("field flags on other than an enum"));
         };
-        let fa = self.b.slot_addr(slot);
-        let mask = self.b.load(Ty::I64, Flags::NONE, fa, 0, MemAttrs::aligned(3));
         let exit = self.create();
-        let mut cases = Vec::with_capacity_in(len as usize, self.alloc.clone());
-        let mut bodies = Vec::with_capacity_in(len as usize, self.alloc.clone());
+        let mut cases = Vec::with_capacity_in(len as usize, self.alloc);
+        let mut bodies = Vec::with_capacity_in(len as usize, self.alloc);
         for v in 0..len {
             let (ff, fl) = self.layout_variants[(first + v) as usize];
             if !self.fields_need_drop(ff, fl) {
@@ -2288,15 +2724,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     continue;
                 }
                 let ft = self.layouts[fr as usize].ty;
-                // A field past 64 is never moved (`arm` refuses it), so always held.
+                // A field past `REST_BITS` is never moved (`arm` refuses it), so always held.
                 let Some(bit) = self.field_bit(l, v, j)? else {
                     self.drop_at(ft, (at.0, at.1 + off as i32))?;
                     continue;
                 };
-                let one = self.b.iconst(Ty::I64, 1u128 << bit);
-                let held = self.b.binary(Op::And, Flags::NONE, mask, one);
-                let zero = self.b.iconst(Ty::I64, 0);
-                let set = self.b.icmp(IntCond::Ne, held, zero);
+                let set = self.test_bit(slot, bit);
                 let yes = self.create();
                 let next = self.create();
                 self.br(set, (yes, &[]), (next, &[]));
@@ -2313,7 +2746,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
 
     /// Drops what an arm left of a temporary scrutinee (`Held::Rest`): its variant is known,
     /// so its fields not moved out are dropped with no flag; nothing moved, the whole value.
-    fn drop_rest(&mut self, at: (Value, i32), l: u32, variant: Option<u32>, moved: u64) -> Result<(), BuildError> {
+    fn drop_rest(&mut self, at: (Value, i32), l: u32, variant: Option<u32>, moved: moves::FieldBits) -> Result<(), BuildError> {
         let Some(v) = variant else {
             let g = self.layouts[l as usize].ty;
             return self.drop_at(g, at);
@@ -2322,8 +2755,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         for j in 0..fl {
             let (_, off, repr) = self.layout_fields[(ff + j) as usize];
             let Repr::Agg(fr) = repr else { continue };
-            // A field past 64 is never moved (`arm` refuses it).
-            let gone = self.field_bit(l, v, j)?.is_some_and(|bit| moved & (1 << bit) != 0);
+            // A field past `REST_BITS` is never moved (`arm` refuses it).
+            let gone = self.field_bit(l, v, j)?.is_some_and(|bit| moved.contains(bit));
             if self.layouts[fr as usize].needs_drop && !gone {
                 let ft = self.layouts[fr as usize].ty;
                 self.drop_at(ft, (at.0, at.1 + off as i32))?;
@@ -2345,7 +2778,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
 
     /// Every binding of pattern `p`, just bound, joins the innermost drop scope, in order.
     fn own_pat(&mut self, p: PatId) -> Result<(), BuildError> {
-        let mut todo = Vec::new_in(self.alloc.clone());
+        let mut todo = Vec::new_in(self.alloc);
         todo.push(p);
         while let Some(p) = todo.pop() {
             let subs = match self.pat(p)? {
@@ -2372,9 +2805,53 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         Ok(())
     }
 
+    /// Emits `slot_dead` on any binding slots allocated for `p` (e.g. on a match guard's
+    /// false edge before jumping to the next arm, where `own_pat` never ran and `ScopeEnd`
+    /// will not execute).
+    fn end_pat_slots(&mut self, p: PatId) -> Result<(), BuildError> {
+        let mut todo = Vec::new_in(self.alloc);
+        todo.push(p);
+        while let Some(p) = todo.pop() {
+            let subs = match self.pat(p)? {
+                Pat::Bind { sub, .. } => {
+                    if let Some((home, _)) = self.slots.get(p.ix()).copied().flatten() {
+                        let slot = match home {
+                            Home::Slot(s) => Some(s),
+                            Home::At(val, off) => self.whole_slot((val, off)),
+                            Home::Indirect(..) => None,
+                        };
+                        if let Some(s) = slot && !self.vals_use_slot(s) {
+                            self.b.slot_dead(s);
+                        }
+                    }
+                    todo.extend(sub);
+                    continue;
+                }
+                Pat::Ref { inner, .. } => {
+                    todo.push(inner);
+                    continue;
+                }
+                Pat::Struct { fields, .. } => {
+                    let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
+                    todo.extend(fps.iter().rev().map(|fp| fp.pat));
+                    continue;
+                }
+                Pat::Or { alts } => alts,
+                Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } => elems,
+                _ => continue,
+            };
+            let subs = self.body.pat_lists.get(subs.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?;
+            todo.extend(subs.iter().rev().copied());
+        }
+        Ok(())
+    }
+
     /// Stores `on` into binding `p`'s flag, if it has one.
     fn set_flag(&mut self, p: PatId, on: bool) {
-        if let Some(Owned { flag: Some(slot), .. }) = self.owned[p.ix()] {
+        if on && let Some(du) = self.definitely_uninit.get_mut(p.ix()) {
+            *du = false;
+        }
+        if let Some(Owned { flag: Some(slot), .. }) = self.owned.get(p.ix()).copied().and_then(LocalOwn::as_drop) {
             let at = self.b.slot_addr(slot);
             let v = self.b.iconst(Ty::I8, u128::from(on));
             self.b.store(Flags::NONE, v, at, 0, MemAttrs::aligned(0));
@@ -2385,7 +2862,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// so a scope entered again starts clean). `kill`: its scope ends, it is not initialized
     /// after (an early exit leaves the state of the code that follows it as it was).
     fn drop_local(&mut self, p: PatId, kill: bool) -> Result<(), BuildError> {
-        let Some(o) = self.owned[p.ix()] else { return Ok(()) };
+        let Some(o) = self.owned.get(p.ix()).copied().and_then(LocalOwn::as_drop) else { return Ok(()) };
         let (home, _) = self.slots[p.ix()].ok_or(malformed("an owned binding without a home"))?;
         match o.flag {
             None => {
@@ -2398,6 +2875,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 }
             }
             Some(slot) => {
+                if self.definitely_uninit.get(p.ix()).copied().unwrap_or(false) {
+                    return Ok(());
+                }
                 let fa = self.b.slot_addr(slot);
                 let f = self.b.load(Ty::I8, Flags::NONE, fa, 0, MemAttrs::aligned(0));
                 let zero = self.b.iconst(Ty::I8, 0);
@@ -2411,14 +2891,30 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.set_flag(p, false);
                 self.jump(join, &[]);
                 self.begin(join);
+                if kill && let Some(du) = self.definitely_uninit.get_mut(p.ix()) {
+                    *du = true;
+                }
             }
         }
         Ok(())
     }
 
-    /// Where drop scope `depth` starts in `scope_pats` (its end when it is not open).
-    fn scope_start(&self, depth: u32) -> usize {
-        self.scope_marks.get(depth as usize).map_or(self.scope_pats.len(), |&m| m as usize)
+    /// Where leaving `t` (`break` or `continue`) starts dropping in `scope_pats`: the earliest
+    /// drop scope or temporary scope opened inside `t` (a `loop` body's temporary scope opens
+    /// before its block's drop scope, so `insert_held` places its temporaries before
+    /// `scope_marks[t.depth]`).
+    fn target_start(&self, t: Target) -> Result<usize, BuildError> {
+        let scope_depth = usize::try_from(t.depth).map_err(|_| malformed("a target depth past `usize`"))?;
+        let temp_depth = usize::try_from(t.temp_depth).map_err(|_| malformed("a target temporary depth past `usize`"))?;
+        let scope = match self.scope_marks.get(scope_depth) {
+            Some(&m) => usize::try_from(m).map_err(|_| malformed("a scope mark past `usize`"))?,
+            None => self.scope_pats.len(),
+        };
+        let temp = match self.temp_marks.get(temp_depth) {
+            Some(&m) => usize::try_from(m).map_err(|_| malformed("a temporary mark past `usize`"))?,
+            None => self.scope_pats.len(),
+        };
+        Ok(scope.min(temp))
     }
 
     /// Whether a binding from `start` of `scope_pats` on may be dropped here.
@@ -2435,6 +2931,44 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
 
     /// A value about to outlive the drops of the bindings from `start` on: an aggregate place is
     /// copied out first, as it may be one of theirs (a field of a binding the drop changes).
+    /// Settles `v` (of `repr`) leaving drop scope `(mark, depth)`: copies an aggregate place into
+    /// a fresh temporary slot when the scope has pending drops (`pending_from(mark)`) or, in a
+    /// coroutine body, when `v` is backed by a slot owned by this closing scope, so the scope's
+    /// local slot can end (`slot_dead`) and the outgoing value lives in a `SlotKind::Temp`.
+    fn settle_scope(&mut self, v: V, repr: Repr, mark: usize, depth: usize) -> Result<V, BuildError> {
+        let in_closing_scope = self.live
+            && self.co.is_some()
+            && matches!(repr, Repr::Agg(_))
+            && match v {
+                V::Place(p, _) => self.value_slot(p).is_some_and(|s| {
+                    self.scope_slots.iter().any(|&(d, x, _)| d >= depth && x == s)
+                        || self.scope_pats.get(mark..).is_some_and(|held| {
+                            held.iter().any(|&h| match h {
+                                Held::Pat(pat) => match self.slots.get(pat.ix()).copied().flatten() {
+                                    Some((Home::Slot(x), _)) => x == s,
+                                    Some((Home::At(val, off), _)) => self.whole_slot((val, off)) == Some(s),
+                                    Some((Home::Indirect(..), _)) | None => false,
+                                },
+                                _ => false,
+                            })
+                        })
+                }),
+                _ => false,
+            };
+        if !in_closing_scope && !self.pending_from(mark) {
+            return Ok(v);
+        }
+        match (v, repr) {
+            (V::Place(..), Repr::Agg(_)) => {
+                let at = self.temp(repr);
+                self.store(v, repr, at)?;
+                self.end_temp_val(v);
+                Ok(V::Place(at.0, at.1))
+            }
+            _ => Ok(v),
+        }
+    }
+
     fn settle(&mut self, v: V, repr: Repr, start: usize) -> Result<V, BuildError> {
         if !self.pending_from(start) {
             return Ok(v);
@@ -2443,17 +2977,100 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             (V::Place(..), Repr::Agg(_)) => {
                 let at = self.temp(repr);
                 self.store(v, repr, at)?;
+                self.end_temp_val(v);
                 Ok(V::Place(at.0, at.1))
             }
             _ => Ok(v),
         }
     }
 
+    /// Pushes a copy of `self.definitely_uninit` onto `self.du_pool` and returns its start index.
+    fn du_push(&mut self) -> usize {
+        let start = self.du_pool.len();
+        self.du_pool.extend_from_slice(&self.definitely_uninit);
+        start
+    }
+
+    /// Pushes an all-`true` identity slice (the top of the `&&` meet lattice) onto `self.du_pool`.
+    fn du_push_true(&mut self) -> usize {
+        let start = self.du_pool.len();
+        let n = self.definitely_uninit.len();
+        self.du_pool.resize(start + n, true);
+        start
+    }
+
+    /// Restores `self.definitely_uninit` from the slice at `start` in `self.du_pool`.
+    fn du_restore(&mut self, start: usize) {
+        let n = self.definitely_uninit.len();
+        if let Some(src) = self.du_pool.get(start..start + n) {
+            self.definitely_uninit.copy_from_slice(src);
+        }
+    }
+
+    /// Intersects `self.definitely_uninit` into the slice at `dst_start` in `self.du_pool`.
+    fn du_intersect_into(&mut self, dst_start: usize) {
+        let n = self.definitely_uninit.len();
+        if let Some(dst) = self.du_pool.get_mut(dst_start..dst_start + n) {
+            for (d, &s) in dst.iter_mut().zip(self.definitely_uninit.iter()) {
+                *d &= s;
+            }
+        }
+    }
+
+    /// Opens a `BranchDu` frame on `self.if_du` for an `if` or `if let`.
+    fn du_if_enter(&mut self) {
+        let entry = self.du_push();
+        let join = self.du_push_true();
+        self.if_du.push(BranchDu { entry, join, any_live: false });
+    }
+
+    /// Opens a `BranchDu` frame on `self.match_du` for a `match`.
+    pub(super) fn du_match_enter(&mut self) {
+        let entry = self.du_push();
+        let join = self.du_push_true();
+        self.match_du.push(BranchDu { entry, join, any_live: false });
+    }
+
+    /// Before a condition link or match guard may branch to `else` / next arm: conservatively
+    /// intersect the current `definitely_uninit` into the innermost open `if` / `match` entry
+    /// snapshot so any local initialized inside the condition/guard is not falsely treated as
+    /// uninitialized on the failure branch.
+    fn du_intersect_open_entries(&mut self) {
+        if let Some(&top) = self.if_du.last() {
+            self.du_intersect_into(top.entry);
+        }
+        if let Some(&top) = self.match_du.last() {
+            self.du_intersect_into(top.entry);
+        }
+    }
+
+    /// Folds the current `definitely_uninit` into the `break` join state of `self.targets[ti]`.
+    fn du_record_break(&mut self, ti: usize) {
+        let Some(slot) = self.target_du.get_mut(ti) else { return };
+        match slot {
+            Some(acc) => {
+                for (a, &cur) in acc.iter_mut().zip(self.definitely_uninit.iter()) {
+                    *a &= cur;
+                }
+            }
+            None => {
+                let mut copy = blaze_own::Vec::with_capacity_in(self.definitely_uninit.len(), self.alloc);
+                copy.extend_from_slice(&self.definitely_uninit);
+                *slot = Some(copy);
+            }
+        }
+    }
+
     /// Binding `p` is used by value: a move, when its type needs drop.
     fn moved(&mut self, e: ExprId, p: PatId) -> Result<(), BuildError> {
-        let Some(o) = self.owned[p.ix()] else { return Ok(()) };
+        let Some(o) = self.owned.get(p.ix()).copied().and_then(LocalOwn::as_drop) else { return Ok(()) };
         if o.flag.is_some() {
             self.set_flag(p, false);
+            if self.live
+                && let Some(du) = self.definitely_uninit.get_mut(p.ix())
+            {
+                *du = true;
+            }
             return Ok(());
         }
         if !self.init[p.ix()] && self.live {
@@ -2506,12 +3123,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let body = self.body;
         let n = body.exprs.len();
         // Per expression: its parent and whether the edge to it is conditional.
-        let mut parent: Vec<(u32, bool), A> = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut parent: Vec<(u32, bool), A> = Vec::with_capacity_in(n, self.alloc);
         parent.resize(n, (NO_EXPR, false));
-        let mut decl: Vec<u32, A> = Vec::with_capacity_in(body.pats.len(), self.alloc.clone());
+        let mut decl: blaze_own::Vec<u32, A> = blaze_own::Vec::with_capacity_in(body.pats.len(), self.alloc);
         decl.resize(body.pats.len(), NO_EXPR);
-        let mut kids: Vec<(ExprId, bool), A> = Vec::new_in(self.alloc.clone());
-        let mut pats: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let mut kids: Vec<(ExprId, bool), A> = Vec::new_in(self.alloc);
+        let mut pats: Vec<PatId, A> = Vec::new_in(self.alloc);
         let list = |l: List| body.expr_lists.get(l.range()).ok_or(malformed("a list past `expr_lists`"));
         for (i, x) in body.exprs.iter().enumerate() {
             kids.clear();
@@ -2610,6 +3227,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     }
                 }
                 Expr::Break { value, .. } | Expr::Return { value } => kids.extend(value.map(|c| (c, false))),
+                Expr::Become { value } => kids.push((value, false)),
                 Expr::Call { callee, args } => {
                     kids.push((callee, false));
                     kids.extend(list(args)?.iter().map(|&c| (c, false)));
@@ -2633,7 +3251,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     kids.push((rhs, false));
                 }
                 Expr::Tuple { elems } | Expr::Array { elems } => kids.extend(list(elems)?.iter().map(|&c| (c, false))),
-                Expr::Struct { fields, base, .. } => {
+                Expr::Struct { fields, base, .. } | Expr::Record { fields, base } => {
                     let inits = body.field_inits.get(fields.range()).ok_or(malformed("a struct literal's fields past `field_inits`"))?;
                     kids.extend(inits.iter().map(|f| (f.expr, false)));
                     kids.extend(base.expr().map(|c| (c, false)));
@@ -2657,6 +3275,34 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         }
         for (i, x) in body.exprs.iter().enumerate() {
             let Expr::Local(p) = *x else { continue };
+            // Mark any local reachable on the LHS of an assignment so loop headers conservatively
+            // clear `definitely_uninit[p]` for bindings a back-edge can re-initialize, while
+            // preserving `definitely_uninit[p]` across loops for move-once bindings like `on_ready`.
+            if let Ok(mut cur) = u32::try_from(i) {
+                while cur != NO_EXPR {
+                    let Some(&(up, _)) = usize::try_from(cur).ok().and_then(|ix| parent.get(ix)) else {
+                        break;
+                    };
+                    if up == NO_EXPR {
+                        break;
+                    }
+                    let Some(up_expr) = usize::try_from(up).ok().and_then(|ix| body.exprs.get(ix)) else {
+                        break;
+                    };
+                    match *up_expr {
+                        Expr::Assign { lhs, .. } | Expr::AssignOp { lhs, .. } if lhs.0 == cur => {
+                            if let Some(a) = self.assigned.get_mut(p.ix()) {
+                                *a = true;
+                            }
+                            break;
+                        }
+                        Expr::Paren(_) | Expr::Field { .. } | Expr::Tuple { .. } | Expr::Struct { .. } | Expr::Array { .. } => {
+                            cur = up;
+                        }
+                        _ => break,
+                    }
+                }
+            }
             // The context: the parent of the outermost parenthesis around the use.
             let mut c = i as u32;
             while let (up, _) = parent[c as usize]
@@ -2686,9 +3332,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         // A part moved out by a place expression (a field, a box's contents) gives its local
         // field flags (walk/moves/boxes.rs).
         self.scan_part_moves(&parent)?;
-        // A part moved out by a closure's by-value capture of a place below its binding
-        // likewise (walk/moves/env_places.rs).
-        self.scan_env_moves()?;
+        // A binding or part moved out by a closure's / async block's by-value capture gives its
+        // local a drop flag (whole binding under a branch/loop) or field flags (partial place)
+        // (walk/moves/env_places.rs).
+        self.scan_env_moves(&parent, &decl)?;
         // A field taken out of a struct update's base likewise (walk/moves/struct_update.rs).
         self.scan_update_moves()?;
         self.expr_parent = parent;
@@ -2731,8 +3378,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     }
 
     /// Every binding of pattern `p` is declared by expression `by`.
-    fn mark_decl(&self, p: PatId, by: u32, decl: &mut Vec<u32, A>) -> Result<(), BuildError> {
-        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+    fn mark_decl(&self, p: PatId, by: u32, decl: &mut [u32]) -> Result<(), BuildError> {
+        let mut todo: blaze_own::Vec<PatId, A> = blaze_own::Vec::new_in(self.alloc);
         todo.push(p);
         while let Some(p) = todo.pop() {
             *decl.get_mut(p.ix()).ok_or(malformed("a pattern past `pats`"))? = by;
@@ -2746,7 +3393,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     continue;
                 }
                 Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } | Pat::Or { alts: elems } => elems,
-                Pat::Struct { fields, .. } => {
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                     let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
                     todo.extend(fps.iter().map(|f| f.pat));
                     continue;
@@ -2859,8 +3506,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     // The function.
 
     fn run(&mut self, sig: &FnSig<'_>, kind: Kind) -> Result<(), BuildError> {
+        let owner = self.body.owner;
+        let c_variadic = kind == Kind::Body && self.adts.c_variadic(owner).is_some();
         // A method's `self` is its first input and its body's first parameter, like any other.
-        if sig.inputs.len() != self.body.params.len() {
+        // A C-variadic fn definition carries one extra body parameter (`mut rest: ...` -> `VaList`).
+        if sig.inputs.len() + usize::from(c_variadic) != self.body.params.len() {
             return Err(malformed("a signature and a body with other numbers of parameters"));
         }
         let sig_err = |error: TyErr| match error {
@@ -2869,16 +3519,16 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             TyErr::Other(error) => error,
         };
         // Drop glue is of the Rust ABI; a body is of its fn's.
-        let owner = self.body.owner;
         let abi = match kind {
             Kind::DropGlue => Abi::Rust,
             Kind::Body => self.adts.abi(owner).ok_or(BuildError::NoAbi { item: owner })?,
             Kind::Closure(..) => return Err(malformed("a closure's body built as a fn's (closure.rs builds it)")),
         };
-        let mut reprs = Vec::with_capacity_in(sig.inputs.len(), self.alloc.clone());
-        let mut passes = Vec::with_capacity_in(sig.inputs.len(), self.alloc.clone());
+        let mut reprs = Vec::with_capacity_in(sig.inputs.len(), self.alloc);
+        let mut passes = Vec::with_capacity_in(sig.inputs.len(), self.alloc);
+        let mut ptr_facts: blaze_own::Vec<u8, A> = blaze_own::Vec::with_capacity_in(sig.inputs.len(), self.alloc);
         // "rust-call": the last parameter, a tuple, arrives as its fields (lib.rs `Abi`).
-        let mut spread = Vec::new_in(self.alloc.clone());
+        let mut spread = Vec::new_in(self.alloc);
         for (i, &t) in sig.inputs.iter().enumerate() {
             let g = self.ground_in(sig.types, t).map_err(sig_err)?;
             let repr = self.repr(g).map_err(sig_err)?;
@@ -2887,9 +3537,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 spread = self.rust_call_fields(repr)?;
                 for &(_, frepr) in spread.iter() {
                     passes.push(self.rust_pass(frepr)?);
+                    ptr_facts.push(0);
                 }
             } else {
                 passes.push(self.pass(g, repr, abi, Some(owner))?);
+                ptr_facts.push(ptr_facts_for_rust_ty(self.ground.view(), g));
             }
         }
         // An `async fn` returns its coroutine, whatever its signature writes (coroutine.rs).
@@ -2904,15 +3556,17 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let tracked = kind == Kind::Body && self.own_tracked()?;
         if tracked {
             passes.push(track_caller::PASS);
+            ptr_facts.push(0);
         }
-        let (params, rets) = self.sig_of(&passes, self.ret_pass);
-        let own = self.b.sig(Conv::C, Variadic::No, &params, &rets);
+        let (params, rets) = self.sig_of_with_ptr_facts(&passes, &ptr_facts, self.ret_pass);
+        let variadic = if c_variadic { Variadic::Yes } else { Variadic::No };
+        let own = self.b.sig(Conv::C, variadic, &params, &rets);
         self.b.set_signature(own);
         self.mark_nounwind(owner, abi, kind == Kind::Body)?;
         let entry = self.create();
         self.reached[entry.index()] = true;
         self.begin(entry);
-        let mut values = Vec::with_capacity_in(params.len(), self.alloc.clone());
+        let mut values = Vec::with_capacity_in(params.len(), self.alloc);
         for p in params.iter() {
             values.push(self.b.param(p.ty));
         }
@@ -2996,7 +3650,15 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             // The caller's copy (or the one a C parameter's registers are written to) is the
             // callee's to keep: a binding lives in it.
-            match self.take_passed(repr, passes[i], &mut next)? {
+            let &pass = passes.get(i).ok_or(malformed("parameter pass missing"))?;
+            let passed = self.take_passed(repr, pass, &mut next)?;
+            if pass == Pass::Ref
+                && let V::Place(at, 0) = passed
+            {
+                let (size, align) = self.size_align(repr);
+                self.ref_params.push((at, size, align));
+            }
+            match passed {
                 V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { .. }) => {
                     self.bind_at(p, (at, off))?;
                     self.own_pat(p)?;
@@ -3008,6 +3670,38 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     let g = self.ground_in(sig.types, sig.inputs[i]).map_err(sig_err)?;
                     self.bind_param(p, v, g)?
                 }
+            }
+        }
+        if c_variadic {
+            let &p = self.body.params.get(sig.inputs.len()).ok_or(malformed("a C-variadic function missing its trailing `...` parameter"))?;
+            let pt = *self.checked.pat_ty.get(p.ix()).ok_or(malformed("a C-variadic parameter missing its type"))?;
+            let g = self.ground_ty(pt).map_err(sig_err)?;
+            let repr = self.repr(g).map_err(sig_err)?;
+            let va_id = self.ls_of(g).map_err(sig_err)?;
+            let l = *self.ls.get(va_id);
+            if l.size != 8 || l.scalar.map(|s| s.prim) != Some(crate::layout::Prim::Ptr) {
+                return Err(BuildError::UnsupportedSig {
+                    what: "a C-variadic definition on a target whose `VaList` is not a single pointer (Linux AAPCS64 register save area)",
+                });
+            }
+            let va_sig = self.b.sig(Conv::C, Variadic::No, &[], &[blaze_lir::builder::Param::of(Ty::PTR)]);
+            let va_intr = self.b.intrinsic("blaze.va_start", va_sig);
+            let va_ptr = self.b.target_intrinsic(va_intr, &[]);
+            let v = match repr {
+                Repr::Ptr => V::Scalar(va_ptr),
+                Repr::Agg(_) => {
+                    let at = self.temp(repr);
+                    self.b.store(Flags::NONE, va_ptr, at.0, at.1, MemAttrs::aligned(3));
+                    V::Place(at.0, at.1)
+                }
+                _ => return Err(malformed("a pointer-sized `VaList` with a non-pointer representation")),
+            };
+            match v {
+                V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { .. }) => {
+                    self.bind_at(p, (at, off))?;
+                    self.own_pat(p)?;
+                }
+                v => self.bind_param(p, v, g)?,
             }
         }
         self.walk_root()
@@ -3061,7 +3755,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// offsets and reprs (codegen.md, "Closures and the Fn traits"). A zero-sized tuple has
     /// none: it crosses the call as nothing.
     fn rust_call_fields(&self, repr: Repr) -> Result<Vec<(u32, Repr), A>, BuildError> {
-        let mut out = Vec::new_in(self.alloc.clone());
+        let mut out = Vec::new_in(self.alloc);
         let l = match repr {
             Repr::None => return Ok(out),
             Repr::Agg(l) => l,
@@ -3122,7 +3816,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             let mut cx = LayoutCx { ground: &mut *self.ground, facts: adts.facts(), scratch: self.scratch };
             self.ls.of(g, &mut cx).map_err(CAbiError::Layout).and_then(|id| {
                 let base = self.ls.get(id).call_ty;
-                cabi::class_of(&mut self.ls, base, &mut cx, self.alloc.clone())
+                cabi::class_of(&mut self.ls, base, &mut cx, self.alloc)
             })
         };
         let class = class.map_err(|error| match error {
@@ -3193,7 +3887,19 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// The lowered signature of passes `inputs` and `ret`: a result pointer first (Rust's plain
     /// pointer, C's `sret`), then each input's registers.
     fn sig_of(&self, inputs: &[Pass], ret: Pass) -> (Vec<Param, A>, Vec<Param, A>) {
-        crate::abi::sig_of_in(inputs, ret, self.alloc.clone())
+        crate::abi::sig_of_in(inputs, ret, self.alloc)
+    }
+
+    /// The lowered signature of passes `inputs` and `ret` with per-input pointer facts
+    /// `ptr_facts`: a result pointer first (Rust's plain pointer, C's `sret`), then each input's
+    /// registers.
+    fn sig_of_with_ptr_facts(
+        &self,
+        inputs: &[Pass],
+        ptr_facts: &[u8],
+        ret: Pass,
+    ) -> (blaze_own::Vec<Param, A>, blaze_own::Vec<Param, A>) {
+        crate::abi::sig_of_with_ptr_facts_in(inputs, ptr_facts, ret, self.alloc)
     }
 
     /// The `size` (1 to 8) bytes at `at`, `start` bytes into a value aligned to `align`, as a
@@ -3241,35 +3947,56 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     }
 
     /// The argument values of `v`, held as `repr`, passed as `p`, into `out`.
-    fn pass_arg(&mut self, v: V, repr: Repr, p: Pass, out: &mut Vec<Value, A>) -> Result<(), BuildError> {
+    /// Returns the fresh `SlotId` when `self.place` had to allocate a temporary slot for a
+    /// non-place `v`, so the caller can end it right after the call.
+    fn pass_arg(&mut self, v: V, repr: Repr, p: Pass, out: &mut Vec<Value, A>) -> Result<Option<SlotId>, BuildError> {
+        self.pass_arg_into(v, repr, p, |x| out.push(x))
+    }
+
+    /// The argument values of `v`, held as `repr`, passed as `p`, handed to `push`.
+    fn pass_arg_into(&mut self, v: V, repr: Repr, p: Pass, mut push: impl FnMut(Value)) -> Result<Option<SlotId>, BuildError> {
+        let mut made = None;
+        let fresh = |v: V| !matches!(v, V::Place(..));
         match p {
             Pass::Ignore => {}
-            Pass::Scalar { ty, agg: false, .. } => out.push(self.scalar(v, ty)?),
+            Pass::Scalar { ty, agg: false, .. } => push(self.scalar(v, ty)?),
             Pass::Scalar { ty, agg: true, .. } => {
                 let at = self.place(v, repr)?;
+                if fresh(v) {
+                    made = self.whole_slot(at);
+                }
                 let attrs = self.mem(repr);
-                out.push(self.b.load(ty, Flags::NONE, at.0, at.1, attrs));
+                push(self.b.load(ty, Flags::NONE, at.0, at.1, attrs));
             }
             // `ArgCopy` made the caller's copy; a `byval` one is copied again by the call.
             Pass::Ref | Pass::Memory { .. } => {
                 let at = self.place(v, repr)?;
-                out.push(self.address(at));
+                if fresh(v) {
+                    made = self.whole_slot(at);
+                }
+                push(self.address(at));
             }
             Pass::Wide { metadata } => {
                 let (ptr, off) = self.place(v, repr)?;
+                if fresh(v) {
+                    made = self.whole_slot((ptr, off));
+                }
                 let attrs = self.mem(repr);
-                out.push(self.b.load(Ty::PTR, Flags::NONE, ptr, off, attrs));
-                out.push(self.b.load(metadata, Flags::NONE, ptr, off + 8, attrs));
+                push(self.b.load(Ty::PTR, Flags::NONE, ptr, off, attrs));
+                push(self.b.load(metadata, Flags::NONE, ptr, off + 8, attrs));
             }
             Pass::Words { size } => {
                 let at = self.place(v, repr)?;
+                if fresh(v) {
+                    made = self.whole_slot(at);
+                }
                 let align = self.size_align(repr).1;
                 for k in 0..size.div_ceil(8) {
-                    out.push(self.read_word(at, k * 8, (size - k * 8).min(8), align)?);
+                    push(self.read_word(at, k * 8, (size - k * 8).min(8), align)?);
                 }
             }
         }
-        Ok(())
+        Ok(made)
     }
 
     /// A value of `repr`, passed as `p`, from the values `next` yields: a parameter in the
@@ -3315,7 +4042,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// stack, of `reprs` passed as `passes`, for a result of `rrepr` passed as `rpass`; pushes
     /// the result.
     fn emit_call(&mut self, callee: Callee, reprs: &[Repr], passes: &[Pass], rrepr: Repr, rpass: Pass) -> Result<(), BuildError> {
-        self.emit_call_from(callee, reprs, passes, None, rrepr, rpass)
+        self.emit_call_from(callee, reprs, passes, None, false, rrepr, rpass)
     }
 
     /// Returns `v` from the function: as the one result, through the result pointer, or as
@@ -3326,13 +4053,15 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             return self.coroutine_return(v);
         }
         let ret = self.ret;
-        let mut xs = Vec::with_capacity_in(2, self.alloc.clone());
+        let mut xs = Vec::with_capacity_in(2, self.alloc);
         match self.ret_pass {
             Pass::Ref | Pass::Memory { .. } => {
                 let to = self.sret.ok_or(malformed("an aggregate result without its pointer"))?;
                 self.store(v, ret, (to, 0))?;
             }
-            p => self.pass_arg(v, ret, p, &mut xs)?,
+            p => {
+                let _ = self.pass_arg(v, ret, p, &mut xs)?;
+            }
         }
         self.drop_from(0)?;
         self.b.ret(&xs);
@@ -3342,7 +4071,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// Whether building place `e` runs no code that could write memory: locals, fields,
     /// dereferences and indexes by a local or a literal.
     fn effect_free_place(&self, e: ExprId) -> Result<bool, BuildError> {
-        let mut todo = Vec::new_in(self.alloc.clone());
+        let mut todo = Vec::new_in(self.alloc);
         todo.push(e);
         while let Some(e) = todo.pop() {
             match self.expr(e)? {
@@ -3377,7 +4106,13 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 // `*index(&a, i)`), a `?` (its value is a place in the matched temporary), and,
                 // until a test shows the slot left alive, an `.await`'s result and an overloaded
                 // operator's call.
-                Expr::Call { .. } | Expr::MethodCall { .. } | Expr::Tuple { .. } | Expr::Array { .. } | Expr::Repeat { .. } | Expr::Struct { .. } => {
+                Expr::Call { .. }
+                | Expr::MethodCall { .. }
+                | Expr::Tuple { .. }
+                | Expr::Array { .. }
+                | Expr::Repeat { .. }
+                | Expr::Struct { .. }
+                | Expr::Record { .. } => {
                     return Ok(true);
                 }
                 _ => return Ok(false),
@@ -3425,12 +4160,16 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     _ => {
                         let at = self.temp(repr);
                         self.store(v, repr, at)?;
+                        self.end_temp_val(v);
                         at
                     }
                 };
                 // Dropped at its statement's end (walk/temps.rs).
                 if drop && self.live {
                     self.hold_temp(e, at, repr)?;
+                    self.note_temp_spill(e, at);
+                } else if !drop && self.live {
+                    self.hold_copy_temp(e, at)?;
                 }
                 self.push_val(V::Place(at.0, at.1), None);
             }
@@ -3439,7 +4178,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Task::Intrinsic(e, which) => self.intrinsic(e, which)?,
             Task::Stmt(s) => self.stmt(s)?,
             Task::Discard => {
-                self.pop()?;
+                let v = self.pop()?;
+                self.end_temp_val(v);
             }
             Task::DropValue(e) => {
                 let v = self.pop()?;
@@ -3450,18 +4190,21 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     let g = self.layouts[l as usize].ty;
                     self.drop_at(g, at)?;
                 }
+                self.end_temp_val(v);
             }
             Task::ScopeEnd(e) => {
                 let v = self.pop()?;
+                let depth = self.scope_marks.len();
                 let mark = self.scope_marks.pop().ok_or(malformed("a block's drop scope out of order"))? as usize;
                 let repr = self.expr_repr(e)?;
-                let v = self.settle(v, repr, mark)?;
+                let v = self.settle_scope(v, repr, mark, depth)?;
                 // Last declared first, each with its unwind ladder (walk/unwind_ladder.rs); each
                 // binding's own drop reads only its own `owned`, so they are cleared after.
                 self.drop_scope(mark, true)?;
+                self.end_scope_slots(mark, depth, v);
                 for i in mark..self.scope_pats.len() {
                     if let Held::Pat(p) = self.scope_pats[i] {
-                        self.owned[p.ix()] = None;
+                        self.owned[p.ix()] = LocalOwn::None;
                     }
                 }
                 self.scope_pats.truncate(mark);
@@ -3480,28 +4223,53 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Task::Let(p, init) => {
                 let v = self.pop()?;
                 // The same answer `stmt` had: `v` is the initializer's place (walk/matches/ref_bind.rs).
-                let borrows = match init {
+                let borrows_place = match init {
                     Some(e) => self.let_borrows_place(p, e)?,
                     None => false,
                 };
+                let borrows_value = !borrows_place && init.is_some() && self.pat_has_ref_bind(p)?;
+                let prebound_slot = match self.slots.get(p.ix()).copied().flatten() {
+                    Some((Home::Slot(slot), _)) => Some(slot),
+                    _ => None,
+                };
+                if let Some(slot) = prebound_slot {
+                    self.clear_dest_slot(slot);
+                }
+                let already_in_place = !borrows_place
+                    && !borrows_value
+                    && match (prebound_slot, v, self.pat(p)?) {
+                        (Some(slot), V::Place(at, off), Pat::Bind { ann, sub: None, .. }) if ann.by_ref.is_none() => {
+                            self.whole_slot((at, off)) == Some(slot)
+                        }
+                        _ => false,
+                    };
                 let fresh = match (init, v, self.pat(p)?) {
-                    _ if borrows => None,
+                    _ if borrows_place || borrows_value || prebound_slot.is_some() => None,
                     (Some(e), V::Place(at, off), Pat::Bind { .. }) if self.live && self.is_fresh(e)? => Some((at, off)),
                     _ => None,
                 };
-                match fresh {
-                    Some(at) => self.bind_at(p, at)?,
-                    None if borrows => self.bind_let_place(p, v)?,
-                    // The initializer's own type: a pattern that peels a reference is recorded
-                    // at the peeled one (`bind_value_of`).
-                    None => match init {
-                        Some(e) => {
-                            let t = self.adjusted_ty(e)?;
-                            let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
-                            self.bind_value_of(p, v, g)?
+                if !already_in_place {
+                    match fresh {
+                        Some(at) => self.bind_at(p, at)?,
+                        None if borrows_place => self.bind_let_place(p, v)?,
+                        None if borrows_value => {
+                            let e = init.ok_or(malformed("a `let` value ref binding without an initializer"))?;
+                            self.bind_let_value_ref(p, e, v)?;
                         }
-                        None => self.bind_value(p, v)?,
-                    },
+                        // The initializer's own type: a pattern that peels a reference is recorded
+                        // at the peeled one (`bind_value_of`).
+                        None => {
+                            match init {
+                                Some(e) => {
+                                    let t = self.adjusted_ty(e)?;
+                                    let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
+                                    self.bind_value_of(p, v, g)?
+                                }
+                                None => self.bind_value(p, v)?,
+                            }
+                            self.end_temp_val(v);
+                        }
+                    }
                 }
                 let from = self.scope_pats.len();
                 self.own_pat(p)?;
@@ -3510,37 +4278,72 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Task::BlockExit(e) => {
                 let v = self.pop()?;
                 let t = self.targets.pop().filter(|t| t.expr == e).ok_or(malformed("a block's break target out of order"))?;
-                let arg = self.arg(v, t.repr)?;
-                self.jump(t.exit, arg.as_slice());
+                let exit_du = self.target_du.pop().flatten();
+                let fall_live = self.live;
+                self.join_jump(v, t.repr, t.res, t.exit)?;
                 self.begin(t.exit);
-                let v = self.join_param(t.repr);
+                match (fall_live, exit_du) {
+                    (true, Some(acc)) => {
+                        for (d, &a) in self.definitely_uninit.iter_mut().zip(acc.iter()) {
+                            *d &= a;
+                        }
+                    }
+                    (true, None) => {}
+                    (false, Some(acc)) => self.definitely_uninit.copy_from_slice(&acc),
+                    (false, None) => self.definitely_uninit.fill(false),
+                }
+                let v = self.join_value(t.repr, t.res);
                 self.push_val(v, None);
             }
             Task::If { expr, then, else_ } => {
                 let c = self.pop()?;
                 let c = self.cond(c)?;
+                let repr = self.expr_repr(expr)?;
+                let res = self.join_slot(repr);
                 let then_block = self.create();
                 let else_block = self.create();
                 let join = self.create();
+                self.du_if_enter();
                 self.br(c, (then_block, &[]), (else_block, &[]));
                 self.begin(then_block);
-                self.work.push(Task::IfThen { expr, else_, else_block, join });
+                self.work.push(Task::IfThen { expr, else_, else_block, join, res });
                 self.work.push(Task::Eval(then));
             }
-            Task::IfThen { expr, else_, else_block, join } => {
+            Task::IfThen { expr, else_, else_block, join, res } => {
                 let v = self.pop()?;
                 let repr = self.expr_repr(expr)?;
-                let arg = self.arg(v, repr)?;
-                self.jump(join, arg.as_slice());
+                if self.live
+                    && let Some(top) = self.if_du.last_mut()
+                {
+                    let dst = top.join;
+                    top.any_live = true;
+                    self.du_intersect_into(dst);
+                }
+                self.join_jump(v, repr, res, join)?;
                 self.begin(else_block);
+                if let Some(&top) = self.if_du.last() {
+                    self.du_restore(top.entry);
+                }
                 match else_ {
                     Some(x) => {
-                        self.work.push(Task::IfElse { expr, join });
+                        self.work.push(Task::IfElse { expr, join, res });
                         self.work.push(Task::Eval(x));
                     }
                     None => {
                         if repr != Repr::None {
                             return Err(malformed("an `if` without `else` whose type has a value"));
+                        }
+                        if let Some(mut top) = self.if_du.pop() {
+                            if self.live {
+                                self.du_intersect_into(top.join);
+                                top.any_live = true;
+                            }
+                            if top.any_live {
+                                self.du_restore(top.join);
+                            } else {
+                                self.definitely_uninit.fill(false);
+                            }
+                            self.du_pool.truncate(top.entry);
                         }
                         self.jump(join, &[]);
                         self.begin(join);
@@ -3548,40 +4351,107 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     }
                 }
             }
-            Task::IfElse { expr, join } => {
+            Task::IfElse { expr, join, res } => {
                 let v = self.pop()?;
                 let repr = self.expr_repr(expr)?;
-                let arg = self.arg(v, repr)?;
-                self.jump(join, arg.as_slice());
-                self.begin(join);
-                let v = self.join_param(repr);
+                if let Some(mut top) = self.if_du.pop() {
+                    if self.live {
+                        self.du_intersect_into(top.join);
+                        top.any_live = true;
+                    }
+                    self.join_jump(v, repr, res, join)?;
+                    self.begin(join);
+                    if top.any_live {
+                        self.du_restore(top.join);
+                    } else {
+                        self.definitely_uninit.fill(false);
+                    }
+                    self.du_pool.truncate(top.entry);
+                } else {
+                    self.join_jump(v, repr, res, join)?;
+                    self.begin(join);
+                }
+                let v = self.join_value(repr, res);
                 self.push_val(v, None);
             }
-            Task::LetLink { expr, fail } => self.let_link(expr, fail)?,
-            Task::CondLink(fail) => self.cond_link(fail)?,
-            Task::LetElse(s) => self.let_else_test(s)?,
-            Task::LetElseEnd(cont, from, els) => self.let_else_end(cont, from, els)?,
+            Task::LetLink { expr, fail } => {
+                self.du_intersect_open_entries();
+                self.let_link(expr, fail)?;
+            }
+            Task::CondLink(fail) => {
+                self.du_intersect_open_entries();
+                self.cond_link(fail)?;
+            }
+            Task::LetElse(s) => {
+                let pre = self.du_push();
+                self.let_else_test(s)?;
+                let post_pass = self.du_push();
+                self.du_restore(pre);
+                self.let_else_du.push((pre, post_pass));
+            }
+            Task::LetElseEnd(cont, from, els) => {
+                self.let_else_end(cont, from, els)?;
+                if let Some((pre, post_pass)) = self.let_else_du.pop() {
+                    self.du_restore(post_pass);
+                    self.du_pool.truncate(pre);
+                }
+            }
             Task::LoopEnd(e) => {
                 let t = self.targets.pop().filter(|t| t.expr == e).ok_or(malformed("a loop's target out of order"))?;
+                let exit_du = self.target_du.pop().flatten();
                 let header = t.header.ok_or(malformed("a loop without its head"))?;
-                self.jump(header, &[]);
+                if self.live {
+                    self.jump(header, &[]);
+                } else {
+                    self.b.unreachable();
+                }
                 self.begin(t.exit);
-                let v = self.join_param(t.repr);
+                if let Some(acc) = exit_du {
+                    self.definitely_uninit.copy_from_slice(&acc);
+                } else {
+                    self.definitely_uninit.fill(false);
+                }
+                let v = self.join_value(t.repr, t.res);
                 self.push_val(v, None);
             }
             Task::Break(target, has_value) => {
                 let v = if has_value { self.pop()? } else { V::None };
-                let t = *self
+                let ti = self
                     .targets
                     .iter()
-                    .rev()
-                    .find(|t| t.expr == target)
+                    .rposition(|t| t.expr == target)
                     .ok_or(malformed("a `break` whose target is not around it"))?;
-                let start = self.scope_start(t.depth);
-                let v = self.settle(v, t.repr, start)?;
-                let arg = self.arg(v, t.repr)?;
-                self.drop_from(start)?;
-                self.jump(t.exit, arg.as_slice());
+                let Some(&t) = self.targets.get(ti) else {
+                    return Err(malformed("a `break` whose target is not around it"));
+                };
+                if !self.live {
+                    self.b.unreachable();
+                    self.dead_block();
+                    self.push_val(V::None, None);
+                    return Ok(());
+                }
+                self.du_record_break(ti);
+                let start = self.target_start(t)?;
+                let scope_depth = usize::try_from(t.depth).map_err(|_| malformed("a target depth past `usize`"))?.saturating_add(1);
+                let temp_depth = usize::try_from(t.temp_depth).map_err(|_| malformed("a target temporary depth past `usize`"))?;
+                match t.res {
+                    Some(slot) => {
+                        let to = (self.b.slot_addr(slot), 0);
+                        self.store(v, t.repr, to)?;
+                        self.end_temp_val(v);
+                        self.drop_from(start)?;
+                        self.end_scope_slots_peek_except(start, scope_depth, Some(temp_depth), Some(slot));
+                        self.jump(t.exit, &[]);
+                    }
+                    None => {
+                        let v = self.settle(v, t.repr, start)?;
+                        let arg = self.arg(v, t.repr)?;
+                        let kept = arg.and_then(|p| self.value_slot(p));
+                        self.drop_from(start)?;
+                        self.end_scope_slots_peek_except(start, scope_depth, Some(temp_depth), kept);
+                        self.jump(t.exit, arg.as_slice());
+                    }
+                }
                 self.dead_block();
                 self.push_val(V::None, None);
             }
@@ -3596,31 +4466,87 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Task::Guard { m, i } => {
                 let g = self.pop()?;
                 let c = self.cond(g)?;
+                self.du_intersect_open_entries();
                 let st = self.matches[m as usize];
                 let next = self.arm_blocks[(st.first + i + 1) as usize];
                 let body = self.create();
-                self.br(c, (body, &[]), (next, &[]));
+                let arm = match self.expr(st.expr) {
+                    Ok(Expr::Match { arms, .. }) => self
+                        .body
+                        .arms
+                        .get(arms.range())
+                        .and_then(|l| usize::try_from(i).ok().and_then(|ix| l.get(ix)))
+                        .copied(),
+                    _ => None,
+                };
+                if self.co.is_some() && let Some(arm) = arm {
+                    let miss = self.create();
+                    self.br(c, (body, &[]), (miss, &[]));
+                    self.begin(miss);
+                    self.end_pat_slots(arm.pat)?;
+                    self.jump(next, &[]);
+                } else {
+                    self.br(c, (body, &[]), (next, &[]));
+                }
                 self.begin(body);
+                if let Some(arm) = arm
+                    && !self.pat_has_ref(arm.pat)?
+                {
+                    let scrut_slot = if let Some(at) = st.tested {
+                        (!at.by_ref).then(|| self.whole_slot(at.at)).flatten()
+                    } else if st.by_ref.is_none() && matches!(st.owner, Owner::None) {
+                        st.of_enum.and_then(|(at, ..)| self.whole_slot(at))
+                    } else {
+                        None
+                    };
+                    if let Some(slot) = scrut_slot {
+                        self.end_temp_slot(slot);
+                    }
+                }
             }
-            Task::GuardAlts { word, chains, n } => self.guard_alts(word, chains, n)?,
+            Task::GuardAlts { word, chains, n } => {
+                self.du_intersect_open_entries();
+                self.guard_alts(word, chains, n)?;
+            }
             Task::ArmMoves { from } => self.arm_moves(from)?,
             Task::ArmEnd { m } => {
                 let v = self.pop()?;
                 let st = self.matches[m as usize];
-                let arg = self.arg(v, st.repr)?;
-                self.jump(st.join, arg.as_slice());
+                if self.live
+                    && let Some(top) = self.match_du.last_mut()
+                {
+                    let dst = top.join;
+                    top.any_live = true;
+                    self.du_intersect_into(dst);
+                }
+                self.join_jump(v, st.repr, st.res, st.join)?;
             }
             Task::MatchEnd => {
                 let st = self.matches.pop().ok_or(malformed("a match's state out of order"))?;
                 let none = self.arm_blocks[(st.first + st.arms) as usize];
                 self.begin(none);
-                self.unreachable_of(TrapKind::MatchNoArm, Some(st.expr));
+                if let Some((_, _, id)) = st.of_enum
+                    && let Variants::Multiple { count, .. } = self.ls.get(id).variants
+                {
+                    self.unreachable_of_enum(id, count, Some(st.expr))?;
+                } else {
+                    self.unreachable_of(TrapKind::MatchNoArm, Some(st.expr));
+                }
                 self.arm_blocks.truncate(st.first as usize);
                 self.begin(st.join);
-                let v = self.join_param(st.repr);
+                if let Some(top) = self.match_du.pop() {
+                    if top.any_live {
+                        self.du_restore(top.join);
+                    } else {
+                        self.definitely_uninit.fill(false);
+                    }
+                    self.du_pool.truncate(top.entry);
+                }
+                let v = self.join_value(st.repr, st.res);
                 self.push_val(v, None);
             }
             Task::Call(e) => self.call(e)?,
+            Task::BecomeCall(e) => self.become_call(e)?,
             Task::OpCall(e) => self.operator_call(e)?,
             Task::Unary(e, op) => {
                 let v = self.pop()?;
@@ -3682,6 +4608,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let c = self.cond(l)?;
                 let rhs_block = self.create();
                 let join = self.create();
+                let entry = self.du_push();
+                self.short_du.push(entry);
                 match op {
                     BinOp::And => {
                         let no = self.b.iconst(Ty::I8, 0);
@@ -3700,6 +4628,14 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Task::ShortEnd(join) => {
                 let r = self.pop()?;
                 let r = self.scalar(r, Ty::I8)?;
+                let rhs_live = self.live;
+                if let Some(entry) = self.short_du.pop() {
+                    if rhs_live {
+                        self.du_intersect_into(entry);
+                    }
+                    self.du_restore(entry);
+                    self.du_pool.truncate(entry);
+                }
                 self.jump(join, &[r]);
                 self.begin(join);
                 let p = self.b.param(Ty::I8);
@@ -3718,12 +4654,13 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         V::Place(..) => {
                             let tmp = self.temp(repr);
                             self.store(v, repr, tmp)?;
+                            self.end_temp_val(v);
                             V::Place(tmp.0, tmp.1)
                         }
                         other => other,
                     };
                     match self.local_of(lhs)? {
-                        Some(p) if self.owned[p.ix()].is_some() => {
+                        Some(p) if self.local_drops(p) => {
                             self.note_whole_assign(e, p);
                             self.drop_local(p, false)?;
                             self.store(v, repr, at)?;
@@ -3761,8 +4698,21 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                             }
                         }
                     }
+                    self.end_temp_val(v);
                 } else {
                     self.store(v, repr, at)?;
+                    self.end_temp_val(v);
+                    if self.live {
+                        if let Some(p) = self.local_of(lhs)? {
+                            self.note_whole_assign(e, p);
+                            self.hold_all(p);
+                        } else if let Repr::Agg(l) = repr
+                            && let Ok(ix) = usize::try_from(l)
+                            && self.layouts.get(ix).is_some_and(|row| row.placed)
+                        {
+                            self.reinit_field_bits(lhs)?;
+                        }
+                    }
                 }
                 self.push_val(V::None, None);
             }
@@ -3796,11 +4746,22 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let V::Place(p, at) = *self.vals.last().ok_or(malformed("an aggregate literal without its place"))? else {
                     return Err(malformed("an aggregate literal without its place"));
                 };
-                self.store(v, repr, (p, at + off as i32))?;
+                let off_i32 = i32::try_from(off).map_err(|_| malformed("an aggregate literal field offset past `i32`"))?;
+                let dst_off = at.checked_add(off_i32).ok_or(malformed("an aggregate literal field offset overflow"))?;
+                let dst = (p, dst_off);
+                let already = match v {
+                    V::Place(vp, voff) => self.same_place((vp, voff), dst),
+                    _ => false,
+                };
+                if !already {
+                    self.store(v, repr, dst)?;
+                    self.end_temp_val(v);
+                }
                 // The literal owns it now (walk/val_stack.rs).
                 self.stored_part(off, repr)?;
             }
             Task::LitBuilt { l } => self.literal_built(l)?,
+            Task::BuildAgg { expr, l, variant } => self.build_agg(expr, l, variant)?,
             Task::StructBase(e) => self.struct_update_base(e)?,
             Task::InitDefaults(e) => self.init_defaults(e)?,
             // A field of an unsized place: of a struct ending in a slice or `str`, reached
@@ -3810,8 +4771,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             Task::Field(e) | Task::FieldPlace(e) => {
                 let (field_off, repr) = self.field(e)?;
-                let v = self.pop()?;
-                let (p, off) = self.place_any(v)?;
+                let src = self.pop()?;
+                let (p, off) = self.place_any(src)?;
                 let at = (p, off + field_off as i32);
                 let v = match task {
                     // A partial move out of a local (walk/moves.rs).
@@ -3820,18 +4781,20 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     _ => V::Place(at.0, at.1),
                 };
                 self.push_val(v, None);
+                self.end_temp_val(src);
             }
             Task::IndexPlace(e) => self.index_place(e)?,
             Task::IndexCall(e) => self.index_call(e)?,
             Task::LoadPlace(e) => {
-                let v = self.pop()?;
-                let at = self.place_any(v)?;
+                let src = self.pop()?;
+                let at = self.place_any(src)?;
                 let repr = self.expr_repr(e)?;
                 if self.repr_needs_drop(repr) {
                     return Err(unsupported(e, "a move out of an indexed element whose type needs drop"));
                 }
                 let v = self.load(repr, at);
                 self.push_val(v, None);
+                self.end_temp_val(src);
             }
             Task::DerefPlace => {
                 // A thin pointer is a scalar (`repr`); a wide one is an aggregate whose
@@ -3851,12 +4814,16 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     _ => {
                         let at = self.temp(repr);
                         self.store(v, repr, at)?;
+                        self.end_temp_val(v);
                         at
                     }
                 };
                 // Dropped at its statement's end (walk/temps.rs).
                 if drop && self.live {
                     self.hold_temp(e, at, repr)?;
+                    self.note_temp_spill(e, at);
+                } else if !drop && self.live {
+                    self.hold_copy_temp(e, at)?;
                 }
                 self.push_val(V::Place(at.0, at.1), None);
             }
@@ -3868,6 +4835,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     _ => {
                         let at = self.temp(repr);
                         self.store(v, repr, at)?;
+                        self.end_temp_val(v);
+                        self.name_temp_at(at, a);
                         V::Place(at.0, at.1)
                     }
                 };
@@ -3919,6 +4888,17 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         }
         match (lead, borrow) {
             (0, false) => self.raw(e)?,
+            // A shared autoref promoted to a `'static` slot (walk/promote.rs): the address of
+            // `e`'s constant row, never a frame temporary; any coercions after it (e.g. `Unsize`)
+            // were already pushed above as `Task::Adjust(e, 1)`. An `Expr::Ref` listed in
+            // `Checked::promoted` promotes its own `&operand`, not a further autoref of it.
+            (0, true)
+                if !matches!(self.expr(e)?, Expr::Ref { .. })
+                    && matches!(kinds[0], AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. })
+                    && self.is_promoted(e) =>
+            {
+                self.promoted_ref(e)?;
+            }
             // An autoref: the address of `e`'s own place.
             (0, true) => {
                 self.work.push(Task::Ref);
@@ -3941,9 +4921,20 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// one calls `Deref::deref` with the pointer to its `Self` (`DerefCall`).
     fn push_deref_chain(&mut self, e: ExprId, lead: usize) {
         let rows = self.adjust_rows(e);
+        let kinds = &self.checked.adjusts.column::<1>()[rows.start..rows.start + lead];
+        let mut builtin_n = 0usize;
+        let mut builtin_u32 = 0u32;
+        for k in kinds {
+            if matches!(*k, AdjustKind::Deref { overloaded: None }) {
+                builtin_n += 1;
+                builtin_u32 += 1;
+            } else {
+                break;
+            }
+        }
         // The tasks run first to last, so they are pushed last to first.
-        for i in (1..lead).rev() {
-            match self.checked.adjusts.column::<1>()[rows.start + i] {
+        for i in (builtin_n.max(1)..lead).rev() {
+            match kinds[i] {
                 AdjustKind::Deref { overloaded: Some(_) } => self.work.push(Task::DerefCall(e, i as u32)),
                 // The pointer step `i` dereferences is the place step `i - 1` reached, loaded
                 // at its own type: a wide pointer whole (rule 76: never as a thin one).
@@ -3953,15 +4944,17 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 }
             }
         }
-        match self.checked.adjusts.column::<1>()[rows.start] {
-            // `e`'s value is the first pointer.
-            AdjustKind::Deref { overloaded: None } => self.work.push(Task::Raw(e)),
+        if builtin_n > 0 {
+            // Leading builtin dereferences go through `PlaceDerefs` so a closure body whose
+            // environment holds a place below its binding (`*r`, `**r`: env_places.rs) reads
+            // the captured place rather than the un-dereferenced root.
+            self.work.push(Task::Ref);
+            self.work.push(Task::PlaceDerefs(e, builtin_u32));
+        } else {
             // `e` is the `Self`: borrowed in place.
-            _ => {
-                self.work.push(Task::DerefCall(e, 0));
-                self.work.push(Task::Ref);
-                self.work.push(Task::PlaceDerefs(e, 0));
-            }
+            self.work.push(Task::DerefCall(e, 0));
+            self.work.push(Task::Ref);
+            self.work.push(Task::PlaceDerefs(e, 0));
         }
     }
 
@@ -3985,7 +4978,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// an unsized tail, an index (`push_index_base`) and a pattern (walk/matches.rs).
     fn deref_call(&mut self, e: ExprId, n: usize) -> Result<(), BuildError> {
         let rows = self.adjust_rows(e);
-        let kinds = &self.checked.adjusts.column::<1>()[rows.clone()];
+        let kinds = &self.checked.adjusts.column::<1>()[rows.start..rows.end];
         let AdjustKind::Deref { overloaded: Some(m) } = kinds[n] else {
             return Err(malformed("a deref call on an adjustment that is not an overloaded dereference"));
         };
@@ -4094,9 +5087,307 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 AdjustKind::Deref { .. } | AdjustKind::Borrow { .. } => {
                     return Err(malformed("a dereference or a borrow among the value adjustments"));
                 }
+                AdjustKind::UnionInject { variant } => self.union_inject(e, t, variant)?,
+                AdjustKind::UnionWiden => self.union_widen(e, n, t)?,
+                AdjustKind::RecordProject => self.record_project(e, n, t)?,
             }
         }
         Ok(())
+    }
+
+    /// Projects a wider structural record on top to a narrower structural record `dst_t`
+    /// (`{ host, port, tls } -> { host }`), copying retained fields by canonical field name and
+    /// dropping any unused source fields that need drop.
+    fn record_project(&mut self, e: ExprId, n: usize, dst_t: PTy) -> Result<(), BuildError> {
+        let src_t = self.ty_before(e, n)?;
+        let src_g = self.ground_ty(src_t).map_err(|error| Self::ty_err(e, error))?;
+        let dst_g = self.ground_ty(dst_t).map_err(|error| Self::ty_err(e, error))?;
+        if src_g == dst_g {
+            return Ok(());
+        }
+        let PNode::Record(src_schema, src_list) = self.ground_node(src_g).map_err(|error| Self::ty_err(e, error))? else {
+            return Err(malformed("a record projection from other than a structural record"));
+        };
+        let PNode::Record(dst_schema, dst_list) = self.ground_node(dst_g).map_err(|error| Self::ty_err(e, error))? else {
+            return Err(malformed("a record projection to other than a structural record"));
+        };
+        let mut src_names: blaze_own::Vec<Name, A> = blaze_own::Vec::new_in(self.alloc);
+        let mut dst_names: blaze_own::Vec<Name, A> = blaze_own::Vec::new_in(self.alloc);
+        let mut src_fields: blaze_own::Vec<PTy, A> = blaze_own::Vec::new_in(self.alloc);
+        let mut dst_fields: blaze_own::Vec<PTy, A> = blaze_own::Vec::new_in(self.alloc);
+        {
+            let gv = self.ground.view();
+            let cv = self.checked.types.view();
+            let s_ns = gv
+                .record_names(src_schema)
+                .or_else(|| cv.record_names(src_schema))
+                .ok_or(malformed("a projected source record missing schema names"))?;
+            let d_ns = gv
+                .record_names(dst_schema)
+                .or_else(|| cv.record_names(dst_schema))
+                .ok_or(malformed("a projected target record missing schema names"))?;
+            src_names.extend_from_slice(s_ns);
+            dst_names.extend_from_slice(d_ns);
+            src_fields.extend_from_slice(gv.list(src_list).map_err(|_| malformed("a source record's fields past the ground table"))?);
+            dst_fields.extend_from_slice(gv.list(dst_list).map_err(|_| malformed("a target record's fields past the ground table"))?);
+        }
+        let v = self.pop()?;
+        let src_repr = self.repr(src_g).map_err(|error| Self::ty_err(e, error))?;
+        let dst_repr = self.repr(dst_g).map_err(|error| Self::ty_err(e, error))?;
+        if !self.live {
+            match dst_repr {
+                Repr::None => self.push_val(V::None, None),
+                Repr::Agg(_) => {
+                    let dst_at = self.temp(dst_repr);
+                    self.push_val(V::Place(dst_at.0, dst_at.1), None);
+                }
+                _ => return Err(malformed("a structural record not held as an aggregate")),
+            }
+            return Ok(());
+        }
+        let src_at = match src_repr {
+            Repr::None => None,
+            Repr::Agg(src_l) => Some((src_l, self.place(v, src_repr)?)),
+            _ => return Err(malformed("a structural record not held as an aggregate")),
+        };
+        let out_val = match dst_repr {
+            Repr::None => V::None,
+            Repr::Agg(dst_l) => {
+                let dst_at = self.temp(dst_repr);
+                let Some((src_l, sat)) = src_at else {
+                    return Err(malformed("a non-ZST record projected from a ZST record"));
+                };
+                for (di, &nm) in dst_names.iter().enumerate() {
+                    let si = src_names
+                        .iter()
+                        .position(|&sn| sn == nm)
+                        .ok_or(malformed("a projected record missing a target field in source"))?;
+                    let ft = *dst_fields.get(di).ok_or(malformed("a target record field past its list"))?;
+                    let frepr = self.repr(ft).map_err(|error| Self::ty_err(e, error))?;
+                    if frepr == Repr::None {
+                        continue;
+                    }
+                    let soff = self.field_offset(src_l, si)?;
+                    let doff = self.field_offset(dst_l, di)?;
+                    let soff_i32 = i32::try_from(soff).map_err(|_| malformed("a record field offset past `i32`"))?;
+                    let doff_i32 = i32::try_from(doff).map_err(|_| malformed("a record field offset past `i32`"))?;
+                    let fv = self.load(frepr, (sat.0, sat.1 + soff_i32));
+                    self.store(fv, frepr, (dst_at.0, dst_at.1 + doff_i32))?;
+                }
+                V::Place(dst_at.0, dst_at.1)
+            }
+            _ => return Err(malformed("a structural record not held as an aggregate")),
+        };
+        for (si, &sn) in src_names.iter().enumerate() {
+            if dst_names.iter().any(|&dn| dn == sn) {
+                continue;
+            }
+            let ft = *src_fields.get(si).ok_or(malformed("a source record field past its list"))?;
+            if !self.needs_drop(ft).map_err(|error| Self::ty_err(e, error))? {
+                continue;
+            }
+            let at = match src_at {
+                Some((src_l, sat)) => {
+                    let soff = self.field_offset(src_l, si)?;
+                    let soff_i32 = i32::try_from(soff).map_err(|_| malformed("a record field offset past `i32`"))?;
+                    (sat.0, sat.1 + soff_i32)
+                }
+                None => {
+                    let slot = self.b.slot(0, 1, SlotKind::Temp);
+                    (self.b.slot_addr(slot), 0)
+                }
+            };
+            self.drop_at(ft, at)?;
+        }
+        let owns = self.repr_needs_drop(dst_repr).then_some(dst_g);
+        self.push_val(out_val, owns);
+        Ok(())
+    }
+
+    /// Injects the value on top into structural union type `dst_t` at member `variant`.
+    fn union_inject(&mut self, e: ExprId, dst_t: PTy, variant: u32) -> Result<(), BuildError> {
+        let v = self.pop()?;
+        let dst_g = self.ground_ty(dst_t).map_err(|error| Self::ty_err(e, error))?;
+        if let PNode::Union(ul) = self.ground_node(dst_g).map_err(|error| Self::ty_err(e, error))?
+            && ul.len == 1
+        {
+            if variant != 0 {
+                return Err(malformed("a single-member union injection at a non-zero variant"));
+            }
+            let owns = self.needs_drop(dst_g).map_err(|error| Self::ty_err(e, error))?.then_some(dst_g);
+            self.push_val(v, owns);
+            return Ok(());
+        }
+        let dst_repr = self.repr(dst_g).map_err(|error| Self::ty_err(e, error))?;
+        match dst_repr {
+            Repr::None => {
+                self.push_val(V::None, None);
+                Ok(())
+            }
+            Repr::Agg(dst_l) => {
+                let (first, len, tag) = self.variant_rows(dst_l, variant)?;
+                if len != 1 {
+                    return Err(malformed("a union variant without exactly one payload field"));
+                }
+                let first_idx = usize::try_from(first).map_err(|_| malformed("a union field index past `usize`"))?;
+                let &(_, field_off, field_repr) = self
+                    .layout_fields
+                    .get(first_idx)
+                    .ok_or(malformed("a union variant's field past `layout_fields`"))?;
+                let field_off_i32 = i32::try_from(field_off).map_err(|_| malformed("a union field offset past `i32`"))?;
+                let dst_at = self.temp(dst_repr);
+                self.write_tag(tag, variant, dst_at);
+                self.store(v, field_repr, (dst_at.0, dst_at.1 + field_off_i32))?;
+                let owns = self.repr_needs_drop(dst_repr).then_some(dst_g);
+                self.push_val(V::Place(dst_at.0, dst_at.1), owns);
+                Ok(())
+            }
+            _ => Err(malformed("a multi-member union not held as an aggregate")),
+        }
+    }
+
+    /// Widens the structural union value on top (`A | B -> A | B | C`).
+    fn union_widen(&mut self, e: ExprId, n: usize, dst_t: PTy) -> Result<(), BuildError> {
+        let src_t = self.ty_before(e, n)?;
+        let src_g = self.ground_ty(src_t).map_err(|error| Self::ty_err(e, error))?;
+        let dst_g = self.ground_ty(dst_t).map_err(|error| Self::ty_err(e, error))?;
+        if src_g == dst_g {
+            return Ok(());
+        }
+        let PNode::Union(src_l_list) = self.ground_node(src_g).map_err(|error| Self::ty_err(e, error))? else {
+            return Err(malformed("a union widening from other than a structural union"));
+        };
+        let PNode::Union(dst_l_list) = self.ground_node(dst_g).map_err(|error| Self::ty_err(e, error))? else {
+            return Err(malformed("a union widening to other than a structural union"));
+        };
+        let mut src_members: blaze_own::Vec<PTy, A> = blaze_own::Vec::new_in(self.alloc);
+        src_members.extend_from_slice(
+            self.ground
+                .view()
+                .list(src_l_list)
+                .map_err(|_| malformed("a source union's members past the ground table"))?,
+        );
+        let mut dst_members: blaze_own::Vec<PTy, A> = blaze_own::Vec::new_in(self.alloc);
+        dst_members.extend_from_slice(
+            self.ground
+                .view()
+                .list(dst_l_list)
+                .map_err(|_| malformed("a target union's members past the ground table"))?,
+        );
+        if let [only] = src_members.as_slice() {
+            let j = dst_members
+                .iter()
+                .position(|dm| dm == only)
+                .ok_or(malformed("a widened union missing a source member"))?;
+            let j = u32::try_from(j).map_err(|_| malformed("a union variant index past `u32`"))?;
+            return self.union_inject(e, dst_t, j);
+        }
+        let v = self.pop()?;
+        let src_repr = self.repr(src_g).map_err(|error| Self::ty_err(e, error))?;
+        let dst_repr = self.repr(dst_g).map_err(|error| Self::ty_err(e, error))?;
+        if dst_repr == Repr::None {
+            self.push_val(V::None, None);
+            return Ok(());
+        }
+        let Repr::Agg(dst_l) = dst_repr else {
+            return Err(malformed("a widened union not held as an aggregate"));
+        };
+        let dst_at = self.temp(dst_repr);
+        if !self.live {
+            self.push_val(V::Place(dst_at.0, dst_at.1), None);
+            return Ok(());
+        }
+        let Repr::Agg(src_l) = src_repr else {
+            return Err(malformed("a multi-member source union not held as an aggregate"));
+        };
+        let src_at = self.place(v, src_repr)?;
+        self.remap_union(Some(e), src_l, src_at, &src_members, dst_l, dst_at, &dst_members)?;
+        let owns = self.repr_needs_drop(dst_repr).then_some(dst_g);
+        self.push_val(V::Place(dst_at.0, dst_at.1), owns);
+        Ok(())
+    }
+
+    /// Copies the active member of source union `src_l` at `src_at` into target union `dst_l` at
+    /// `dst_at`, switching on the source discriminant across every source member that appears in
+    /// `dst_members` (shared by `AdjustKind::UnionWiden` and `UnionPat::Residual`).
+    pub(super) fn remap_union(
+        &mut self,
+        at_expr: Option<ExprId>,
+        src_l: u32,
+        src_at: (Value, i32),
+        src_members: &[PTy],
+        dst_l: u32,
+        dst_at: (Value, i32),
+        dst_members: &[PTy],
+    ) -> Result<(), BuildError> {
+        let src_l_idx = usize::try_from(src_l).map_err(|_| malformed("a layout index past `usize`"))?;
+        let Some(&Shape::Enum { id: src_id, len: src_len, .. }) = self.layouts.get(src_l_idx).map(|row| &row.shape) else {
+            return Err(malformed("a multi-member union not laid out as an enum"));
+        };
+        let copy_one = |w: &mut Self, i: u32, j: u32| -> Result<(), BuildError> {
+            let (sfirst, slen, _) = w.variant_rows(src_l, i)?;
+            let (dfirst, dlen, dtag) = w.variant_rows(dst_l, j)?;
+            if slen != 1 || dlen != 1 {
+                return Err(malformed("a union variant without exactly one payload field"));
+            }
+            let sfirst_idx = usize::try_from(sfirst).map_err(|_| malformed("a union field index past `usize`"))?;
+            let dfirst_idx = usize::try_from(dfirst).map_err(|_| malformed("a union field index past `usize`"))?;
+            let &(_, soff, srepr) = w
+                .layout_fields
+                .get(sfirst_idx)
+                .ok_or(malformed("a source union variant's field past `layout_fields`"))?;
+            let &(_, doff, drepr) = w
+                .layout_fields
+                .get(dfirst_idx)
+                .ok_or(malformed("a target union variant's field past `layout_fields`"))?;
+            let soff_i32 = i32::try_from(soff).map_err(|_| malformed("a union field offset past `i32`"))?;
+            let doff_i32 = i32::try_from(doff).map_err(|_| malformed("a union field offset past `i32`"))?;
+            w.write_tag(dtag, j, dst_at);
+            let pv = w.load(srepr, (src_at.0, src_at.1 + soff_i32));
+            w.store(pv, drepr, (dst_at.0, dst_at.1 + doff_i32))
+        };
+        match self.ls.get(src_id).variants {
+            Variants::Single { index } if index < src_len => {
+                let idx = usize::try_from(index).map_err(|_| malformed("a union variant past `usize`"))?;
+                let sm = *src_members.get(idx).ok_or(malformed("a union variant past its members"))?;
+                let j = dst_members
+                    .iter()
+                    .position(|&dm| dm == sm)
+                    .ok_or(malformed("a remapped union missing the single present source member"))?;
+                let j = u32::try_from(j).map_err(|_| malformed("a union variant index past `u32`"))?;
+                copy_one(self, index, j)?;
+                Ok(())
+            }
+            Variants::Single { .. } => Ok(()),
+            Variants::Multiple { .. } => {
+                let d = self.read_discriminant(src_id, src_at)?;
+                let join = self.create();
+                let none = self.create();
+                let mut cases: blaze_own::Vec<(u128, Block), A> = blaze_own::Vec::new_in(self.alloc);
+                let mut arms: blaze_own::Vec<(Block, u32, u32), A> = blaze_own::Vec::new_in(self.alloc);
+                for (i_idx, &sm) in src_members.iter().enumerate() {
+                    let Some(j_idx) = dst_members.iter().position(|&dm| dm == sm) else {
+                        continue;
+                    };
+                    let i = u32::try_from(i_idx).map_err(|_| malformed("a union variant index past `u32`"))?;
+                    let j = u32::try_from(j_idx).map_err(|_| malformed("a union variant index past `u32`"))?;
+                    let case = self.discriminant_case(src_id, i)?;
+                    let block = self.create();
+                    cases.push((case, block));
+                    arms.push((block, i, j));
+                }
+                self.switch(d, none, &cases);
+                for &(block, i, j) in arms.iter() {
+                    self.begin(block);
+                    copy_one(self, i, j)?;
+                    self.jump(join, &[]);
+                }
+                self.begin(none);
+                self.unreachable_of_enum(src_id, src_len, at_expr)?;
+                self.begin(join);
+                Ok(())
+            }
+        }
     }
 
     /// Adjustment `n` of `e`, an unsizing of the value on top (lib.rs, "Wide pointers";
@@ -4292,18 +5583,143 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 if args.len() != len as usize {
                     return Err(malformed("a ctor call whose arguments are not its variant's fields"));
                 }
-                let at = self.temp(repr);
+                if self.co.is_some() {
+                    self.work.push(Task::BuildAgg { expr: e, l, variant });
+                    for &a in args.iter().rev() {
+                        if let Repr::Agg(_) = self.adjusted_repr(a)? {
+                            self.work.push(Task::ArgCopy(a));
+                        }
+                        self.work.push(Task::Eval(a));
+                    }
+                    return Ok(());
+                }
+                let at = match self.take_dest(e, repr) {
+                    Some(dest) => dest,
+                    None => self.temp(repr),
+                };
                 self.write_tag(tag, variant, at);
                 // Partly built while its arguments run, owned part by part (walk/val_stack.rs).
                 self.push_literal(at);
                 self.work.push(Task::LitBuilt { l });
+                let at_slot = self.value_slot(at.0);
+                let l_ix = usize::try_from(l).map_err(|_| malformed("a layout index past `usize`"))?;
+                let can_sub_dest = self.live
+                    && at_slot.is_some()
+                    && self.layouts.get(l_ix).is_some_and(|row| !row.needs_drop && !row.placed);
+                let first_ix = usize::try_from(first).map_err(|_| malformed("a variant's field index past `usize`"))?;
                 for (i, &a) in args.iter().enumerate().rev() {
-                    let (_, off, repr) = self.layout_fields[first as usize + i];
-                    self.work.push(Task::InitAt { off, repr });
+                    let row_ix = first_ix.checked_add(i).ok_or(malformed("a ctor field index overflow"))?;
+                    let &(_, off, frepr) = self.layout_fields.get(row_ix).ok_or(malformed("a ctor field past `layout_fields`"))?;
+                    if can_sub_dest
+                        && let Some(slot) = at_slot
+                    {
+                        self.try_sub_dest(a, slot, at.1, off, frepr)?;
+                    }
+                    self.work.push(Task::InitAt { off, repr: frepr });
                     self.work.push(Task::Eval(a));
                 }
             }
             _ => return Err(malformed("a ctor call of a type held as a scalar")),
+        }
+        Ok(())
+    }
+
+    /// `Task::BuildAgg`: constructs an aggregate ctor call, struct/record literal, tuple, or
+    /// array from its already-evaluated operands on top of `self.vals`.
+    fn build_agg(&mut self, e: ExprId, l: u32, variant: u32) -> Result<(), BuildError> {
+        let repr = Repr::Agg(l);
+        match self.expr(e)? {
+            Expr::Call { args, .. } => {
+                let list = self.body.expr_lists.get(args.range()).ok_or(malformed("a call's arguments past `expr_lists`"))?;
+                let n = list.len();
+                let base = self.vals.len().checked_sub(n).ok_or(malformed("a ctor call's arguments missing from the value stack"))?;
+                let slice = self.vals.get(base..).ok_or(malformed("a ctor call's arguments past `vals`"))?;
+                let mut vs = blaze_own::Vec::with_capacity_in(n, self.alloc);
+                vs.extend_from_slice(slice);
+                self.truncate_vals(base);
+                if !self.live {
+                    self.push_val(V::None, None);
+                    return Ok(());
+                }
+                let (first, _, tag) = self.variant_rows(l, variant)?;
+                let first_ix = usize::try_from(first).map_err(|_| malformed("a variant's field index past `usize`"))?;
+                let at = self.temp(repr);
+                self.write_tag(tag, variant, at);
+                for (i, &v) in vs.iter().enumerate() {
+                    let row_ix = first_ix.checked_add(i).ok_or(malformed("a ctor field index overflow"))?;
+                    let &(_, off, frepr) = self.layout_fields.get(row_ix).ok_or(malformed("a ctor field past `layout_fields`"))?;
+                    let off_i32 = i32::try_from(off).map_err(|_| malformed("a field offset past `i32`"))?;
+                    self.store(v, frepr, (at.0, at.1 + off_i32))?;
+                    self.end_temp_val(v);
+                }
+                let owned = self.owned_arg(repr);
+                self.push_val(V::Place(at.0, at.1), owned);
+            }
+            Expr::Struct { fields, .. } | Expr::Record { fields, .. } => {
+                let inits = self.body.field_inits.get(fields.range()).ok_or(malformed("a struct literal's fields past `field_inits`"))?;
+                let n = inits.len();
+                let base = self.vals.len().checked_sub(n).ok_or(malformed("a struct literal's fields missing from the value stack"))?;
+                let slice = self.vals.get(base..).ok_or(malformed("a struct literal's fields past `vals`"))?;
+                let mut vs = blaze_own::Vec::with_capacity_in(n, self.alloc);
+                vs.extend_from_slice(slice);
+                self.truncate_vals(base);
+                if !self.live {
+                    self.push_val(V::None, None);
+                    return Ok(());
+                }
+                let (first, len, tag) = self.variant_rows(l, variant)?;
+                let at = self.temp(repr);
+                self.write_tag(tag, variant, at);
+                for (init, &v) in inits.iter().zip(vs.iter()) {
+                    let row = (first..first.saturating_add(len))
+                        .find(|&i| usize::try_from(i).ok().and_then(|ix| self.layout_fields.get(ix)).is_some_and(|f| f.0 == init.name))
+                        .ok_or(malformed("a struct literal naming a field its struct lacks"))?;
+                    let row_ix = usize::try_from(row).map_err(|_| malformed("a field row past `usize`"))?;
+                    let &(_, off, frepr) = self.layout_fields.get(row_ix).ok_or(malformed("a struct field past `layout_fields`"))?;
+                    let off_i32 = i32::try_from(off).map_err(|_| malformed("a field offset past `i32`"))?;
+                    self.store(v, frepr, (at.0, at.1 + off_i32))?;
+                    self.end_temp_val(v);
+                }
+                let owned = self.owned_arg(repr);
+                self.push_val(V::Place(at.0, at.1), owned);
+            }
+            Expr::Tuple { elems } | Expr::Array { elems } => {
+                let list = self.body.expr_lists.get(elems.range()).ok_or(malformed("a literal's elements past `expr_lists`"))?;
+                let n = list.len();
+                let base = self.vals.len().checked_sub(n).ok_or(malformed("a literal's elements missing from the value stack"))?;
+                let slice = self.vals.get(base..).ok_or(malformed("a literal's elements past `vals`"))?;
+                let mut vs = blaze_own::Vec::with_capacity_in(n, self.alloc);
+                vs.extend_from_slice(slice);
+                self.truncate_vals(base);
+                if !self.live {
+                    self.push_val(V::None, None);
+                    return Ok(());
+                }
+                let l_ix = usize::try_from(l).map_err(|_| malformed("a layout index past `usize`"))?;
+                let shape = self.layouts.get(l_ix).ok_or(malformed("a layout past `layouts`"))?.shape;
+                let at = self.temp(repr);
+                for (i, &v) in vs.iter().enumerate() {
+                    let i_u32 = u32::try_from(i).map_err(|_| malformed("a literal element index past `u32`"))?;
+                    let (off, frepr) = match shape {
+                        Shape::Fields { first, len } if i_u32 < len => {
+                            let row_ix = usize::try_from(first.saturating_add(i_u32)).map_err(|_| malformed("a tuple field index past `usize`"))?;
+                            let &(_, off, frepr) = self.layout_fields.get(row_ix).ok_or(malformed("a tuple field past `layout_fields`"))?;
+                            (off, frepr)
+                        }
+                        Shape::Array { elem, len, stride } if i_u32 < len => {
+                            let off = i_u32.checked_mul(stride).ok_or(malformed("an array element offset overflow"))?;
+                            (off, elem)
+                        }
+                        _ => return Err(malformed("a literal with more elements than its type")),
+                    };
+                    let off_i32 = i32::try_from(off).map_err(|_| malformed("a field offset past `i32`"))?;
+                    self.store(v, frepr, (at.0, at.1 + off_i32))?;
+                    self.end_temp_val(v);
+                }
+                let owned = self.owned_arg(repr);
+                self.push_val(V::Place(at.0, at.1), owned);
+            }
+            _ => return Err(malformed("`BuildAgg` on another expression")),
         }
         Ok(())
     }
@@ -4332,8 +5748,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         };
         let fields = self.ground.view().list(fl).map_err(|_| malformed("a list past the ground table"))?.len();
         let abi = self.adts.abi(item).ok_or(BuildError::NoAbi { item })?;
-        let mut reprs = Vec::with_capacity_in(fields, self.alloc.clone());
-        let mut passes = Vec::with_capacity_in(fields, self.alloc.clone());
+        let mut reprs = Vec::with_capacity_in(fields, self.alloc);
+        let mut passes = Vec::with_capacity_in(fields, self.alloc);
         for i in 0..fields {
             let ft = self.ground.view().list(fl).map_err(|_| malformed("a list past the ground table"))?[i];
             let repr = self.repr(ft).map_err(|error| Self::ty_err(e, error))?;
@@ -4386,7 +5802,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         if let Some(check) = intrinsics::validity::Check::of(which) {
             return self.validity_check(e, which, check, gl, list.len());
         }
-        let mut generics = Vec::new_in(self.alloc.clone());
+        let mut generics = Vec::new_in(self.alloc);
         let n_generics = self.ground.view().list(gl).map_err(|_| malformed("a list past the ground table"))?.len();
         for i in 0..n_generics {
             let g = *self.ground.view().list(gl).map_err(|_| malformed("a list past the ground table"))?.get(i).ok_or(malformed("a list past the ground table"))?;
@@ -4424,11 +5840,27 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         // scalar (a newtype's too), any other aggregate its address.
         let n = list.len();
         let base = self.vals.len().checked_sub(n).ok_or(malformed("an intrinsic's arguments missing from the value stack (a build bug)"))?;
-        let mut cargs = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut cargs = Vec::with_capacity_in(n, self.alloc);
+        let mut arg_temps: blaze_own::Vec<SlotId, A> = blaze_own::Vec::new_in(self.alloc);
         for (i, &a) in list.iter().enumerate() {
             let v = self.vals[base + i];
+            if let V::Place(p, off) = v
+                && let Some(slot) = self.whole_slot((p, off))
+            {
+                arg_temps.push(slot);
+            }
             let at = self.adjusted_ty(a)?;
             let g = self.ground_ty(at).map_err(|error| Self::ty_err(a, error))?;
+            if which == Which::VaArg && i == 0 {
+                let PNode::Ref(_, va_ty) = self.ground_node(g).map_err(|error| Self::ty_err(a, error))? else {
+                    return Err(BuildError::Intrinsic { expr: e, which, why: "`va_arg` whose argument is not `&mut VaList`", unsupported: false });
+                };
+                let va_id = self.ls_of(va_ty).map_err(|error| Self::ty_err(a, error))?;
+                let va_l = *self.ls.get(va_id);
+                if va_l.size != 8 || va_l.scalar.map(|s| s.prim) != Some(crate::layout::Prim::Ptr) {
+                    return Err(BuildError::Intrinsic { expr: e, which, why: "a non-pointer `VaList` layout (Linux AAPCS64 register save area)", unsupported: true });
+                }
+            }
             let repr = self.repr_at(a, at)?;
             // `simd_shuffle`'s indices ("`U` must be a **const** vector of `u32`s", stdarch's
             // `const { SimdShuffleIdx(..) }`): the address of the constant's own data row, which
@@ -4545,6 +5977,15 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 scalar => self.load(scalar, (addr, 0)),
             },
         };
+        let kept_out = match v {
+            V::Place(p, _) | V::Unsized(p, _) | V::Scalar(p) => self.value_slot(p),
+            V::None => None,
+        };
+        for slot in arg_temps {
+            if Some(slot) != kept_out {
+                self.end_temp_slot(slot);
+            }
+        }
         self.push_val(v, None);
         Ok(())
     }
@@ -4554,7 +5995,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// inherent impl's constant, none for a free `const`) grounded at this instance's: the
     /// Reference, "Associated Items", "Associated Constants": `<T as Tr>::C` at `T = u8` is
     /// `u8`'s impl's value, so `size_of::<u8>` and `size_of::<u64>` read different records.
-    fn const_value(&mut self, e: ExprId, item: ItemKey) -> Result<V, BuildError> {
+    pub(super) fn const_value(&mut self, e: ExprId, item: ItemKey) -> Result<V, BuildError> {
         let args = self.const_path_args(e)?;
         let adts = self.adts;
         let record = adts.const_value(item, &args[..]).ok_or(BuildError::NoConstValue { expr: e, item })?;
@@ -4590,10 +6031,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// with no row (a constant with no generics).
     fn const_path_args(&mut self, e: ExprId) -> Result<Vec<PTy, A>, BuildError> {
         let Some(list) = self.checked.const_args_of(e) else {
-            return Ok(Vec::new_in(self.alloc.clone()));
+            return Ok(Vec::new_in(self.alloc));
         };
         let tys = self.types.list(list).map_err(|_| malformed("a constant path's arguments past the record's types"))?;
-        let mut grounded = Vec::with_capacity_in(tys.len(), self.alloc.clone());
+        let mut grounded = Vec::with_capacity_in(tys.len(), self.alloc);
         for &t in tys {
             grounded.push(self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?);
         }
@@ -4631,7 +6072,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// root's bytes, little-endian at the type's width; anything else is the place of the root's
     /// data row, its relocations to the record's other allocations (each a data row of its own),
     /// to statics and to fns.
-    fn const_record_value(&mut self, e: ExprId, record: &DataRecord<Global>) -> Result<V, BuildError> {
+    pub(super) fn const_record_value(&mut self, e: ExprId, record: &DataRecord<Global>) -> Result<V, BuildError> {
         let repr = self.expr_repr(e)?;
         self.const_record_value_as(e, repr, record)
     }
@@ -4680,15 +6121,18 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let Repr::Agg(l) = self.expr_repr(e)? else {
             return Err(malformed("a struct expression's defaults of a value held as other than an aggregate"));
         };
-        let variant = Self::def_variant(self.expr_def(e)).ok_or(malformed("a struct literal the check did not resolve to a struct or variant"))?;
-        let (first, len, _) = self.variant_rows(l, variant)?;
         let t = self.expr_ty(e)?;
         let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
-        let PNode::Adt(_, list) = self.ground_node(g).map_err(|error| Self::ty_err(e, error))? else {
-            return Err(malformed("a struct expression with defaults of a type that is not an ADT"));
+        let mut args: Vec<PTy, A> = Vec::new_in(self.alloc);
+        let variant = match self.ground_node(g).map_err(|error| Self::ty_err(e, error))? {
+            PNode::Adt(_, list) => {
+                args.extend_from_slice(self.ground.view().list(list).map_err(|_| malformed("an ADT's arguments past the ground table"))?);
+                Self::def_variant(self.expr_def(e)).ok_or(malformed("a struct literal the check did not resolve to a struct or variant"))?
+            }
+            PNode::Record(..) => 0,
+            _ => return Err(malformed("a struct expression with defaults of a type that is not an ADT or record")),
         };
-        let mut args: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
-        args.extend_from_slice(self.ground.view().list(list).map_err(|_| malformed("an ADT's arguments past the ground table"))?);
+        let (first, len, _) = self.variant_rows(l, variant)?;
         let checked: &'x Checked<'c> = self.checked;
         let adts = self.adts;
         let (idx, keys) = checked.default_fields_of(e);
@@ -4745,9 +6189,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         self.b.func_addr(r)
     }
 
-    /// The address of `table`: `data_addr` of its `Vtable` reference, one place per table. The
-    /// unsizing to `dyn` (codegen.md, "Trait objects") pairs it with the data pointer.
-    fn vtable_addr(&mut self, table: crate::vtable::VtableRef) -> Result<Value, BuildError> {
+    /// The place of `table` in `self.vtables`, one place per table.
+    pub(super) fn vtable_place(&mut self, table: crate::vtable::VtableRef) -> Result<u32, BuildError> {
         let place = match self.vtables.iter().position(|&t| t == table) {
             Some(at) => at,
             None => {
@@ -4755,7 +6198,13 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.vtables.len() - 1
             }
         };
-        let place = u32::try_from(place).map_err(|_| malformed("more than 2^32 vtables"))?;
+        u32::try_from(place).map_err(|_| malformed("more than 2^32 vtables"))
+    }
+
+    /// The address of `table`: `data_addr` of its `Vtable` reference, one place per table. The
+    /// unsizing to `dyn` (codegen.md, "Trait objects") pairs it with the data pointer.
+    fn vtable_addr(&mut self, table: crate::vtable::VtableRef) -> Result<Value, BuildError> {
+        let place = self.vtable_place(table)?;
         let r = self.b.reference(RefKind::Vtable, place);
         Ok(self.b.data_addr(r))
     }
@@ -4770,8 +6219,62 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         }
     }
 
+    /// If `v` is a scalar constant whose exact `stride`-byte representation consists of a single
+    /// repeated byte, returns that byte so `[v; N]` lowers to one `Op::Memset`.
+    fn repeat_byte_fill(&self, v: V, elem: Repr, stride: u32) -> Option<u8> {
+        let elem_ty = elem.scalar()?;
+        let width = elem_ty.bits(self.b.ptr_bits());
+        if stride == 0 || width != stride.checked_mul(8)? {
+            return None;
+        }
+        let bytes_len = usize::try_from(stride).ok()?;
+        let V::Scalar(val) = v else {
+            return None;
+        };
+        let view = self.b.func().view();
+        let ix = val.index();
+        if ix >= view.len() || view.ty(val) != elem_ty {
+            return None;
+        }
+        let uniform_byte = |bytes: &[u8]| -> Option<u8> {
+            let (&first, rest) = bytes.split_first()?;
+            rest.iter().all(|&b| b == first).then_some(first)
+        };
+        match view.op(ix) {
+            Op::Null => Some(0),
+            Op::Iconst => {
+                let word = *view.data.get(ix)?;
+                let bytes = if width <= 32 {
+                    u128::from(word).to_le_bytes()
+                } else {
+                    i128::from(i32::from_le_bytes(word.to_le_bytes())).to_le_bytes()
+                };
+                uniform_byte(bytes.get(..bytes_len)?)
+            }
+            Op::Fconst => {
+                let word = *view.data.get(ix)?;
+                let bytes = word.to_le_bytes();
+                uniform_byte(bytes.get(..bytes_len)?)
+            }
+            Op::IconstWide | Op::FconstWide => {
+                let words_len = usize::try_from(elem_ty.const_words()).ok()?;
+                if words_len == 0 || words_len.checked_mul(4) != Some(bytes_len) {
+                    return None;
+                }
+                let start = usize::try_from(*view.data.get(ix)?).ok()?;
+                let end = start.checked_add(words_len)?;
+                let words = view.extra.get(start..end)?;
+                let first = words.first()?.to_le_bytes()[0];
+                let uniform = u32::from_le_bytes([first; 4]);
+                words.iter().all(|&w| w == uniform).then_some(first)
+            }
+            _ => None,
+        }
+    }
+
     /// `[x; N]`: the value on top stored `N` times into the array's temporary under it,
-    /// unrolled up to `UNROLL_LEAVES` leaves and in a loop beyond.
+    /// unrolled up to `UNROLL_LEAVES` leaves, as a single `Op::Memset` for uniform-byte scalar
+    /// constants beyond that, and in a loop otherwise.
     fn repeat(&mut self, e: ExprId) -> Result<(), BuildError> {
         let v = self.pop()?;
         let repr = self.expr_repr(e)?;
@@ -4780,14 +6283,34 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             self.push_val(V::None, None);
             return Ok(());
         };
-        let Shape::Array { elem, len, stride } = self.layouts[l as usize].shape else {
-            return Err(malformed("an array literal of a type that is not an array"));
-        };
-        let to = self.temp(repr);
-        if self.layouts[l as usize].leaves <= UNROLL_LEAVES {
-            for i in 0..len {
-                self.store(v, elem, (to.0, to.1 + (i * stride) as i32))?;
+        let (elem, len, stride, leaves, align) = match &self.layouts[l as usize] {
+            Layout { shape: Shape::Array { elem, len, stride }, leaves, align, .. } => {
+                (*elem, *len, *stride, *leaves, *align)
             }
+            _ => return Err(malformed("an array literal of a type that is not an array")),
+        };
+        let to = match self.take_dest(e, repr) {
+            Some(dest) => dest,
+            None => self.temp(repr),
+        };
+        if leaves <= UNROLL_LEAVES {
+            for i in 0..len {
+                let off = i
+                    .checked_mul(stride)
+                    .and_then(|o| i32::try_from(o).ok())
+                    .and_then(|o| to.1.checked_add(o))
+                    .ok_or(malformed("an array repeat element offset past `i32`"))?;
+                self.store(v, elem, (to.0, off))?;
+            }
+        } else if let Some(byte) = self.repeat_byte_fill(v, elem, stride)
+            && let Some(total) = u64::from(len).checked_mul(u64::from(stride))
+            && total > 0
+        {
+            let dst = self.address(to);
+            let fill = self.b.iconst(Ty::I8, u128::from(byte));
+            let bytes = self.b.iconst(Ty::I64, u128::from(total));
+            let attrs = MemAttrs::aligned(align);
+            self.b.bulk(Op::Memset, Flags::NONE, dst, fill, bytes, attrs);
         } else {
             // The loop's source is the element itself: the same place at every index.
             let (i, _, tp, header, exit) = self.array_loop(len, stride, to, to);
@@ -4797,6 +6320,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             self.jump(header, &[next]);
             self.begin(exit);
         }
+        self.end_temp_val(v);
         self.push_val(V::Place(to.0, to.1), None);
         Ok(())
     }
@@ -4804,7 +6328,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// Pushes the tasks that evaluate `e` as a place.
     fn place_of(&mut self, e: ExprId) -> Result<(), BuildError> {
         let rows = self.adjust_rows(e);
-        let kinds = &self.checked.adjusts.column::<1>()[rows.clone()];
+        let kinds = &self.checked.adjusts.column::<1>()[rows.start..rows.end];
         // An autoderef of builtin steps only: `*`, once per step.
         if kinds.iter().all(|k| *k == AdjustKind::Deref { overloaded: None }) {
             let n = kinds.len() as u32;
@@ -4829,15 +6353,15 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             return Ok(());
         }
         if n > 0 {
-            // The value is the first pointer; each step but the last loads the next one, at the
-            // type adjustment row `row` left (a wide pointer whole). Pushed last to first: the
-            // first load (row 0) runs first.
+            // Step down one builtin dereference at a time so `env_use` is checked at every
+            // intermediate deref depth (e.g. `r: &mut &S` captured as `*r` with `n = 2`).
             self.work.push(Task::DerefPlace);
-            for row in (0..n - 1).rev() {
-                self.work.push(Task::LoadAdjusted(e, row));
-                self.work.push(Task::DerefPlace);
+            if n == 1 {
+                self.work.push(Task::Raw(e));
+            } else {
+                self.work.push(Task::LoadAdjusted(e, n - 2));
+                self.work.push(Task::PlaceDerefs(e, n - 1));
             }
-            self.work.push(Task::Raw(e));
             return Ok(());
         }
         match self.expr(e)? {
@@ -4846,7 +6370,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let at = self.home(home);
                 self.push_val(V::Place(at.0, at.1), None);
             }
-            Expr::Path(_) if matches!(self.expr_def(e), Some(Def::Static(..))) => {
+            Expr::Path(_) if matches!(self.expr_def(e), Some(Def::Static(item, _)) if !self.adts.static_item(item).is_some_and(|s| s.extern_weak)) => {
                 let at = self.static_addr(e)?;
                 self.push_val(V::Place(at, 0), None);
             }
@@ -4902,6 +6426,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     // `push_scrutinee`; walk/matches/irrefutable.rs `bind_let_owned`).
                     self.push_scrutinee(init)?;
                 } else {
+                    self.try_let_dest(pat, init)?;
                     self.work.push(Task::Eval(init));
                 }
             }
@@ -4952,17 +6477,30 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         let v = self.const_param_value(e, index)?;
                         self.push_val(v, None);
                     }
-                    // A static by value: a copy read from its memory.
-                    (_, Some(Def::Static(..))) => {
+                    // A static by value: a copy read from its memory (except foreign
+                    // `#[linkage = "extern_weak"]`, which evaluates to the symbol's address
+                    // directly — e.g. `Option<fn>` or `*mut u8` — never dereferencing `*(&sym)`).
+                    (_, Some(Def::Static(item, _))) => {
                         let at = self.static_addr(e)?;
                         let repr = self.expr_repr(e)?;
-                        let v = match repr {
-                            Repr::Agg(_) => {
-                                let to = self.temp(repr);
-                                self.copy(repr, (at, 0), to)?;
-                                V::Place(to.0, to.1)
+                        let v = if self.adts.static_item(item).is_some_and(|s| s.extern_weak) {
+                            match repr {
+                                Repr::Agg(_) => {
+                                    let to = self.temp(repr);
+                                    self.store(V::Scalar(at), Repr::Ptr, to)?;
+                                    V::Place(to.0, to.1)
+                                }
+                                _ => V::Scalar(at),
                             }
-                            _ => self.load(repr, (at, 0)),
+                        } else {
+                            match repr {
+                                Repr::Agg(_) => {
+                                    let to = self.temp(repr);
+                                    self.copy(repr, (at, 0), to)?;
+                                    V::Place(to.0, to.1)
+                                }
+                                _ => self.load(repr, (at, 0)),
+                            }
                         };
                         self.push_val(v, None);
                     }
@@ -4992,10 +6530,13 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Expr::Block { stmts, tail, .. } => {
                 let list = self.body.stmt_lists.get(stmts.range()).ok_or(malformed("a block's statements past `stmt_lists`"))?;
                 let depth = self.scope_marks.len() as u32;
+                let temp_depth = u32::try_from(self.temp_marks.len()).map_err(|_| malformed("temporary scope depth past `u32`"))?;
                 if self.break_target[e.ix()] {
                     let repr = self.expr_repr(e)?;
+                    let res = self.join_slot(repr);
                     let exit = self.create();
-                    self.targets.push(Target { expr: e, header: None, exit, repr, depth });
+                    self.targets.push(Target { expr: e, header: None, exit, repr, res, depth, temp_depth });
+                    self.target_du.push(None);
                     self.work.push(Task::BlockExit(e));
                 }
                 // The block's drop scope: its bindings are dropped after its value is made.
@@ -5010,7 +6551,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 }
             }
             // A condition holding a `let` (`if let`, `while let`, a let chain): walk/lets.rs.
-            Expr::If { cond, then, else_ } if self.cond_has_let(cond)? => self.if_let(e, cond, then, else_)?,
+            Expr::If { cond, then, else_ } if self.cond_has_let(cond)? => {
+                self.du_if_enter();
+                self.if_let(e, cond, then, else_)?;
+            }
             Expr::If { cond, then, else_ } => {
                 self.work.push(Task::If { expr: e, then, else_ });
                 self.work.push(Task::Eval(cond));
@@ -5056,7 +6600,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     s = inner;
                 }
                 match self.expr(s)? {
-                    Expr::Local(p) if self.owned[p.ix()].is_some() && self.adjust_rows(scrutinee).is_empty() => {
+                    Expr::Local(p) if self.local_drops(p) && self.adjust_rows(scrutinee).is_empty() => {
                         self.work.push(Task::Place(s));
                     }
                     // An unsized scrutinee (`match *w { [a, .., d] => .. }`, `w: Deref<Target =
@@ -5082,12 +6626,23 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             Expr::Loop { body } => {
                 let repr = self.expr_repr(e)?;
+                let res = self.join_slot(repr);
                 let header = self.create();
                 let exit = self.create();
                 self.jump(header, &[]);
                 self.begin(header);
+                // A back-edge may re-initialize any outer flagged binding that is assigned in the
+                // body; bindings never assigned stay `definitely_uninit` across the loop so
+                // already-moved parameters/locals never emit dead drop-flag reads after `.await`.
+                for (du, &is_assigned) in self.definitely_uninit.iter_mut().zip(self.assigned.iter()) {
+                    if is_assigned {
+                        *du = false;
+                    }
+                }
                 let depth = self.scope_marks.len() as u32;
-                self.targets.push(Target { expr: e, header: Some(header), exit, repr, depth });
+                let temp_depth = u32::try_from(self.temp_marks.len()).map_err(|_| malformed("temporary scope depth past `u32`"))?;
+                self.targets.push(Target { expr: e, header: Some(header), exit, repr, res, depth, temp_depth });
+                self.target_du.push(None);
                 self.work.push(Task::LoopEnd(e));
                 self.work.push(Task::Discard);
                 self.work.push(Task::Eval(body));
@@ -5106,8 +6661,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     .find(|t| t.expr == target)
                     .ok_or(malformed("a `continue` whose loop is not around it"))?;
                 let header = t.header.ok_or(malformed("a `continue` of a block"))?;
-                let start = self.scope_start(t.depth);
+                let start = self.target_start(t)?;
+                let scope_depth = usize::try_from(t.depth).map_err(|_| malformed("a target depth past `usize`"))?.saturating_add(1);
+                let temp_depth = usize::try_from(t.temp_depth).map_err(|_| malformed("a target temporary depth past `usize`"))?;
                 self.drop_from(start)?;
+                self.end_scope_slots_peek_except(start, scope_depth, Some(temp_depth), None);
                 self.jump(header, &[]);
                 self.dead_block();
                 self.push_val(V::None, None);
@@ -5118,11 +6676,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     self.work.push(Task::Eval(v));
                 }
             }
+            Expr::Become { value } => self.eval_become(value)?,
             Expr::Call { callee, args } => {
                 let list = self.body.expr_lists.get(args.range()).ok_or(malformed("a call's arguments past `expr_lists`"))?;
                 let t = self.adjusted_ty(callee)?;
-                let item = match self.node_at(callee, t)? {
-                    PNode::FnDef(item, _) => item,
+                let (item, fn_args) = match self.node_at(callee, t)? {
+                    PNode::FnDef(item, fn_args) => (item, fn_args),
                     // Through a fn pointer: its value first, then the arguments, then the call
                     // (lib.rs, "Fn pointers").
                     PNode::FnPtr(..) => {
@@ -5144,12 +6703,22 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     // then the arguments, each a field of the method's tuple (lib.rs
                     // `Abi::RustCall`).
                     _ if self.checked.callees.column::<0>().contains(&e) => {
+                        let instance = self.method_callee(e)?;
+                        let by_value_dyn = matches!(self.dyn_slot(e, instance)?, Some(DynSlot { by_value: true, .. }));
                         self.work.push(Task::Call(e));
-                        for &a in list.iter().rev().chain([&callee]) {
+                        for &a in list.iter().rev() {
                             if let Repr::Agg(_) = self.adjusted_repr(a)? {
                                 self.work.push(Task::ArgCopy(a));
                             }
                             self.work.push(Task::Eval(a));
+                        }
+                        if by_value_dyn {
+                            self.work.push(Task::Place(callee));
+                        } else {
+                            if let Repr::Agg(_) = self.adjusted_repr(callee)? {
+                                self.work.push(Task::ArgCopy(callee));
+                            }
+                            self.work.push(Task::Eval(callee));
                         }
                         return Ok(());
                     }
@@ -5169,9 +6738,14 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 // A `#[rustc_legacy_const_generics]` argument is the callee's const generic, not a
                 // value it is passed (`Self::legacy_listed`).
                 let listed = self.legacy_listed(callee, item, list.len())?;
+                let by_value_dyn = matches!(self.dyn_slot(e, Instance { item, args: fn_args })?, Some(DynSlot { by_value: true, .. }));
                 self.work.push(Task::Call(e));
                 for (k, &a) in list.iter().enumerate().rev() {
                     if listed.contains(&(k as u32)) {
+                        continue;
+                    }
+                    if k == 0 && by_value_dyn {
+                        self.work.push(Task::Place(a));
                         continue;
                     }
                     // An aggregate argument gets its caller's copy at once, before the next
@@ -5188,12 +6762,22 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             // adjustments: the autoderef, the autoref) its first argument.
             Expr::MethodCall { receiver, args, .. } => {
                 let list = self.body.expr_lists.get(args.range()).ok_or(malformed("a call's arguments past `expr_lists`"))?;
+                let instance = self.method_callee(e)?;
+                let by_value_dyn = matches!(self.dyn_slot(e, instance)?, Some(DynSlot { by_value: true, .. }));
                 self.work.push(Task::Call(e));
-                for &a in list.iter().rev().chain([&receiver]) {
+                for &a in list.iter().rev() {
                     if let Repr::Agg(_) = self.adjusted_repr(a)? {
                         self.work.push(Task::ArgCopy(a));
                     }
                     self.work.push(Task::Eval(a));
+                }
+                if by_value_dyn {
+                    self.work.push(Task::Place(receiver));
+                } else {
+                    if let Repr::Agg(_) = self.adjusted_repr(receiver)? {
+                        self.work.push(Task::ArgCopy(receiver));
+                    }
+                    self.work.push(Task::Eval(receiver));
                 }
             }
             Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
@@ -5281,13 +6865,17 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.work.push(Task::Cast(e));
                 self.work.push(Task::Eval(operand));
             }
-            Expr::Struct { base: blaze_typeck::StructBase::Expr(_), .. } => self.struct_update(e)?,
+            Expr::Struct { base: blaze_typeck::StructBase::Expr(_), .. }
+            | Expr::Record { base: blaze_typeck::StructBase::Expr(_), .. } => self.struct_update(e)?,
             // `S { a: 1, .. }` (RFC 3681) is built as `S { a: 1, b: B_DEFAULT }` would be: the
             // written fields in written order, then each unwritten field from its default's
             // value at this instance (`Task::InitDefaults`: `Checked::default_fields`, each a
             // constant pulled before the walk by front2 const_at.rs `needs_of`).
-            Expr::Struct { fields, base: base @ (blaze_typeck::StructBase::None | blaze_typeck::StructBase::Defaults), .. } => {
-                let defaults = base == blaze_typeck::StructBase::Defaults;
+            Expr::Struct { fields, base: base @ (blaze_typeck::StructBase::None | blaze_typeck::StructBase::Defaults), .. }
+            | Expr::Record { fields, base: base @ (blaze_typeck::StructBase::None | blaze_typeck::StructBase::Defaults) } => {
+                let defaults = base == blaze_typeck::StructBase::Defaults
+                    || !self.checked.default_fields_of(e).0.is_empty();
+                let is_record = matches!(self.expr(e)?, Expr::Record { .. });
                 let repr = self.expr_repr(e)?;
                 let inits = self.body.field_inits.get(fields.range()).ok_or(malformed("a struct literal's fields past `field_inits`"))?;
                 match repr {
@@ -5300,8 +6888,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         }
                     }
                     Repr::Agg(l) => {
-                        let variant = Self::def_variant(self.expr_def(e))
-                            .ok_or(malformed("a struct literal the check did not resolve to a struct or variant"))?;
+                        let variant = if is_record {
+                            0
+                        } else {
+                            Self::def_variant(self.expr_def(e))
+                                .ok_or(malformed("a struct literal the check did not resolve to a struct or variant"))?
+                        };
                         let (first, len, tag) = self.variant_rows(l, variant)?;
                         // A union literal names exactly one field (the reference, "Unions").
                         let named = if self.layouts[l as usize].is_union { 1 } else { len as usize };
@@ -5310,7 +6902,23 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         if inits.len() + taken != named {
                             return Err(malformed("a struct literal that does not name every field, or a union literal not one"));
                         }
-                        let at = self.temp(repr);
+                        if self.co.is_some() {
+                            if defaults {
+                                self.work.push(Task::InitDefaults(e));
+                            }
+                            self.work.push(Task::BuildAgg { expr: e, l, variant });
+                            for init in inits.iter().rev() {
+                                if let Repr::Agg(_) = self.adjusted_repr(init.expr)? {
+                                    self.work.push(Task::ArgCopy(init.expr));
+                                }
+                                self.work.push(Task::Eval(init.expr));
+                            }
+                            return Ok(());
+                        }
+                        let at = match self.take_dest(e, repr) {
+                            Some(dest) => dest,
+                            None => self.temp(repr),
+                        };
                         self.write_tag(tag, variant, at);
                         // Partly built while its fields run, owned part by part
                         // (walk/val_stack.rs); one value once the last is stored.
@@ -5321,12 +6929,23 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         if defaults {
                             self.work.push(Task::InitDefaults(e));
                         }
+                        let at_slot = self.value_slot(at.0);
+                        let l_ix = usize::try_from(l).map_err(|_| malformed("a layout index past `usize`"))?;
+                        let can_sub_dest = self.live
+                            && at_slot.is_some()
+                            && self.layouts.get(l_ix).is_some_and(|row| !row.needs_drop && !row.placed);
                         for init in inits.iter().rev() {
                             let row = (first..first + len)
                                 .find(|&i| self.layout_fields[i as usize].0 == init.name)
                                 .ok_or(malformed("a struct literal naming a field its struct lacks"))?;
-                            let (_, off, repr) = self.layout_fields[row as usize];
-                            self.work.push(Task::InitAt { off, repr });
+                            let row_ix = usize::try_from(row).map_err(|_| malformed("a field row past `usize`"))?;
+                            let &(_, off, frepr) = self.layout_fields.get(row_ix).ok_or(malformed("a struct field past `layout_fields`"))?;
+                            if can_sub_dest
+                                && let Some(slot) = at_slot
+                            {
+                                self.try_sub_dest(init.expr, slot, at.1, off, frepr)?;
+                            }
+                            self.work.push(Task::InitAt { off, repr: frepr });
                             self.work.push(Task::Eval(init.expr));
                         }
                     }
@@ -5346,22 +6965,51 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         }
                     }
                     Repr::Agg(l) => {
-                        let shape = self.layouts[l as usize].shape;
-                        let at = self.temp(repr);
+                        if self.co.is_some() {
+                            self.work.push(Task::BuildAgg { expr: e, l, variant: 0 });
+                            for &x in list.iter().rev() {
+                                if let Repr::Agg(_) = self.adjusted_repr(x)? {
+                                    self.work.push(Task::ArgCopy(x));
+                                }
+                                self.work.push(Task::Eval(x));
+                            }
+                            return Ok(());
+                        }
+                        let l_ix = usize::try_from(l).map_err(|_| malformed("a layout index past `usize`"))?;
+                        let (shape, no_drop) = match self.layouts.get(l_ix) {
+                            Some(row) => (row.shape, !row.needs_drop && !row.placed),
+                            None => return Err(malformed("a layout past `layouts`")),
+                        };
+                        let at = match self.take_dest(e, repr) {
+                            Some(dest) => dest,
+                            None => self.temp(repr),
+                        };
                         // Partly built while its elements run, owned element by element
                         // (walk/val_stack.rs).
                         self.push_literal(at);
                         self.work.push(Task::LitBuilt { l });
+                        let at_slot = self.value_slot(at.0);
+                        let can_sub_dest = self.live && at_slot.is_some() && no_drop;
                         for (i, &x) in list.iter().enumerate().rev() {
-                            let (off, repr) = match shape {
-                                Shape::Fields { first, len } if (i as u32) < len => {
-                                    let (_, off, repr) = self.layout_fields[(first + i as u32) as usize];
-                                    (off, repr)
+                            let i_u32 = u32::try_from(i).map_err(|_| malformed("a literal element index past `u32`"))?;
+                            let (off, frepr) = match shape {
+                                Shape::Fields { first, len } if i_u32 < len => {
+                                    let row_ix = usize::try_from(first.saturating_add(i_u32)).map_err(|_| malformed("a tuple field index past `usize`"))?;
+                                    let &(_, off, frepr) = self.layout_fields.get(row_ix).ok_or(malformed("a tuple field past `layout_fields`"))?;
+                                    (off, frepr)
                                 }
-                                Shape::Array { elem, len, stride } if (i as u32) < len => (i as u32 * stride, elem),
+                                Shape::Array { elem, len, stride } if i_u32 < len => {
+                                    let off = i_u32.checked_mul(stride).ok_or(malformed("an array element offset overflow"))?;
+                                    (off, elem)
+                                }
                                 _ => return Err(malformed("a literal with more elements than its type")),
                             };
-                            self.work.push(Task::InitAt { off, repr });
+                            if can_sub_dest
+                                && let Some(slot) = at_slot
+                            {
+                                self.try_sub_dest(x, slot, at.1, off, frepr)?;
+                            }
+                            self.work.push(Task::InitAt { off, repr: frepr });
                             self.work.push(Task::Eval(x));
                         }
                     }
@@ -5377,6 +7025,19 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Expr::Closure { .. } => self.closure_value(e)?,
         }
         Ok(())
+    }
+
+    pub(super) fn str_lit(&mut self, e: ExprId) -> Result<V, BuildError> {
+        let text = self.adts.str_lit(self.body.owner, e).ok_or(BuildError::NoLiteralValue { expr: e })?;
+        let len = u128::try_from(text.len()).unwrap_or(u128::MAX);
+        let data = self.b.data(text.as_bytes(), 0, &[]);
+        let p = self.b.data_addr(data);
+        let repr = self.expr_repr(e)?;
+        let at = self.temp(repr);
+        self.b.store(Flags::NONE, p, at.0, at.1, MemAttrs::aligned(3));
+        let n = self.b.iconst(Ty::I64, len);
+        self.b.store(Flags::NONE, n, at.0, at.1 + 8, MemAttrs::aligned(3));
+        Ok(V::Place(at.0, at.1))
     }
 
     fn lit(&mut self, e: ExprId, lit: Lit) -> Result<(), BuildError> {
@@ -5402,16 +7063,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             // Its bytes as data, and the pair of their address and length (lib.rs, "Wide pointers").
             Lit::Str => {
-                let text = self.adts.str_lit(self.body.owner, e).ok_or(BuildError::NoLiteralValue { expr: e })?;
-                let len = text.len() as u128;
-                let data = self.b.data(text.as_bytes(), 0, &[]);
-                let p = self.b.data_addr(data);
-                let repr = self.expr_repr(e)?;
-                let at = self.temp(repr);
-                self.b.store(Flags::NONE, p, at.0, at.1, MemAttrs::aligned(3));
-                let n = self.b.iconst(Ty::I64, len);
-                self.b.store(Flags::NONE, n, at.0, at.1 + 8, MemAttrs::aligned(3));
-                self.push_val(V::Place(at.0, at.1), None);
+                let v = self.str_lit(e)?;
+                self.push_val(v, None);
                 return Ok(());
             }
             // strs.rs: a wide pointer over the bytes and their nul; a `char` as its `u32`.
@@ -5624,7 +7277,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     fn call(&mut self, e: ExprId) -> Result<(), BuildError> {
         // The arguments in order (a method's receiver first) and the callee instance: its item
         // and its call's arguments, grounded at this instance's.
-        let mut list = Vec::new_in(self.alloc.clone());
+        let mut list = Vec::new_in(self.alloc);
         // An overloaded call (`f(x)` through `Fn*`): its arguments are written apart already,
         // the fields of the trait method's tuple, so none is spread.
         let mut overloaded = false;
@@ -5640,9 +7293,15 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         list.extend(written.iter().enumerate().filter(|&(k, _)| !listed.contains(&(k as u32))).map(|(_, &a)| a));
                         Instance { item, args }
                     }
-                    PNode::FnPtr(_, header) => {
+                    PNode::FnPtr(sig_list, header) => {
                         list.extend_from_slice(written);
-                        return self.call_pointer(e, &list, header.abi);
+                        let declared = if header.c_variadic {
+                            let len = self.ground.view().list(sig_list).map_err(|_| malformed("a fn pointer past the ground table"))?.len();
+                            Some(len.saturating_sub(1))
+                        } else {
+                            None
+                        };
+                        return self.call_pointer(e, &list, header.abi, declared);
                     }
                     // A closure called directly (closure.rs `push_closure_call`).
                     PNode::Closure { .. } if !self.through_fn_trait(e) => return self.closure_call(e, callee, written),
@@ -5663,19 +7322,19 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             _ => return Err(malformed("a call task on another expression")),
         };
-        if let Some((_, slot)) = self.dyn_slot(e, instance)? {
+        if let Some(DynSlot { slot, by_value, .. }) = self.dyn_slot(e, instance)? {
             self.refuse_tracked_slot(e, instance)?;
             // A "rust-call" method called with its tuple written whole (`(**self).call_mut(args)`
             // in core's `impl FnMut<A> for &mut F` at `F = dyn FnMut(..)`): the slot's fn takes
             // the tuple's fields apart, as a direct call does (`spread_tuple`).
             let spread = !overloaded && self.adts.abi(instance.item) == Some(Abi::RustCall);
-            return self.dyn_call(e, instance, &list, slot, spread);
+            return self.dyn_call(e, instance, &list, slot, spread, by_value);
         }
         let item = instance.item;
         let abi = self.adts.abi(item).ok_or(BuildError::NoAbi { item })?;
         let n = list.len();
-        let mut reprs = Vec::with_capacity_in(n, self.alloc.clone());
-        let mut passes = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut reprs = Vec::with_capacity_in(n, self.alloc);
+        let mut passes = Vec::with_capacity_in(n, self.alloc);
         // A C-variadic callee: its declared count splits the arguments (walk/c_variadic.rs).
         let declared = self.adts.c_variadic(item).map(|d| d as usize);
         if declared.is_some() {
@@ -5712,7 +7371,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// of a trait above it, with `Self` (its first argument) a trait object. The checker records
     /// no other mark (codegen.md, "Trait objects"). A trait implemented for a `dyn` type by an
     /// impl, or a generic fn at `T = dyn Tr`, has no slot there: an ordinary call.
-    fn dyn_slot(&mut self, e: ExprId, instance: Instance) -> Result<Option<(ItemKey, u32)>, BuildError> {
+    fn dyn_slot(&mut self, e: ExprId, instance: Instance) -> Result<Option<DynSlot>, BuildError> {
         let view = self.ground.view();
         let Some(&self_ty) = view.list(instance.args).map_err(|_| malformed("a callee's arguments past the ground table"))?.first() else {
             return Ok(None);
@@ -5724,20 +7383,20 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             return Ok(None);
         };
         let adts = self.adts;
-        let shape = crate::vtable::Shape::of(principal, |t| adts.object_trait(t), self.alloc.clone())
+        let shape = crate::vtable::Shape::of(principal, |t| adts.object_trait(t), self.scratch)
             .map_err(|error| BuildError::Vtable { at: Some(e), error })?;
-        if let Some(slot) = shape.slot(instance.item) {
-            return Ok(Some((principal, slot)));
+        if let Some((slot, by_value)) = shape.slot_info(instance.item) {
+            return Ok(Some(DynSlot { principal, slot, by_value }));
         }
         // No slot. A method of a trait on the object's own tree (the principal or a supertrait)
         // with `Self` the object is still a dynamic call by the Reference ("Trait objects"; no
         // impl of such a trait for the object type can be written, E0371): built as a direct
         // call it would run the trait's default body, not the concrete type's. Such a method
         // has no slot when the world marks it not dispatchable (`where Self: Sized`, generic,
-        // or `self` by value, which `unsized_fn_params` can call on `Box<dyn FnOnce>`): refused
-        // by name. A method of another trait (`impl Other for dyn Tr`) is an ordinary call.
+        // or a non-dispatchable `self` by value): refused by name. A method of another trait
+        // (`impl Other for dyn Tr`) is an ordinary call.
         let traits = shape.prefix.iter().copied().chain(shape.words.iter().filter_map(|w| match *w {
-            crate::vtable::Word::Super(s) => Some(s),
+            crate::vtable::Word::Super { trait_, .. } => Some(trait_),
             crate::vtable::Word::Method { .. } => None,
         }));
         for t in traits {
@@ -5750,19 +7409,26 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     }
 
     /// Dynamic call `e` of `instance` at vtable `slot` (codegen.md, "Trait objects"): the
-    /// receiver, a wide pointer, is the `list.len()`-th value from the top; `f = load [vtable +
-    /// 8 * (3 + slot)]`, then `f(data, args..)`. The callee is the impl's method at the concrete
-    /// type, so the receiver is passed in its thin form (`DispatchFromDyn`): `&self` and `&mut
-    /// self` as a pointer, `self: Box<Self>` as a `Box` of a sized type. With `spread`, the
-    /// last argument is a "rust-call" method's tuple written whole, passed as its fields.
-    fn dyn_call(&mut self, e: ExprId, instance: Instance, list: &[ExprId], slot: u32, spread: bool) -> Result<(), BuildError> {
+    /// receiver, a wide pointer (or an unsized place `V::Unsized` when `by_value` is true, e.g.
+    /// `Box<dyn FnOnce>::call_once`), is the `list.len()`-th value from the top; `f = load
+    /// [vtable + 8 * (3 + slot)]`, then `f(data, args..)`. For `by_value`, the slot holds a
+    /// `VTableShim` taking `data: *mut Self`, and the caller clears the owning `Box`'s `[Deref]`
+    /// drop bit right before the call so the box's drop frees the allocation without
+    /// double-dropping the consumed trait object. With `spread`, the last argument is a
+    /// "rust-call" method's tuple written whole, passed as its fields.
+    fn dyn_call(&mut self, e: ExprId, instance: Instance, list: &[ExprId], slot: u32, spread: bool, by_value: bool) -> Result<(), BuildError> {
         let item = instance.item;
         let abi = self.adts.abi(item).ok_or(BuildError::NoAbi { item })?;
         let n = list.len();
-        let mut reprs = Vec::with_capacity_in(n, self.alloc.clone());
-        let mut passes = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut reprs = Vec::with_capacity_in(n, self.alloc);
+        let mut passes = Vec::with_capacity_in(n, self.alloc);
         let mut wide = Repr::None;
         for (i, &a) in list.iter().enumerate() {
+            if i == 0 && by_value {
+                reprs.push(Repr::Ptr);
+                passes.push(self.rust_pass(Repr::Ptr)?);
+                continue;
+            }
             let t = self.adjusted_ty(a)?;
             let mut g = self.ground_ty(t).map_err(|error| Self::ty_err(a, error))?;
             if i == 0 {
@@ -5784,21 +7450,47 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             self.spread_tuple(&mut reprs, &mut passes)?;
         }
-        let v = core::mem::replace(&mut self.vals[at], V::None);
-        let place = self.place(v, wide)?;
-        let data = self.load(Repr::Ptr, place);
-        let data = self.scalar(data, Ty::PTR)?;
-        let vt = self.load(Repr::Ptr, (place.0, place.1 + 8));
-        let vt = self.scalar(vt, Ty::PTR)?;
-        self.vals[at] = match reprs[0] {
-            Repr::Ptr => V::Scalar(data),
-            Repr::Agg(_) => {
-                let to = self.temp(reprs[0]);
-                self.b.store(Flags::NONE, data, to.0, to.1, MemAttrs::aligned(3));
-                V::Place(to.0, to.1)
+        let recv_slot = self.vals.get_mut(at).ok_or(malformed("a dynamic call's receiver missing from the value stack (a build bug)"))?;
+        let v = core::mem::replace(recv_slot, V::None);
+        let (data, vt) = if by_value {
+            let V::Unsized(p, off) = v else {
+                return Err(malformed("a by-value dynamic call's receiver is not an unsized place"));
+            };
+            let data = self.load(Repr::Ptr, (p, off));
+            let data = self.scalar(data, Ty::PTR)?;
+            let vt = self.load(Repr::Ptr, (p, off + 8));
+            let vt = self.scalar(vt, Ty::PTR)?;
+            if let Some(slot) = self.vals.get_mut(at) {
+                *slot = V::Scalar(data);
             }
-            _ => return Err(malformed("a thin receiver held as other than a pointer or an aggregate")),
+            // Clear the owning `Box`'s `[Deref]` bit right before entering the call so an unwind
+            // in an earlier argument still drops `*self`, while normal return or unwind inside
+            // the call frees the box without running `dyn_glue` on the moved-out object.
+            let recv_expr = *list.first().ok_or(malformed("a by-value dynamic call without a receiver expression"))?;
+            self.move_unsized_box_contents(recv_expr)?;
+            (data, vt)
+        } else {
+            let place = self.place(v, wide)?;
+            let data = self.load(Repr::Ptr, place);
+            let data = self.scalar(data, Ty::PTR)?;
+            let vt = self.load(Repr::Ptr, (place.0, place.1 + 8));
+            let vt = self.scalar(vt, Ty::PTR)?;
+            let r0 = *reprs.first().ok_or(malformed("a dynamic call without a receiver representation"))?;
+            let recv_val = match r0 {
+                Repr::Ptr => V::Scalar(data),
+                Repr::Agg(_) => {
+                    let to = self.temp(r0);
+                    self.b.store(Flags::NONE, data, to.0, to.1, MemAttrs::aligned(3));
+                    V::Place(to.0, to.1)
+                }
+                _ => return Err(malformed("a thin receiver held as other than a pointer or an aggregate")),
+            };
+            if let Some(slot) = self.vals.get_mut(at) {
+                *slot = recv_val;
+            }
+            (data, vt)
         };
+        let _ = data;
         let off = 8 * (crate::vtable::HEADER_WORDS + slot);
         let off = i32::try_from(off).map_err(|_| malformed("a vtable slot past 2^31 bytes"))?;
         let f = self.b.load(Ty::PTR, Flags::NONE, vt, off, MemAttrs::aligned(3));
@@ -5824,7 +7516,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             PNode::Ptr(m, _) => PNode::Ptr(m, unit),
             PNode::Adt(k, l) if self.adts.lang_adt(LangItem::OwnedBox) == Some(k) => {
                 let view = self.ground.view();
-                let mut args = Vec::new_in(self.alloc.clone());
+                let mut args = Vec::new_in(self.alloc);
                 for &t in view.list(l).map_err(|_| malformed("a type's arguments past the ground table"))? {
                     args.push(match view.node(t) {
                         Ok(PNode::Dynamic(_)) => unit,
@@ -5858,17 +7550,22 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// Call `e` through a fn pointer of ABI `abi`: the pointer under the arguments `list` on
     /// the stack; the signature lowered from the arguments' and the result's types, by the
     /// pointer's ABI (lib.rs, "Fn pointers").
-    fn call_pointer(&mut self, e: ExprId, list: &[ExprId], abi: blaze_typeck::Abi) -> Result<(), BuildError> {
-        let abi = pointer_abi(abi).ok_or_else(|| unsupported(e, "a fn pointer outside the Rust, rust-call and C-family calling conventions"))?;
+    fn call_pointer(&mut self, e: ExprId, list: &[ExprId], raw_abi: blaze_typeck::Abi, declared: Option<usize>) -> Result<(), BuildError> {
+        let abi = pointer_abi(raw_abi).ok_or_else(|| unsupported(e, "a fn pointer outside the Rust, rust-call and C-family calling conventions"))?;
+        let nounwind = matches!(raw_abi, blaze_typeck::Abi::C | blaze_typeck::Abi::System);
+        if declared.is_some() {
+            Self::c_variadic_abi(e, abi, Some(nounwind))?;
+        }
         let n = list.len();
-        let mut reprs = Vec::with_capacity_in(n, self.alloc.clone());
-        let mut passes = Vec::with_capacity_in(n, self.alloc.clone());
-        for &a in list.iter() {
+        let mut reprs = Vec::with_capacity_in(n, self.alloc);
+        let mut passes = Vec::with_capacity_in(n, self.alloc);
+        for (i, &a) in list.iter().enumerate() {
             let t = self.adjusted_ty(a)?;
             let g = self.ground_ty(t).map_err(|error| Self::ty_err(a, error))?;
             let repr = self.repr_at(a, t)?;
             reprs.push(repr);
-            passes.push(self.pass(g, repr, abi, None)?);
+            let pass = if declared.is_some_and(|d| i >= d) { Self::vararg_pass(a, repr)? } else { self.pass(g, repr, abi, None)? };
+            passes.push(pass);
         }
         if abi == Abi::RustCall {
             self.spread_tuple(&mut reprs, &mut passes)?;
@@ -5881,7 +7578,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let at = self.vals.len().checked_sub(reprs.len() + 1).ok_or(malformed("a call's pointer missing from the value stack (a build bug)"))?;
         let p = self.remove_val(at);
         let p = self.scalar(p, Ty::PTR)?;
-        self.emit_call(Callee::Pointer(p), &reprs, &passes, rrepr, rpass)?;
+        self.emit_call_from(Callee::Pointer(p), &reprs, &passes, declared, nounwind, rrepr, rpass)?;
         if let PNode::Never = self.node_at(e, ty)? {
             self.pop_val();
             self.unreachable_of(TrapKind::AfterDivergingCall, Some(e));
@@ -5898,7 +7595,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let item = self.checked.callees.column::<1>()[at];
         let generic = self.checked.callees.column::<2>()[at];
         let tys = self.types.list(generic).map_err(|_| malformed("a callee's arguments past the record's types"))?;
-        let mut grounded = Vec::with_capacity_in(tys.len(), self.alloc.clone());
+        let mut grounded = Vec::with_capacity_in(tys.len(), self.alloc);
         for &t in tys {
             grounded.push(self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?);
         }
@@ -5968,13 +7665,13 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// the result) and left in place by `_`; nothing deeper is built.
     /// `own`: each by-value binding joins the drop scope here; else the caller owns them
     /// (a guarded arm, once its guard passed: walk/moves.rs `Pending`).
-    fn bind_variant(&mut self, p: PatId, at: (Value, i32), l: u32, by_ref: bool, own: bool) -> Result<u64, BuildError> {
+    fn bind_variant(&mut self, p: PatId, at: (Value, i32), l: u32, by_ref: bool, own: bool) -> Result<moves::FieldBits, BuildError> {
         let variant = Self::def_variant(self.pat_def(p)).ok_or(malformed("a variant pattern the check did not resolve"))?;
         let (first, len, _) = self.variant_rows(l, variant)?;
         let n = len as usize;
         // (field row, subpattern) pairs.
-        let mut binds = Vec::new_in(self.alloc.clone());
-        let mut moved = 0u64;
+        let mut binds = Vec::new_in(self.alloc);
+        let mut moved = moves::FieldBits::EMPTY;
         match self.pat(p)? {
             Pat::TupleStruct { elems, rest, .. } => {
                 let subs = self.body.pat_lists.get(elems.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?;
@@ -6031,9 +7728,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     Pat::Bind { ann, sub: None, .. } if ann.by_ref.is_none() => {
                         let bit = self.field_bit(l, variant, row as u32 - first)?.ok_or(BuildError::UnsupportedPat {
                             pat: sub,
-                            what: "a move out of a field past an enum's 64th (its field flags are one word)",
+                            what: "a move out of a field past an enum variant's 256th (its field flags are 256 bits)",
                         })?;
-                        moved |= 1 << bit;
+                        moved.set(bit);
                     }
                     _ => {
                         return Err(BuildError::UnsupportedPat {
@@ -6065,6 +7762,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         if let V::Unsized(..) = s {
             return self.match_tested(e, scrutinee, arms, s, Repr::None);
         }
+        if self.try_match_whole_bind(e, scrutinee, arms, s)? {
+            return Ok(());
+        }
         let mut srepr = self.adjusted_repr(scrutinee)?;
         // A place behind a pointer that needs drop, matched in place (`Expr::Match` pushed its
         // place): by tests, whose bindings refuse a move out with no owner (walk/moves.rs
@@ -6079,7 +7779,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         }
         // A reference to an enum, matched by variant patterns: the default binding mode (the
         // reference, "Binding modes"): the references are followed to the enum's place.
-        let mut by_ref = false;
+        let mut by_ref: Option<Value> = None;
         // The enum's ground type when the references were followed to it.
         let mut pointee: Option<PTy> = None;
         let mut owner = Owner::None;
@@ -6102,16 +7802,20 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     _ => {}
                 }
             }
-            let is_enum = matches!(self.ground_node(g).map_err(|error| Self::ty_err(scrutinee, error))?, PNode::Adt(..))
-                && self.is_agg(g).map_err(|error| Self::ty_err(scrutinee, error))?;
+            let is_enum = match self.ground_node(g).map_err(|error| Self::ty_err(scrutinee, error))? {
+                PNode::Adt(..) => true,
+                PNode::Union(l) => l.len != 1,
+                _ => false,
+            } && self.is_agg(g).map_err(|error| Self::ty_err(scrutinee, error))?;
             if variant_pats && depth > 0 && is_enum {
-                let mut p = self.scalar(s, Ty::PTR)?;
+                let raw = self.scalar(s, Ty::PTR)?;
+                let mut p = raw;
                 for _ in 1..depth {
                     p = self.b.load(Ty::PTR, Flags::NONE, p, 0, MemAttrs::aligned(3));
                 }
                 srepr = self.repr(g).map_err(|error| Self::ty_err(scrutinee, error))?;
                 s = V::Place(p, 0);
-                by_ref = true;
+                by_ref = Some(raw);
                 pointee = Some(g);
             }
         }
@@ -6129,6 +7833,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 };
                 match self.ground_node(g).map_err(|error| Self::ty_err(scrutinee, error))? {
                     PNode::Adt(..) => Some(self.layout(g).map_err(|error| Self::ty_err(scrutinee, error))?),
+                    PNode::Union(l) if l.len != 1 => Some(self.layout(g).map_err(|error| Self::ty_err(scrutinee, error))?),
                     _ => None,
                 }
             }
@@ -6147,10 +7852,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 // By value, what no arm moves is dropped at the scrutinee's end: a local's
                 // field flags, or a temporary's rest per arm (codegen.md, "A `match` by value
                 // on an enum that needs drop"); through a reference nothing moves.
-                if self.layouts[l as usize].needs_drop && !by_ref {
+                if self.layouts[l as usize].needs_drop && by_ref.is_none() {
                     owner = match self.local_of(scrutinee)? {
                         // As `Expr::Match` evaluated it: in place.
-                        Some(p) if self.owned[p.ix()].is_some() && self.adjust_rows(scrutinee).is_empty() => Owner::Local(p),
+                        Some(p) if self.local_drops(p) && self.adjust_rows(scrutinee).is_empty() => Owner::Local(p),
                         // A temporary: held in its temporary scope like every temporary
                         // (walk/temps.rs `hold_temp`, as `Held::Moved` with its word: "The
                         // scrutinee of a `match` expression is not a temporary scope"), wherever
@@ -6184,8 +7889,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             let to = self.arm_blocks[first as usize];
             self.jump(to, &[]);
         } else {
-            let mut values = Vec::new_in(self.alloc.clone());
-            let mut cases: Vec<(u128, Block), A> = Vec::new_in(self.alloc.clone());
+            let mut values = Vec::new_in(self.alloc);
+            let mut cases: Vec<(u128, Block), A> = Vec::new_in(self.alloc);
             let mut default = self.arm_blocks[(first + n) as usize];
             for (i, arm) in list.iter().enumerate() {
                 values.clear();
@@ -6203,7 +7908,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             self.switch(x, default, &cases);
         }
-        self.matches.push(MatchState { expr: e, scrutinee: x, width, of_enum, join, repr, first, arms: n, guarded, by_ref, owner, tested: None });
+        let res = self.join_slot(repr);
+        self.matches.push(MatchState { expr: e, scrutinee: x, width, of_enum, join, repr, res, first, arms: n, guarded, by_ref, owner, tested: None });
+        self.du_match_enter();
         let m = (self.matches.len() - 1) as u32;
         self.work.push(Task::MatchEnd);
         for i in (0..n).rev() {
@@ -6213,6 +7920,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     }
 
     fn arm(&mut self, m: u32, i: u32) -> Result<(), BuildError> {
+        if let Some(&top) = self.match_du.last() {
+            self.du_restore(top.entry);
+        }
         let st = self.matches[m as usize];
         let Expr::Match { arms, .. } = self.expr(st.expr)? else { return Err(malformed("a match's state on another expression")) };
         let arm = *self.body.arms.get(arms.range()).and_then(|l| l.get(i as usize)).ok_or(malformed("an arm past `arms`"))?;
@@ -6223,7 +7933,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         }
         self.begin(block);
         if st.guarded {
-            let mut values = Vec::new_in(self.alloc.clone());
+            let mut values = Vec::new_in(self.alloc);
             let always = self.pat_values(arm.pat, st.width, st.of_enum.map(|o| o.2), &mut values)?;
             if !always {
                 let ty = Ty::int(st.width).ok_or(malformed("a scrutinee of no integer width"))?;
@@ -6245,7 +7955,6 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         // The arm's drop scope: its bindings drop at its end. (A temporary scrutinee that needs
         // drop is never the switch's: the match by tests holds it in its temporary scope.)
         self.scope_marks.push(self.scope_pats.len() as u32);
-        let mut moved = 0u64;
         let mut whole = false;
         // A guarded arm's bindings are stored before its guard, which reads them, but own
         // their parts and take them from the scrutinee only once it passed (walk/moves.rs
@@ -6255,18 +7964,25 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         match (self.pat(arm.pat)?, st.of_enum) {
             (Pat::Bind { .. }, None) => self.bind_value(arm.pat, V::Scalar(st.scrutinee))?,
             (Pat::Bind { .. }, Some((at, _, _))) => {
-                self.bind_value(arm.pat, V::Place(at.0, at.1))?;
+                // Top-level identifier bindings do not peel references (Reference, "Binding
+                // modes"): in a match on `&E` / `&mut E` / `&&E`, `existing => ..` binds the
+                // original reference scalar, not the dereferenced enum place.
+                let bound = match st.by_ref {
+                    Some(ptr) => V::Scalar(ptr),
+                    None => V::Place(at.0, at.1),
+                };
+                self.bind_value(arm.pat, bound)?;
                 if st.owner != Owner::None {
                     self.arm_effect(moves::Pending::OwnPat(arm.pat), hold)?;
                     whole = true;
                 }
             }
             (Pat::TupleStruct { .. } | Pat::Struct { .. }, Some((at, l, _))) => {
-                moved = self.bind_variant(arm.pat, at, l, st.by_ref, !hold)?;
-                if hold && !st.by_ref {
+                let moved = self.bind_variant(arm.pat, at, l, st.by_ref.is_some(), !hold)?;
+                if hold && st.by_ref.is_none() {
                     self.arm_effect(moves::Pending::OwnPat(arm.pat), true)?;
                 }
-                if moved != 0 {
+                if !moved.is_empty() {
                     let _variant = Self::def_variant(self.pat_def(arm.pat)).ok_or(malformed("a variant pattern the check did not resolve"))?;
                     if self.layouts[l as usize].drop_fn.is_some() {
                         return Err(BuildError::UnsupportedPat {
@@ -6276,8 +7992,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     }
                     match st.owner {
                         Owner::Local(x) => {
-                            let slot = self.owned[x.ix()]
-                                .and_then(|o| o.rest)
+                            let slot = self
+                                .field_mask(x)
                                 .ok_or(malformed("a match moving fields out of a local without field flags"))?;
                             self.arm_effect(moves::Pending::Clear { mask: slot, bits: moved }, hold)?;
                         }
@@ -6307,6 +8023,15 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 Owner::None => {}
             }
         }
+        if arm.guard.is_none()
+            && st.by_ref.is_none()
+            && matches!(st.owner, Owner::None)
+            && let Some((at, ..)) = st.of_enum
+            && !self.pat_has_ref(arm.pat)?
+            && let Some(slot) = self.whole_slot(at)
+        {
+            self.end_temp_slot(slot);
+        }
         self.work.push(Task::ArmEnd { m });
         self.work.push(Task::ScopeEnd(arm.body));
         // An `if let` guard (walk/lets.rs `let_guard`): its links, each failure to `next`.
@@ -6322,5 +8047,50 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             self.work.push(Task::Eval(g));
         }
         Ok(())
+    }
+}
+
+/// Whether `node` is a primitive type with no interior mutability (`Freeze`, zero `UnsafeCell`).
+fn is_plain_freeze_prim(node: PNode) -> bool {
+    matches!(
+        node,
+        PNode::Bool
+            | PNode::Char
+            | PNode::Int(_)
+            | PNode::Uint(_)
+            | PNode::Float(_)
+            | PNode::Ptr(..)
+            | PNode::FnPtr(..)
+    )
+}
+
+/// [`ParamFactsRec`] bitmask implied by Rust's reference aliasing and non-null rules for a
+/// parameter of ground type `ty` (attached to the parameter's `Ty::PTR` register when lowering the
+/// function's own LIR signature).
+fn ptr_facts_for_rust_ty(ground: PTys<'_>, ty: PTy) -> u8 {
+    let Ok(node) = ground.node(ty) else {
+        return 0;
+    };
+    match node {
+        // Every `&mut T` / `&mut [T]` / `&mut dyn Trait` is unique and non-null, even if `T`
+        // contains `UnsafeCell`.
+        PNode::Ref(Mutbl::Mut, _) => ParamFactsRec::NOALIAS | ParamFactsRec::NONNULL,
+        // Every `&T` / `&[T]` / `&str` / `&dyn Trait` is non-null; when the pointee is a plain
+        // primitive, `str`, or slice/array of plain primitives (no `UnsafeCell`), it is also
+        // `noalias readonly` (matching `rustc_codegen_llvm`).
+        PNode::Ref(Mutbl::Not, inner) => {
+            let freeze_readonly = match ground.node(inner) {
+                Ok(PNode::Str) => true,
+                Ok(PNode::Slice(elem) | PNode::Array(elem, _)) => ground.node(elem).is_ok_and(is_plain_freeze_prim),
+                Ok(other) => is_plain_freeze_prim(other),
+                Err(_) => false,
+            };
+            if freeze_readonly {
+                ParamFactsRec::NOALIAS | ParamFactsRec::NONNULL | ParamFactsRec::READONLY
+            } else {
+                ParamFactsRec::NONNULL
+            }
+        }
+        _ => 0,
     }
 }

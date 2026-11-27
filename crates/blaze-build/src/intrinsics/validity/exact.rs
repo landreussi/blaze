@@ -153,7 +153,23 @@ fn filled<A: Allocator + Clone>(check: Check, ty: PTy, layouts: &mut Layouts<A>,
                 Fields::Array { count: 0, .. } => continue,
                 _ => None,
             },
-            PNode::Tuple(_) | PNode::Closure { .. } => None,
+            PNode::Tuple(_) | PNode::Record(..) | PNode::Closure { .. } => None,
+            PNode::Union(ul) => {
+                if ul.len == 0 {
+                    return Ok(false);
+                }
+                if ul.len == 1 {
+                    None
+                } else {
+                    let v = match l.variants {
+                        Variants::Single { index } => Some(index),
+                        Variants::Multiple { tag, .. } => layouts.variant_of_tag(id, check.fill(tag.prim.bits())),
+                    };
+                    let Some(v) = v.and_then(|v| usize::try_from(v).ok()) else { return Ok(false) };
+                    let Some(end) = v.checked_add(1) else { return Ok(false) };
+                    Some(v..end)
+                }
+            }
             PNode::Future(..) | PNode::Coroutine { .. } => {
                 return Err(refuse(Refusal::Unsupported(
                     "the zero or 0x01 validity of a coroutine's state (which state the fill selects is the coroutine pass's encoding)",
@@ -186,6 +202,8 @@ const NO: u8 = 3;
 enum Form<'w> {
     /// Every type it holds by value.
     All,
+    /// At least one member of a tagged union (`PNode::Union`).
+    Any,
     /// Some variant with every field.
     AnyVariant(Adt<'w>),
     /// Always (a union, an empty array).
@@ -195,19 +213,16 @@ enum Form<'w> {
 }
 
 /// The and-or evaluation of inhabitedness: a post-order walk on a work stack, each type
-/// decided once (`state`, by the type's ground index).
+/// decided once (`state`, sparse by ground type so `O(|reachable|)` rather than `O(max_ty_index)`).
 fn inhabited<A: Allocator + Clone>(ty: PTy, layouts: &mut Layouts<A>, cx: &mut LayoutCx<'_, '_>) -> Result<bool, LayoutError> {
     let facts = cx.facts;
-    let mut state: Vec<u8, A> = Vec::new_in(layouts.alloc());
+    let mut state: crate::instance::PtyMap<u8, A> = crate::instance::PtyMap::new_in(layouts.alloc());
     let mut stack: Vec<PTy, A> = Vec::new_in(layouts.alloc());
     let mut parts: Vec<PTy, A> = Vec::new_in(layouts.alloc());
     stack.push(ty);
     while let Some(&t) = stack.last() {
-        let at = t.0 as usize;
-        if state.len() <= at {
-            state.resize(at + 1, UNSEEN);
-        }
-        if state[at] == YES || state[at] == NO {
+        let cur = state.get(t).unwrap_or(UNSEEN);
+        if cur == YES || cur == NO {
             stack.pop();
             continue;
         }
@@ -226,7 +241,8 @@ fn inhabited<A: Allocator + Clone>(ty: PTy, layouts: &mut Layouts<A>, cx: &mut L
                 Fields::Array { count: 0, .. } => Form::Yes,
                 _ => Form::All,
             },
-            PNode::Tuple(_) | PNode::Closure { .. } | PNode::Coroutine { .. } | PNode::Pat(..) => Form::All,
+            PNode::Tuple(_) | PNode::Record(..) | PNode::Closure { .. } | PNode::Coroutine { .. } | PNode::Pat(..) => Form::All,
+            PNode::Union(_) => Form::Any,
             PNode::Bool
             | PNode::Char
             | PNode::Int(_)
@@ -243,18 +259,14 @@ fn inhabited<A: Allocator + Clone>(ty: PTy, layouts: &mut Layouts<A>, cx: &mut L
             _ => return Err(LayoutError { ty: t, why: Refusal::Malformed("a validity assertion's type the layout lays out but no rule names") }),
         };
         parts.clear();
-        if matches!(form, Form::All | Form::AnyVariant(_)) {
+        if matches!(form, Form::All | Form::Any | Form::AnyVariant(_)) {
             layouts.field_types(t, cx, &mut parts)?;
         }
-        if state[at] == UNSEEN {
-            state[at] = OPEN;
+        if cur == UNSEEN {
+            state.set(t, OPEN);
             let before = stack.len();
             for &p in parts.iter() {
-                let pi = p.0 as usize;
-                if state.len() <= pi {
-                    state.resize(pi + 1, UNSEEN);
-                }
-                match state[pi] {
+                match state.get(p).unwrap_or(UNSEEN) {
                     UNSEEN => stack.push(p),
                     OPEN => return Err(LayoutError { ty: p, why: Refusal::Recursive }),
                     _ => {}
@@ -264,9 +276,10 @@ fn inhabited<A: Allocator + Clone>(ty: PTy, layouts: &mut Layouts<A>, cx: &mut L
                 continue;
             }
         }
-        let all_yes = |fs: &[PTy]| fs.iter().all(|p| state[p.0 as usize] == YES);
+        let all_yes = |fs: &[PTy]| fs.iter().all(|&p| state.get(p) == Some(YES));
         let yes = match form {
             Form::All => all_yes(&parts),
+            Form::Any => parts.iter().any(|&p| state.get(p) == Some(YES)),
             Form::Yes => true,
             Form::Record => !l.uninhabited,
             Form::AnyVariant(adt) => {
@@ -278,10 +291,10 @@ fn inhabited<A: Allocator + Clone>(ty: PTy, layouts: &mut Layouts<A>, cx: &mut L
                 any
             }
         };
-        state[at] = if yes { YES } else { NO };
+        state.set(t, if yes { YES } else { NO });
         stack.pop();
     }
-    Ok(state.get(ty.0 as usize) == Some(&YES))
+    Ok(state.get(ty) == Some(YES))
 }
 
 #[cfg(test)]

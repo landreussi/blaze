@@ -20,7 +20,7 @@ use crate::term::{
 use crate::tys::{Relate, Tys};
 
 /// The most words one canonical form holds (rule 18).
-pub const MAX_WORDS: usize = 1 << 16;
+pub const MAX_WORDS: usize = 1 << 20;
 
 /// The highest variable index a [`Decode`] accepts (rule 18): its slot table's cap, over every
 /// form it decodes until `reset` (a certificate's rows share one numbering).
@@ -62,6 +62,10 @@ const T_EX_AUTO: u32 = 31;
 const T_LIST: u32 = 32;
 const T_COROUTINE: u32 = 33;
 const T_PAT: u32 = 34;
+const T_RECORD: u32 = 35;
+const T_UNION: u32 = 36;
+const T_RE_BOUND: u32 = 37;
+const T_RE_PLACEHOLDER: u32 = 38;
 
 // Predicate tags.
 const P_TRAIT: u32 = 64;
@@ -79,6 +83,8 @@ const P_CAHT: u32 = 76;
 const P_EQ: u32 = 77;
 /// `Pred::ConstHolds`: laid out as `P_TRAIT` (the list, the def, a flag word of 0).
 const P_HOLDS: u32 = 78;
+/// `Pred::ForFields`: container term, `args_after_self` list, header, then the trait def.
+const P_FOR_FIELDS: u32 = 79;
 
 fn header(tag: u32, arity: u32) -> u32 {
     tag | (arity << 8)
@@ -262,6 +268,12 @@ impl<'a> Canon<'a> {
                 push_def(out, cond);
                 out.push(0);
             }
+            Pred::ForFields { container, trait_, args_after_self } => {
+                self.term(tys, out, container)?;
+                self.list(tys, out, args_after_self)?;
+                out.push(header(P_FOR_FIELDS, 2));
+                push_def(out, trait_);
+            }
             Pred::Projection { alias, term } => two(self, out, alias, term, P_PROJ)?,
             Pred::NormalizesTo { alias, term } => two(self, out, alias, term, P_NORM)?,
             Pred::TypeOutlives { ty, region } => two(self, out, ty, region, P_TOUT)?,
@@ -311,6 +323,13 @@ fn emit<T: Tys>(tys: &T, out: &mut Vec<u32, Alloc<'_>>, k: TyKind) {
         TyKind::Str => out.push(header(T_STR, 0)),
         TyKind::Never => out.push(header(T_NEVER, 0)),
         TyKind::Tuple(l) => out.push(header(T_TUPLE, l.len)),
+        TyKind::Record(s, l) => {
+            out.push(header(T_RECORD, l.len));
+            let [b0, b1, b2, b3, b4, b5, b6, b7] = s.to_le_bytes();
+            out.push(u32::from_le_bytes([b0, b1, b2, b3]));
+            out.push(u32::from_le_bytes([b4, b5, b6, b7]));
+        }
+        TyKind::Union(l) => out.push(header(T_UNION, l.len)),
         TyKind::Ref(_, _, m) => {
             out.push(header(T_REF, 2));
             out.push(mutbl_word(m));
@@ -380,6 +399,16 @@ fn emit<T: Tys>(tys: &T, out: &mut Vec<u32, Alloc<'_>>, k: TyKind) {
         TyKind::Error => out.push(header(T_ERROR, 0)),
         TyKind::ReStatic => out.push(header(T_RE_STATIC, 0)),
         TyKind::ReParam(_) | TyKind::ReErased => out.push(header(T_RE_ERASED, 0)),
+        TyKind::ReBound(d, i) => {
+            out.push(header(T_RE_BOUND, 0));
+            out.push(d);
+            out.push(i);
+        }
+        TyKind::RePlaceholder(u, i) => {
+            out.push(header(T_RE_PLACEHOLDER, 0));
+            out.push(u);
+            out.push(i);
+        }
         TyKind::ConstValue(t, v) => {
             out.push(header(T_CONST, 0));
             out.push(t.code());
@@ -515,6 +544,19 @@ impl<'a> Decode<'a> {
                     self.pop_kids(n, at)?;
                     TyKind::Tuple(tys.mk_list(&self.kids)?)
                 }
+                T_RECORD => {
+                    need(2)?;
+                    i += 2;
+                    let lo = *w.get(at + 1).ok_or(bad(at))?;
+                    let hi = *w.get(at + 2).ok_or(bad(at))?;
+                    let s = u64::from(lo) | (u64::from(hi) << 32);
+                    self.pop_kids(n, at)?;
+                    TyKind::Record(s, tys.mk_list(&self.kids)?)
+                }
+                T_UNION => {
+                    self.pop_kids(n, at)?;
+                    TyKind::Union(tys.mk_list(&self.kids)?)
+                }
                 T_REF => {
                     need(1)?;
                     i += 1;
@@ -621,6 +663,16 @@ impl<'a> Decode<'a> {
                 T_ERROR => TyKind::Error,
                 T_RE_STATIC => TyKind::ReStatic,
                 T_RE_ERASED => TyKind::ReErased,
+                T_RE_BOUND => {
+                    need(2)?;
+                    i += 2;
+                    TyKind::ReBound(w[at + 1], w[at + 2])
+                }
+                T_RE_PLACEHOLDER => {
+                    need(2)?;
+                    i += 2;
+                    TyKind::RePlaceholder(w[at + 1], w[at + 2])
+                }
                 T_CONST => {
                     need(1)?;
                     // An enum's definition: four words between the code and the bits.
@@ -739,6 +791,17 @@ impl<'a> Decode<'a> {
                 }
                 *i += 4;
                 Pred::DynCompatible(read_def(w, at + 1))
+            }
+            P_FOR_FIELDS => {
+                if at + 5 > w.len() {
+                    return Err(bad);
+                }
+                let trait_ = read_def(w, at + 1);
+                *i += 4;
+                self.pop_kids(1, at)?;
+                let container = self.kids[0];
+                let args_after_self = self.lists.pop().ok_or(bad)?;
+                Pred::ForFields { container, trait_, args_after_self }
             }
             _ => return Err(bad),
         })

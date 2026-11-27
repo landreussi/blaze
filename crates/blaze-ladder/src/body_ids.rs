@@ -148,6 +148,41 @@ pub fn record_key(symbol: Symbol, body: &BodyId<'_>, facts: &[Read], builder: &B
     CodeKey(h.finish())
 }
 
+/// Computes the content-addressed [`CodeKey`] of a previously walked instance `(symbol, tabled, name)`
+/// against today's [`BodyIds`], [`Builder`], and [`ProducerId<CodeBuilder>`], without compiling it.
+/// Returns `None` if `tabled` has no valid body record today, any read moved, or any item in `name`
+/// lacks a crate fact. Uses the exact same inputs as `Walk::start` (rule 30).
+pub fn instance_key(
+    symbol: Symbol,
+    tabled: ItemKey,
+    name: &[u8],
+    ids: &dyn BodyIds,
+    builder: &Builder,
+    producer: &ProducerId<CodeBuilder>,
+    alloc: Alloc<'_>,
+) -> Option<CodeKey> {
+    let body = ids.body_check(tabled)?;
+    if body.reads.is_empty() {
+        return None;
+    }
+    for read in body.reads {
+        if ids.today(&read.fact) != Some(read.digest) {
+            return None;
+        }
+    }
+    let mut items: AVec<'_, ItemKey> = Vec::new_in(alloc);
+    each_item(name, |item| items.push(item)).ok()?;
+    items.sort_unstable();
+    items.dedup();
+    let mut facts: AVec<'_, Read> = Vec::with_capacity_in(items.len(), alloc);
+    for &item in items.iter() {
+        facts.push(ids.crate_fact(item)?);
+    }
+    facts.sort_unstable();
+    facts.dedup();
+    Some(record_key(symbol, &body, facts.as_slice(), builder, producer))
+}
+
 /// Why an instance name's items cannot be listed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NameError {
@@ -194,7 +229,10 @@ pub fn each_item(name: &[u8], mut each: impl FnMut(ItemKey)) -> Result<(), NameE
         let bytes = name.get(at..at + 4).ok_or(NameError::Truncated { at })?;
         Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     };
-    each(key_at(0)?);
+    let head = key_at(0)?;
+    if head != blaze_build::REIFY_SHIM_ITEM && head != blaze_build::VTABLE_SHIM_ITEM && head != blaze_build::TEST_REPORT_SHIM_ITEM {
+        each(head);
+    }
     // The item's key (16) and the count of arguments (4); at no argument, nothing more.
     let args = u32_at(16)? as usize;
     let mut at = 20;
@@ -207,17 +245,22 @@ pub fn each_item(name: &[u8], mut each: impl FnMut(ItemKey)) -> Result<(), NameE
         let tag = *name.get(at).ok_or(NameError::Truncated { at })?;
         // (the payload's bytes, whether it starts with an item's key)
         let (payload, keyed) = match tag {
-            0 | 1 | 5 | 6 | 7 | 10 | 11 | 15 | 16 => (0, false),
+            0 | 1 | 5 | 6 | 7 | 10 | 11 | 15 | 16 | 26 => (0, false),
             2 | 3 | 4 | 8 | 9 | 21 => (1, false),
-            12 | 13 | 17 | 19 => (16, true),
+            12 | 13 | 17 | 19 | 24 => (16, true),
             14 => (16, false),
             18 => (24, true),
             20 | 23 => (20, true),
             22 => (4, false),
+            25 => (8, false),
             _ => return Err(NameError::Tag { tag, at }),
         };
         if keyed {
-            each(key_at(at + 1)?);
+            let item = key_at(at + 1)?;
+            // Synthetic polymorphization opaque-thin marker (`PNode::Foreign`) has no user crate.
+            if item != crate::front2::poly_canon::OPAQUE_THIN_FOREIGN_KEY {
+                each(item);
+            }
         }
         // The tag, the payload, the child count, then each child's reference.
         let kids = u32_at(at + 1 + payload)? as usize;
@@ -332,7 +375,7 @@ pub struct EntryForm;
 
 impl Form for EntryForm {
     fn declared(&self, entry: &[u8], out: &mut DeclaredList<'_>) -> Result<(), EntryError> {
-        if entry.get(..8) == Some(&STATIC_ENTRY_MAGIC[..]) {
+        if entry.starts_with(&STATIC_ENTRY_MAGIC[..]) {
             let view = StaticEntryView::read(entry)?;
             view.each_declared(
                 |d| {
@@ -360,7 +403,7 @@ impl Form for EntryForm {
     /// A code entry's read-list rows (code_records.rs `EntryView::reads_count`); a static's
     /// entry carries none (the module doc's OPEN).
     fn reads(&self, entry: &[u8]) -> Result<u32, EntryError> {
-        if entry.get(..8) == Some(&STATIC_ENTRY_MAGIC[..]) {
+        if entry.starts_with(&STATIC_ENTRY_MAGIC[..]) {
             return Ok(0);
         }
         Ok(EntryView::read(entry)?.reads_count())
@@ -397,6 +440,12 @@ pub trait Make {
     fn verify(&mut self, tabled: ItemKey, name: &[u8], entry: &[u8]) -> Result<Option<Verdict>, Self::Error> {
         let _ = (tabled, name, entry);
         Ok(None)
+    }
+    /// Keyed verification hook receiving `(key, under)` (instance key and content key of the
+    /// stored entry) so a suite-level or certificate-checked verifier can memoize `Verdict::Holds`
+    /// within a single checked snapshot without re-evaluating read lists. Defaults to [`Make::verify`].
+    fn verify_keyed(&mut self, _key: CodeKey, _under: CodeKey, tabled: ItemKey, name: &[u8], entry: &[u8]) -> Result<Option<Verdict>, Self::Error> {
+        self.verify(tabled, name, entry)
     }
 }
 
@@ -1247,7 +1296,7 @@ impl<'a> Walk<'a> {
             let rows = form.reads(bytes).map_err(|why| WalkError::Entry { tabled, found: true, why })?;
             let holds = match rows {
                 0 => true,
-                rows => match verify.verify(tabled, name.as_slice(), bytes).map_err(|why| WalkError::Verify { tabled, why })? {
+                rows => match verify.verify_keyed(key, under, tabled, name.as_slice(), bytes).map_err(|why| WalkError::Verify { tabled, why })? {
                     None => return Err(WalkError::Unverified { tabled, rows }),
                     Some(Verdict::Holds) => {
                         self.verified += 1;

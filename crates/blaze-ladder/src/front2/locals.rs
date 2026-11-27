@@ -419,6 +419,10 @@ pub struct Locals<'n> {
     /// constant's own body continues there ([`Locals::find`]), as a local item's does; the
     /// constant is no item, so it is not in `heads`.
     anons: HashMap<ItemKey, (ItemKey, u32), &'n Frame>,
+    /// Each block module (`__blaze_block_*`) owned by a lowered body, mapping the block module's
+    /// library key back to its enclosing body's checker key: what `type_name` prints items
+    /// declared in that block (`struct LocalStruct;` in `fn outer`) under (`crate::outer::LocalStruct`).
+    block_owners: HashMap<LibKey, ItemKey, &'n Frame>,
     /// The scope table's planted bug, for the test that must catch it; `Planted::None` else.
     planted: super::scope_table::Planted,
     /// Under `BlockScopes::Bodies`, each body's record ([`BodyScopes`]); `None` under `Modules`.
@@ -435,7 +439,27 @@ fn covariant<'s, 'l: 's>(locals: &'s Locals<'l>) -> &'s Locals<'s> {
 
 impl<'n> Locals<'n> {
     pub fn new(frame: &'n Frame) -> Locals<'n> {
-        Locals { frame, bodies: HashMap::new_in(frame), heads: HashMap::new_in(frame), foreign: HashMap::new_in(frame), anons: HashMap::new_in(frame), planted: super::scope_table::Planted::None, body_scopes: None }
+        Locals {
+            frame,
+            bodies: HashMap::new_in(frame),
+            heads: HashMap::new_in(frame),
+            foreign: HashMap::new_in(frame),
+            anons: HashMap::new_in(frame),
+            block_owners: HashMap::new_in(frame),
+            planted: super::scope_table::Planted::None,
+            body_scopes: None,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        let Locals { frame: _, bodies, heads, foreign, anons, block_owners, planted, body_scopes } = self;
+        bodies.clear();
+        heads.clear();
+        foreign.clear();
+        anons.clear();
+        block_owners.clear();
+        *planted = super::scope_table::Planted::None;
+        *body_scopes = None;
     }
 
     /// Reads every body kept after this under `BlockScopes::Bodies`: its block names from its
@@ -496,6 +520,11 @@ impl<'n> Locals<'n> {
     /// The local items of the body `owner`.
     pub fn body(&self, owner: ItemKey) -> Option<&BodyLocals<'n>> {
         self.bodies.get(&owner)
+    }
+
+    /// The body (`ItemKey`) whose lowered block owns the block module `module`.
+    pub fn block_owner(&self, module: LibKey) -> Option<ItemKey> {
+        self.block_owners.get(&module).copied()
     }
 
     /// The body whose row `gap` names, and that row, when the gap names a row by its body's
@@ -747,6 +776,14 @@ impl<'n> Locals<'n> {
         }
         let blocks: &'n [BlockModule] = frame.alloc_slice_copy(&blocks);
         let scopes: &'n [super::scope_table::ScopeAt] = frame.alloc_slice_copy(&table.scopes);
+        for scope in scopes.iter() {
+            if let Some(m) = scope.own() {
+                self.block_owners.insert(m, at.owner);
+            }
+        }
+        for block in blocks.iter() {
+            self.block_owners.insert(block.module, at.owner);
+        }
         let names_of_blocks = match self.body_scopes {
             None => super::scope_table::BlockNames::Modules,
             Some(s) => match library_body.ok_or(NoBodyScope::NoLibraryBody).and_then(|body| s.of(body)) {
@@ -770,7 +807,7 @@ impl<'n> Locals<'n> {
         if names.seeded_text_of(item).is_some_and(|it| same(it.text)) {
             return Some(item);
         }
-        if let Some(h) = self.heads.get(&checker_of(item)) {
+        if let Some(h) = self.heads.get(&owner).or_else(|| self.heads.get(&checker_of(item))) {
             return self.library_twin(names, h, text);
         }
         library_item_or_member(names, keys, item, owner, text)
@@ -794,7 +831,22 @@ impl<'n> Locals<'n> {
         let written = blaze_scope::names::Written { kind: blaze_surface::PathKind::Plain, segments: &segments };
         let found = names.walk(h.names_at, blaze_surface::Namespace::Values, written).ok()?.whole(1)?;
         let it = names.text_of(found.key)?;
-        (it.module == h.names_at && it.text == text).then_some(found.key)
+        // `blaze-file-items::nested::scan` skips leading comments (`///`, `/**`, `//`, `/*`) when
+        // slicing `NestedItem::range`, whereas `blaze-lower`'s parser `FN`/`CONST`/`STATIC` node
+        // includes leading doc comments (e.g. `std::sys::process::unix::<impl Command>::posix_spawn::get_posix_spawn_addchdir`).
+        (it.module == h.names_at && strip_leading_trivia(it.text) == strip_leading_trivia(text)).then_some(found.key)
+    }
+
+    /// The `(body, scope)` at which an AST node of `owner` with lowered block scope `scope` stands:
+    /// inside `owner` at `s` when `scope` is `Some(s)`, or—when `scope` is `None` (a local item's
+    /// signature or unblocked initializer, which has no enclosing `Expr::Block` in its own view)—at
+    /// the declaring block `(h.enclosing, h.scope)` of that local item (`LocalHead`). `None` for a
+    /// non-local item's signature.
+    pub fn scope_or_declared(&self, owner: ItemKey, scope: Option<u32>) -> Option<(ItemKey, u32)> {
+        match scope {
+            Some(s) => Some((owner, s)),
+            None => self.head(owner).map(|h| (h.enclosing, h.scope)),
+        }
     }
 
     /// The local item `name` names in `ns`, written in block `scope` of the body `owner`: the
@@ -836,6 +888,47 @@ impl<'n> Locals<'n> {
             Some(d) => Ok((d, h.text, h.names_at)),
             None => Err(HeadError::Item(key, Why::Unsupported(h.kind.form(), h.range))),
         })
+    }
+}
+
+/// Strips leading whitespace, `//...` line comments, and nested `/*...*/` block comments.
+fn strip_leading_trivia(mut s: &str) -> &str {
+    loop {
+        s = s.trim_start();
+        if let Some(rest) = s.strip_prefix("//") {
+            match rest.find('\n') {
+                Some(nl) => s = &rest[nl + 1..],
+                None => return "",
+            }
+        } else if let Some(mut rest) = s.strip_prefix("/*") {
+            let mut depth = 1usize;
+            while depth > 0 {
+                let bytes = rest.as_bytes();
+                let mut i = 0;
+                let mut matched = false;
+                while i + 1 < bytes.len() {
+                    if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                        depth += 1;
+                        rest = &rest[i + 2..];
+                        matched = true;
+                        break;
+                    }
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        depth -= 1;
+                        rest = &rest[i + 2..];
+                        matched = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if !matched {
+                    return "";
+                }
+            }
+            s = rest;
+        } else {
+            return s;
+        }
     }
 }
 

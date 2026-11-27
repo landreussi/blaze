@@ -238,11 +238,11 @@ fn fixture(text: &str) -> Fixture {
     let crates = inputs.crates();
     let keys: &'static [CrateItemKey] = Vec::leak(crates.iter().map(|c| c.key).collect());
     let crate_names: &'static [&'static str] = Vec::leak(crates.iter().map(|c| leak(c.name)).collect());
-    let names = inputs.resolve(&crates, a).unwrap_or_else(|e| panic!("the fixture's one solve: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("the fixture's one solve: {e}"));
     let mut kept = Kept::default();
     for c in names.crates().iter() {
-        kept.names.push(aligned(&names_record::encode(c, a).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), a));
-        kept.items.push(aligned(&items_record::encode_with(c, &names, a).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), a));
+        kept.names.push(aligned(&names_record::encode(c, a).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
+        kept.items.push(aligned(&items_record::encode_with(c, &names, a).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
         kept.files.push(c.files.iter().map(|f| (f.package.as_str().to_string(), leak(f.text))).collect());
         kept.expansions.push(c.expansions.iter().filter_map(|(call, e)| e.made.map(|m| (*call, leak(m.text)))).collect());
         kept.origins.push(c.expansions.iter().filter_map(|(call, e)| e.made.as_ref().map(|m| (*call, made_origins(*call, &m.origins)))).collect());
@@ -1533,6 +1533,227 @@ pub extern \"C-unwind\" fn main() -> i32 {{
 }}
 "
         ),
+        42,
+    );
+}
+
+/// RFC 3407 `become` direct mutual recursion over 200,000 steps with a 256-byte local stack array
+/// per frame (~51 MiB if non-TCO, which would immediately overflow macOS's 8 MiB stack): proves
+/// real O(1) stack tail calls.
+#[test]
+fn become_mutual_recursion_200k_o1_stack() {
+    row(
+        "become direct mutual recursion 200k O(1) stack",
+        "
+#[lang = \"panic_bounds_check\"]
+fn panic_bounds_check(_index: usize, _len: usize) -> ! { loop {} }
+
+fn step_a(n: u32, acc: u32) -> u32 {
+    let mut pad: [u32; 64] = [0; 64];
+    pad[0] = n;
+    pad[63] = acc;
+    if pad[0] == 0 {
+        return pad[63];
+    }
+    become step_b(pad[0] - 1, pad[63] + 1);
+}
+
+fn step_b(n: u32, acc: u32) -> u32 {
+    let mut pad: [u32; 64] = [0; 64];
+    pad[0] = n;
+    pad[63] = acc;
+    if pad[0] == 0 {
+        return pad[63];
+    }
+    become step_a(pad[0] - 1, pad[63] + 2);
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    let res = step_a(200_000, 0);
+    // 100,000 steps add 1 + 100,000 steps add 2 = 300,000
+    if res == 300_000 { 42 } else { 1 }
+}
+",
+        42,
+    );
+}
+
+/// Exact `evm2::interpreter::dispatch` shape: `extern \"rust-preserve-none\"` indirect tail-call
+/// dispatch table (`become table[op](...)`) carrying a multi-field `Copy` aggregate (`Pass::Ref`
+/// buffer reuse across 200,000 mutual tail calls) and a direct `become finish(...)` exit.
+#[test]
+fn become_indirect_preserve_none_table_with_pass_ref_struct_200k() {
+    row(
+        "become indirect preserve-none table with Pass::Ref struct 200k",
+        "
+#[lang = \"panic_bounds_check\"]
+fn panic_bounds_check(_index: usize, _len: usize) -> ! { loop {} }
+
+struct PairStack {
+    a: u32,
+    b: u32,
+    c: u32,
+    d: u32,
+}
+impl Copy for PairStack {}
+
+type TailFn = extern \"rust-preserve-none\" fn(u32, PairStack, &mut u32, *const ()) -> u32;
+
+extern \"rust-preserve-none\" fn op_even(n: u32, mut st: PairStack, out: &mut u32, tbl: *const ()) -> u32 {
+    let mut pad: [u32; 64] = [0; 64];
+    pad[0] = n;
+    if pad[0] == 0 {
+        become finish(pad[0], st, out, tbl);
+    }
+    st.a = st.a + 1;
+    st.d = st.d + 2;
+    let table: &[TailFn; 2] = unsafe { &*(tbl as *const [TailFn; 2]) };
+    let next = table[1];
+    become next(pad[0] - 1, st, out, tbl);
+}
+
+extern \"rust-preserve-none\" fn op_odd(n: u32, mut st: PairStack, out: &mut u32, tbl: *const ()) -> u32 {
+    let mut pad: [u32; 64] = [0; 64];
+    pad[0] = n;
+    if pad[0] == 0 {
+        become finish(pad[0], st, out, tbl);
+    }
+    st.b = st.b + 1;
+    st.c = st.c + 3;
+    let table: &[TailFn; 2] = unsafe { &*(tbl as *const [TailFn; 2]) };
+    let next = table[0];
+    become next(pad[0] - 1, st, out, tbl);
+}
+
+extern \"rust-preserve-none\" fn finish(_n: u32, st: PairStack, out: &mut u32, _tbl: *const ()) -> u32 {
+    *out = st.a + st.b + st.c + st.d;
+    if st.a == 100_000 && st.b == 100_000 && st.c == 300_000 && st.d == 200_000 { 42 } else { 2 }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    let table: [TailFn; 2] = [op_even, op_odd];
+    let mut total: u32 = 0;
+    let st = PairStack { a: 0, b: 0, c: 0, d: 0 };
+    let code = (table[0])(200_000, st, &mut total, (&table as *const [TailFn; 2]) as *const ());
+    if code == 42 && total == 700_000 { 42 } else { 3 }
+}
+",
+        42,
+    );
+}
+
+/// RFC 3407 drop ordering: locals in the caller frame MUST be dropped BEFORE control transfers
+/// to the tail-called callee.
+#[test]
+fn become_drops_locals_before_tail_call() {
+    row(
+        "become drops locals before tail call",
+        "
+#[lang = \"drop\"]
+trait Drop {
+    fn drop(&mut self);
+}
+
+#[lang = \"drop_in_place\"]
+unsafe fn drop_in_place<T: PointeeSized>(to_drop: *mut T) {
+    unsafe { drop_in_place(to_drop) }
+}
+
+struct Guard {
+    slot: *mut u32,
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        unsafe { *self.slot = *self.slot + 40; }
+    }
+}
+
+fn read_after_drop(p: *mut u32) -> u32 {
+    unsafe { *p + 2 }
+}
+
+fn caller(p: *mut u32) -> u32 {
+    let _g = Guard { slot: p };
+    become read_after_drop(p);
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    let mut val: u32 = 0;
+    caller(&mut val as *mut u32) as i32
+}
+",
+        42,
+    );
+}
+
+/// Builtin `FnPtr::addr` returning `usize` and `FnPtr::as_ptr` / `FnPtr::from_ptr` roundtrip
+/// (core's `impl<F: FnPtr> PartialEq for F` calls `self.addr() == other.addr()` with no written
+/// `impl FnPtr` item).
+#[test]
+fn fn_ptr_trait_addr_usize_and_roundtrip() {
+    row(
+        "fn_ptr_trait addr usize and roundtrip",
+        "
+#[lang = \"fn_ptr_trait\"]
+trait FnPtr: Copy {
+    fn addr(self) -> usize;
+    fn as_ptr(self) -> *const ();
+    unsafe fn from_ptr(ptr: *const ()) -> Self;
+}
+
+fn eq_fn<F: FnPtr>(a: F, b: F) -> bool {
+    a.addr() == b.addr()
+}
+
+fn roundtrip<F: FnPtr>(f: F) -> F {
+    let p = f.as_ptr();
+    unsafe { F::from_ptr(p) }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    let f1: fn(u8) -> u8 = double;
+    let f2: fn(u8) -> u8 = double;
+    let f3: fn(u8) -> u8 = triple;
+    let same = eq_fn(f1, f2);
+    let diff = !eq_fn(f1, f3);
+    let rt = roundtrip(f3);
+    if same && diff && rt(14) == 42 { 42 } else { 1 }
+}
+",
+        42,
+    );
+}
+
+/// Builtin `FnPtr::addr` with the `*const ()` return signature and a default body (verifies
+/// both raw-pointer returns and default-bodied trait methods are intercepted cleanly).
+#[test]
+fn fn_ptr_trait_addr_raw_ptr() {
+    row(
+        "fn_ptr_trait addr raw ptr",
+        "
+#[lang = \"fn_ptr_trait\"]
+trait FnPtr: Copy {
+    fn addr(self) -> *const () {
+        0 as *const ()
+    }
+}
+
+fn eq_ptr<F: FnPtr>(a: F, b: F) -> bool {
+    a.addr() == b.addr()
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    let a: fn(u8) -> u8 = double;
+    let b: fn(u8) -> u8 = triple;
+    if eq_ptr(a, a) && !eq_ptr(a, b) { 42 } else { 2 }
+}
+",
         42,
     );
 }

@@ -16,27 +16,124 @@ use bstd::fs::{Dir, ReadWrite};
 use bstd::mem::{Bytes, Frame};
 use bstd::path::Path;
 
-use crate::body_types::LazyTrees;
+use crate::body_types::{LazyTrees, SharedTrees, SyncLazyTrees};
 use crate::work::held_str;
+
+/// Thread-safe subset of [`Packs`] for worker pools (`Open` or `SyncLazy`).
+#[derive(Clone, Copy)]
+pub(crate) enum SyncPacks<'n> {
+    Open(&'n [PackView<'n>]),
+    SyncLazy(&'n SyncLazyTrees<'n>, &'n bstd::fs::Fs),
+}
+
+impl<'n> From<SyncPacks<'n>> for Packs<'n> {
+    fn from(packs: SyncPacks<'n>) -> Packs<'n> {
+        match packs {
+            SyncPacks::Open(views) => Packs::Open(views),
+            SyncPacks::SyncLazy(lazy, fs) => Packs::SyncLazy(lazy, fs),
+        }
+    }
+}
 
 /// The packs of a crate list's trees as a job reads them, tree `k` (1-based; tree 0 is the
 /// checkout) by [`Packs::tree`]: every tree opened before the job ([`Packs::Open`]: a check's
 /// stages, whose pool jobs share one slice), or each opened on the first read of a text from it
-/// ([`Packs::OnFirstRead`]: `blaze run`'s parent, which reads the trees its walk touches).
+/// ([`Packs::OnFirstRead`]: `blaze run`'s parent; [`Packs::SyncLazy`]: `Bodies` pool workers).
 #[derive(Clone, Copy)]
 pub(crate) enum Packs<'n> {
     Open(&'n [PackView<'n>]),
     OnFirstRead(&'n LazyTrees<'n>),
+    Shared(SharedTrees<'n>),
+    SyncLazy(&'n SyncLazyTrees<'n>, &'n bstd::fs::Fs),
 }
 
 impl<'n> Packs<'n> {
     /// Tree `k`'s pack; `None` past the list's trees, or (on first read) a tree that could not
-    /// be opened, which `TreesSeen::refused` (body_types.rs) names for the caller to stop on
-    /// (rule 3).
-    pub(crate) fn tree(&self, k: usize) -> Option<PackView<'n>> {
+    /// be opened, which `TreesSeen::refused` / `SyncLazyTrees::refused` (body_types.rs) names for
+    /// the caller to stop on (rule 3).
+    pub(crate) fn tree(&self, cx: &Cx, frame: &Frame, k: usize) -> Option<PackView<'n>> {
         match self {
             Packs::Open(views) => views.get(k.checked_sub(1)?).copied(),
             Packs::OnFirstRead(lazy) => lazy.tree(k),
+            Packs::Shared(shared) => shared.tree(cx, frame, k),
+            Packs::SyncLazy(lazy, fs) => lazy.tree(cx, fs, frame, k),
+        }
+    }
+
+    /// Reads UTF-8 text of `inner` in pack `k`. On [`Packs::SyncLazy`] and [`Packs::Shared`],
+    /// serves from the shared per-entry decompressed cache with zero `frame` allocation and zero
+    /// repeat Zstd decode.
+    pub(crate) fn read_str(&self, cx: &Cx, frame: &'n Frame, k: usize, inner: &str) -> Option<&'n str> {
+        match self {
+            Packs::SyncLazy(lazy, fs) => lazy.read_str(cx, fs, frame, k, inner),
+            Packs::Shared(shared) => shared.read_str(cx, frame, k, inner),
+            _ => self.tree(cx, frame, k)?.read_str_slice(inner, frame).ok()?,
+        }
+    }
+
+    /// Reads raw bytes of `inner` in pack `k`. On [`Packs::SyncLazy`] and [`Packs::Shared`],
+    /// serves from the shared per-entry decompressed cache with zero `frame` allocation and zero
+    /// repeat Zstd decode.
+    pub(crate) fn read_slice(&self, cx: &Cx, frame: &'n Frame, k: usize, inner: &str) -> Option<&'n [u8]> {
+        match self {
+            Packs::SyncLazy(lazy, fs) => lazy.read_slice(cx, fs, frame, k, inner),
+            Packs::Shared(shared) => shared.read_slice(cx, frame, k, inner),
+            _ => self.tree(cx, frame, k)?.read_slice(inner, frame).ok()?,
+        }
+    }
+
+    /// Reads checkout file `inner` through the shared [`SyncLazyTrees`] cache when active,
+    /// returning `(cached_path, entry)` borrowed at `'n` (zero bytes in any stretch `Frame`).
+    /// Returns `None` when not backed by [`Packs::SyncLazy`].
+    pub(crate) fn read_checkout(
+        &self,
+        cx: &Cx,
+        root: &Dir<ReadWrite>,
+        inner: &str,
+    ) -> Option<Result<(&'n str, &'n crate::body_types::CachedCheckout), bstd::sync::OnceError<core::convert::Infallible>>> {
+        match self {
+            Packs::SyncLazy(lazy, _) => Some(lazy.read_checkout(cx, root, inner)),
+            _ => None,
+        }
+    }
+
+    /// Reads UTF-8 checkout file `inner` through [`Packs::SyncLazy`] when active (zero `frame`
+    /// allocation, zero repeat disk read or UTF-8 check).
+    pub(crate) fn read_checkout_str(
+        &self,
+        cx: &Cx,
+        root: &Dir<ReadWrite>,
+        inner: &str,
+    ) -> Option<Result<(&'n str, Option<&'n str>), bstd::sync::OnceError<core::convert::Infallible>>> {
+        self.read_checkout(cx, root, inner).map(|res| res.map(|(path, entry)| (path, entry.as_str())))
+    }
+
+    /// Reads raw bytes of checkout file `inner` through [`Packs::SyncLazy`] when active (zero
+    /// `frame` allocation, zero repeat disk read).
+    pub(crate) fn read_checkout_bytes(
+        &self,
+        cx: &Cx,
+        root: &Dir<ReadWrite>,
+        inner: &str,
+    ) -> Option<Result<(&'n str, Option<&'n [u8]>), bstd::sync::OnceError<core::convert::Infallible>>> {
+        self.read_checkout(cx, root, inner).map(|res| res.map(|(path, entry)| (path, entry.as_bytes())))
+    }
+
+    /// Returns the precomputed `FILE_DOMAIN` digest for an already-cached UTF-8 checkout file
+    /// `inner` when backed by [`Packs::SyncLazy`].
+    pub(crate) fn checkout_digest(&self, inner: &str) -> Option<blaze_ids::ContentId> {
+        match self {
+            Packs::SyncLazy(lazy, _) => lazy.checkout_digest(inner),
+            _ => None,
+        }
+    }
+
+    /// Returns the cached path slice for an already-cached checkout file `inner` when backed by
+    /// [`Packs::SyncLazy`].
+    pub(crate) fn cached_checkout_path(&self, inner: &str) -> Option<&'n str> {
+        match self {
+            Packs::SyncLazy(lazy, _) => lazy.cached_checkout_path(inner),
+            _ => None,
         }
     }
 }
@@ -50,6 +147,18 @@ impl<'a: 'n, 'p: 'a, 'n> From<&'a [PackView<'p>]> for Packs<'n> {
 impl<'n> From<&'n LazyTrees<'n>> for Packs<'n> {
     fn from(lazy: &'n LazyTrees<'n>) -> Packs<'n> {
         Packs::OnFirstRead(lazy)
+    }
+}
+
+impl<'n> From<SharedTrees<'n>> for Packs<'n> {
+    fn from(shared: SharedTrees<'n>) -> Packs<'n> {
+        Packs::Shared(shared)
+    }
+}
+
+impl<'a: 'n, 'f: 'a, 'n> From<(&'a SyncLazyTrees<'f>, &'a bstd::fs::Fs)> for Packs<'n> {
+    fn from((lazy, fs): (&'a SyncLazyTrees<'f>, &'a bstd::fs::Fs)) -> Packs<'n> {
+        Packs::SyncLazy(lazy, fs)
     }
 }
 
@@ -106,6 +215,9 @@ pub(crate) struct JobTexts<'n> {
     /// the frame: [`SourceTexts::proc_macro_unusable`] gives them for the call the solve asks
     /// about just after the run (one job, one thread: the run and the ask are in order).
     pub(crate) run_stopped: core::cell::Cell<Option<&'n str>>,
+    /// Live status board and clock, when running inside `engine_check`: reports active
+    /// Wasmtime proc-macro expansions (`WorkKind::ProcMacro`) while they execute.
+    pub(crate) activity: Option<(&'n crate::engine_status::Board<'n>, &'n bstd::clock::Clock)>,
 }
 
 /// The environments of a job's crates past its one owner ([`JobTexts::envs`]), each made at
@@ -247,12 +359,12 @@ impl<'n> JobTexts<'n> {
             return match error.kind {
                 FsKind::NotFound | FsKind::IsADirectory | FsKind::NotADirectory => Found::Absent,
                 _ => {
-                    let why: &'n bstd::fs::FsError = blaze_own::Box::leak(blaze_own::Box::new_in(error, self.frame));
+                    let why: &'n bstd::fs::FsError = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(error, self.frame));
                     Found::Unknown(Unread { path: held_str(inner, self.frame), why })
                 }
             };
         }
-        let held: &'n Bytes<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(bytes, self.frame));
+        let held: &'n Bytes<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(bytes, self.frame));
         Found::Known(held.as_slice())
     }
 
@@ -263,8 +375,17 @@ impl<'n> JobTexts<'n> {
         let at = Path::new(inner).ok()?;
         let mut bytes = Bytes::new_in(self.frame, "a pool job's checkout files");
         self.root.read_all(self.cx, &at, &mut bytes).ok()?;
-        let held: &'n Bytes<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(bytes, self.frame));
+        let held: &'n Bytes<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(bytes, self.frame));
         Some(held.as_slice())
+    }
+
+    /// Returns the precomputed `FILE_DOMAIN` digest for an already-cached checkout file `inner`,
+    /// skipping when `(0, inner)` is overridden by `self.corrected`.
+    pub(crate) fn checkout_digest(&self, inner: &str) -> Option<blaze_ids::ContentId> {
+        if self.corrected.iter().any(|(t, p, _)| *t == 0 && *p == inner) {
+            return None;
+        }
+        self.packs.checkout_digest(inner)
     }
 }
 
@@ -277,13 +398,17 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
             return Some(text);
         }
         if tree != 0 {
-            return core::str::from_utf8(self.packs.tree(tree)?.find(inner)?.bytes).ok();
+            return self.packs.read_str(self.cx, self.frame, tree, inner);
         }
         if let Some((_, text)) = self.read.borrow().iter().find(|(p, _)| *p == inner) {
             return *text;
         }
-        let text = self.checkout(inner);
-        self.read.borrow_mut().push((held_str(inner, self.frame), text));
+        let (path_held, text) = match self.packs.read_checkout_str(self.cx, self.root, inner) {
+            Some(Ok((cached_path, text))) => (cached_path, text),
+            Some(Err(_)) => (held_str(inner, self.frame), None),
+            None => (held_str(inner, self.frame), self.checkout(inner)),
+        };
+        self.read.borrow_mut().push((path_held, text));
         text
     }
 
@@ -309,11 +434,31 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
             self.unread.borrow_mut().push((unread.path, unread));
             Found::Unknown(unread)
         };
+        if let Some(got) = self.packs.read_checkout(self.cx, self.root, inner) {
+            return match got {
+                Ok((cached_path, entry)) => match entry.as_source(cached_path) {
+                    Found::Known(text) => {
+                        self.read.borrow_mut().push((cached_path, Some(text)));
+                        Found::Known(text)
+                    }
+                    Found::Absent => {
+                        self.read.borrow_mut().push((cached_path, None));
+                        Found::Absent
+                    }
+                    Found::Unknown(unread) => unknown(unread),
+                },
+                Err(error) => {
+                    let why: &'n bstd::sync::OnceError<core::convert::Infallible> =
+                        blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(error, self.frame));
+                    unknown(Unread { path: held_str(inner, self.frame), why })
+                }
+            };
+        }
         let text = match self.checkout_found(inner) {
             Found::Known(bytes) => match core::str::from_utf8(bytes) {
                 Ok(text) => Some(text),
                 Err(error) => {
-                    let why: &'n core::str::Utf8Error = blaze_own::Box::leak(blaze_own::Box::new_in(error, self.frame));
+                    let why: &'n core::str::Utf8Error = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(error, self.frame));
                     return unknown(Unread { path: held_str(inner, self.frame), why });
                 }
             },
@@ -335,13 +480,18 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
         let (tree, inner) = rest.split_once('/')?;
         let tree: usize = tree.parse().ok()?;
         if tree != 0 {
-            return Some(self.packs.tree(tree)?.find(inner)?.bytes);
+            return self.packs.read_slice(self.cx, self.frame, tree, inner);
         }
-        let bytes = self.checkout_bytes(inner);
+        let (path_held, bytes) = match self.packs.read_checkout_bytes(self.cx, self.root, inner) {
+            Some(Ok((cached_path, bytes))) => (cached_path, bytes),
+            Some(Err(_)) => (held_str(inner, self.frame), None),
+            None => (held_str(inner, self.frame), self.checkout_bytes(inner)),
+        };
         let from = from.strip_prefix("/0/").unwrap_or(from);
+        let from_held = self.packs.cached_checkout_path(from).unwrap_or_else(|| held_str(from, self.frame));
         // What the reader was handed, the one read (rule 77: never read twice), so a body's row
         // holds the digest of what it read whichever cell defines the file.
-        self.data.borrow_mut().push((held_str(inner, self.frame), held_str(from, self.frame), bytes));
+        self.data.borrow_mut().push((path_held, from_held, bytes));
         bytes
     }
 
@@ -401,7 +551,15 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
             }
         };
         let Ok((world_at, edition)) = self.caller(krate) else { return Err(refused) };
-        procs.run(world_at, edition, def, call, alloc).map_err(|stopped| {
+        let _active = self.activity.map(|(board, clock)| {
+            let name = procs.crate_name(def).or_else(|| def.proc_name()).unwrap_or("proc-macro");
+            board.show_activity(
+                blaze_screen::WorkKind::ProcMacro,
+                crate::engine_status::Label::of(name),
+                board.now(clock),
+            )
+        });
+        procs.run(self.cx, self.packs, world_at, edition, def, call, alloc).map_err(|stopped| {
             if let Some(error) = &stopped.call {
                 self.run_stopped.set(Some(held_str(&std::format!("{error}"), self.frame)));
             }
@@ -423,7 +581,7 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
             Err(words) => return Some(ProcUnusable::Module(words)),
             Ok(Some(procs)) => match self.caller(krate) {
                 Err(not) => std::format!("{not}"),
-                Ok((world_at, _)) => match procs.unusable(world_at, def) {
+                Ok((world_at, _)) => match procs.unusable(self.cx, self.packs, world_at, def) {
                     Some(words) => words,
                     None => return self.run_stopped.take().map(ProcUnusable::Run),
                 },
@@ -465,6 +623,7 @@ mod tests {
             callers: &[],
             by_need: None,
             run_stopped: core::cell::Cell::new(None),
+            activity: None,
         }
     }
 

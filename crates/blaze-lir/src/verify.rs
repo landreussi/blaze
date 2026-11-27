@@ -21,7 +21,9 @@
 //! head, and so the dominance rule above, unchanged, is what refuses in its output any value
 //! that would cross a poll outside the state.
 
-use std::fmt;
+use alloc::alloc::Allocator;
+use blaze_own::Vec;
+use core::fmt;
 
 use crate::{
     flags::Ordering,
@@ -64,9 +66,9 @@ impl fmt::Display for VerifyError {
     }
 }
 
-impl std::error::Error for VerifyError {}
+impl core::error::Error for VerifyError {}
 
-type Result<T = ()> = std::result::Result<T, VerifyError>;
+type Result<T = ()> = core::result::Result<T, VerifyError>;
 
 fn func(rule: &'static str) -> VerifyError {
     VerifyError { at: At::Func, rule }
@@ -134,9 +136,10 @@ pub struct VerifiedFunc<A: core::alloc::Allocator> {
 }
 
 impl<A: core::alloc::Allocator> VerifiedFunc<A> {
-    /// `func` verified all the way ([`verify`]), or the rule it breaks.
+    /// `func` verified all the way ([`verify_in`], using `func`'s own allocator), or the rule it
+    /// breaks.
     pub fn new(func: crate::Func<A>) -> core::result::Result<VerifiedFunc<A>, VerifyError> {
-        verify(func.view())?;
+        verify_in(func.view(), func.allocator())?;
         Ok(VerifiedFunc { func })
     }
 
@@ -161,12 +164,18 @@ impl<A: core::alloc::Allocator> VerifiedFunc<A> {
     }
 }
 
+/// Checks `view` all the way: [`structure`], then what it means, using `alloc` for scratch.
+/// The answer is the proof ([`Verified`]) every emitter takes.
+pub fn verify_in<A: Allocator>(view: View<'_>, alloc: A) -> core::result::Result<Verified<'_>, VerifyError> {
+    structure(view)?;
+    semantics(&view, &alloc)?;
+    Ok(Verified { view })
+}
+
 /// Checks `view` all the way: [`structure`], then what it means. The answer is the proof
 /// ([`Verified`]) every emitter takes.
 pub fn verify(view: View<'_>) -> core::result::Result<Verified<'_>, VerifyError> {
-    structure(view)?;
-    semantics(&view)?;
-    Ok(Verified { view })
+    verify_in(view, alloc::alloc::Global)
 }
 
 /// Checks what every reader of `view` relies on: lengths, tags, ranges and indices.
@@ -269,7 +278,7 @@ pub fn structure(view: View<'_>) -> Result {
 }
 
 /// Whether `ty` is a type of the encoding whose compound row exists.
-fn check_ty(view: &View<'_>, ty: Ty) -> std::result::Result<(), &'static str> {
+fn check_ty(view: &View<'_>, ty: Ty) -> core::result::Result<(), &'static str> {
     if !ty.is_valid() {
         return Err("a type of no known encoding");
     }
@@ -280,7 +289,7 @@ fn check_ty(view: &View<'_>, ty: Ty) -> std::result::Result<(), &'static str> {
 }
 
 /// Whether one word of an operand names something that exists.
-fn index(view: &View<'_>, word: Word) -> std::result::Result<(), &'static str> {
+fn index(view: &View<'_>, word: Word) -> core::result::Result<(), &'static str> {
     let ok = match word {
         Word::Value(value) => (value as usize) < view.ops.len(),
         Word::Block(block) => (block as usize) < view.block_starts.len(),
@@ -448,7 +457,7 @@ fn structure_tables(view: &View<'_>) -> Result {
         if !within(rec.name_first, rec.name_len, view.names.len()) || rec.sig as usize >= view.sigs.len() {
             return Err(row("intrinsics", r, "a name past `names` or a signature past `sigs`"));
         }
-        if std::str::from_utf8(&view.names[rec.name_first as usize..][..rec.name_len as usize]).is_err() {
+        if core::str::from_utf8(&view.names[rec.name_first as usize..][..rec.name_len as usize]).is_err() {
             return Err(row("intrinsics", r, "a name that is not UTF-8"));
         }
     }
@@ -468,7 +477,7 @@ fn structure_tables(view: &View<'_>) -> Result {
         if rec.options & !options != 0 {
             return Err(row("asms", r, "an option of no known meaning"));
         }
-        if std::str::from_utf8(view.asm_str(rec.clobbers_first, rec.clobbers_len)).is_err() {
+        if core::str::from_utf8(view.asm_str(rec.clobbers_first, rec.clobbers_len)).is_err() {
             return Err(row("asms", r, "clobbers that are not UTF-8"));
         }
         let pieces = &view.asm_pieces[rec.pieces_first as usize..][..rec.pieces_len as usize];
@@ -477,7 +486,7 @@ fn structure_tables(view: &View<'_>) -> Result {
             match piece.kind {
                 AsmPieceRec::TEXT => {
                     if !within(piece.a, piece.b, view.asm_text.len())
-                        || std::str::from_utf8(view.asm_str(piece.a, piece.b)).is_err()
+                        || core::str::from_utf8(view.asm_str(piece.a, piece.b)).is_err()
                     {
                         return Err(row("asms", r, "template text past `asm_text` or not UTF-8"));
                     }
@@ -502,7 +511,7 @@ fn structure_tables(view: &View<'_>) -> Result {
                 return Err(row("asms", r, "an operand of no known kind"));
             };
             if !within(operand.reg_first, operand.reg_len, view.asm_text.len())
-                || std::str::from_utf8(view.asm_str(operand.reg_first, operand.reg_len)).is_err()
+                || core::str::from_utf8(view.asm_str(operand.reg_first, operand.reg_len)).is_err()
                 || operand.class > 1
                 || operand.pad != [0; 2]
             {
@@ -513,7 +522,7 @@ fn structure_tables(view: &View<'_>) -> Result {
             }
         }
     }
-    if std::str::from_utf8(view.features).is_err() {
+    if core::str::from_utf8(view.features).is_err() {
         return Err(func("target features that are not UTF-8"));
     }
     canonical(view)
@@ -560,7 +569,7 @@ fn canonical(view: &View<'_>) -> Result {
                 let regs = view.asm_operands[rec.operands_first as usize..][..rec.operands_len as usize]
                     .iter()
                     .map(|it| (it.reg_first, it.reg_len));
-                pieces.chain(regs).chain(std::iter::once((rec.clobbers_first, rec.clobbers_len)))
+                pieces.chain(regs).chain(core::iter::once((rec.clobbers_first, rec.clobbers_len)))
             });
             tiles(text, view.asm_text.len())
         }),
@@ -699,9 +708,9 @@ pub fn sole_switch_default(view: &View<'_>, block: Block) -> Option<Value> {
 }
 
 /// The block of each instruction, by layout.
-fn block_of(view: &View<'_>) -> Vec<u32> {
-    // alloc: the verifier's scratch, one word per instruction, for one function
-    let mut of = vec![0u32; view.len()];
+fn block_of<'a, A: Allocator>(view: &View<'_>, alloc: &'a A) -> Vec<u32, &'a A> {
+    let mut of = Vec::with_capacity_in(view.len(), alloc);
+    of.resize(view.len(), 0u32);
     for b in 0..view.blocks() {
         for at in view.block(Block(b as u32)) {
             of[at] = b as u32;
@@ -711,41 +720,77 @@ fn block_of(view: &View<'_>) -> Vec<u32> {
 }
 
 /// What [`semantics`] works from: each block's successors and predecessors, and dominators.
-struct Cfg {
+struct Cfg<'a, A: Allocator> {
     /// Per block, its immediate dominator; [`NONE`] for an unreachable block, itself for the
     /// entry.
-    idom: Vec<u32>,
+    idom: Vec<u32, &'a A>,
     /// Per block, how many edges lead to it.
-    preds: Vec<u32>,
+    preds: Vec<u32, &'a A>,
 }
 
-impl Cfg {
-    fn of(view: &View<'_>) -> Cfg {
+impl<'a, A: Allocator> Cfg<'a, A> {
+    fn of(view: &View<'_>, alloc: &'a A) -> Cfg<'a, A> {
         let blocks = view.blocks();
-        // alloc: the verifier's scratch, a few words per block, for one function
-        let mut succs: Vec<Vec<u32>> = vec![Vec::new(); blocks];
-        // alloc: as above
-        let mut preds_of: Vec<Vec<u32>> = vec![Vec::new(); blocks];
-        // alloc: as above
-        let mut preds = vec![0u32; blocks];
+        let mut succ_counts = Vec::with_capacity_in(blocks, alloc);
+        succ_counts.resize(blocks, 0u32);
+        let mut preds = Vec::with_capacity_in(blocks, alloc);
+        preds.resize(blocks, 0u32);
+        let mut total_edges = 0usize;
         for b in 0..blocks {
             edges(view, view.terminator(Block(b as u32)), |edge| {
-                succs[b].push(edge.to.0);
-                preds_of[edge.to.index()].push(b as u32);
+                succ_counts[b] += 1;
                 preds[edge.to.index()] += 1;
+                total_edges += 1;
             });
         }
+        // Flat CSR arrays: zero per-block heap allocations.
+        let mut succ_off = Vec::with_capacity_in(blocks + 1, alloc);
+        let mut pred_off = Vec::with_capacity_in(blocks + 1, alloc);
+        let mut s_acc = 0u32;
+        let mut p_acc = 0u32;
+        for b in 0..blocks {
+            succ_off.push(s_acc);
+            pred_off.push(p_acc);
+            s_acc += succ_counts[b];
+            p_acc += preds[b];
+        }
+        succ_off.push(s_acc);
+        pred_off.push(p_acc);
+
+        let mut succ_cur = Vec::with_capacity_in(blocks, alloc);
+        succ_cur.extend_from_slice(&succ_off[..blocks]);
+        let mut pred_cur = Vec::with_capacity_in(blocks, alloc);
+        pred_cur.extend_from_slice(&pred_off[..blocks]);
+
+        let mut succ_edges = Vec::with_capacity_in(total_edges, alloc);
+        succ_edges.resize(total_edges, 0u32);
+        let mut pred_edges = Vec::with_capacity_in(total_edges, alloc);
+        pred_edges.resize(total_edges, 0u32);
+        for b in 0..blocks {
+            edges(view, view.terminator(Block(b as u32)), |edge| {
+                let si = succ_cur[b] as usize;
+                succ_cur[b] += 1;
+                succ_edges[si] = edge.to.0;
+
+                let to = edge.to.index();
+                let pi = pred_cur[to] as usize;
+                pred_cur[to] += 1;
+                pred_edges[pi] = b as u32;
+            });
+        }
+
         // Reverse postorder from the entry, by an explicit stack.
-        // alloc: as above
-        let mut post = Vec::with_capacity(blocks);
-        // alloc: as above
-        let mut seen = vec![false; blocks];
-        // alloc: as above
-        let mut stack = vec![(0u32, 0usize)];
+        let mut post = Vec::with_capacity_in(blocks, alloc);
+        let mut seen = Vec::with_capacity_in(blocks, alloc);
+        seen.resize(blocks, false);
+        let mut stack = Vec::with_capacity_in(blocks.max(1), alloc);
+        stack.push((0u32, 0usize));
         seen[0] = true;
         while let Some(top) = stack.last_mut() {
             let (b, next) = *top;
-            if let Some(&s) = succs[b as usize].get(next) {
+            let start = succ_off[b as usize] as usize;
+            let end = succ_off[b as usize + 1] as usize;
+            if let Some(&s) = succ_edges[start..end].get(next) {
                 top.1 += 1;
                 if !seen[s as usize] {
                     seen[s as usize] = true;
@@ -756,22 +801,25 @@ impl Cfg {
                 stack.pop();
             }
         }
-        // alloc: as above
-        let mut order = vec![NONE; blocks];
+        let mut order = Vec::with_capacity_in(blocks, alloc);
+        order.resize(blocks, NONE);
         for (i, &b) in post.iter().rev().enumerate() {
             order[b as usize] = i as u32;
         }
         // Cooper, Harvey and Kennedy's iteration, bounded: it settles in at most as many
         // rounds as the graph is deep, so twice the blocks is a bound it never reaches.
-        // alloc: as above
-        let mut idom = vec![NONE; blocks];
+        let mut idom = Vec::with_capacity_in(blocks, alloc);
+        idom.resize(blocks, NONE);
         idom[0] = 0;
-        let rpo: Vec<u32> = post.iter().rev().copied().collect(); // alloc: as above
+        let mut rpo = Vec::with_capacity_in(post.len(), alloc);
+        rpo.extend(post.iter().rev().copied());
         for _ in 0..2 * blocks + 2 {
             let mut changed = false;
             for &b in rpo.iter().skip(1) {
                 let mut new = NONE;
-                for &p in &preds_of[b as usize] {
+                let p_start = pred_off[b as usize] as usize;
+                let p_end = pred_off[b as usize + 1] as usize;
+                for &p in &pred_edges[p_start..p_end] {
                     if idom[p as usize] == NONE {
                         continue;
                     }
@@ -829,7 +877,7 @@ fn intersect(idom: &[u32], order: &[u32], mut a: u32, mut b: u32) -> u32 {
 }
 
 /// Checks what `view`, whose [`structure`] holds, means.
-fn semantics(view: &View<'_>) -> Result {
+fn semantics<A: Allocator>(view: &View<'_>, alloc: &A) -> Result {
     let ptr_int = Ty::int(view.head.ptr_bits).unwrap_or(Ty::I64);
     let own = view.sig(SigId(view.head.sig));
     // Blocks: parameters at the head, one terminator at the end; landing blocks' one
@@ -838,7 +886,7 @@ fn semantics(view: &View<'_>) -> Result {
         let range = view.block(Block(b as u32));
         let params = view.params(Block(b as u32));
         let kind = view.block_kind(Block(b as u32));
-        for at in range.clone() {
+        for at in range.start..range.end {
             let op = view.op(at);
             if op == Op::Param && at >= params.end {
                 return Err(inst(view, at, "a parameter after an instruction of its block"));
@@ -857,14 +905,14 @@ fn semantics(view: &View<'_>) -> Result {
             if kind.is_landing() {
                 return Err(block(0, "an entry block that is a landing block"));
             }
-            let tys = params.clone().map(|at| view.tys[at]);
+            let tys = (params.start..params.end).map(|at| view.tys[at]);
             if !tys.eq(own.params.iter().map(|it| it.ty)) {
                 return Err(block(0, "entry parameters that are not the signature's"));
             }
         }
     }
-    let cfg = Cfg::of(view);
-    let of = block_of(view);
+    let cfg = Cfg::of(view, alloc);
+    let of = block_of(view, alloc);
     // Edges.
     for b in 0..view.blocks() {
         let at = view.terminator(Block(b as u32));
@@ -925,13 +973,13 @@ fn semantics(view: &View<'_>) -> Result {
             Res::Some if ty.is_none() => return Err(inst(view, at, "no result type on an operation that makes one")),
             Res::None | Res::Some | Res::Any => {}
         }
-        types(view, at, op, ty, ptr_int, &own).map_err(|rule| inst(view, at, rule))?;
+        types(view, at, op, ty, ptr_int, &own, alloc).map_err(|rule| inst(view, at, rule))?;
         // Every value used is defined where it dominates the use.
         if !cfg.reachable(of[at]) {
             continue;
         }
         let mut bad = None;
-        let mut visit = |word: Word| -> std::result::Result<(), ()> {
+        let mut visit = |word: Word| -> core::result::Result<(), ()> {
             if let Word::Value(value) = word {
                 if let Some(rule) = dominance(view, &cfg, &of, value as usize, at) {
                     bad = Some(rule);
@@ -961,7 +1009,7 @@ fn semantics(view: &View<'_>) -> Result {
 
 /// Why the use of `value` at instruction `at` is not dominated by its definition, if it is
 /// not.
-fn dominance(view: &View<'_>, cfg: &Cfg, of: &[u32], value: usize, at: usize) -> Option<&'static str> {
+fn dominance<A: Allocator>(view: &View<'_>, cfg: &Cfg<'_, A>, of: &[u32], value: usize, at: usize) -> Option<&'static str> {
     if view.ty(Value(value as u32)).is_none() {
         return Some("a use of an instruction that makes no value");
     }
@@ -1002,14 +1050,15 @@ fn is_float_ty(ty: Ty) -> bool {
 }
 
 /// Checks the types of instruction `at`'s operands and result.
-fn types(
+fn types<A: Allocator>(
     view: &View<'_>,
     at: usize,
     op: Op,
     ty: Ty,
     ptr_int: Ty,
     own: &crate::func::Sig<'_>,
-) -> std::result::Result<(), &'static str> {
+    alloc: &A,
+) -> core::result::Result<(), &'static str> {
     let mut o = view.operands(at);
     let t = |v: Value| view.ty(v);
     let need = |ok: bool, rule: &'static str| if ok { Ok(()) } else { Err(rule) };
@@ -1311,7 +1360,7 @@ fn types(
             need(s.is_scalar() && s.is_int(), "a switch on a value that is not a scalar integer")?;
             o.target();
             let bits = s.bits(ptr_bits);
-            let mut seen: Vec<u128> = Vec::new(); // alloc: the verifier's scratch, one switch's cases
+            let mut seen: Vec<u128, &A> = Vec::new_in(alloc);
             for (words, _) in o.cases(scrutinee) {
                 let value = words.iter().rev().fold(0u128, |all, &w| (all << 32) | w as u128);
                 need(bits >= 128 || value >> bits == 0, "a case value with bits past its scrutinee's width")?;
@@ -1343,7 +1392,7 @@ fn types(
 }
 
 /// Whether `args` are what `sig` takes: its parameters, and past them for a variadic one.
-fn arguments(view: &View<'_>, sig: SigId, args: Values<'_>) -> std::result::Result<(), &'static str> {
+fn arguments(view: &View<'_>, sig: SigId, args: Values<'_>) -> core::result::Result<(), &'static str> {
     let sig = view.sig(sig);
     let variadic = sig.bits & SigRec::VARIADIC != 0;
     let count_ok = match variadic {

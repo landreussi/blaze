@@ -44,6 +44,7 @@
 //!
 //! The crate is a sans-IO core: it reads no clock, file or thread.
 
+#![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
@@ -51,6 +52,8 @@
 #![deny(blaze::sans_io_core)]
 
 /// LIR's integer arithmetic, one home: what the evaluator runs and the simplify stage folds by.
+
+extern crate alloc;
 mod arith;
 /// Bodies by identity and what a direct call reaches: the evaluator's and the inliner's seam.
 pub mod body;
@@ -94,9 +97,15 @@ pub use func::{Block, BlockKind, Func, Head, Value, View};
 pub use op::{End, Field, Info, Layout, Op, Operands, Res};
 pub use parse::{ParseError, parse};
 pub use print::print;
-pub use simplify::egraph;
+pub use simplify::{
+    amac, bce, bce_hoist, coldsplit, coro_opt, devirt, egraph, escape, gemm, ifconv, jump_thread, loopnest,
+    mach_egraph, memopt, modulo_sched, prefetch, rvsdg, sched, semproof, simd_idioms, slp, soa, speculate, superopt,
+    taildup, thread_jumps, unroll, unswitch, vectorize,
+};
+#[cfg(any(test, feature = "eval"))]
+pub use simplify::validate;
 pub use ty::{Scalar, Ty};
-pub use verify::{Verified, VerifiedFunc, VerifyError, verify};
+pub use verify::{Verified, VerifiedFunc, VerifyError, verify, verify_in};
 
 /// The version of what LIR's bytes mean: its operations, their operands and flags, its types
 /// and tables. Part of the record's schema ([`persist::SCHEMA`]) and of every key of a LIR, so

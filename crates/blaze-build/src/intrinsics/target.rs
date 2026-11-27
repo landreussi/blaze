@@ -31,12 +31,14 @@ use blaze_lir::{Builder, Full, Op, Ty, Value};
 
 use crate::BuildError;
 
+pub mod crc32;
 pub mod float;
 #[cfg(test)]
 mod float_tests;
 pub mod neon;
 #[cfg(test)]
 mod neon_tests;
+pub mod pmull;
 pub mod sha2;
 #[cfg(test)]
 mod sha2_tests;
@@ -67,6 +69,12 @@ pub enum Target {
     /// `llvm.aarch64.crypto.sha256{h,h2,su0,su1}` and `llvm.aarch64.crypto.sha512{h,h2,su0,su1}`
     /// of target/sha2.rs: LIR scalar operations on the lanes, no `target_intrinsic`.
     Sha2(sha2::Sha2Fn),
+    /// `llvm.aarch64.crc32{b,h,w,x}` and `llvm.aarch64.crc32c{b,h,w,x}` of target/crc32.rs:
+    /// branchless LIR scalar operations, no `target_intrinsic`.
+    Crc32(crc32::Crc32Fn),
+    /// `llvm.aarch64.neon.pmull64` and `llvm.aarch64.neon.pmull.v8i16` of target/pmull.rs:
+    /// branchless LIR scalar operations, no `target_intrinsic`.
+    Pmull(pmull::PmullFn),
     /// `llvm.aarch64.isb`: instruction synchronization barrier, `isb #imm`.
     Aarch64Isb,
     /// `llvm.aarch64.dmb`: data memory barrier, `dmb #imm`.
@@ -75,6 +83,10 @@ pub enum Target {
     Aarch64Dsb,
     /// `llvm.aarch64.hint`: a hint instruction, `hint #imm` (`yield` is `hint #1`).
     Aarch64Hint,
+    /// `llvm.wasm.memory.grow.i64`: WebAssembly `memory64` `memory.grow` `(mem: u32, pages: usize) -> usize`.
+    Wasm64MemoryGrow,
+    /// `llvm.wasm.memory.size.i64`: WebAssembly `memory64` `memory.size` `(mem: u32) -> usize`.
+    Wasm64MemorySize,
 }
 
 /// Every barrier and hint, in declaration order (the float functions are target/float.rs's
@@ -136,6 +148,18 @@ pub fn named(link_name: &str) -> Result<Target, UnknownTarget> {
     if let Some(f) = sha2::named(link_name) {
         return Ok(Target::Sha2(f));
     }
+    if let Some(f) = crc32::named(link_name) {
+        return Ok(Target::Crc32(f));
+    }
+    if let Some(f) = pmull::named(link_name) {
+        return Ok(Target::Pmull(f));
+    }
+    if link_name == "llvm.wasm.memory.grow.i64" {
+        return Ok(Target::Wasm64MemoryGrow);
+    }
+    if link_name == "llvm.wasm.memory.size.i64" {
+        return Ok(Target::Wasm64MemorySize);
+    }
     ALL.iter().copied().find(|t| t.link_name() == link_name).ok_or_else(|| UnknownTarget::of(link_name))
 }
 
@@ -147,10 +171,14 @@ impl Target {
             Target::Aarch64Dmb => "llvm.aarch64.dmb",
             Target::Aarch64Dsb => "llvm.aarch64.dsb",
             Target::Aarch64Hint => "llvm.aarch64.hint",
+            Target::Wasm64MemoryGrow => "llvm.wasm.memory.grow.i64",
+            Target::Wasm64MemorySize => "llvm.wasm.memory.size.i64",
             Target::Float(call) => call.link_name(),
             Target::Neon(call) => call.link_name(),
             Target::Sha3(call) => call.link_name(),
             Target::Sha2(f) => f.link_name(),
+            Target::Crc32(f) => f.link_name(),
+            Target::Pmull(f) => f.link_name(),
         }
     }
 }
@@ -173,8 +201,11 @@ pub fn build<A: Allocator + Clone>(b: &mut Builder<A, Full>, t: Target, imm: Val
         Target::Sha3(_) => {
             return Err(BuildError::Target { target: t, expr: None, why: "a SHA3 function built as a barrier (a build bug)" });
         }
-        Target::Sha2(_) => {
-            return Err(BuildError::Target { target: t, expr: None, why: "a SHA-2 function built as a barrier (a build bug)" });
+        Target::Sha2(_) | Target::Crc32(_) | Target::Pmull(_) => {
+            return Err(BuildError::Target { target: t, expr: None, why: "a crypto/CRC/PMULL function built as a barrier (a build bug)" });
+        }
+        Target::Wasm64MemoryGrow | Target::Wasm64MemorySize => {
+            return Err(BuildError::Target { target: t, expr: None, why: "a wasm64 memory intrinsic built as a barrier (a build bug)" });
         }
         Target::Aarch64Isb | Target::Aarch64Dmb | Target::Aarch64Dsb | Target::Aarch64Hint => {}
     }

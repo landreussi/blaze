@@ -528,11 +528,11 @@ fn cost_of_one_body() {
 
     let start = Instant::now();
     let kept = {
-        let names = inputs.resolve(&crates, g).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
         let mut kept = Kept { names: Vec::new(), items: Vec::new(), files: Vec::new(), expansions: Vec::new(), origins: Vec::new() };
         for c in names.crates().iter() {
-            kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), g));
-            kept.items.push(aligned(&items_record::encode_with(c, &names, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), g));
+            kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
+            kept.items.push(aligned(&items_record::encode_with(c, &names, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
             kept.files.push(c.files.iter().map(|f| (f.package.as_str().to_string(), leak(f.text))).collect());
             kept.expansions.push(c.expansions.iter().filter_map(|(call, e)| e.made.map(|m| (*call, leak(m.text)))).collect());
             kept.origins.push(c.expansions.iter().filter_map(|(call, e)| e.made.as_ref().map(|m| (*call, made_origins(*call, &m.origins)))).collect());
@@ -618,7 +618,7 @@ fn cost_of_one_body() {
     let mut all_reads: HashMap<ItemKey, Vec<String>> = HashMap::new();
     let start = Instant::now();
     for (key, _) in bodies.iter() {
-        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::All, heads: None, sources: None, goals: None, census: None };
+        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::All, heads: None, sources: None, goals: None, prepared: None, front: None };
         let (before, b0, t0) = (cost.spent(), BYTES.load(Ordering::Relaxed), Instant::now());
         let out = check_body(view, &task_of(*key), &body_frame, &NameMake, shared).unwrap_or_else(|e| panic!("the body task of {key:x}: {e}"));
         let us = t0.elapsed().as_micros() as u64;
@@ -682,7 +682,7 @@ fn cost_of_one_body() {
     let mut differ: Vec<String> = Vec::new();
     let mut reads_differ: Vec<String> = Vec::new();
     for (key, bytes, reads) in kept_outs.iter() {
-        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::First, heads: None, sources: None, goals: None, census: None };
+        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::First, heads: None, sources: None, goals: None, prepared: None, front: None };
         let out = check_body(view, &task_of(*key), &body_frame, &NameMake, shared).unwrap_or_else(|e| panic!("the body task of {key:x}: {e}"));
         let label = NamesSource::name_of(task_records, *key).unwrap_or("?");
         if out.bytes.as_slice() != bytes.as_slice() {
@@ -717,7 +717,7 @@ fn cost_of_one_body() {
         let mut differ: Vec<String> = Vec::new();
         let mut per_body: Vec<(String, usize)> = Vec::new();
         for (key, bytes, _) in order {
-            let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::All, heads: None, sources: None, goals: Some(table), census: None };
+            let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::All, heads: None, sources: None, goals: Some(table), prepared: None, front: None };
             let out = check_body(view, &task_of(*key), &body_frame, &NameMake, shared).unwrap_or_else(|e| panic!("the body task of {key:x}: {e}"));
             let label = NamesSource::name_of(task_records, *key).unwrap_or("?").to_string();
             if out.bytes.as_slice() != bytes.as_slice() {
@@ -756,7 +756,7 @@ fn cost_of_one_body() {
     // program's index and no prepared macros, as a `ProjectWorld` sets it up.
     let const_world: &'static ProjectWorld<'static, &'static Records<'static>> =
         Box::leak(Box::new(ProjectWorld::from_records(freeze_records, frame(), lang, g).unwrap_or_else(|e| panic!("the world did not start: {e}"))));
-    let prepared: &'static Prepares<'static> = Prepares::new_in(g);
+    let prepared: &'static Prepares<'static> = Prepares::new_in(blaze_own::testing::bump());
     let evaluator: &'static mut (dyn ConstValues<'static> + 'static) = Box::leak(Box::new(StoreConsts { names: freeze_records, index: &const_world.front.index, prepared }));
     let start = Instant::now();
     let freezing: &'static Freezing<'static, 'static, &'static Records<'static>> = Box::leak(Box::new(Freezing::new(
@@ -767,7 +767,7 @@ fn cost_of_one_body() {
     // type: counted with its reason, and left out of the seeded run.
     let mut refused: HashMap<ItemKey, String> = HashMap::new();
     for (key, _, _) in kept_outs.iter() {
-        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::All, heads: Some(freezing), sources: None, goals: None, census: None };
+        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::All, heads: Some(freezing), sources: None, goals: None, prepared: None, front: None };
         if let Err(e) = check_body(view, &task_of(*key), &body_frame, &NameMake, shared) {
             let label = NamesSource::name_of(task_records, *key).unwrap_or("?");
             note!("SEED REFUSED `{label}`: {e}");
@@ -798,7 +798,7 @@ fn cost_of_one_body() {
     // `Part::Heads` entries) and its impl questions filed (`Part::Impls` entries), its name.
     let mut per_body: Vec<(u64, u64, u64, String)> = Vec::new();
     for (key, bytes, _) in kept_outs.iter().filter(|(k, _, _)| !refused.contains_key(k)) {
-        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::All, heads: Some(table), sources: None, goals: None, census: None };
+        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::All, heads: Some(table), sources: None, goals: None, prepared: None, front: None };
         let (before, t0) = (cost.spent(), Instant::now());
         let out = check_body(view, &task_of(*key), &body_frame, &NameMake, shared).unwrap_or_else(|e| panic!("seeded, the body task of {key:x}: {e}"));
         let spent = cost.spent().since(&before);

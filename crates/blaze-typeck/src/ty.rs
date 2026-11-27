@@ -3,7 +3,7 @@
 //! The tests implement them over a toy type language (`crate::toy`).
 
 use crate::error::{CheckError, Stop};
-use crate::ids::{ExprId, FloatTy, FnPtrHeader, IntTy, ItemKey, Mutbl, Name, PatId, UintTy};
+use crate::ids::{ExprId, FloatTy, FnPtrHeader, IntTy, ItemKey, Mutbl, Name, PatId, RecordSchema, UintTy};
 use crate::world::{Reads, World};
 
 /// A type: a 4-byte handle into the context's tables. Becomes blaze-ty's `Ty`.
@@ -70,14 +70,17 @@ pub enum TyView {
     Str,
     Never,
     Tuple(TyList),
+    Record(RecordSchema, TyList),
+    Union(TyList),
     Ref(Mutbl, Ty),
     Ptr(Mutbl, Ty),
     /// `[elem; len]`: `len` a const term of type `usize` (`ConstValue`, `ConstParam`,
     /// `ConstInfer`).
     Array(Ty, Ty),
     Slice(Ty),
-    /// A pattern type `base is PAT`: `PNode::Pat`'s view, its ranges `ConstValue` terms in
-    /// pairs. Opaque to the checker: no coercion, deref, field or method reaches the base.
+    /// A pattern type `base is PAT`: `PNode::Pat`'s view, holding either canonical range
+    /// `ConstValue` pairs or a finite const value-set (`Never` tag + sorted `u128` member
+    /// digests). Opaque to the checker: no coercion, deref, field or method reaches the base.
     Pat(Ty, TyList),
     Adt(ItemKey, TyList),
     FnDef(ItemKey, TyList),
@@ -148,6 +151,8 @@ pub enum Goal {
     WellFormed(Ty),
     /// The `where const` condition `cond` holds at `args` (`PClause::Const`).
     ConstHolds { cond: ItemKey, args: TyList },
+    /// `for<F in fields(container)> F: trait_<args...>` (`PClause::ForFields`; `args` = args after `Self`).
+    ForFields { container: Ty, trait_: ItemKey, args: TyList },
 }
 
 /// Where an obligation came from, for its error.
@@ -367,6 +372,18 @@ pub trait TypeCtx {
     /// Supply the inferred call kind and the stored capture types. A missing tuple
     /// means the binding rows did not establish the precise captured places.
     fn settle_closure(&mut self, closure: ExprId, kind: ClosureKind, upvars: Option<Ty>) -> Result<(), CheckError>;
+
+    /// Whether every callable trait obligation on `closure` in this body is a by-value
+    /// `FnOnce` / `AsyncFnOnce` obligation (at least one such obligation, and zero `Fn`, `FnMut`,
+    /// `AsyncFn`, or `AsyncFnMut` obligations). When true, an `async` closure's future is
+    /// strictly the owning `CallOnceFuture` storing its captures by value, never a borrowing
+    /// `CallRefFuture`.
+    fn closure_used_only_once(
+        &mut self,
+        closure: ExprId,
+        once_traits: [Option<ItemKey>; 2],
+        ref_traits: [Option<ItemKey>; 4],
+    ) -> bool;
 }
 
 /// A closure's kind (`rustc_type_ir::ClosureKind`), weakest trait first.

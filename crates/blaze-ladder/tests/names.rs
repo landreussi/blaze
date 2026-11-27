@@ -29,12 +29,12 @@ fn his_main_names_bstds_and_cores_items() {
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let root = names.root(0);
     // (path, namespace, the crate its definition is in, its name, its kind when not `Other`).
     let expected: [(&str, Namespace, &str, Option<&str>, Option<DefKind>); 5] = [
         ("Cx", Namespace::Types, "bstd", Some("Cx"), None),
-        ("Io", Namespace::Types, "bstd", Some("Io"), None),
+        ("Out", Namespace::Types, "bstd", Some("Out"), None),
         ("Error", Namespace::Types, "bstd", Some("Error"), None),
         ("Result", Namespace::Types, "core", Some("Result"), Some(DefKind::Enum)),
         // A variant has no item text of its own: its crate is what is checked.

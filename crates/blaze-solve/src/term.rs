@@ -408,6 +408,10 @@ pub enum TyKind {
     Str,
     Never,
     Tuple(List),
+    /// A structural record: canonical schema hash of sorted field names, and sorted field types.
+    Record(u64, List),
+    /// A structural tagged union: canonical member types.
+    Union(List),
     /// Region, pointee.
     Ref(Ty, Ty, Mutbl),
     RawPtr(Ty, Mutbl),
@@ -451,6 +455,10 @@ pub enum TyKind {
     ReStatic,
     ReParam(u32),
     ReErased,
+    /// A region bound by an enclosing `for<..>` binder: De Bruijn index, var.
+    ReBound(u32, u32),
+    /// A universally quantified region from a `for<..>` goal: universe, index.
+    RePlaceholder(u32, u32),
     // Consts.
     /// A value of a const generic: its type and its bits, little-endian as consteval writes them.
     ConstValue(ValTy, u128),
@@ -595,6 +603,10 @@ pub enum Pred {
     /// argument is ground (`Facts::const_holds`); ambiguous while one is an inference variable;
     /// never decided over a generic parameter; never proves two impls disjoint (coherence).
     ConstHolds { cond: Def, args: List },
+    /// `for<F in fields(container)> F: trait_<args_after_self...>`: every field type `F` of the
+    /// product type `container` (struct ADT, structural record, or tuple) implements
+    /// `trait_<args_after_self...>`, or the bound is assumed in the param env.
+    ForFields { container: Ty, trait_: Def, args_after_self: List },
     /// The const `ct` has type `ty`.
     ConstArgHasType { ct: Ty, ty: Ty },
     /// Internal to a probe: unify `a` and `b` now (never canonicalized, never a query).
@@ -731,6 +743,15 @@ pub enum Lang {
     CallOnceFuture,
     /// `AsyncFnMut::CallRefFuture` (`call_ref_future`).
     CallRefFuture,
+    /// The trait `From` (`from` / `core::convert::From`), for error-union conversions.
+    From,
+    /// Compiler-builtin marker trait satisfied by every `enum` ADT (`#[lang = "blaze_enum"]`).
+    Enum,
+    /// Compiler-builtin marker trait satisfied by every fieldless `enum` ADT (`#[lang = "blaze_unit_enum"]`).
+    UnitEnum,
+    /// `core::any::TryAsDynCompatible` (`#[lang = "try_as_dyn"]`): implemented for `dyn Trait + 'a`
+    /// without associated type bounds.
+    TryAsDyn,
 }
 
 /// The shape of a self type impls are bucketed by (rustc's `SimplifiedType`, blaze-impls'
@@ -747,6 +768,8 @@ pub enum Shape {
     Str,
     Never,
     Tuple(u32),
+    Record(u64, u32),
+    Union(u32),
     Ref(Mutbl),
     Ptr(Mutbl),
     Array,
@@ -779,6 +802,8 @@ pub fn shape_of_kind(k: TyKind) -> Option<Shape> {
         TyKind::Str => Shape::Str,
         TyKind::Never => Shape::Never,
         TyKind::Tuple(l) => Shape::Tuple(l.len),
+        TyKind::Record(s, l) => Shape::Record(s, l.len),
+        TyKind::Union(l) => Shape::Union(l.len),
         TyKind::Ref(_, _, m) => Shape::Ref(m),
         TyKind::RawPtr(_, m) => Shape::Ptr(m),
         TyKind::Array(..) => Shape::Array,
@@ -803,6 +828,8 @@ pub fn shape_of_kind(k: TyKind) -> Option<Shape> {
         | TyKind::ReStatic
         | TyKind::ReParam(_)
         | TyKind::ReErased
+        | TyKind::ReBound(..)
+        | TyKind::RePlaceholder(..)
         | TyKind::ConstValue(..)
         | TyKind::ConstParam(_)
         | TyKind::ExTrait(..)
@@ -815,7 +842,12 @@ pub fn shape_of_kind(k: TyKind) -> Option<Shape> {
 pub fn is_region(k: TyKind) -> bool {
     matches!(
         k,
-        TyKind::ReStatic | TyKind::ReParam(_) | TyKind::ReErased | TyKind::Infer(Var { kind: VarKind::Region, .. })
+        TyKind::ReStatic
+            | TyKind::ReParam(_)
+            | TyKind::ReErased
+            | TyKind::ReBound(..)
+            | TyKind::RePlaceholder(..)
+            | TyKind::Infer(Var { kind: VarKind::Region, .. })
     )
 }
 
@@ -839,6 +871,8 @@ pub enum Children {
 pub fn children(k: TyKind) -> Children {
     match k {
         TyKind::Tuple(l)
+        | TyKind::Record(_, l)
+        | TyKind::Union(l)
         | TyKind::Adt(_, l)
         | TyKind::FnDef(_, l)
         | TyKind::FnPtr(l, _)
@@ -869,6 +903,8 @@ pub fn children(k: TyKind) -> Children {
         | TyKind::ReStatic
         | TyKind::ReParam(_)
         | TyKind::ReErased
+        | TyKind::ReBound(..)
+        | TyKind::RePlaceholder(..)
         | TyKind::ConstValue(..)
         | TyKind::ConstParam(_)
         | TyKind::ExAuto(_) => Children::None,

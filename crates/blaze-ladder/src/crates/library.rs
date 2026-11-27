@@ -9,12 +9,12 @@
 //! is part of what the library was resolved under): another is refused by name
 //! (`ApartError::Differs`), never resolved over the wrong library.
 
-use blaze_own::Alloc;
+use blaze_own::Bump;
 use blaze_scope::apart::{Apart, ApartError};
 use blaze_scope::resolve::{CrateInput, Names};
 use blaze_scope::task::{First, Serial};
 
-use super::{Inputs, Texts, Toolchain, UserCrate};
+use super::{Inputs, Shared, Texts, Toolchain, UserCrate};
 
 /// Every toolchain unit's names, and the inputs they were resolved from.
 pub struct Library<'t> {
@@ -26,9 +26,9 @@ impl<'t> Library<'t> {
     /// The names of every crate of `crates` (`inputs.crates()`) but the program's (index 0),
     /// on this thread (`Serial`: no thread is started). `inputs`' program crate is a stand-in:
     /// its name and edition are read, its files are not.
-    /// The names are held in `alloc`, the caller's, alive as long as the library.
-    pub fn solve(inputs: &'t Inputs<'t>, crates: &[CrateInput<'t>], alloc: Alloc<'t>) -> Result<Library<'t>, ApartError<'t>> {
-        let apart = Apart::solve(crates, 0, inputs.sysroot, &inputs.texts, &Serial, First::Prefetch, alloc)?;
+    /// The names are held in `bump`, the caller's arena, alive as long as the library.
+    pub fn solve(inputs: &'t Inputs<'t>, crates: &[CrateInput<'t>], bump: Bump<'t>) -> Result<Library<'t>, ApartError<'t>> {
+        let apart = Apart::solve(crates, 0, inputs.sysroot, &inputs.texts, &Serial, First::Prefetch, bump)?;
         Ok(Library { inputs, apart })
     }
 
@@ -42,10 +42,10 @@ impl<'t> Library<'t> {
     pub fn inputs_for(&self, user: &'t UserCrate<'t>) -> Inputs<'t> {
         let of = self.inputs;
         Inputs {
-            texts: Texts { user: user.files, packs: of.texts.packs.clone() },
-            features: of.features.clone(),
-            cfgs: of.cfgs.clone(),
-            deps: of.deps.clone(),
+            texts: Texts { user: user.files, packs: Shared::Borrowed(&of.texts.packs), arena: of.texts.arena },
+            features: Shared::Borrowed(&of.features),
+            cfgs: Shared::Borrowed(&of.cfgs),
+            deps: Shared::Borrowed(&of.deps),
             user,
             tc: of.tc,
             sysroot: of.sysroot,

@@ -15,11 +15,11 @@ fn a_shelf_is_sized_by_its_machine() {
     assert_eq!(ShelfSize::for_threads(1), ShelfSize::MOST);
     assert_eq!(ShelfSize::for_threads(8), ShelfSize::MOST, "the 8-thread figure is today's");
     let wide = ShelfSize::for_threads(128);
-    assert_eq!(wide, ShelfSize { chunks: 1, spans: 1 });
-    assert!(128 * wide.bytes() <= 512 << 20, "128 threads keep {} bytes warm at most", 128 * wide.bytes());
+    assert_eq!(wide, ShelfSize { chunks: 2, spans: 2 });
+    assert!(128 * wide.bytes() <= 1024 << 20, "128 threads keep {} bytes warm at most", 128 * wide.bytes());
     for threads in 1..=512 {
         let size = ShelfSize::for_threads(threads);
-        assert!(size.chunks >= 1 && size.spans >= 1 && size.chunks <= SHELF && size.spans <= SPANS);
+        assert!(size.chunks >= 2 && size.spans >= 2 && size.chunks <= SHELF && size.spans <= SPANS);
         assert!(ShelfSize::for_threads(threads + 1).bytes() <= size.bytes(), "more threads never keep more each");
         if (8..=64).contains(&threads) {
             assert!(threads * size.bytes() <= WARM_ALL, "{threads} threads share the machine's budget");
@@ -27,12 +27,12 @@ fn a_shelf_is_sized_by_its_machine() {
     }
 }
 
-/// A task of 64 allocations of 100 KiB, in chunks: about four chunks' worth, given back as it
+/// A task of 100 allocations of 100 KiB, in chunks: about six chunks' worth, given back as it
 /// ends; then what its thread keeps warm, trimmed after.
 fn busy_then_spare() -> usize {
     for _ in 0..2 {
         task(Tag::Codegen, |frame| {
-            for _ in 0..64 {
+            for _ in 0..100 {
                 frame.alloc_slice_fill_with(100 << 10, |i| i as u8);
             }
         });
@@ -43,7 +43,7 @@ fn busy_then_spare() -> usize {
 }
 
 /// Sixteen threads stand for a 128-thread machine's: each sized as one of its workers keeps at
-/// most one chunk and one span warm, so the machine's idle frames are under 512 MiB. The cause,
+/// most two chunks and two spans warm, so the machine's idle frames are under 1 GiB. The cause,
 /// tested by removing it: a thread handed no size (today's shelf) keeps more than that bound
 /// after the same work, and one sized for eight threads keeps exactly what today's does.
 #[test]
@@ -62,7 +62,7 @@ fn a_128_thread_machine_keeps_its_idle_frames_under_its_bound() {
         .max()
         .unwrap_or(0);
     assert!(most <= wide.bytes(), "a 128-thread machine's worker keeps {most} bytes warm, past {}", wide.bytes());
-    assert!(128 * most <= 512 << 20);
+    assert!(128 * most <= 1024 << 20);
     let today = thread::spawn(busy_then_spare).join().expect("the control's thread");
     assert!(today > wide.bytes(), "the control: an unsized shelf keeps {today} bytes, no more than a sized one's {}", wide.bytes());
     assert!(today <= WARM);
@@ -101,4 +101,34 @@ fn spans_past_a_shelf_go_to_the_bounded_pool() {
     })
     .join()
     .expect("the spans' thread");
+}
+
+/// Non-task frames (`Frame::new`) reuse spans through the process's span pool, and cooling the
+/// span pool sheds committed pages down to one granule per span without issuing `munmap`.
+#[test]
+fn non_task_frames_reuse_pooled_spans_and_cool_without_munmap() {
+    use super::{Frame, cool_span_pool, trim_span_pool};
+
+    // Warm one 3 MiB span via a non-task frame and release it into the pool.
+    {
+        let frame = Frame::new(Tag::Other).expect("non-task frame");
+        let big = frame.alloc_slice_fill_with(3 << 20, |i| i as u8);
+        assert_eq!(big[(3 << 20) - 1], ((3 << 20) - 1) as u8);
+    }
+    assert!(pooled_span_bytes() > 0, "non-task frame returned its span to the pool");
+    assert!(pooled_span_bytes() <= SPAN_POOL * SPAN_WARM);
+
+    // Cooling sheds committed bytes to one granule per span without unmapping.
+    let before_cool = pooled_span_bytes();
+    cool_span_pool();
+    let after_cool = pooled_span_bytes();
+    assert!(after_cool > 0 && after_cool < before_cool, "cool reduced {before_cool} -> {after_cool}");
+
+    // A second non-task frame reuses the cooled span cleanly.
+    {
+        let frame = Frame::new(Tag::Other).expect("second non-task frame");
+        let big = frame.alloc_slice_fill_with(3 << 20, |i| (i.wrapping_mul(3)) as u8);
+        assert_eq!(big[(3 << 20) - 1], (((3usize << 20) - 1).wrapping_mul(3)) as u8);
+    }
+    trim_span_pool();
 }

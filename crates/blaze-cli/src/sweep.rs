@@ -42,20 +42,193 @@ pub(crate) const EXECUTOR_FILE: &str = "/blaze/facts/executor";
 /// The command reads the pins once, however many question files share them. These are the
 /// same pins used by ScriptSetup::open before a script can receive a successful reply.
 #[derive(Default)]
-struct FactFiles {
+struct FactFiles<'a> {
     setting: Option<blaze_proc_macro::spawn_route::SpawnSetting>,
+    exe_dir: Option<&'a str>,
+    home: Option<(&'a Cx, &'a Dir<ReadWrite>)>,
+    /// Host `$HOME` path string (for computing the Nix runtime closure identity on NixOS when a
+    /// `cc-probe` leaf row is followed).
+    home_path: Option<&'a str>,
+    /// Lazy active SDK identity digest (`facts::sdk_id_digest`): resolved at most once when a
+    /// `cc-probe` leaf row is actually followed (zero overhead on pure-Rust workspaces). Real
+    /// SDK resolution failures propagate as `Err(CliError)` instead of substituting an empty SDK.
+    sdk_digest: Option<&'a dyn Fn() -> Result<[u8; 32], CliError>>,
+    cached_sdk: Option<[u8; 32]>,
+    #[cfg(target_os = "linux")]
+    root_reader: Option<bstd::procs::hermetic::RootReader>,
 }
 
-impl FactFiles {
+/// Reads a sealed `c-probe/<64-hex>` record from the command's `.blaze` home capability after
+/// verifying the subject's `(answerer, clang, sdk)` against the active command's hermetic answerer
+/// (including the Nix runtime closure on NixOS), `pins/clang.json` host pin, and active SDK
+/// identity, capping on-disk size before allocating.
+fn read_c_probe_reply(
+    home: Option<(&Cx, &Dir<ReadWrite>)>,
+    parsed: blaze_build_script::facts::CcProbeSubject,
+    key_hex: &str,
+    active_answerer: &ContentId,
+    active_sdk: &[u8; 32],
+    alloc: blaze_own::Alloc<'_>,
+) -> Result<ContentId, CliError> {
+    let Some(active_pin) = blaze_proc_macro::probe_clang::active_clang_pin(crate::graph::TRIPLE) else {
+        return Ok(crate::engine_script_reads::NONE);
+    };
+    read_c_probe_reply_with(home, parsed, key_hex, active_answerer, &active_pin, active_sdk, alloc)
+}
+
+fn read_c_probe_reply_with(
+    home: Option<(&Cx, &Dir<ReadWrite>)>,
+    parsed: blaze_build_script::facts::CcProbeSubject,
+    key_hex: &str,
+    active_answerer: &ContentId,
+    active_pin: &[u8; 32],
+    active_sdk: &[u8; 32],
+    alloc: blaze_own::Alloc<'_>,
+) -> Result<ContentId, CliError> {
+    if parsed.answerer != *active_answerer || parsed.clang != *active_pin || parsed.sdk != *active_sdk {
+        return Ok(crate::engine_script_reads::NONE);
+    }
+    let Some((cx, dir)) = home else {
+        return Ok(crate::engine_script_reads::NONE);
+    };
+    const PREFIX: &[u8] = b"v2/build-script/records/c-probe/";
+    if key_hex.len() != 64 || !key_hex.is_ascii() {
+        return Ok(crate::engine_script_reads::NONE);
+    }
+    let mut path_buf = [0u8; PREFIX.len() + 64];
+    path_buf[..PREFIX.len()].copy_from_slice(PREFIX);
+    path_buf[PREFIX.len()..].copy_from_slice(key_hex.as_bytes());
+    let Ok(path_str) = core::str::from_utf8(&path_buf) else {
+        return Ok(crate::engine_script_reads::NONE);
+    };
+    let Ok(rel) = Path::new(path_str) else {
+        return Ok(crate::engine_script_reads::NONE);
+    };
+    let file = match dir.open_read(cx, &rel) {
+        Ok(file) => file,
+        Err(error) if error.kind == FsKind::NotFound => return Ok(crate::engine_script_reads::NONE),
+        Err(error) => return Err(CliError::Fs(error)),
+    };
+    let len_u64 = match file.len(cx) {
+        Ok(len) => len,
+        Err(error) if error.kind == FsKind::NotFound => return Ok(crate::engine_script_reads::NONE),
+        Err(error) => return Err(CliError::Fs(error)),
+    };
+    if len_u64 > blaze_proc_macro::probe_clang::MAX_RECORD_BYTES {
+        return Ok(crate::engine_script_reads::NONE);
+    }
+    let Ok(len) = usize::try_from(len_u64) else {
+        return Ok(crate::engine_script_reads::NONE);
+    };
+    let mut raw = blaze_own::AVec::new_in(alloc);
+    raw.resize(len, 0u8);
+    // Accumulate until `len` bytes or a zero-length read proves EOF so short positional reads on
+    // FUSE/network filesystems never truncate a valid record and spuriously invalidate the fact.
+    let mut filled = 0usize;
+    while filled < len {
+        let Ok(step_off) = u64::try_from(filled) else {
+            return Ok(crate::engine_script_reads::NONE);
+        };
+        let Some(dst) = raw.as_mut_slice().get_mut(filled..) else {
+            break;
+        };
+        let n = match file.read_into(dst, step_off).wait(cx) {
+            Ok(n) => n,
+            Err(error) if error.kind == FsKind::NotFound => return Ok(crate::engine_script_reads::NONE),
+            Err(error) => return Err(CliError::Fs(error)),
+        };
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    raw.truncate(filled);
+    let Some(body) = blaze_proc_macro::record::unseal_record(raw.as_slice()) else {
+        return Ok(crate::engine_script_reads::NONE);
+    };
+    let Ok(answer) = blaze_build_script::c_tasks_probe::decode_answer(body, alloc) else {
+        return Ok(crate::engine_script_reads::NONE);
+    };
+    Ok(blaze_build_script::c_tasks_probe::canonical_reply_digest(&answer))
+}
+
+impl<'a> FactFiles<'a> {
+    fn active_sdk_digest(&mut self) -> Result<[u8; 32], CliError> {
+        if let Some(cached) = self.cached_sdk {
+            return Ok(cached);
+        }
+        let digest = match self.sdk_digest {
+            Some(resolve) => resolve()?,
+            None => blaze_build_script::facts::sdk_id_digest(""),
+        };
+        self.cached_sdk = Some(digest);
+        Ok(digest)
+    }
+
+    fn active_answerer_id(&mut self, alloc: blaze_own::Alloc<'_>) -> Result<ContentId, CliError> {
+        #[cfg(target_os = "linux")]
+        {
+            // Recompute live on every saved `cc-probe` leaf (matching `HermeticClangProbe::id`) so a
+            // mid-sweep `/run/current-system` switch cannot let later leaves pass under the old closure,
+            // while still reusing `self.root_reader` across leaves.
+            let id = match (self.home, self.home_path) {
+                (Some((cx, _)), Some(home)) => {
+                    if self.root_reader.as_ref().is_none_or(|r| r.is_stalled()) {
+                        let created = bstd::procs::hermetic::RootReader::new(cx).map_err(|_| {
+                            CliError::Text { what: "cannot open root reader for c-probe runtime closure identity" }
+                        })?;
+                        self.root_reader = Some(created);
+                    }
+                    let computed = match self.root_reader.as_ref() {
+                        Some(reader) => blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id_for_home_with(
+                            reader,
+                            cx,
+                            home,
+                            crate::graph::TRIPLE,
+                            alloc,
+                        ),
+                        None => blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id_for_home(
+                            cx,
+                            home,
+                            crate::graph::TRIPLE,
+                            alloc,
+                        ),
+                    };
+                    computed
+                        .map_err(|_| CliError::Text { what: "cannot compute active c-probe runtime closure identity" })?
+                        .unwrap_or_else(blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id)
+                }
+                _ => blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id(),
+            };
+            Ok(id)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = alloc;
+            Ok(blaze_proc_macro::probe_clang::default_answerer_strategy_id())
+        }
+    }
+
     fn read(&mut self, path: &str, alloc: blaze_own::Alloc<'_>) -> Result<ContentId, CliError> {
+        if let Some(subject) = path.strip_prefix(REPLY_FILES)
+            && let Some(parsed) = blaze_build_script::facts::parse_cc_probe_subject(subject)
+            && let Some(key_hex) = subject.rsplit('\n').next()
+        {
+            let active_sdk = self.active_sdk_digest()?;
+            let active_answerer = self.active_answerer_id(alloc)?;
+            return read_c_probe_reply(self.home, parsed, key_hex, &active_answerer, &active_sdk, alloc);
+        }
         if path == SHIM_FILE {
             let installed = || {
+                if let Some(dir) = self.exe_dir {
+                    return Ok::<_, CliError>(std::path::Path::new(dir).join(blaze_build_script::fact_shim::SHIM_NAME));
+                }
                 let exe = std::env::current_exe().map_err(|_| CliError::Text { what: "cannot locate blaze to follow the native fact shim image" })?;
                 let dir = exe.parent().ok_or(CliError::Text { what: "blaze has no parent folder for its native fact shim" })?;
                 Ok::<_, CliError>(dir.join(blaze_build_script::fact_shim::SHIM_NAME))
             };
             #[cfg(test)]
-            let shim = TEST_FACT_INPUTS.with_borrow(|inputs| inputs.as_ref().and_then(|(_, path)| path.clone())).map_or_else(installed, Ok)?;
+            let shim = self.exe_dir.is_none().then(|| TEST_FACT_INPUTS.with_borrow(|inputs| inputs.as_ref().and_then(|(_, path)| path.clone()))).flatten().map_or_else(installed, Ok)?;
             #[cfg(not(test))]
             let shim = installed()?;
             return match blaze_proc_macro::native_facts::image_digest(&shim) {
@@ -89,6 +262,34 @@ impl FactFiles {
             FactNow::NotAFact => Err(CliError::Text { what: "saved build-script reply names no question in the pinned fact table" }),
         }
     }
+}
+
+/// Verifies every [`FACT_MOUNT`] leaf row in `leaves` against today's host shim image (under
+/// `exe_dir` when provided, else beside `current_exe`) and pinned userland facts. Returns `true`
+/// iff every `FACT_MOUNT` row matches its stored digest.
+pub(crate) fn verify_fact_leaves(leaves: &Leaves<'_>, exe_dir: Option<&str>, frame: &Frame) -> bool {
+    let erased = blaze_own::Erased::new(frame);
+    let mut fact_files = FactFiles {
+        setting: None,
+        exe_dir,
+        home: None,
+        home_path: None,
+        sdk_digest: None,
+        cached_sdk: None,
+        #[cfg(target_os = "linux")]
+        root_reader: None,
+    };
+    for i in 0..leaves.len() {
+        let row = leaves.row(i);
+        let path = leaves.path(i);
+        if row.kind == LeafKind::ScriptFile && path.starts_with(FACT_MOUNT) {
+            match fact_files.read(path, erased.handle()) {
+                Ok(id) if id == row.id => {}
+                _ => return false,
+            }
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -287,7 +488,11 @@ pub const ABSENT: u8 = 4;
 /// Both `x.rs` and `x/mod.rs` are there (rustc's E0761): a finding whatever they hold, so
 /// neither is read; the id is of the slot's path, the stamp none.
 pub const BOTH: u8 = 8;
-const FLAGS: u8 = MODULE | AT_MOD_RS | ABSENT | BOTH;
+/// Set on a `ScriptFile` / `ScriptStat` / `ScriptListing` row when every path component from
+/// the checkout root to this path was verified not to be a symlink, so the journal's own reach
+/// (`Index::reaches`) suffices instead of re-reading every script file on unrelated edits.
+pub const DIRECT_PATH: u8 = 16;
+const FLAGS: u8 = MODULE | AT_MOD_RS | ABSENT | BOTH | DIRECT_PATH;
 
 /// One row: what was read (or probed) at a path, and how it was.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -462,6 +667,21 @@ pub fn real_path<'f>(slot: &str, flags: u8, frame: &'f Frame) -> Vec<u8, &'f Fra
     }
 }
 
+/// [`real_path`] allocated directly in `alloc`, with exact capacity and no frame copy.
+pub fn real_path_in<A: core::alloc::Allocator>(slot: &str, flags: u8, alloc: A) -> Vec<u8, A> {
+    if flags & AT_MOD_RS != 0 {
+        let stem = slot.strip_suffix(".rs").unwrap_or(slot);
+        let mut out = Vec::with_capacity_in(stem.len() + 7, alloc);
+        out.extend_from_slice(stem.as_bytes());
+        out.extend_from_slice(b"/mod.rs");
+        out
+    } else {
+        let mut out = Vec::with_capacity_in(slot.len(), alloc);
+        out.extend_from_slice(slot.as_bytes());
+        out
+    }
+}
+
 /// Where a slot is today: its flags and stamp and id, or absent. `old` is its last row.
 fn slot_now(
     cx: &Cx,
@@ -570,7 +790,7 @@ pub const HOME_IGNORE: &str = ".blaze/.gitignore";
 pub const HOME_IGNORE_TEXT: &[u8] = b"*\n";
 /// git's entry in the checkout's root: a directory in a clone, a file (`gitdir: ...`) in a
 /// worktree or a submodule. Not listed, whichever it is.
-const GIT: &str = ".git";
+pub(crate) const GIT: &str = ".git";
 /// The tag cargo writes in its build directory in the checkout's root
 /// (`Workspace::default_target_dir`, the root joined with `target`): a `target` holding it whose
 /// first bytes are the Cache Directory Tagging signature is cargo's, no package's, and not
@@ -880,7 +1100,7 @@ impl<'f> Looked<'f> {
                 LeafKind::Slot => {
                     wanted.push((path, row, 0));
                     if old.flags & MODULE != 0 {
-                        let mod_rs = mod_rs_of(path, frame).leak();
+                        let mod_rs = mod_rs_of(path, frame).into_bump_slice();
                         let mod_rs = core::str::from_utf8(mod_rs).map_err(|_| CliError::Text { what: "a module path is not UTF-8" })?;
                         wanted.push((mod_rs, row, 1));
                     }
@@ -1019,7 +1239,25 @@ impl<S: Stamps> Follow<S> {
         served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
         frame: &'f Frame,
     ) -> Result<(Followed<'f>, u32), CliError> {
-        self.follow_served_by::<Batched>(cx, root, home, last, marked, served, frame)
+        self.follow_served_with_sdk(cx, root, home, None, last, marked, served, None, frame)
+    }
+
+    /// [`Follow::follow_served`] carrying a lazy active SDK identity resolver for `cc-probe`
+    /// revalidation (invoked at most once, only if `last` contains a `cc-probe` leaf).
+    #[expect(clippy::too_many_arguments, reason = "sweep follow: each input one capability or proof")]
+    pub(crate) fn follow_served_with_sdk<'f>(
+        &self,
+        cx: &Cx,
+        root: &Dir<ReadWrite>,
+        home: Option<&Dir<ReadWrite>>,
+        home_path: Option<&str>,
+        last: &Leaves<'_>,
+        marked: Option<&[bool]>,
+        served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
+        sdk_digest: Option<&dyn Fn() -> Result<[u8; 32], CliError>>,
+        frame: &'f Frame,
+    ) -> Result<(Followed<'f>, u32), CliError> {
+        self.follow_served_by_with_sdk::<Batched>(cx, root, home, home_path, last, marked, served, sdk_digest, frame)
     }
 
     /// A served script observation can depend on paths beyond its recorded name, including
@@ -1027,6 +1265,7 @@ impl<S: Stamps> Follow<S> {
     /// is journal_sweep.rs `ServedReach`'s, folded into `marked`, so an unmarked row is kept
     /// here as any other. Each served row's ask is bracketed by two events in a span naming its
     /// kind, so the profile says what the served reads cost.
+    #[expect(clippy::too_many_arguments, reason = "sweep follow: each input one capability or proof")]
     pub(crate) fn follow_served_by<'f, W: Walk>(
         &self,
         cx: &Cx,
@@ -1034,7 +1273,23 @@ impl<S: Stamps> Follow<S> {
         home: Option<&Dir<ReadWrite>>,
         last: &Leaves<'_>,
         marked: Option<&[bool]>,
+        served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
+        frame: &'f Frame,
+    ) -> Result<(Followed<'f>, u32), CliError> {
+        self.follow_served_by_with_sdk::<W>(cx, root, home, None, last, marked, served, None, frame)
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "sweep follow: each input one capability or proof")]
+    fn follow_served_by_with_sdk<'f, W: Walk>(
+        &self,
+        cx: &Cx,
+        root: &Dir<ReadWrite>,
+        home: Option<&Dir<ReadWrite>>,
+        home_path: Option<&str>,
+        last: &Leaves<'_>,
+        marked: Option<&[bool]>,
         mut served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
+        sdk_digest: Option<&dyn Fn() -> Result<[u8; 32], CliError>>,
         frame: &'f Frame,
     ) -> Result<(Followed<'f>, u32), CliError> {
         let cx = cx.span("sweep: stat each path the last answer read, and read only what its stamp does not prove");
@@ -1044,7 +1299,16 @@ impl<S: Stamps> Follow<S> {
         let mut bytes = Bytes::new_in(frame, "a file the last answer read");
         let mut layout_moved = false;
         let erased = blaze_own::Erased::new(frame);
-        let mut fact_files = FactFiles::default();
+        let mut fact_files = FactFiles {
+            setting: None,
+            exe_dir: None,
+            home: home.map(|dir| (&cx, dir)),
+            home_path,
+            sdk_digest,
+            cached_sdk: None,
+            #[cfg(target_os = "linux")]
+            root_reader: None,
+        };
         // The `MacroFiles` rows, decided after the loop: their files' and folders' rows come
         // after them in the table's (kind, path) order.
         let mut crates: Vec<usize, &Frame> = Vec::new_in(frame);
@@ -1126,10 +1390,28 @@ impl<S: Stamps> Follow<S> {
                                 LeafKind::ScriptStat => "sweep: a build script's stat asked again of its served tree",
                                 _ => "sweep: a build script's file asked again of its served tree",
                             });
+                            let before_stamp = match kind {
+                                crate::engine_script_reads::ReadKind::File | crate::engine_script_reads::ReadKind::Listing => {
+                                    crate::engine_script_reads::settled_path_stamp(&cx, root, &self.stamps, self.plant, path)
+                                }
+                                crate::engine_script_reads::ReadKind::Stat | crate::engine_script_reads::ReadKind::Git => None,
+                            };
                             asked.event("asked");
-                            let row = checkout.row(kind, path)?;
+                            let (flags, _, id) = checkout.row(kind, path)?;
                             asked.event("answered");
-                            row
+                            let stamp = match crate::engine_script_reads::settled_meta_stamp(&cx, root, &self.stamps, self.plant, kind, path, id) {
+                                Some(stamp) => Some(stamp),
+                                None if matches!(kind, crate::engine_script_reads::ReadKind::File | crate::engine_script_reads::ReadKind::Listing)
+                                    && before_stamp.is_some()
+                                    && id != crate::engine_script_reads::NONE
+                                    && id != crate::engine_script_reads::DENIED =>
+                                {
+                                    let after_stamp = crate::engine_script_reads::settled_path_stamp(&cx, root, &self.stamps, self.plant, path);
+                                    (after_stamp == before_stamp).then_some(before_stamp).flatten()
+                                }
+                                None => None,
+                            };
+                            (flags, stamp, id)
                         }
                         None => crate::engine_script_reads::now(&cx, root, &self.stamps, self.plant, kind, path, Some((old.stamp, old.id)), frame)?,
                     }
@@ -1554,6 +1836,7 @@ mod tests {
         Ok(())
     }
 
+    /// The invariant: the sweep checks every file, manifest, absent probe, and directory listing recorded in the leaf table without trusting racy timestamps.
     #[test]
     fn the_sweep_follows_what_was_read_and_nothing_else() {
         check(Config::cases(300), |tape| rounds(tape, Plant::None));
@@ -1741,6 +2024,151 @@ mod tests {
         assert!(super::wanted("", "target", true, false) && !super::wanted("", "target", true, true), "a `target` is listed exactly when untagged");
         assert!(!super::wanted("", ".blaze", true, false) && !super::wanted("", ".git", true, false));
         assert!(super::wanted("crates", "target", true, true), "control: only the root's `target` can be cargo's");
+    }
+
+    /// Rule 23 selective invalidation in `sweep.rs`: each `cc-probe\n<64-hex>` reply row is
+    /// validated through the `.blaze` home capability against `v2/build-script/records/c-probe/<hex>`.
+    /// Changing one cached probe record moves ONLY that probe's row, leaving unrelated probes' rows
+    /// unchanged.
+    #[test]
+    fn sweep_c_probe_reply_validates_selectively_through_home_dir() {
+        use blaze_build_script::c_tasks_probe::{ProbeAnswer, ProbeKey, canonical_reply_digest, encode_answer};
+        use blaze_build_script::facts::cc_probe_subject;
+        use blaze_own::{AVec, String as OwnString};
+
+        let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+        let frame = cx.frame();
+        let erased = blaze_own::Erased::new(frame);
+        let alloc = erased.handle();
+        let fs = io.need_fs().expect("files");
+        let root = fs.open_dir(&cx, &Path::new("data").expect("a path")).expect("open");
+        let home = fs.open_dir(&cx, &Path::new("home/.blaze").expect("a path")).expect("open");
+        let store_dir = home.subdir(&Path::new("v2").expect("v2"));
+        let dir_store = blaze_proc_macro::record::DirStore::build_scripts(io.spawner(), None, &store_dir);
+
+        let key_a = ProbeKey(ContentId([0x11; 32]));
+        let key_b = ProbeKey(ContentId([0x22; 32]));
+        let ans_a = ProbeAnswer { code: 0, stdout: OwnString::new_in(alloc), stderr: OwnString::new_in(alloc) };
+        let ans_b = ProbeAnswer { code: 0, stdout: OwnString::from_str_in("ok", alloc), stderr: OwnString::new_in(alloc) };
+        let mut enc_a = AVec::new_in(alloc);
+        encode_answer(&ans_a, &mut enc_a);
+        let mut enc_b = AVec::new_in(alloc);
+        encode_answer(&ans_b, &mut enc_b);
+        blaze_proc_macro::probe_clang::CProbeStore::put(&dir_store, &key_a, enc_a.as_slice()).expect("put A");
+        blaze_proc_macro::probe_clang::CProbeStore::put(&dir_store, &key_b, enc_b.as_slice()).expect("put B");
+
+        let active_answerer = blaze_proc_macro::probe_clang::default_answerer_strategy_id();
+        let active_pin = blaze_proc_macro::probe_clang::active_clang_pin(crate::graph::TRIPLE).unwrap_or([0x55u8; 32]);
+        let active_sdk = blaze_build_script::facts::sdk_id_digest("");
+        let stale_sdk = blaze_build_script::facts::sdk_id_digest("macos-sdk-14.5");
+        let subj_a = cc_probe_subject(&active_answerer, &active_pin, &active_sdk, &key_a, alloc);
+        let subj_b = cc_probe_subject(&active_answerer, &active_pin, &active_sdk, &key_b, alloc);
+        let stale_pin = [0x99u8; 32];
+        let subj_stale = cc_probe_subject(&active_answerer, &stale_pin, &active_sdk, &key_b, alloc);
+        let subj_stale_sdk = cc_probe_subject(&active_answerer, &active_pin, &stale_sdk, &key_b, alloc);
+        let key_a_hex = subj_a.as_str().rsplit('\n').next().unwrap();
+        let key_b_hex = subj_b.as_str().rsplit('\n').next().unwrap();
+        let dig_a = canonical_reply_digest(&ans_a);
+        let dig_b = canonical_reply_digest(&ans_b);
+
+        // Direct validation (runs on every platform, including hosts without a clang.json pin).
+        let parsed_a = blaze_build_script::facts::parse_cc_probe_subject(subj_a.as_str()).unwrap();
+        let parsed_b = blaze_build_script::facts::parse_cc_probe_subject(subj_b.as_str()).unwrap();
+        let parsed_stale = blaze_build_script::facts::parse_cc_probe_subject(subj_stale.as_str()).unwrap();
+        let parsed_stale_sdk = blaze_build_script::facts::parse_cc_probe_subject(subj_stale_sdk.as_str()).unwrap();
+        assert_eq!(read_c_probe_reply_with(Some((&cx, &home)), parsed_a, key_a_hex, &active_answerer, &active_pin, &active_sdk, alloc).unwrap(), dig_a);
+        assert_eq!(read_c_probe_reply_with(Some((&cx, &home)), parsed_b, key_b_hex, &active_answerer, &active_pin, &active_sdk, alloc).unwrap(), dig_b);
+        assert_eq!(
+            read_c_probe_reply_with(Some((&cx, &home)), parsed_stale, key_b_hex, &active_answerer, &active_pin, &active_sdk, alloc).unwrap(),
+            crate::engine_script_reads::NONE,
+            "stale clang pin must invalidate"
+        );
+        assert_eq!(
+            read_c_probe_reply_with(Some((&cx, &home)), parsed_stale_sdk, key_b_hex, &active_answerer, &active_pin, &active_sdk, alloc).unwrap(),
+            crate::engine_script_reads::NONE,
+            "stale SDK identity must invalidate"
+        );
+
+        let path_a = std::format!("{REPLY_FILES}{}", subj_a.as_str());
+        let path_b = std::format!("{REPLY_FILES}{}", subj_b.as_str());
+        let path_stale = std::format!("{REPLY_FILES}{}", subj_stale.as_str());
+        let mut rows = Rows::new_in(frame);
+        rows.push(LeafKind::ScriptFile, 0, &path_a, None, dig_a);
+        rows.push(LeafKind::ScriptFile, 0, &path_b, None, dig_b);
+        rows.push(LeafKind::ScriptFile, 0, &path_stale, None, dig_b);
+        let table = Leaves::bytes_in(&rows, frame).expect("table");
+        let (last, _) = Leaves::of(&table).expect("leaves");
+        let model = Model { now: Cell::new(10 * TICK), mtimes: RefCell::new(StdMap::new()) };
+
+        if blaze_proc_macro::probe_clang::active_clang_pin(crate::graph::TRIPLE).is_some() {
+            let followed = Follow { stamps: &model, plant: Plant::None }.follow(&cx, &root, Some(&home), &last, frame).expect("follow 1");
+            let id_of = |p: &str| followed.now.rows.iter().find(|r| followed.now.path(r) == p).expect("row").id;
+            assert_eq!(id_of(&path_a), dig_a, "probe A stands");
+            assert_eq!(id_of(&path_b), dig_b, "probe B stands");
+            assert_eq!(id_of(&path_stale), crate::engine_script_reads::NONE, "stale clang pin must invalidate");
+
+            // SDK resolution errors must propagate through sweep rather than substituting the
+            // empty SDK digest and falsely accepting stale no-SDK probe records.
+            let failing_sdk = || Err(CliError::Text { what: "simulated SDK resolution I/O failure" });
+            let err = Follow { stamps: &model, plant: Plant::None }
+                .follow_served_with_sdk(&cx, &root, Some(&home), None, &last, None, None, Some(&failing_sdk), frame)
+                .err()
+                .expect("SDK resolution failure must propagate during c-probe sweep");
+            assert!(
+                std::format!("{err}").contains("simulated SDK resolution I/O failure"),
+                "unexpected SDK sweep error: {err}"
+            );
+        }
+
+        // Replace ONLY probe A's sealed file with a different answer; probe B stays valid.
+        let ans_a2 = ProbeAnswer { code: 1, stdout: OwnString::new_in(alloc), stderr: OwnString::from_str_in("bad flag", alloc) };
+        let mut enc_a2 = AVec::new_in(alloc);
+        encode_answer(&ans_a2, &mut enc_a2);
+        let mut sealed = std::vec::Vec::with_capacity(enc_a2.len() + 32);
+        sealed.extend_from_slice(enc_a2.as_slice());
+        sealed.extend_from_slice(&ContentId::of("blaze expansion record seal 1", enc_a2.as_slice()).0);
+        let rel_a = std::format!("v2/build-script/records/c-probe/{key_a_hex}");
+        home.publish(&cx, &Path::new(&rel_a).expect("rel_a"), Content::bytes(&sealed), Durable::No).expect("overwrite A");
+
+        assert_eq!(
+            read_c_probe_reply_with(Some((&cx, &home)), parsed_a, key_a_hex, &active_answerer, &active_pin, &active_sdk, alloc).unwrap(),
+            canonical_reply_digest(&ans_a2),
+            "probe A reflects new answer"
+        );
+        assert_eq!(
+            read_c_probe_reply_with(Some((&cx, &home)), parsed_b, key_b_hex, &active_answerer, &active_pin, &active_sdk, alloc).unwrap(),
+            dig_b,
+            "probe B untouched"
+        );
+
+        // Oversized corrupted record (> MAX_RECORD_BYTES) is rejected as NONE before allocating in
+        // BOTH sweep and primary DirStore::get_c_probe readers.
+        let oversized = std::vec![0u8; (blaze_proc_macro::probe_clang::MAX_RECORD_BYTES as usize) + 1];
+        home.publish(&cx, &Path::new(&rel_a).expect("rel_a"), Content::bytes(&oversized), Durable::No).expect("oversized A");
+        assert_eq!(
+            read_c_probe_reply_with(Some((&cx, &home)), parsed_a, key_a_hex, &active_answerer, &active_pin, &active_sdk, alloc).unwrap(),
+            crate::engine_script_reads::NONE,
+            "oversized c-probe record must return NONE in sweep"
+        );
+        assert!(
+            blaze_proc_macro::probe_clang::CProbeStore::get(&dir_store, &key_a, alloc).unwrap().is_none(),
+            "oversized c-probe record must return None in DirStore::get_c_probe"
+        );
+        // Re-putting a valid answer over the oversized corrupted record succeeds cleanly without
+        // invoking the unbounded reader, and subsequent reads return the new answer.
+        blaze_proc_macro::probe_clang::CProbeStore::put(&dir_store, &key_a, enc_a2.as_slice())
+            .expect("put_c_probe must replace oversized corrupted record");
+        assert_eq!(
+            blaze_proc_macro::probe_clang::CProbeStore::get(&dir_store, &key_a, alloc).unwrap().as_deref(),
+            Some(enc_a2.as_slice()),
+            "replaced oversized c-probe record is readable"
+        );
+        assert_eq!(
+            read_c_probe_reply_with(Some((&cx, &home)), parsed_b, key_b_hex, &active_answerer, &active_pin, &active_sdk, alloc).unwrap(),
+            dig_b,
+            "probe B still untouched"
+        );
     }
 }
 

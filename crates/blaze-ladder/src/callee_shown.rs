@@ -67,6 +67,8 @@ pub fn self_form(v: PTys<'_>, args: List) -> &'static str {
     match node {
         PNode::Adt(..) => "an ADT",
         PNode::Tuple(_) => "a tuple",
+        PNode::Record(..) => "a record",
+        PNode::Union(_) => "a union",
         PNode::FnDef(..) => "a fn item",
         PNode::FnPtr(..) => "a fn pointer",
         PNode::Closure { .. } => "a closure",
@@ -197,6 +199,22 @@ pub fn args_shown(v: PTys<'_>, args: List, name: &dyn Fn(ItemKey) -> Option<Box<
                 }
                 Err(_) => out.push_str("(a list past the ground table)"),
             },
+            PNode::Record(_, l) => match v.list(l) {
+                Ok(all) => {
+                    work.push(Step::Words(")"));
+                    push_list(&mut work, all, ", ");
+                    out.push_str("record(");
+                }
+                Err(_) => out.push_str("record(a list past the ground table)"),
+            },
+            PNode::Union(l) => match v.list(l) {
+                Ok(all) => {
+                    work.push(Step::Words(")"));
+                    push_list(&mut work, all, " | ");
+                    out.push_str("union(");
+                }
+                Err(_) => out.push_str("union(a list past the ground table)"),
+            },
             PNode::Closure { owner, ordinal, .. } => match name(owner) {
                 Some(p) => {
                     let _ = write!(out, "<closure {ordinal} of {p}>");
@@ -217,6 +235,9 @@ pub fn args_shown(v: PTys<'_>, args: List, name: &dyn Fn(ItemKey) -> Option<Box<
             PNode::Char => out.push_str("char"),
             PNode::Str => out.push_str("str"),
             PNode::Never => out.push('!'),
+            PNode::Foreign(k) if k == crate::front2::poly_canon::OPAQUE_THIN_FOREIGN_KEY => {
+                out.push_str("poly::OpaqueThin");
+            }
             // Every other form (an integer or float type, a pointer to a fn, a `dyn`, a
             // pattern type, a projection, a constant) by the table's own words for it.
             other => {

@@ -80,20 +80,21 @@ fn listed(record: &ItemsRecord<'static>) -> AVec<'static, (ItemKey, ItemKey, &'s
 fn with_u32(bytes: &[u8], at: usize, value: u32) -> &'static [u8] {
     let mut copy = AVec::from_slice_in(bytes, Alloc::global());
     copy[at..at + 4].copy_from_slice(&value.to_le_bytes());
-    aligned(&copy, Alloc::global())
+    aligned(&copy, super::SyncFrame::leaked())
 }
 
 #[test]
 fn a_member_finds_its_owner_in_one_search() {
-    let g = Alloc::global();
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
     let inputs = [input("k0", PATH, &[])];
-    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("solve: {e:?}"));
+    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("solve: {e:?}"));
     let names = solved[0].names;
     let a = encode(names, g).unwrap_or_else(|e| panic!("encode: {e:?}"));
     let b = encode(names, g).unwrap_or_else(|e| panic!("encode again: {e:?}"));
     assert!(a == b, "the record encodes to different bytes twice");
-    let bytes: &'static [u8] = aligned(&a, g);
-    let record = super::items_record::one_file(bytes, names.files[0].text, g);
+    let bytes: &'static [u8] = aligned(&a, bump);
+    let record = super::items_record::one_file(bytes, names.files[0].text, bump);
 
     // Every named member, by its key alone, answers the owner and the name its list holds.
     let members = listed(&record);
@@ -113,7 +114,7 @@ fn a_member_finds_its_owner_in_one_search() {
     assert!(matches!(record.member_owner(s), Ok(None)), "a struct's key is no member's: {:?}", record.member_owner(s));
 
     // The reader over a set of crates answers the same.
-    let read = RecordItems::new(&[names.key], Kept { record: bytes }, g);
+    let read = RecordItems::new(&[names.key], Kept { record: bytes }, bump);
     for (member, owner, name) in members.iter() {
         assert!(matches!(read.member_owner(*member), Ok(Some(got)) if got == (*owner, *name)), "`{name}` through the crates' reader: {:?}", read.member_owner(*member));
     }
@@ -121,25 +122,26 @@ fn a_member_finds_its_owner_in_one_search() {
     // PLANTED BUG 1: the section's first row names another owner's row.
     let at = u32::from_le_bytes(bytes[8 + 4 * F_OWNED_AT..][..4].try_into().expect("four bytes")) as usize;
     assert!(at % 16 == 0 && at + members.len() * OWNED_ROW <= bytes.len(), "the section at {at} lies in the record's {} bytes", bytes.len());
-    let first: ItemKey = {
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&bytes[at..at + 32]);
-        ItemKey(blaze_id::ContentId(key))
-    };
+    let first: ItemKey = record.owned_key_at(0).unwrap_or_else(|e| panic!("first owned key: {e:?}")).unwrap_or_else(|| panic!("no first owned row"));
     let (_, true_owner, first_name) = *members.iter().find(|m| m.0 == first).unwrap_or_else(|| panic!("the section's first key {first:?} is no listed member"));
-    let owner_row = u32::from_le_bytes(bytes[at + 32..][..4].try_into().expect("four bytes"));
+    let owner_row = u32::from_le_bytes(bytes[at..][..4].try_into().expect("four bytes"));
     let other_owner = if owner_row == 0 { 1 } else { 0 };
-    let planted = ItemsRecord::open(with_u32(bytes, at + 32, other_owner), g).unwrap_or_else(|e| panic!("open the planted record: {e:?}"));
+    let planted = ItemsRecord::open(with_u32(bytes, at, other_owner), g).unwrap_or_else(|e| panic!("open the planted record: {e:?}"));
     let got = planted.member_owner(first).unwrap_or_else(|e| panic!("the planted owner of `{first_name}`: {e:?}"));
     assert!(got.is_some_and(|(owner, name)| owner != true_owner && name == first_name), "planted bug 1 (another owner's row) was not caught: `{first_name}` answers {got:?}, its owner is {true_owner:?}");
 
-    // PLANTED BUG 2: the section's first row names another member's row.
-    let member_row = u32::from_le_bytes(bytes[at + 36..][..4].try_into().expect("four bytes"));
+    // PLANTED BUG 2: the section's first row names another member's row (the 8-byte row looks up
+    // the member key directly from `T_MEMBERS`, so `first` is no longer present at row 0), and an
+    // out-of-range member row is refused by name.
+    let member_row = u32::from_le_bytes(bytes[at + 4..][..4].try_into().expect("four bytes"));
     let other_member = if member_row == 0 { 1 } else { 0 };
-    let planted = ItemsRecord::open(with_u32(bytes, at + 36, other_member), g).unwrap_or_else(|e| panic!("open the second planted record: {e:?}"));
+    let planted = ItemsRecord::open(with_u32(bytes, at + 4, other_member), g).unwrap_or_else(|e| panic!("open the second planted record: {e:?}"));
     let got = planted.member_owner(first);
+    assert!(matches!(got, Ok(None)), "planted bug 2a (another member's row) was not caught: {got:?}");
+    let planted_oob = ItemsRecord::open(with_u32(bytes, at + 4, u32::MAX), g).unwrap_or_else(|e| panic!("open the third planted record: {e:?}"));
+    let got_oob = planted_oob.member_owner(first);
     assert!(
-        matches!(got, Err(ItemsRecordError::Short { what: "a member owner's member row (it holds another key)", .. })),
-        "planted bug 2 (another member's row) was not refused by name: {got:?}"
+        matches!(got_oob, Err(ItemsRecordError::Short { what: "a member owner's member row", .. })),
+        "planted bug 2b (out-of-range member row) was not refused by name: {got_oob:?}"
     );
 }

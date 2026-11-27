@@ -43,7 +43,7 @@ use blaze_file_items::{Outline, outline};
 use blaze_format::FormatError;
 use blaze_hash::HashMap;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
-use blaze_own::{AString, AVec, Alloc, Box};
+use blaze_own::{AString, AVec, Alloc, BString, BVec, Bump};
 pub use blaze_own::found::{Found, Unread};
 use blaze_surface::{
     Binding, BindingState, BuildError, BuiltinFn, CallShape, CrateRootBuilder, CrateRootView,
@@ -56,16 +56,17 @@ use blaze_unit_graph::Implicit;
 use crate::graph::{CrateGraph, CrateId, ExternGone, GraphCrate, GraphDep, GraphError, RootAttrs, Sysroot};
 use crate::names::{PathError, Unheld, VariantHit, Why, World, Written, variant_in};
 use crate::task::{
-    CallSrc, Cfg, Fill, FillEnv, FillReport, Files, First, Fragment, Held, ImplSrc,
+    CallSrc, Cfg, Fill, FillEnv, FillReport, Files, First, Fragment, FragmentTokens, Held, ImplSrc,
     ItemText, LangSrc, Loc, LowerCx, LowerNote, Lowered, MacroBody, MacroSrc, Member, ModMade, Par,
     PreludeImport, RootInput, RootNote, RootPlan, TaskError, Tree, Variant, Where,
-    crate_root, crate_tools, file_attrs, lower, walk,
+    crate_root, crate_tools, file_attrs, lower, lower_in, walk,
 };
 use crate::task::{joined, pop_dir};
 use crate::task::ExpandPart;
-use crate::task::{AttrOrder, Attrs, inline_child, walk_rows};
+pub use crate::task::{AttrOrder, ProcExport};
+use crate::task::{Attrs, inline_child, walk_rows};
 use crate::tree_record::{TreeEnum, TreeModule, TreeRecord};
-use crate::task::{ProcAttr, ProcDecls, ProcExport};
+use crate::task::{ProcAttr, ProcDecls};
 use blaze_surface::ProcKind;
 use crate::{ExpandRequest, NameAnswer, Node, Passed, Resolved, ScopeFacts};
 use crate::crate_scope::Dep;
@@ -188,6 +189,26 @@ pub trait SourceTexts<'a> {
         AttrOrder::Written
     }
 
+    /// Warms any one-time caller state needed before a parallel wave of proc-macro calls for
+    /// crate `krate` (called sequentially on the main thread before `par.map`, never from worker
+    /// threads). Default: no-op.
+    fn prepare_par_proc(&self, _krate: usize, _def: &MacroDefinition<'_>) {}
+
+    /// Thread-safe proc-macro execution for wave-batched parallel macro expansion.
+    /// Returns `Some(Ok(produced))` when executed safely without touching non-`Sync` state, or
+    /// `None` when unsupported or refused (in which case the sequential commit phase re-runs
+    /// through [`SourceTexts::run_proc_macro`] + [`SourceTexts::proc_macro_unusable`] so error
+    /// reporting is byte-identical). Default: `None`.
+    fn par_proc_macro<'b>(
+        &self,
+        _krate: usize,
+        _def: &MacroDefinition<'_>,
+        _call: ProcCall<'_>,
+        _alloc: Alloc<'b>,
+    ) -> Option<Result<Produced<'b>, HostError>> {
+        None
+    }
+
     /// The planted bug of the body-glob test (rule 23, blaze-ladder
     /// tests/front2_body_scope_impls.rs): [`ReachPlant::Unplaced`] places no finished module
     /// for a body solve ([`crate::cells::Outside::chain`] answers `None`), so a glob of a
@@ -195,6 +216,26 @@ pub trait SourceTexts<'a> {
     /// fix. Every real source answers [`ReachPlant::None`].
     fn reach_plant(&self) -> ReachPlant {
         ReachPlant::None
+    }
+}
+
+/// Parallelism and record-writing options for per-crate name resolution (rule 83).
+#[derive(Clone, Copy, Debug)]
+pub struct ResolveOpts<'a> {
+    /// Whether to build the crate's `inner` `CrateScope` record (`false` on the engine path,
+    /// where Section 1 is omitted on disk and `out` digests `names_record` + `items_record`).
+    pub write_inner: bool,
+    /// Thread-safe bump arena (same lifetime `'a` as the crate's frame) used by parallel workers
+    /// during `lower_modules`, `Cells::scope`, and wave-batched macro expansion. `None` runs
+    /// purely serially on the crate's single-threaded frame.
+    pub parallel_bump: Option<Bump<'a>>,
+    /// Number of parallel workers available to `Par::map` (`<= 1`: serial).
+    pub par_workers: usize,
+}
+
+impl<'a> Default for ResolveOpts<'a> {
+    fn default() -> ResolveOpts<'a> {
+        ResolveOpts { write_inner: true, parallel_bump: None, par_workers: 1 }
     }
 }
 
@@ -332,6 +373,8 @@ pub struct Tables<'a> {
     pub texts: HashMap<ItemKey, (ItemText<'a>, At), Alloc<'a>>,
     /// The other way: the item at an entry of a text's outline.
     pub by_place: HashMap<(At, ItemIndex), ItemKey, Alloc<'a>>,
+    /// Whether `by_place` is populated (false for record-only CLI solves, true for in-memory `Names`).
+    track_by_place: bool,
     /// Each trait's and impl's members on under the cfg, in declaration order.
     pub members: HashMap<ItemKey, AVec<'a, Member<'a>>, Alloc<'a>>,
     /// The tuple and unit structs, each its own constructor.
@@ -343,6 +386,10 @@ pub struct Tables<'a> {
 
 impl<'a> Tables<'a> {
     fn new_in(alloc: Alloc<'a>) -> Tables<'a> {
+        Self::with_by_place_in(alloc, true)
+    }
+
+    fn with_by_place_in(alloc: Alloc<'a>, track_by_place: bool) -> Tables<'a> {
         Tables {
             values: AVec::new_in(alloc),
             macros: HashMap::new_in(alloc),
@@ -353,6 +400,7 @@ impl<'a> Tables<'a> {
             use_locs: HashMap::new_in(alloc),
             texts: HashMap::new_in(alloc),
             by_place: HashMap::new_in(alloc),
+            track_by_place,
             members: HashMap::new_in(alloc),
             ctors: HashMap::new_in(alloc),
         }
@@ -376,7 +424,7 @@ impl<'a> Tables<'a> {
 
     /// A fragment's tables (not its declarations, nor the modules it made) added; `owner` is
     /// the fragment's key, `at` the text it is.
-    fn add(&mut self, owner: ItemKey, at: At, part: Lowered<'a, 'a>) -> AVec<'a, LowerNote<'a>> {
+    fn add<'s>(&mut self, owner: ItemKey, at: At, part: Lowered<'a, 'a, 's>) -> AVec<'s, LowerNote<'a>> {
         let Lowered { macros, calls, enums, impls, langs, use_locs, texts, members, ctors, notes, values, .. } = part;
         for (owner, list) in members {
             self.join_members(owner, list);
@@ -395,29 +443,76 @@ impl<'a> Tables<'a> {
         self.enums.extend(enums);
         self.impls.extend(impls);
         self.langs.extend(langs);
-        self.use_locs.insert(owner, use_locs);
+        if !use_locs.is_empty() {
+            self.use_locs.insert(owner, use_locs);
+        }
         for t in texts.into_iter() {
-            self.by_place.insert((at, t.item), t.key);
+            if self.track_by_place {
+                self.by_place.insert((at, t.item), t.key);
+            }
             self.texts.insert(t.key, (t, at));
         }
         notes
     }
 
     fn merge(&mut self, other: Tables<'a>) {
-        let Tables { macros, calls, enums, impls, langs, use_locs, texts, by_place, members, ctors, values } = other;
-        self.by_place.extend(by_place);
-        self.values.extend(values);
-        for (owner, list) in members {
-            self.join_members(owner, list);
+        // Merge the smaller HashMap into the larger one (preserving `other`-wins semantics on any
+        // key collision) so merging large expansion tables into small file tables avoids repeated
+        // bump-abandoned rehashes during Stage::Publish (~60-70 MB saved on `core`).
+        fn merge_map<'a, K: Eq + core::hash::Hash, V>(
+            dst: &mut HashMap<K, V, Alloc<'a>>,
+            mut src: HashMap<K, V, Alloc<'a>>,
+        ) {
+            if src.len() > dst.len() {
+                let prev = core::mem::replace(dst, src);
+                dst.reserve(prev.len());
+                for (k, v) in prev {
+                    dst.entry(k).or_insert(v);
+                }
+            } else {
+                dst.reserve(src.len());
+                for (k, v) in src.drain() {
+                    dst.insert(k, v);
+                }
+            }
         }
-        self.ctors.extend(ctors);
-        self.macros.extend(macros);
-        self.calls.extend(calls);
-        self.enums.extend(enums);
+        let Tables { macros, calls, enums, impls, langs, use_locs, texts, by_place, track_by_place: _, members, ctors, values } = other;
+        if self.track_by_place {
+            merge_map(&mut self.by_place, by_place);
+        }
+        self.values.reserve(values.len());
+        self.values.extend(values);
+        if members.len() > self.members.len() {
+            let prev = core::mem::replace(&mut self.members, members);
+            self.members.reserve(prev.len());
+            for (owner, mut list) in prev {
+                match self.members.get_mut(&owner) {
+                    Some(existing) => {
+                        list.reserve(existing.len());
+                        list.extend(existing.iter().copied());
+                        *existing = list;
+                    }
+                    None => {
+                        self.members.insert(owner, list);
+                    }
+                }
+            }
+        } else {
+            self.members.reserve(members.len());
+            for (owner, list) in members {
+                self.join_members(owner, list);
+            }
+        }
+        merge_map(&mut self.ctors, ctors);
+        merge_map(&mut self.macros, macros);
+        merge_map(&mut self.calls, calls);
+        merge_map(&mut self.enums, enums);
+        self.impls.reserve(impls.len());
         self.impls.extend(impls);
+        self.langs.reserve(langs.len());
         self.langs.extend(langs);
-        self.use_locs.extend(use_locs);
-        self.texts.extend(texts);
+        merge_map(&mut self.use_locs, use_locs);
+        merge_map(&mut self.texts, texts);
     }
 }
 
@@ -467,23 +562,64 @@ impl<'a> core::ops::Deref for ExpansionText<'a> {
     fn deref(&self) -> &Self::Target { &self.contents }
 }
 
-/// A macro call's expansion: what it adds to its module.
+/// Cold refusal metadata for a macro call whose expansion was refused, boxed in the crate bump
+/// arena so normal expansions pay zero bytes for refusal fields (`size_of::<Expansion>()` = 24 B).
 #[derive(Debug)]
-pub struct Expansion<'a> {
-    /// Empty when the call is not expanded: then `refused` says why (a refused call), or the
-    /// call wrote nothing (a derive of a cfg-off item, a statement call that declares nothing).
-    pub decls: DeclsBuilder<'a, &'a str>,
-    /// `None` when no text was made.
-    pub made: Option<&'a ExpansionText<'a>>,
+pub struct ExpansionRefusal<'a> {
     /// The call's expansion was refused ([`crate::refused`]): its module's scope says so, and
     /// a name looked up behind it is unknown, never absent.
-    pub refused: Option<crate::refused::Refused<'a>>,
-    /// For a refused call, the note that refused it (the last the solve noted for the call
-    /// before it returned nothing) and the first `env!` variable the host refused during it:
-    /// the reason the names record's failed-call row keeps ([`crate::call_refusal`]). `None`
-    /// for a call that expanded, and for a refused call whose driver noted nothing (a bug,
-    /// kept as [`crate::call_refusal::RefusalKind::Unnoted`]).
-    pub refused_by: Option<(ExpandNote<'a>, Option<&'a str>)>,
+    pub refused: crate::refused::Refused<'a>,
+    /// The note that refused the call (the last the solve noted for the call before it returned
+    /// nothing) and the first `env!` variable the host refused during it.
+    pub by: Option<(ExpandNote<'a>, Option<&'a str>)>,
+}
+
+/// A macro call's expansion: what it adds to its module. Stored compactly (24 bytes: three
+/// arena-backed pointers) so `CrateNames::expansions` does not bloat to 320 B/slot.
+#[derive(Debug)]
+pub struct Expansion<'a> {
+    /// `None` when the call wrote no declarations (a refused call, a block module's outer shell,
+    /// a derive of a cfg-off item, a statement call that declares nothing).
+    decls: Option<&'a DeclsBuilder<'a, &'a str>>,
+    /// `None` when no text was made.
+    pub made: Option<&'a ExpansionText<'a>>,
+    /// `Some` only when the call's expansion was refused.
+    pub refusal: Option<&'a ExpansionRefusal<'a>>,
+}
+
+impl<'a> Expansion<'a> {
+    fn from_decls(decls: DeclsBuilder<'a, &'a str>, made: Option<&'a ExpansionText<'a>>, bump: Bump<'a>) -> Expansion<'a> {
+        let empty = decls.items.is_empty()
+            && decls.mods.is_empty()
+            && decls.uses.is_empty()
+            && decls.extern_crates.is_empty()
+            && decls.macro_rules.is_empty()
+            && decls.calls.is_empty();
+        Expansion { decls: (!empty).then(|| &*bump.alloc_val(decls)), made, refusal: None }
+    }
+
+    fn empty_with(made: Option<&'a ExpansionText<'a>>) -> Expansion<'a> {
+        Expansion { decls: None, made, refusal: None }
+    }
+
+    fn from_refusal(refused: crate::refused::Refused<'a>, by: Option<(ExpandNote<'a>, Option<&'a str>)>, bump: Bump<'a>) -> Expansion<'a> {
+        Expansion { decls: None, made: None, refusal: Some(bump.alloc_val(ExpansionRefusal { refused, by })) }
+    }
+
+    #[inline]
+    pub fn decls(&self) -> Option<&'a DeclsBuilder<'a, &'a str>> {
+        self.decls
+    }
+
+    #[inline]
+    pub fn refused(&self) -> Option<crate::refused::Refused<'a>> {
+        self.refusal.map(|r| r.refused)
+    }
+
+    #[inline]
+    pub fn refused_by(&self) -> Option<(ExpandNote<'a>, Option<&'a str>)> {
+        self.refusal.and_then(|r| r.by)
+    }
 }
 
 /// Which text of a call did not lex.
@@ -1095,7 +1231,7 @@ pub fn resolve_crates<'a, S: SourceTexts<'a>, P: Par>(
     sysroot: Sysroot,
     sources: &S,
     par: &P,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 ) -> Result<Names<'a>, NamesError<'a>> {
     resolve_crates_with::<S, P>(crates, sysroot, sources, par, First::Prefetch, alloc)
 }
@@ -1107,22 +1243,26 @@ pub fn resolve_crates_with<'a, S: SourceTexts<'a>, P: Par>(
     sources: &S,
     par: &P,
     first: First,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Result<Names<'a>, NamesError<'a>> {
+    let alloc = bump.alloc();
     let graph = graph_of(crates, sysroot, alloc)?;
     let mut finished: AVec<'a, Option<Dep<'a>>> = AVec::with_capacity_in(crates.len(), alloc);
     finished.extend(crates.iter().map(|_| None));
     let mut whole: AVec<'a, Option<&'a CrateNames<'a>>> = AVec::with_capacity_in(crates.len(), alloc);
     whole.extend(crates.iter().map(|_| None));
     let mut by_prefix = HashMap::new_in(alloc);
-    let prepares = Prepares::new_in(alloc);
+    let prepares = Prepares::new_in(bump);
     for wave in graph.waves() {
         for &id in wave {
+            let Some(input) = crates.get(id.index()) else {
+                continue;
+            };
             let done = {
                 let built = Built { crates: &finished, by_prefix: &by_prefix, asked: None };
-                resolve_one::<S, P>(&graph, &crates[id.index()], id, id.index(), &built, sources, par, first, prepares, &crate::expansions::KeptExpansions::none(alloc), alloc)?
+                resolve_one::<S, P>(&graph, input, id, id.index(), &built, sources, par, first, prepares, &crate::expansions::KeptExpansions::none(alloc), bump)?
             };
-            let done: &'a CrateNames<'a> = Box::leak(Box::new_in(done, alloc));
+            let done: &'a CrateNames<'a> = bump.alloc_val(done);
             by_prefix.insert(done.key.prefix(), id.index());
             finished[id.index()] = Some(Dep::Whole(done));
             whole[id.index()] = Some(done);
@@ -1350,15 +1490,15 @@ fn shown<'a>(path: &'a str, from: &str) -> &'a str {
 }
 
 /// `text` kept as long as `alloc`.
-fn keep<'a>(text: &str, alloc: Alloc<'a>) -> &'a str {
-    Box::leak(AString::from_str_in(text, alloc).into_boxed_str())
+fn keep<'a>(text: &str, alloc: Bump<'a>) -> &'a str {
+    alloc.alloc_str(text)
 }
 
 /// A file read and outlined, kept as long as `alloc`.
-fn file_of<'a>(path: &'a str, text: &'a str, outlined: Outline<'a>, from: &str, alloc: Alloc<'a>) -> &'a SourceFile<'a> {
+fn file_of<'a>(path: &'a str, text: &'a str, outlined: Outline<'a>, from: &str, alloc: Bump<'a>) -> &'a SourceFile<'a> {
     let package = crate::package_path::PackagePath::of(path, from, alloc);
     let contents = DigestedText { text, id: file_id(text) };
-    Box::leak(Box::new_in(SourceFile { path, package, shown: shown(path, from), contents, outline: outlined }, alloc))
+    alloc.alloc_val(SourceFile { path, package, shown: shown(path, from), contents, outline: outlined })
 }
 
 /// A record's bytes copied to blocks aligned as blaze-format reads them in place.
@@ -1368,14 +1508,35 @@ struct Block([u8; 16]);
 
 const _: () = assert!(core::mem::align_of::<Block>() == blaze_format::ALIGN);
 
-pub fn aligned<'a>(bytes: &[u8], alloc: Alloc<'a>) -> &'a [u8] {
-    let mut blocks = AVec::with_capacity_in(bytes.len().div_ceil(16), alloc);
+/// Owned 16-aligned copy of a record's bytes: drops its buffer instead of freezing in a bump arena.
+pub(crate) struct AlignedBuf<'a> {
+    bytes: AVec<'a, u8>,
+    pad: usize,
+}
+
+impl<'a> AlignedBuf<'a> {
+    pub(crate) fn copy_from(bytes: &[u8], alloc: Alloc<'a>) -> AlignedBuf<'a> {
+        const ALIGN: usize = blaze_format::ALIGN;
+        let mut buf: AVec<'a, u8> = AVec::with_capacity_in(bytes.len() + ALIGN, alloc);
+        let pad = buf.as_ptr().align_offset(ALIGN).min(ALIGN);
+        buf.resize(pad, 0);
+        buf.extend_from_slice(bytes);
+        AlignedBuf { bytes: buf, pad }
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        self.bytes.get(self.pad..).unwrap_or(&[])
+    }
+}
+
+pub fn aligned<'a>(bytes: &[u8], alloc: Bump<'a>) -> &'a [u8] {
+    let mut blocks = BVec::with_capacity_in(bytes.len().div_ceil(16), alloc);
     for chunk in bytes.chunks(16) {
         let mut block = [0u8; 16];
         block[..chunk.len()].copy_from_slice(chunk);
         blocks.push(Block(block));
     }
-    let blocks: &'a [Block] = blocks.leak();
+    let blocks: &'a [Block] = blocks.into_bump_slice();
     // SAFETY: `Block` is `repr(C)` around `[u8; 16]`, so `blocks` is `16 * len` initialized
     // bytes with no padding, borrowed for `'a` and never written again.
     let all: &'a [u8] = unsafe { core::slice::from_raw_parts(blocks.as_ptr().cast::<u8>(), blocks.len() * 16) };
@@ -1412,8 +1573,28 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     first: First,
     prepares: &'a Prepares<'a>,
     kept: &crate::expansions::KeptExpansions<'_, 'a>,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Result<CrateNames<'a>, NamesError<'a>> {
+    resolve_one_with(graph, input, id, source, built, sources, par, first, prepares, kept, ResolveOpts::default(), bump)
+}
+
+#[expect(clippy::too_many_arguments, reason = "one crate's every input, named")]
+#[allow(clippy::too_many_arguments, reason = "the graph's id and the sources' index differ in a per-crate call")]
+pub(crate) fn resolve_one_with<'a, 'r, 'p: 'a, S: SourceTexts<'a>, P: Par>(
+    graph: &CrateGraph<'a, &'a str>,
+    input: &CrateInput<'a>,
+    id: CrateId,
+    source: usize,
+    built: &Built<'_, 'a>,
+    sources: &S,
+    par: &P,
+    first: First,
+    prepares: &'r Prepares<'p>,
+    kept: &crate::expansions::KeptExpansions<'_, 'a>,
+    opts: ResolveOpts<'a>,
+    bump: Bump<'a>,
+) -> Result<CrateNames<'a>, NamesError<'a>> {
+    let alloc = bump.alloc();
     // The crate's index for `sources`: its graph id in a whole-set call, the caller's index
     // in a per-crate one ([`crate::crate_scope::resolve_crate`]).
     let index = source;
@@ -1425,12 +1606,12 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
 
     // A one-group solve handed the module tree record reads, outlines and lowers its members'
     // files alone (tree_record.rs); every other solve walks the files from the root.
-    let held_tree = par.names_members().and_then(|m| m.tree.map(|b| (m, aligned(b, alloc))));
+    let held_tree = par.names_members().and_then(|m| m.tree.map(|b| (m, aligned(b, bump))));
     // A member that moved the tree (its walk rows, `mod` lines or exports are not the record's,
     // or it is in no row) makes the tree again from the files, as the record's inputs moved:
     // the solve's `tree_record` is then the new one.
     let from_record = match held_tree {
-        Some((members, bytes)) => from_tree_record(graph, input, id, index, edition, &cfg, built, sources, par, members, bytes, &mut notes, alloc)?,
+        Some((members, bytes)) => from_tree_record(graph, input, id, index, edition, &cfg, built, sources, par, members, bytes, &opts, &mut notes, bump)?,
         None => None,
     };
     if held_tree.is_some() && from_record.is_none() {
@@ -1438,7 +1619,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     }
     let prepared = match from_record {
         Some(prepared) => prepared,
-        None => walked_files(graph, input, id, index, edition, &cfg, built, sources, par, &mut notes, alloc)?,
+        None => walked_files(graph, input, id, index, edition, &cfg, built, sources, par, &opts, &mut notes, bump)?,
     };
     let Prepared { set, tree, low, listed, root_attrs, root_bytes, record } = prepared;
 
@@ -1449,7 +1630,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
         let m = &tree.modules[i];
         let info = module_info(input.key, &tree, i);
         let bytes = match d.write(m.key, &info, alloc) {
-            Ok(bytes) => aligned(&bytes, alloc),
+            Ok(bytes) => aligned(&bytes, bump),
             Err(error) => {
                 notes.push(NamesNote::DeclsRecord { module: m.key, error: RecordError::Refused(error) });
                 continue;
@@ -1465,14 +1646,18 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     let root_record = |error| NamesError::RootRecord { krate: input.name, error };
     let view = CrateRootView::read(root_bytes).map_err(|e| root_record(RecordError::NotRead(e)))?;
     let mut crate_root_record = CrateRootBuilder::from(&view, alloc);
-    // The module tree record: held in (its members matched their rows), or written from this
-    // walk.
+    // The module tree record: only built when group solves or `BlockScopes::Bodies` read it
+    // (skipping the dead re-walk and serialization on the engine `CrateScope` path).
+    let needs_tree_record = par.names_groups()
+        || par.names_members().is_some()
+        || par.block_scopes() == crate::surface::BlockScopes::Bodies;
     let tree_record: &'a [u8] = match &record {
         Some((bytes, _)) => bytes,
-        None => {
-            let written = tree_record_of(&set, &tree, &decls, &low.tables.macros, &low.tables.enums, &cfg, edition, &crate_root_record.tools, root_attrs, root_bytes, alloc);
-            aligned(&written.map_err(|error| NamesError::TreeRecord { krate: input.name, error })?, alloc)
+        None if needs_tree_record => {
+            let written = tree_record_of(&set, &tree, &decls, &low.tables.macros, &low.tables.enums, &cfg, edition, &crate_root_record.tools, root_attrs, root_bytes, bump);
+            aligned(&written.map_err(|error| NamesError::TreeRecord { krate: input.name, error })?, bump)
         }
+        None => &[],
     };
     let mut chains: HashMap<ItemKey, AVec<'a, ItemKey>, Alloc<'a>> = HashMap::new_in(alloc);
     let mut by_index: AVec<'a, AVec<'a, ItemKey>> = AVec::with_capacity_in(tree.modules.len(), alloc);
@@ -1488,8 +1673,10 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
         chains.insert(m.key, chain);
     }
 
-    // The names.
-    let run = Run::new_in(set, prepares, alloc);
+    // The names. Move `low.tables` straight into `run.tables` so Stage::Publish never rehashes
+    // and merges two large tables (saves ~40 MB on `core`).
+    let empty_tables = Tables::new_in(alloc);
+    let run = Run::with_tables_in(set, prepares, low.tables, alloc);
     let mut fill: Fill<'a, &'a str> = Fill::new_in(alloc);
     fill.first = first;
     let added_externs: AVec<'a, (&'a str, ItemKey)>;
@@ -1504,7 +1691,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
             script: input.script,
             cfg: &cfg,
             tree: &tree,
-            tables: &low.tables,
+            tables: &empty_tables,
             decls: &decls,
             root: &crate_root_record,
             chains: &chains,
@@ -1521,6 +1708,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
             },
             made_before: None,
             alloc,
+            bump,
         };
         let mark = |stage: crate::task::Stage| par.stage(stage);
         let part = |part: ExpandPart, macro_name: &str, size: usize| par.expand_part(part, macro_name, size);
@@ -1530,24 +1718,47 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
         let scratch = |work: &mut dyn FnMut(Alloc<'_>)| par.call_scratch(work);
         let cx = FillCx { base: &base, run: &run, facts: Facts { base: &base, run: &run }, mark: &mark, part: &part, seen: &seen, scratch: &scratch };
         // The cell core solves and writes the scopes. The files' blocks that hold impls are
-        // modules before it starts: it is told of them as of any made module.
+        // modules before it starts: it is told of them as of any made module. Run `blocks_of`
+        // inside `par.call_scratch` so nested scans and block lowering scratch never leak into
+        // the crate's frame.
         par.stage(crate::task::Stage::Solve);
         par.names_part(crate::task::NamesPart::Blocks);
-        blocks_of(&base, &run, &low.bodies, None);
+        crate::task::Scratch::run(&scratch, alloc, |block_scratch| {
+            blocks_of(&base, &run, &low.bodies, None, block_scratch, None);
+        });
         let places = |m: ItemKey| held(run.block_places.lock(), "block places").get(&m).copied();
-        let expand = |call: ItemKey, def: Def| {
-            let _ = crate::task::Expand::expand(&cx, ExpandRequest { call, def });
+        let expand_batch = |batch: &[(ItemKey, Def)]| {
+            cx.expand_batch(batch, par, &opts);
         };
-        let made = |out: &mut AVec<'a, ItemKey>| out.extend(held(run.made.read(), "made modules").keys().copied());
+        let made = |out: &mut AVec<'_, ItemKey>| out.extend(held(run.made.read(), "made modules").keys().copied());
         let names_part = |p: crate::task::NamesPart| par.names_part(p);
         // The places counted: each held body's, and each attribute value's written as a call
         // (crate::attr_values: its macros are looked up at its item's place).
-        let held_places = |out: &mut AVec<'a, (ItemKey, u32)>| {
+        let held_places = |out: &mut AVec<'_, (ItemKey, u32)>| {
             out.extend(held(run.held.lock(), "held bodies").iter().map(|b| b.0.place));
-            out.extend(low.tables.values.iter().map(|v| v.place));
             out.extend(held(run.tables.read(), "tables").values.iter().map(|v| v.place));
         };
-        let solved = crate::cells::solve_and_write(&cx.facts, built, &cx.facts, &places, tree.modules[0].key, &expand, &made, &held_places, par.decide_check(), par.decide_plant(), par.names_groups(), par.names_members(), &names_part, alloc)
+        let solve_scratch = |work: &mut dyn FnMut(Alloc<'_>)| par.solve_scratch(work);
+        let solved = crate::cells::solve_and_write(
+            &cx.facts,
+            built,
+            &cx.facts,
+            &places,
+            tree.modules[0].key,
+            &expand_batch,
+            &made,
+            &held_places,
+            par.decide_check(),
+            par.decide_plant(),
+            par.names_groups(),
+            par.names_members(),
+            &names_part,
+            &solve_scratch,
+            par,
+            opts.parallel_bump.map(Bump::alloc),
+            opts.par_workers,
+            bump,
+        )
             .map_err(|error| NamesError::Cells { krate: input.name, error })?;
         if let Some(check) = &solved.decide {
             par.decided(input.name, check);
@@ -1597,11 +1808,11 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     }));
     bodies.sort_unstable_by_key(|b| b.src.key);
     let files = held(files.into_inner(), "files").into_files();
-    let mut tables_all = low.tables;
-    tables_all.merge(held(tables.into_inner(), "tables"));
+    let tables_all = held(tables.into_inner(), "tables");
     let made = held(made.into_inner(), "made modules");
+    chains.reserve(made.len());
     for (&m, module) in made.iter() {
-        chains.insert(m, module.chain.clone());
+        chains.insert(m, module.chain.clone_in(alloc));
     }
     notes.extend(held(run_notes.into_inner(), "notes"));
     let mut names = CrateNames {
@@ -1658,8 +1869,8 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
         }
     };
     let values = match input.script {
-        Some(out) => crate::attr_values::value_rows(&names, built, &cuts, &|site: &crate::attr_values::ValueSite<'a>| ScriptCx { inner: host_of(site), out }, alloc),
-        None => crate::attr_values::value_rows(&names, built, &cuts, &host_of, alloc),
+        Some(out) => crate::attr_values::value_rows(&names, built, &cuts, &|site: &crate::attr_values::ValueSite<'a>| ScriptCx { inner: host_of(site), out }, bump),
+        None => crate::attr_values::value_rows(&names, built, &cuts, &host_of, bump),
     };
     names.values = values;
     Ok(names)
@@ -1775,7 +1986,7 @@ pub fn solve_held_body<'a, S: SourceTexts<'a>>(
     body: HeldBody<'a>,
     sources: &S,
     prepares: &'a Prepares<'a>,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 ) -> Result<BodySolved<'a>, BodySolveError> {
     let tree = ReadTree::of(c, alloc).map_err(|error| BodySolveError::TreeRecord { body: body.src.key, error })?;
     solve_held_body_in(&tree, deps, input, source, body, sources, prepares, alloc)
@@ -1796,12 +2007,13 @@ pub struct ReadTree<'a> {
 impl<'a> ReadTree<'a> {
     /// `c`'s tree record (`CrateNames::tree_record`), read and checked once, and its files'
     /// index by path.
-    pub fn of(c: &'a CrateNames<'a>, alloc: Alloc<'a>) -> Result<ReadTree<'a>, crate::tree_record::TreeRecordError> {
+    pub fn of(c: &'a CrateNames<'a>, bump: Bump<'a>) -> Result<ReadTree<'a>, crate::tree_record::TreeRecordError> {
+        let alloc = bump.alloc();
         let mut files: FileIndex<'a> = HashMap::new_in(alloc);
         for (i, f) in c.files.iter().enumerate() {
             files.insert(f.path, u32::try_from(i).expect("a crate's files are counted in u32"));
         }
-        let files: &'a FileIndex<'a> = Box::leak(Box::new_in(files, alloc));
+        let files: &'a FileIndex<'a> = bump.alloc_val(files);
         Ok(ReadTree { names: c, record: TreeRecord::read(c.tree_record, alloc)?, files })
     }
 
@@ -1821,7 +2033,7 @@ pub fn solve_held_body_in<'a, S: SourceTexts<'a>>(
     body: HeldBody<'a>,
     sources: &S,
     prepares: &'a Prepares<'a>,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 ) -> Result<BodySolved<'a>, BodySolveError> {
     solve_held_body_scratch(tree, deps, input, source, body, sources, prepares, &crate::task::Scratch::kept, alloc)
 }
@@ -1840,14 +2052,15 @@ pub fn solve_held_body_scratch<'a, S: SourceTexts<'a>>(
     sources: &S,
     prepares: &'a Prepares<'a>,
     hook: crate::task::ScratchHook<'_>,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Result<BodySolved<'a>, BodySolveError> {
+    let alloc = bump.alloc();
     let c = tree.names;
     let at = body.src.key;
     // Every walked module's place and `mod` lines, read from the record (no module's
     // declarations are cloned for a body).
     let record = &tree.record;
-    let asked = crate::asked::Asked::new_in(alloc);
+    let asked = crate::asked::Asked::new_in(bump);
     let built = Built { crates: &deps.slots, by_prefix: deps.by_prefix, asked: Some(&asked) };
     let kept = crate::expansions::KeptExpansions::none(alloc);
     let no_decls: HashMap<ItemKey, (ModuleInfo<&'a str>, DeclsBuilder<'a, &'a str>), Alloc<'a>> = HashMap::new_in(alloc);
@@ -1884,6 +2097,7 @@ pub fn solve_held_body_scratch<'a, S: SourceTexts<'a>>(
         blocks: BlocksAt::Body,
         made_before: Some(&c.made),
         alloc,
+        bump,
     };
     let macros_read: core::cell::RefCell<AVec<'a, (ItemKey, ContentId)>> = core::cell::RefCell::new(AVec::new_in(alloc));
     let (scopes, made_outside, outermost, modules, enums) = {
@@ -1892,7 +2106,7 @@ pub fn solve_held_body_scratch<'a, S: SourceTexts<'a>>(
         let seen = |_: ItemKey, _: &str| {};
         let scratch = |_: &mut dyn FnMut(Alloc<'_>)| crate::task::Scratch::Kept;
         let cx = FillCx { base: &base, run: &run, facts: Facts { base: &base, run: &run }, mark: &mark, part: &part, seen: &seen, scratch: &scratch };
-        make_blocks(&base, &run, core::slice::from_ref(&body.src), body.writer);
+        make_blocks(&base, &run, core::slice::from_ref(&body.src), body.writer, alloc, None);
         let mut outermost: AVec<'a, ItemKey> = AVec::new_in(alloc);
         outermost.extend(held(run.block_places.lock(), "block places").iter().filter(|&(_, &p)| p == body.src.place).map(|(&k, _)| k));
         outermost.sort_unstable();
@@ -1997,28 +2211,31 @@ fn walked_files<'a, S: SourceTexts<'a>, P: Par>(
     built: &Built<'_, 'a>,
     sources: &S,
     par: &P,
+    opts: &ResolveOpts<'a>,
     notes: &mut AVec<'a, NamesNote<'a>>,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Result<Prepared<'a>, NamesError<'a>> {
+    let alloc = bump.alloc();
     par.stage(crate::task::Stage::Files);
     let unread = |error| NamesError::SourceUnread { krate: input.name, error };
     let root_text = sources.source(index, input.root).known().map_err(unread)?.ok_or(NamesError::RootNotRead { krate: input.name, path: input.root })?;
     let mut set = FileSet::new_in(alloc);
-    let root_file = set.add(file_of(input.root, root_text, outline(root_text, edition, alloc), input.shown_from, alloc));
+    let root_outline = blaze_file_items::outline_auto_extensions(root_text, edition, blaze_file_items::Bodies::Skipped, alloc);
+    let root_file = set.add(file_of(input.root, root_text, root_outline, input.shown_from, bump));
     let mut root_dir = AString::from_str_in(input.root, alloc);
     pop_dir(&mut root_dir);
     let mut tried: HashMap<&'a str, (), Alloc<'a>> = HashMap::new_in(alloc);
     let mut walked = None;
     for _ in 0..MOST_WALKS {
         par.names_part(crate::task::NamesPart::Walk);
-        let tree = walk(&set, cfg, input.key, input.name, root_file, &root_dir, edition, alloc);
+        let tree = walk(&set, cfg, input.key, input.name, root_file, &root_dir, edition, bump);
         par.names_part(crate::task::NamesPart::Outline);
         let mut read: AVec<'a, (&'a str, &'a str)> = AVec::new_in(alloc);
         for path in tree.missing.iter() {
             if set.find(path).is_some() || tried.contains_key(path.as_str()) {
                 continue;
             }
-            let path = keep(path, alloc);
+            let path = keep(path, bump);
             tried.insert(path, ());
             if let Some(text) = sources.source(index, path).known().map_err(unread)? {
                 read.push((path, text));
@@ -2034,7 +2251,7 @@ fn walked_files<'a, S: SourceTexts<'a>, P: Par>(
             return Err(NamesError::OutlineCount { krate: input.name, files: read.len(), outlines: outlines.len() });
         }
         for (&(path, text), outlined) in read.iter().zip(outlines) {
-            set.add(file_of(path, text, outlined, input.shown_from, alloc));
+            set.add(file_of(path, text, outlined, input.shown_from, bump));
         }
     }
     let tree = walked.ok_or(NamesError::WalkUnbounded { krate: input.name })?;
@@ -2047,10 +2264,10 @@ fn walked_files<'a, S: SourceTexts<'a>, P: Par>(
     let root = set.at(root_file as usize);
     let attrs = file_attrs(cfg, &root.outline, root.text, alloc);
     let tools = crate_tools(&attrs, alloc);
-    let mut low = lower_modules(input.key, input.implicit.entry, input.implicit.proc_macro, edition, cfg, &tools, &set, &tree, listed, notes, par, None, sources.attr_order(), alloc);
+    let mut low = lower_modules(input.key, input.implicit.entry, input.implicit.proc_macro, edition, cfg, &tools, &set, &tree, listed, notes, par, opts, None, sources.attr_order(), bump);
     let root_attrs = RootAttrs { no_std: attrs.no_std, no_core: attrs.no_core, arbitrary_ints: attrs.arbitrary_ints };
     let macro_exports = core::mem::replace(&mut low.macro_exports, AVec::new_in(alloc));
-    let root_bytes = root_record_of(graph, input, id, root.id, &attrs, &tree, &mut low, &macro_exports, built, notes, alloc)?;
+    let root_bytes = root_record_of(graph, input, id, root.id, &attrs, &tree, &mut low, &macro_exports, built, notes, bump)?;
     Ok(Prepared { set, tree, low, listed, root_attrs, root_bytes, record: None })
 }
 
@@ -2068,10 +2285,11 @@ fn root_record_of<'a>(
     macro_exports: &[(&'a str, ItemKey, MacroShapes)],
     built: &Built<'_, 'a>,
     notes: &mut AVec<'a, NamesNote<'a>>,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Result<&'a [u8], NamesError<'a>> {
+    let alloc = bump.alloc();
     let root_attrs = RootAttrs { no_std: attrs.no_std, no_core: attrs.no_core, arbitrary_ints: attrs.arbitrary_ints };
-    let plan = root_plan(graph, id, root_attrs, built, notes, alloc)?;
+    let plan = root_plan(graph, id, root_attrs, built, notes, bump)?;
     // From 2018 the injected item's name is def-site (rustc's `std_inject`: `ident_span = if
     // edition >= Edition2018 { span } else { call_site }`, `span` with the pass's def-site
     // context): a name the root writes itself is a different name and stands, no duplicate.
@@ -2098,7 +2316,7 @@ fn root_record_of<'a>(
     let cr = crate_root(&root_input, &plan, &mut root_notes, alloc);
     notes.extend(root_notes.into_iter().map(NamesNote::Root));
     let bytes = cr.write(alloc).map_err(|e| NamesError::RootRecord { krate: input.name, error: RecordError::Refused(e) })?;
-    Ok(aligned(&bytes, alloc))
+    Ok(aligned(&bytes, bump))
 }
 
 /// A one-group solve's files and tree from the module tree record `bytes`: the tree is the
@@ -2119,10 +2337,12 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
     par: &P,
     members: crate::cells::Members<'_>,
     bytes: &'a [u8],
+    opts: &ResolveOpts<'a>,
     notes: &mut AVec<'a, NamesNote<'a>>,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Result<Option<Prepared<'a>>, NamesError<'a>> {
     use crate::cells::MemberRefusal;
+    let alloc = bump.alloc();
     let refuse = |r: MemberRefusal| NamesError::Cells { krate: input.name, error: crate::cells::Unwritten::Member(r) };
     par.stage(crate::task::Stage::Files);
     par.tree_record_read(bytes.len());
@@ -2151,7 +2371,7 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
                 // A file gone: the file set moved under the record. One not read is no gone one.
                 let found = sources.source(index, m.file).known().map_err(|error| NamesError::SourceUnread { krate: input.name, error })?;
                 let Some(text) = found else { return Ok(None) };
-                set.add(file_of(m.file, text, outline(text, edition, alloc), input.shown_from, alloc));
+                set.add(file_of(m.file, text, outline(text, edition, alloc), input.shown_from, bump));
             }
         }
     }
@@ -2182,6 +2402,7 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
             dir: AString::from_str_in(m.dir, alloc),
             path_dir: AString::from_str_in(m.path_dir, alloc),
             no_implicit_prelude: m.no_implicit_prelude,
+            macro_use: m.macro_use,
             path: AString::from_str_in(m.path, alloc),
         });
     }
@@ -2193,7 +2414,7 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
         let m = &tree.modules[i];
         let f = set.at(m.file as usize);
         rows.clear();
-        let file_attrs = walk_rows(cfg, &f.outline, f.text, m.item, edition, &mut rows, alloc);
+        let file_attrs = walk_rows(cfg, &f.outline, f.text, m.item, edition, &mut rows, bump);
         let row = &record.modules[i];
         if rows[..] != row.rows[..] || file_attrs != row.file_attrs {
             return Ok(None);
@@ -2203,7 +2424,7 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
     par.stage(crate::task::Stage::Lower);
     let listed = if input.implicit.proc_macro { sources.proc_exports(index) } else { None };
     let root_member = at.first() == Some(&0);
-    let stored = aligned(record.crate_root, alloc);
+    let stored = aligned(record.crate_root, bump);
     let (tools, attrs) = if root_member {
         let root = set.at(tree.modules[0].file as usize);
         let attrs = file_attrs(cfg, &root.outline, root.text, alloc);
@@ -2213,15 +2434,15 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
     };
     // The members' notes are kept only when the record holds: a tree made again notes its own.
     let mut own_notes = AVec::new_in(alloc);
-    let mut low = lower_modules(input.key, input.implicit.entry, input.implicit.proc_macro, edition, cfg, &tools, &set, &tree, listed, &mut own_notes, par, Some(at), sources.attr_order(), alloc);
+    let mut low = lower_modules(input.key, input.implicit.entry, input.implicit.proc_macro, edition, cfg, &tools, &set, &tree, listed, &mut own_notes, par, opts, Some(at), sources.attr_order(), bump);
     let stored_view = CrateRootView::read(stored).map_err(|_| refuse(MemberRefusal::TreeCrateRoot))?;
-    if members_moved(input.key, &tree, &low, &record, &stored_view, alloc) {
+    if members_moved(input.key, &tree, &low, &record, &stored_view, bump) {
         return Ok(None);
     }
     if !defining.is_empty() {
         // Their macro table rows alone: their scopes, notes and calls are their records'.
         let mut dropped = AVec::new_in(alloc);
-        let outside = lower_modules(input.key, input.implicit.entry, input.implicit.proc_macro, edition, cfg, &tools, &set, &tree, listed, &mut dropped, par, Some(defining), sources.attr_order(), alloc);
+        let outside = lower_modules(input.key, input.implicit.entry, input.implicit.proc_macro, edition, cfg, &tools, &set, &tree, listed, &mut dropped, par, opts, Some(defining), sources.attr_order(), bump);
         let found = macros_by_module(&outside.tables.macros, alloc);
         if outside.at.iter().any(|&i| found.get(&tree.modules[i].key).copied().unwrap_or(0) != record.modules[i].macros) {
             // A module's macros moved under the record: its inputs moved.
@@ -2238,7 +2459,7 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
         Some((root_file, attrs)) => {
             let exports: AVec<'a, (&'a str, ItemKey, MacroShapes)> = AVec::from_iter_in(stored_view.macro_exports(), alloc);
             let root_attrs = RootAttrs { no_std: attrs.no_std, no_core: attrs.no_core, arbitrary_ints: attrs.arbitrary_ints };
-            (root_attrs, root_record_of(graph, input, id, root_file, &attrs, &tree, &mut low, &exports, built, notes, alloc)?)
+            (root_attrs, root_record_of(graph, input, id, root_file, &attrs, &tree, &mut low, &exports, built, notes, bump)?)
         }
     };
     Ok(Some(Prepared { set, tree, low, listed, root_attrs, root_bytes, record: Some((bytes, record)) }))
@@ -2247,12 +2468,13 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
 /// Whether a member's `mod` lines or `#[macro_export]` macros (its record written and read
 /// back, the form the tree record's lines were taken in) are not the tree record's row and
 /// crate root's: the record's inputs moved.
-fn members_moved<'a>(krate: CrateItemKey, tree: &Tree<'a, 'a>, low: &Lowering<'a>, record: &TreeRecord<'a>, root: &CrateRootView<'_>, alloc: Alloc<'a>) -> bool {
+fn members_moved<'a>(krate: CrateItemKey, tree: &Tree<'a, 'a>, low: &Lowering<'a>, record: &TreeRecord<'a>, root: &CrateRootView<'_>, bump: Bump<'a>) -> bool {
+    let alloc = bump.alloc();
     for (&i, d) in low.at.iter().zip(low.decls.iter()) {
         let key = tree.modules[i].key;
         let row = &record.modules[i];
         let Ok(bytes) = d.write(key, &module_info(krate, tree, i), alloc) else { return true };
-        let Ok(view) = ModuleDeclsView::read(aligned(&bytes, alloc)) else { return true };
+        let Ok(view) = ModuleDeclsView::read(aligned(&bytes, bump)) else { return true };
         let d = DeclsBuilder::from(&view, alloc);
         if d.mods.len() != row.lines.len() || d.mods.iter().zip(row.lines.iter()).any(|(c, l)| (c.module, c.macro_use) != *l) {
             return true;
@@ -2309,14 +2531,15 @@ fn tree_record_of<'a>(
     tools: &[&'a str],
     root_attrs: RootAttrs,
     crate_root: &'a [u8],
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Result<AVec<'a, u8>, crate::tree_record::TreeRecordError> {
+    let alloc = bump.alloc();
     let defined = macros_by_module(macros, alloc);
     let mut modules = AVec::with_capacity_in(tree.modules.len(), alloc);
     for m in tree.modules.iter() {
         let f = set.at(m.file as usize);
         let mut rows = AVec::new_in(alloc);
-        let file_attrs = walk_rows(cfg, &f.outline, f.text, m.item, edition, &mut rows, alloc);
+        let file_attrs = walk_rows(cfg, &f.outline, f.text, m.item, edition, &mut rows, bump);
         let (lines, exports) = match decls.get(&m.key) {
             Some((_, d)) => (AVec::from_iter_in(d.mods.iter().map(|c| (c.module, c.macro_use)), alloc), d.macro_rules.iter().filter(|r| r.export).count()),
             None => (AVec::new_in(alloc), 0),
@@ -2330,6 +2553,7 @@ fn tree_record_of<'a>(
             dir: m.dir.as_str(),
             path_dir: m.path_dir.as_str(),
             no_implicit_prelude: m.no_implicit_prelude,
+            macro_use: m.macro_use,
             path: m.path.as_str(),
             lines,
             rows,
@@ -2367,6 +2591,7 @@ fn module_enums<'d, 'a>(d: &'d DeclsBuilder<'a, &'a str>, enums: &'d HashMap<Ite
     d.items.iter().filter(|it| it.def.kind == DefKind::Enum).filter_map(move |it| enums.get(&it.def.key).map(|v| (it.def.key, v.as_slice())))
 }
 
+#[expect(clippy::too_many_arguments, reason = "module lowering inputs, each named")]
 fn lower_modules<'a, P: Par>(
     krate: CrateItemKey,
     entry: bool,
@@ -2380,23 +2605,27 @@ fn lower_modules<'a, P: Par>(
     listed: Option<&'a [ProcExport<'a>]>,
     notes: &mut AVec<'a, NamesNote<'a>>,
     par: &P,
+    opts: &ResolveOpts<'a>,
     only: Option<AVec<'a, usize>>,
     order: AttrOrder,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Lowering<'a> {
+    let alloc = bump.alloc();
     // The modules lowered, ascending: every one, or a one-group solve's members.
     let at: AVec<'a, usize> = only.unwrap_or_else(|| AVec::from_iter_in(0..tree.modules.len(), alloc));
-    let mut parts = AVec::with_capacity_in(at.len(), alloc);
-    par.map(
-        at.len(),
-        |j| {
+    let mut run_in = |s_alloc: Alloc<'_>| -> Lowering<'a> {
+        let par_run = opts.par_workers > 1 && at.len() >= 8 && opts.parallel_bump.is_some();
+        let work_bump = if par_run { opts.parallel_bump.unwrap_or(bump) } else { bump };
+        let work_out: Alloc<'_> = if par_run { work_bump.alloc() } else { s_alloc };
+        let mut parts = AVec::with_capacity_in(at.len(), s_alloc);
+        let lower_one = |j: usize| {
             let i = at[j];
             let m = &tree.modules[i];
-            let file = set.at(m.file as usize);
+            let file = set.at(usize::try_from(m.file).unwrap_or(0));
             let fragment = Fragment {
                 // A file: no expansion wrote it.
                 marks: None,
-                tokens: None,
+                tokens: FragmentTokens::None,
                 module: m.key,
                 owner: m.key,
                 text: file.text,
@@ -2414,39 +2643,91 @@ fn lower_modules<'a, P: Par>(
                 None => ProcDecls::Text,
                 Some(list) => ProcDecls::Module { here: if i == 0 { list } else { &[] } },
             };
-            lower(LowerCx { krate, tools, edition, cfg, walked: tree, procs, entry: entry && i == 0, harness: harness && i == 0, order }, fragment, alloc)
-        },
-        &mut parts,
-    );
-    let mut out = Lowering {
-        decls: AVec::with_capacity_in(parts.len(), alloc),
-        at: AVec::new_in(alloc),
-        tables: Tables::new_in(alloc),
-        prelude: None,
-        macro_use: AVec::new_in(alloc),
-        macro_exports: AVec::new_in(alloc),
-        bodies: AVec::new_in(alloc),
-    };
-    for (&i, mut part) in at.iter().zip(parts) {
-        let m = &tree.modules[i];
-        out.bodies.extend(part.bodies.iter().copied());
-        for rules in part.decls.macro_rules.iter() {
-            if rules.export {
-                out.macro_exports.push((rules.name, rules.def, rules.shapes));
+            let mut lowered = None;
+            let _ = par.call_scratch(&mut |scratch| {
+                lowered = Some(crate::task::lower_in_out(
+                    LowerCx { krate, tools, edition, cfg, walked: tree, procs, entry: entry && i == 0, harness: harness && i == 0, order },
+                    fragment,
+                    work_out,
+                    scratch,
+                    work_bump,
+                ));
+            });
+            lowered.unwrap_or_else(|| crate::task::lower_in_out(LowerCx { krate, tools, edition, cfg, walked: tree, procs, entry: entry && i == 0, harness: harness && i == 0, order }, fragment, work_out, work_out, work_bump))
+        };
+        if !par_run && opts.parallel_bump.is_some() {
+            for j in 0..at.len() {
+                parts.push(lower_one(j));
             }
+        } else {
+            par.map(at.len(), lower_one, &mut parts);
         }
-        let prelude = part.prelude.take();
-        if i == 0 {
-            out.prelude = prelude;
-            out.macro_use = core::mem::replace(&mut part.macro_use, AVec::new_in(alloc));
-        } else if prelude.is_some() {
-            notes.push(NamesNote::PreludeImportOutsideRoot { module: m.key });
+        let mut tables = Tables::with_by_place_in(alloc, par.track_by_place());
+        let (mut n_macros, mut n_calls, mut n_enums, mut n_impls, mut n_langs, mut n_use_locs, mut n_texts, mut n_members, mut n_ctors, mut n_values, mut n_bodies) = (0usize, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        for p in parts.iter() {
+            n_macros += p.macros.len();
+            n_calls += p.calls.len();
+            n_enums += p.enums.len();
+            n_impls += p.impls.len();
+            n_langs += p.langs.len();
+            if !p.use_locs.is_empty() {
+                n_use_locs += 1;
+            }
+            n_texts += p.texts.len();
+            n_members += p.members.len();
+            n_ctors += p.ctors.len();
+            n_values += p.values.len();
+            n_bodies += p.bodies.len();
         }
-        let decls = core::mem::replace(&mut part.decls, DeclsBuilder::new_in(alloc));
-        let lowered = out.tables.add(m.key, At::File(m.file), part);
-        notes.extend(lowered.into_iter().map(NamesNote::Lower));
-        out.decls.push(decls);
-    }
+        tables.macros.reserve(n_macros);
+        tables.calls.reserve(n_calls);
+        tables.enums.reserve(n_enums);
+        tables.impls.reserve(n_impls);
+        tables.langs.reserve(n_langs);
+        tables.use_locs.reserve(n_use_locs);
+        tables.texts.reserve(n_texts);
+        if tables.track_by_place {
+            tables.by_place.reserve(n_texts);
+        }
+        tables.members.reserve(n_members);
+        tables.ctors.reserve(n_ctors);
+        tables.values.reserve(n_values);
+        let mut out = Lowering {
+            decls: AVec::with_capacity_in(parts.len(), alloc),
+            at: AVec::new_in(alloc),
+            tables,
+            prelude: None,
+            macro_use: AVec::new_in(alloc),
+            macro_exports: AVec::new_in(alloc),
+            bodies: AVec::with_capacity_in(n_bodies, alloc),
+        };
+        for (&i, mut part) in at.iter().zip(parts) {
+            let m = &tree.modules[i];
+            out.bodies.extend(part.bodies.iter().copied());
+            for rules in part.decls.macro_rules.iter() {
+                if rules.export {
+                    out.macro_exports.push((rules.name, rules.def, rules.shapes));
+                }
+            }
+            let prelude = part.prelude.take();
+            if i == 0 {
+                out.prelude = prelude;
+                out.macro_use = core::mem::replace(&mut part.macro_use, AVec::new_in(alloc));
+            } else if prelude.is_some() {
+                notes.push(NamesNote::PreludeImportOutsideRoot { module: m.key });
+            }
+            let decls = core::mem::replace(&mut part.decls, DeclsBuilder::new_in(alloc));
+            let lowered = out.tables.add(m.key, At::File(m.file), part);
+            notes.extend(lowered.into_iter().map(NamesNote::Lower));
+            out.decls.push(decls);
+        }
+        out
+    };
+    let mut out = None;
+    let _ = par.solve_scratch(&mut |s_alloc| {
+        out = Some(run_in(s_alloc));
+    });
+    let mut out = out.unwrap_or_else(|| run_in(alloc));
     out.at = at;
     out
 }
@@ -2476,8 +2757,9 @@ fn root_plan<'a>(
     attrs: RootAttrs,
     built: &Built<'_, 'a>,
     notes: &mut AVec<'a, NamesNote<'a>>,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Result<RootPlan<'a, 'a>, NamesError<'a>> {
+    let alloc = bump.alloc();
     let externs = graph.externs(id, attrs);
     let krate = graph.get(id).name;
     notes.extend(externs.dropped.iter().map(|d| NamesNote::ExternDropped { krate, name: d.name, why: d.why }));
@@ -2502,10 +2784,10 @@ fn root_plan<'a>(
     // of the root: `crate::std` names it, and in 2015 `use std::..` reads it there.
     let injected = externs.macro_use.filter(|c| root_of(*c).is_some()).map(|_| if attrs.no_std { "core" } else { "std" });
     let prelude = externs.std_prelude.map(|p| {
-        let mut why = AString::new_in(alloc);
+        let mut why = BString::new_in(bump);
         let Some(other) = built.at(p.krate.index()) else {
             push_fmt(&mut why, format_args!("crate {} not finished", p.krate.0));
-            return Err(&*Box::leak(why.into_boxed_str()));
+            return Err(&*why.into_bump_str());
         };
         let mut at = other.root();
         for segment in p.path {
@@ -2519,7 +2801,7 @@ fn root_plan<'a>(
                         push_fmt(&mut why, format_args!("::{s}"));
                     }
                     push_fmt(&mut why, format_args!("`: `{segment}` is {found:?}"));
-                    return Err(&*Box::leak(why.into_boxed_str()));
+                    return Err(&*why.into_bump_str());
                 }
             }
         }
@@ -2528,7 +2810,7 @@ fn root_plan<'a>(
     Ok(RootPlan { extern_prelude, deps, macro_use, prelude, injected })
 }
 
-fn push_fmt(out: &mut AString<'_>, args: fmt::Arguments<'_>) {
+fn push_fmt<A: core::alloc::Allocator>(out: &mut blaze_own::String<A>, args: fmt::Arguments<'_>) {
     out.write_fmt(args).expect("writing to a string fails only when its allocator does");
 }
 
@@ -2567,6 +2849,7 @@ struct Base<'r, 'a, S> {
     /// `None` in a crate solve.
     made_before: Option<&'r HashMap<ItemKey, MadeModule<'a>, Alloc<'a>>>,
     alloc: Alloc<'a>,
+    bump: Bump<'a>,
 }
 
 /// What becomes of the blocks of a body lowered in a solve (D189's seam,
@@ -2587,16 +2870,31 @@ enum BlocksAt {
 /// item ([`blaze_file_items::nested::Nested::writes`], the scan [`make_blocks`] reads first):
 /// any other body's blocks declare nothing a name or an impl table reads, and its own lowering
 /// answers its block-local names.
-fn blocks_of<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, bodies: &[crate::task::BodySrc<'a>], writer: Option<&'a ExpansionText<'a>>) {
+fn blocks_of<'a, S: SourceTexts<'a>>(
+    base: &Base<'_, 'a, S>,
+    run: &Run<'a, '_, '_>,
+    bodies: &[crate::task::BodySrc<'a>],
+    writer: Option<&'a ExpansionText<'a>>,
+    scratch: Alloc<'_>,
+    deferred_tokens: Option<&dyn Fn() -> crate::nested_input::ExpansionTokens<'a>>,
+) {
     match base.blocks {
-        BlocksAt::Crate | BlocksAt::Body => make_blocks(base, run, bodies, writer),
+        BlocksAt::Crate | BlocksAt::Body => make_blocks(base, run, bodies, writer, scratch, deferred_tokens),
         BlocksAt::Held => {
             let writes = |b: &crate::task::BodySrc<'a>| {
-                let nested = blaze_file_items::nested::scan(b.text, base.alloc);
+                let nested = blaze_file_items::nested::scan(b.text, scratch);
                 nested.end == blaze_file_items::nested::NestedEnd::Whole && nested.writes()
             };
             let mut held_bodies = held(run.held.lock(), "held bodies");
-            held_bodies.extend(bodies.iter().filter(|b| writes(b)).map(|&b| (b, writer)));
+            for &b in bodies.iter() {
+                if writes(&b) {
+                    let mut b = b;
+                    if b.tokens.is_none() {
+                        b.tokens = deferred_tokens.map(|f| f());
+                    }
+                    held_bodies.push((b, writer));
+                }
+            }
         }
     }
 }
@@ -2622,7 +2920,7 @@ impl<'a, S> Base<'_, 'a, S> {
 }
 
 /// What the expansions of one crate add, shared by the fill's threads.
-struct Run<'a> {
+struct Run<'a, 'r, 'p> {
     files: Mutex<FileSet<'a>>,
     tables: RwLock<Tables<'a>>,
     expansions: Mutex<HashMap<ItemKey, Expansion<'a>, Alloc<'a>>>,
@@ -2639,15 +2937,19 @@ struct Run<'a> {
     /// Each declarative macro this crate's item calls name, prepared once: the call's set,
     /// shared by every crate it resolves (a definition is keyed by its defining item, which
     /// names its crate).
-    prepares: &'a Prepares<'a>,
+    prepares: &'r Prepares<'p>,
 }
 
-impl<'a> Run<'a> {
-    fn new_in(files: FileSet<'a>, prepares: &'a Prepares<'a>, alloc: Alloc<'a>) -> Run<'a> {
+impl<'a, 'r, 'p> Run<'a, 'r, 'p> {
+    fn new_in(files: FileSet<'a>, prepares: &'r Prepares<'p>, alloc: Alloc<'a>) -> Run<'a, 'r, 'p> {
+        Self::with_tables_in(files, prepares, Tables::new_in(alloc), alloc)
+    }
+
+    fn with_tables_in(files: FileSet<'a>, prepares: &'r Prepares<'p>, tables: Tables<'a>, alloc: Alloc<'a>) -> Run<'a, 'r, 'p> {
         Run {
             prepares,
             files: Mutex::new(files),
-            tables: RwLock::new(Tables::new_in(alloc)),
+            tables: RwLock::new(tables),
             expansions: Mutex::new(HashMap::new_in(alloc)),
             made: RwLock::new(HashMap::new_in(alloc)),
             notes: Mutex::new(AVec::new_in(alloc)),
@@ -2662,13 +2964,13 @@ impl<'a> Run<'a> {
     }
 }
 
-struct Facts<'r, 'a, S> {
+struct Facts<'r, 'a, 'rp, 'p, S> {
     base: &'r Base<'r, 'a, S>,
-    run: &'r Run<'a>,
+    run: &'r Run<'a, 'rp, 'p>,
 }
 
 /// This crate's enums for the cell core: the lowered text's, then the expansions' so far.
-impl<'a, S> crate::cells::EnumNames<&'a str> for Facts<'_, 'a, S> {
+impl<'a, S> crate::cells::EnumNames<&'a str> for Facts<'_, 'a, '_, '_, S> {
     fn holds(&self, of: ItemKey) -> bool {
         self.base.tables.enums.contains_key(&of) || held(self.run.tables.read(), "tables").enums.contains_key(&of) || self.recorded_enum(of).is_some()
     }
@@ -2691,7 +2993,7 @@ impl<'a, S> crate::cells::EnumNames<&'a str> for Facts<'_, 'a, S> {
     }
 }
 
-impl<'a, S> Facts<'_, 'a, S> {
+impl<'a, S> Facts<'_, 'a, '_, '_, S> {
     /// An enum of a module this one-group solve did not lower, as the module tree record holds
     /// it (the module's text is the record's: `members_moved` walked again otherwise). A lowered
     /// module's enums are the tables' (equal to its row), an expansion's are the run's.
@@ -2700,7 +3002,7 @@ impl<'a, S> Facts<'_, 'a, S> {
     }
 }
 
-impl<'a, S> ScopeFacts for Facts<'_, 'a, S> {
+impl<'a, S> ScopeFacts for Facts<'_, 'a, '_, '_, S> {
     type Name = &'a str;
 
     fn module(&self, module: ItemKey) -> Result<ModuleInfo<&'a str>, SurfaceError> {
@@ -2742,7 +3044,43 @@ impl<'a, S> ScopeFacts for Facts<'_, 'a, S> {
     }
 
     fn expansion(&self, call: ItemKey) -> Result<Option<DeclsBuilder<'_, &'a str>>, SurfaceError> {
-        Ok(held(self.run.expansions.lock(), "expansions").get(&call).map(|e| e.decls.clone()))
+        Ok(held(self.run.expansions.lock(), "expansions").get(&call).map(|e| {
+            e.decls().map_or_else(|| DeclsBuilder::new_in(self.base.alloc), |d| d.clone())
+        }))
+    }
+
+    fn with_decls<R>(&self, module: ItemKey, f: impl FnOnce(&DeclsBuilder<'_, Self::Name>) -> R) -> Result<R, SurfaceError> {
+        if let Some(it) = self.base.decls.get(&module) {
+            return Ok(f(&it.1));
+        }
+        if let Some(it) = self.base.made_before.and_then(|m| m.get(&module)) {
+            return Ok(f(&it.decls));
+        }
+        let guard = held(self.run.made.read(), "made modules");
+        let it = guard.get(&module).ok_or(SurfaceError::NoRecord { fact: "ModuleDecls", item: module })?;
+        Ok(f(&it.decls))
+    }
+
+    fn with_crate_root<R>(&self, krate: CrateItemKey, f: impl FnOnce(&CrateRootBuilder<'_, Self::Name>) -> R) -> Result<R, SurfaceError> {
+        if krate == self.base.key {
+            Ok(f(self.base.root))
+        } else {
+            Err(SurfaceError::NoCrateRecord { fact: "CrateRoot", krate })
+        }
+    }
+
+    fn with_expansion<R>(&self, call: ItemKey, f: impl FnOnce(Option<&DeclsBuilder<'_, Self::Name>>) -> R) -> Result<R, SurfaceError> {
+        let guard = held(self.run.expansions.lock(), "expansions");
+        match guard.get(&call) {
+            Some(e) => match e.decls() {
+                Some(d) => Ok(f(Some(d))),
+                None => {
+                    let empty = DeclsBuilder::new_in(self.base.alloc);
+                    Ok(f(Some(&empty)))
+                }
+            },
+            None => Ok(f(None)),
+        }
     }
 
     /// A derive's helpers from its `attributes(..)`, as written: a proc derive's
@@ -2751,7 +3089,12 @@ impl<'a, S> ScopeFacts for Facts<'_, 'a, S> {
     /// attributes(default))]`), kept in its record (names-attr-4). A macro that is no derive
     /// declares none.
     fn derive_helpers(&self, derive: ItemKey, out: &mut AVec<'_, &'a str>) -> Result<(), SurfaceError> {
-        let Some(src) = self.base.macro_src(derive) else {
+        let src = held(self.run.tables.read(), "tables")
+            .macros
+            .get(&derive)
+            .copied()
+            .or_else(|| self.base.macro_src(derive));
+        let Some(src) = src else {
             return Err(SurfaceError::NoRecord { fact: "MacroSrc", item: derive });
         };
         match src.body {
@@ -2779,10 +3122,10 @@ impl<'a, S> ScopeFacts for Facts<'_, 'a, S> {
     }
 }
 
-struct FillCx<'r, 'a, S> {
+struct FillCx<'r, 'a, 'rp, 'p, S> {
     base: &'r Base<'r, 'a, S>,
-    run: &'r Run<'a>,
-    facts: Facts<'r, 'a, S>,
+    run: &'r Run<'a, 'rp, 'p>,
+    facts: Facts<'r, 'a, 'rp, 'p, S>,
     /// The caller's stage mark ([`crate::task::Par::stage`]): an expansion is its own stretch.
     mark: &'r dyn Fn(crate::task::Stage),
     /// The caller's part mark ([`crate::task::Par::expand_part`]).
@@ -2799,19 +3142,19 @@ type PartMark<'r> = &'r dyn Fn(ExpandPart, &str, usize);
 /// [`crate::task::Par::call_scratch`] as [`expand_decls`] takes it.
 type CallScratch<'r> = &'r dyn Fn(&mut dyn FnMut(Alloc<'_>)) -> crate::task::Scratch;
 
-impl<'a, S: SourceTexts<'a>> crate::task::Expand for FillCx<'_, 'a, S> {
+impl<'a, 'p: 'a, S: SourceTexts<'a>> crate::task::Expand for FillCx<'_, 'a, '_, 'p, S> {
     fn expand(&self, request: ExpandRequest) -> crate::task::Expanded {
         (self.mark)(crate::task::Stage::Expand);
         (self.part)(ExpandPart::Find, "", 0);
         // A refused call is stored REFUSED, never as an empty expansion (rules 3 and 19): its
         // module's scope then holds the refusal (`crate::refused::write_refused`), and a name
         // looked up behind it is unknown because of it, not absent.
-        let env = crate::refused::EnvRefusal::new_in(self.base.alloc);
+        let env = crate::refused::EnvRefusal::new_in(self.base.bump);
         // The note that refuses the call: the last the driver notes for it before it returns
         // nothing (every way it does notes why first), kept for the names record's row.
         let last = core::cell::Cell::new(None);
         let expansion = match expand_decls(self.base, self.run, request, self.part, self.seen, self.scratch, &env, &last) {
-            Some((decls, made)) => Expansion { decls, made, refused: None, refused_by: None },
+            Some((decls, made)) => Expansion::from_decls(decls, made, self.base.bump),
             None => {
                 let src = self.base.tables.calls.get(&request.call).copied().or_else(|| held(self.run.tables.read(), "tables").calls.get(&request.call).copied());
                 // `OUT_DIR` is set for the package (it has a build script) but not known: no
@@ -2819,7 +3162,7 @@ impl<'a, S: SourceTexts<'a>> crate::task::Expand for FillCx<'_, 'a, S> {
                 let out_dir_unknown = self.base.script.is_none()
                     && self.base.sources.crate_env(self.base.index).is_some_and(|e| e.get("OUT_DIR") == Err(crate::crate_env::EnvUnknown));
                 let refused = crate::refused::Refused::of(src.map(|s| (s.module, s.name)), env.first(), out_dir_unknown);
-                Expansion { decls: DeclsBuilder::new_in(self.base.alloc), made: None, refused: Some(refused), refused_by: last.get().map(|note| (note, env.first())) }
+                Expansion::from_refusal(refused, last.get().map(|note| (note, env.first())), self.base.bump)
             }
         };
         (self.part)(ExpandPart::Store, "", 0);
@@ -2830,10 +3173,851 @@ impl<'a, S: SourceTexts<'a>> crate::task::Expand for FillCx<'_, 'a, S> {
     }
 }
 
-impl<'r, 'a, S: SourceTexts<'a>> FillEnv<&'a str> for FillCx<'r, 'a, S> {
-    type Facts = Facts<'r, 'a, S>;
+/// Read-only inputs snapshotted on the main thread before a parallel macro expansion wave.
+struct ParCallInput<'r, 'a> {
+    call: ItemKey,
+    def_key: ItemKey,
+    src: CallSrc<'a>,
+    mac: MacroSrc<'a>,
+    from_dep: bool,
+    def_krate: CrateItemKey,
+    def_edition: Edition,
+    runner: Option<CrateItemKey>,
+    file_path: &'a str,
+    file_text: &'a str,
+    module_path: Option<&'r str>,
+    in_block: bool,
+}
 
-    fn facts(&self) -> &Facts<'r, 'a, S> {
+enum PrepCall<'r, 'a> {
+    Serial,
+    Parallel(ParCallInput<'r, 'a>),
+}
+
+enum ParCallResult<'a> {
+    Serial,
+    Empty {
+        notes: AVec<'a, NamesNote<'a>>,
+        eager_checked: AVec<'a, &'a str>,
+        called_seen: bool,
+    },
+    Failed {
+        notes: AVec<'a, NamesNote<'a>>,
+        last: Option<ExpandNote<'a>>,
+        env_first: Option<&'a str>,
+        eager_checked: AVec<'a, &'a str>,
+    },
+    Ready {
+        src: CallSrc<'a>,
+        decls: DeclsBuilder<'a, &'a str>,
+        made: &'a ExpansionText<'a>,
+        column: Option<blaze_expand::origin_column::OriginsRef<'a>>,
+        out: Lowered<'a, 'a, 'a>,
+        mods: AVec<'a, ModMade<'a>>,
+        bodies: AVec<'a, crate::task::BodySrc<'a>>,
+        tokens: Option<crate::nested_input::ExpansionTokens<'a>>,
+        synthetic_blocks: AVec<'a, u32>,
+        notes: AVec<'a, NamesNote<'a>>,
+        eager_checked: AVec<'a, &'a str>,
+    },
+}
+
+/// Thread-safe read-only expansion host used during Phase 2 of wave-batched parallel macro
+/// expansion. Any file-reading `include*!` or unsupported/failing proc-macro sets `needs_serial`
+/// so Phase 3 re-runs that single call sequentially on the main thread with the full [`Host`].
+struct ParHost<'r, 's, 'a, S> {
+    cfg: &'r Cfg<'a, 'a>,
+    crate_env: Option<&'r crate::crate_env::CrateEnv<'a>>,
+    file: &'a str,
+    shown_file: core::cell::OnceCell<Option<AString<'a>>>,
+    krate: usize,
+    text: &'a str,
+    call_at: u32,
+    module_path: Option<&'r str>,
+    sources: &'r S,
+    alloc: Alloc<'a>,
+    needs_serial: &'s core::cell::Cell<bool>,
+}
+
+impl<'a, S: SourceTexts<'a>> ExpandCx for ParHost<'_, '_, 'a, S> {
+    fn env(&self, name: &str) -> Result<Option<&str>, HostError> {
+        let refused = HostError { ask: HostAsk::Env, why: HostWhy::Refused };
+        let env = self.crate_env.ok_or(refused)?;
+        let value = env.get(name).map_err(|_| refused)?;
+        if value.is_none()
+            && name == "STD_ENV_ARCH"
+            && env.get("CARGO_CRATE_NAME").ok().flatten() == Some("std")
+            && let Some(arch) = self.cfg.atoms().iter().find_map(|&(k, v)| (k == "target_arch").then_some(v).flatten())
+        {
+            return Ok(Some(arch));
+        }
+        Ok(value)
+    }
+
+    fn cfg(&self, predicate: &TokenStream<'_>) -> Result<bool, HostError> {
+        let text = render_with(
+            predicate,
+            None,
+            |_| None,
+            |_| false,
+            &mut |_, _, _, _| {},
+            Option::<&mut AVec<'_, Option<u32>>>::None,
+            self.alloc,
+        )
+        .map_err(|_| HostError { ask: HostAsk::Cfg, why: HostWhy::Refused })?;
+        Ok(self.cfg.eval(&text).unwrap_or(false))
+    }
+
+    fn include(&self, _written: &str, _how: IncludeAs) -> Result<Included<'_>, HostError> {
+        self.needs_serial.set(true);
+        Err(HostError { ask: HostAsk::Include, why: HostWhy::Refused })
+    }
+
+    fn place(&self, what: PlaceOf) -> Result<HostPlace<'_>, HostError> {
+        let refused = HostError { ask: HostAsk::Place, why: HostWhy::Refused };
+        match what {
+            PlaceOf::File => {
+                let shown = self.shown_file.get_or_init(|| {
+                    self.crate_env.and_then(|env| env.shown_file(self.file, self.alloc))
+                });
+                shown.as_ref().map(|text| HostPlace::Text(text.as_str())).ok_or(refused)
+            }
+            PlaceOf::ModulePath => self.module_path.map(HostPlace::Text).ok_or(refused),
+            PlaceOf::Line | PlaceOf::Column => {
+                let unreadable = HostError { ask: HostAsk::Place, why: HostWhy::Unreadable };
+                let at = usize::try_from(self.call_at).map_err(|_| unreadable)?;
+                let before = self.text.get(..at).ok_or(unreadable)?;
+                let line_start = before.rfind('\n').map_or(0, |pos| pos + 1);
+                let number = match what {
+                    PlaceOf::Line => before.bytes().filter(|b| *b == b'\n').count() + 1,
+                    _ => before.get(line_start..).ok_or(unreadable)?.chars().count() + 1,
+                };
+                Ok(HostPlace::Number(u32::try_from(number).map_err(|_| unreadable)?))
+            }
+        }
+    }
+
+    fn run_proc_macro<'b>(&self, def: &MacroDefinition<'_>, call: ProcCall<'_>, alloc: Alloc<'b>) -> Result<Produced<'b>, HostError> {
+        let Some(Ok(produced)) = self.sources.par_proc_macro(self.krate, def, call, alloc) else {
+            self.needs_serial.set(true);
+            return Err(REFUSED);
+        };
+        // If a workspace member proc-macro read a file outside its package (D111), re-run
+        // sequentially in Phase 3 so `file_left_reads` files the exact warning in call order.
+        if let Some(env) = self.crate_env {
+            let seen = env.seen();
+            let left = produced.reads.list().iter().any(|read| {
+                read.kind == blaze_expand::ReadKind::ProcMacro
+                    && produced.reads.subject(read).strip_prefix("file:").is_some_and(|p| seen.left_package(p))
+            });
+            if left {
+                self.needs_serial.set(true);
+                return Err(REFUSED);
+            }
+        }
+        Ok(produced)
+    }
+}
+
+impl<'r, 'a, 'rp, 'p: 'a, S: SourceTexts<'a>> FillCx<'r, 'a, 'rp, 'p, S> {
+    /// Expands a deterministic wave of simultaneously-ready macro calls. When `requests.len() >= 4`
+    /// and a thread-safe `parallel_bump` with `par_workers > 1` is available, runs the pure
+    /// expansion/rendering/outlining/lowering phase concurrently across workers via `par.map`,
+    /// then commits all results into `Run` sequentially in exact `requests` order (rule 25).
+    fn expand_batch<P: Par>(&self, requests: &[(ItemKey, Def)], par: &P, opts: &ResolveOpts<'a>) {
+        let par_bump = match opts.parallel_bump {
+            Some(pb) if opts.par_workers > 1 && requests.len() >= 4 && !self.base.kept.keeps() => pb,
+            _ => {
+                for &(call, def) in requests {
+                    let _ = crate::task::Expand::expand(self, ExpandRequest { call, def });
+                }
+                return;
+            }
+        };
+        (self.mark)(crate::task::Stage::Expand);
+        let par_alloc = par_bump.alloc();
+        let home = self.base.alloc;
+        let crate_env = self.base.sources.crate_env(self.base.index);
+        let own_proc_key = self.base.sources.proc_macro_key(self.base.index);
+        let attr_plant = self.base.sources.attr_plant();
+        let attr_order = self.base.sources.attr_order();
+
+        // Phase 1: snapshot read-only inputs and handle `base.built.ask` / `seen` / proc-macro
+        // caller warm-up sequentially on the main thread before any worker starts.
+        let mut base_shadowed: AVec<'a, &'a str> = AVec::new_in(home);
+        let mut prepared: AVec<'a, PrepCall<'_, 'a>> = AVec::with_capacity_in(requests.len(), home);
+        {
+            let tables_r = held(self.run.tables.read(), "tables");
+            let made_r = held(self.run.made.read(), "made modules");
+            let files_r = held(base_files(self.run), "files");
+            for m in self.base.tables.macros.values().chain(tables_r.macros.values()) {
+                if !matches!(m.body, MacroBody::BuiltinFn(b) if b == m.name) {
+                    base_shadowed.push(m.name);
+                }
+            }
+            base_shadowed.sort_unstable();
+            base_shadowed.dedup();
+            let mut proc_warmed = false;
+            for &(call, def) in requests {
+                if def == crate::cells::KEEP_ITEM || def == crate::cells::PROC_MACRO_HARNESS {
+                    prepared.push(PrepCall::Serial);
+                    continue;
+                }
+                let Some(src) = self.base.tables.calls.get(&call).copied().or_else(|| tables_r.calls.get(&call).copied()) else {
+                    prepared.push(PrepCall::Serial);
+                    continue;
+                };
+                let def_key = def.key;
+                let mac_opt = self.base.tables.macros.get(&def_key).copied().or_else(|| tables_r.macros.get(&def_key).copied());
+                let (mac, from_dep, def_krate, def_edition, runner) = match mac_opt {
+                    Some(mac) => (Some(mac), false, self.base.key, self.base.edition, own_proc_key),
+                    None => match self.base.built.of(def_key) {
+                        Some(other) => {
+                            let mac = other.macro_of(def_key);
+                            (mac, true, other.key(), other.edition(), other.proc_key())
+                        }
+                        None => (None, false, self.base.key, self.base.edition, None),
+                    },
+                };
+                let Some(mac) = mac else {
+                    prepared.push(PrepCall::Serial);
+                    continue;
+                };
+                if matches!(mac.body, MacroBody::BuiltinFn("include" | "include_str" | "include_bytes")) {
+                    prepared.push(PrepCall::Serial);
+                    continue;
+                }
+                let Some(file_idx) = usize::try_from(src.loc.file).ok() else {
+                    prepared.push(PrepCall::Serial);
+                    continue;
+                };
+                let file = files_r.at(file_idx);
+                let in_block = made_r.get(&src.module).is_some_and(|m| m.info.name.is_some_and(crate::blocks::is_block_module));
+                let module_path: Option<&str> = match self.base.tree.by_key.get(&src.module) {
+                    Some(&i) => self.base.tree.modules.get(i).map(|m| m.path.as_str()),
+                    None => made_r.get(&src.module).map(|it| it.path),
+                };
+                if !proc_warmed && matches!(mac.body, MacroBody::Proc { .. }) && runner.is_some() {
+                    if let Ok(proc_def) = definition_of_in(mac, def_krate, runner, def_edition, src.kind, home) {
+                        self.base.sources.prepare_par_proc(self.base.index, &proc_def);
+                        proc_warmed = true;
+                    }
+                }
+                prepared.push(PrepCall::Parallel(ParCallInput {
+                    call,
+                    def_key,
+                    src,
+                    mac,
+                    from_dep,
+                    def_krate,
+                    def_edition,
+                    runner,
+                    file_path: file.path,
+                    file_text: file.text,
+                    module_path,
+                    in_block,
+                }));
+            }
+        }
+
+        // Phase 2: expand, render, outline, and lower all parallelizable calls concurrently.
+        let mut results: AVec<'a, ParCallResult<'a>> = AVec::with_capacity_in(prepared.len(), home);
+        let base_shadowed_slice = base_shadowed.as_slice();
+        let base = self.base;
+        let run = self.run;
+        par.map(
+            prepared.len(),
+            |idx| {
+                let Some(PrepCall::Parallel(input)) = prepared.get(idx) else {
+                    return ParCallResult::Serial;
+                };
+                let mut res = None;
+                let _ = par.call_scratch(&mut |scratch_alloc| {
+                    res = Some(expand_one_par(
+                        base,
+                        run,
+                        input,
+                        crate_env,
+                        base_shadowed_slice,
+                        attr_plant,
+                        attr_order,
+                        scratch_alloc,
+                        par_bump,
+                    ));
+                });
+                res.unwrap_or_else(|| {
+                    expand_one_par(
+                        base,
+                        run,
+                        input,
+                        crate_env,
+                        base_shadowed_slice,
+                        attr_plant,
+                        attr_order,
+                        par_alloc,
+                        par_bump,
+                    )
+                })
+            },
+            &mut results,
+        );
+
+        // Phase 3: commit sequentially in exact deterministic `requests` order, re-running any
+        // call that hit `Serial` or whose eager-builtin lookup was shadowed by an earlier call in
+        // the same wave (rule 25).
+        let out_dir_unknown = self.base.script.is_none()
+            && crate_env.is_some_and(|e| e.get("OUT_DIR") == Err(crate::crate_env::EnvUnknown));
+        let mut new_macros: AVec<'a, &'a str> = AVec::new_in(home);
+        let mut any_extra_macro = false;
+        for ((&(call, def), prep), res) in requests.iter().zip(prepared.iter()).zip(results) {
+            let shadowed_conflict = match &res {
+                ParCallResult::Serial => true,
+                ParCallResult::Empty { eager_checked, .. }
+                | ParCallResult::Failed { eager_checked, .. }
+                | ParCallResult::Ready { eager_checked, .. } => {
+                    !eager_checked.is_empty()
+                        && (any_extra_macro
+                            || eager_checked.iter().any(|name| new_macros.iter().any(|added| added == name)))
+                }
+            };
+            if shadowed_conflict {
+                let before_macros = held(self.run.tables.read(), "tables").macros.len();
+                let _ = crate::task::Expand::expand(self, ExpandRequest { call, def });
+                if held(self.run.tables.read(), "tables").macros.len() > before_macros {
+                    any_extra_macro = true;
+                }
+                continue;
+            }
+            if let PrepCall::Parallel(in_call) = prep {
+                if in_call.from_dep {
+                    self.base.built.ask(|| crate::asked::Question::macro_src(in_call.def_key, Some(in_call.mac), home));
+                }
+                let call_seen = match &res {
+                    ParCallResult::Empty { called_seen, .. } => *called_seen,
+                    ParCallResult::Failed { .. } | ParCallResult::Ready { .. } => true,
+                    ParCallResult::Serial => false,
+                };
+                if call_seen {
+                    (self.seen)(in_call.def_key, in_call.src.input);
+                }
+            }
+            match res {
+                ParCallResult::Serial => {}
+                ParCallResult::Empty { notes, .. } => {
+                    if !notes.is_empty() {
+                        held(self.run.notes.lock(), "notes").extend(notes);
+                    }
+                    let expansion = Expansion::from_decls(DeclsBuilder::new_in(home), None, self.base.bump);
+                    held(self.run.expansions.lock(), "expansions").insert(call, expansion);
+                }
+                ParCallResult::Failed { notes, last, env_first, .. } => {
+                    if !notes.is_empty() {
+                        held(self.run.notes.lock(), "notes").extend(notes);
+                    }
+                    let src = self.base.tables.calls.get(&call).copied().or_else(|| held(self.run.tables.read(), "tables").calls.get(&call).copied());
+                    let refused = crate::refused::Refused::of(src.map(|s| (s.module, s.name)), env_first, out_dir_unknown);
+                    let expansion = Expansion::from_refusal(refused, last.map(|n| (n, env_first)), self.base.bump);
+                    held(self.run.expansions.lock(), "expansions").insert(call, expansion);
+                }
+                ParCallResult::Ready { src, decls, made, column, out, mods, mut bodies, tokens, synthetic_blocks, notes, .. } => {
+                    if !notes.is_empty() {
+                        held(self.run.notes.lock(), "notes").extend(notes);
+                    }
+                    for (_, m) in out.macros.iter() {
+                        if !matches!(m.body, MacroBody::BuiltinFn(b) if b == m.name) {
+                            new_macros.push(m.name);
+                        }
+                    }
+                    let before_macros = held(self.run.tables.read(), "tables").macros.len();
+                    let made_text = made.text;
+                    if !mods.is_empty() {
+                        let place = Made {
+                            text: made_text,
+                            outline: &made.outline,
+                            at: Where::Expansion(src.loc),
+                            place: At::Expansion(call),
+                            dir: None,
+                            written: src.written,
+                            marks: column.map(|col| crate::crate_roots::TextMarks { text: made_text, column: col }),
+                            tokens: FragmentTokens::from_option(tokens),
+                            synthetic_blocks: &synthetic_blocks,
+                        };
+                        let mut work = |s: Alloc<'_>| {
+                            make_modules(self.base, self.run, src.module, &mods, place, src.depth + 1, &mut bodies, s);
+                        };
+                        if (self.scratch)(&mut work) == crate::task::Scratch::Kept {
+                            work(home);
+                        }
+                    }
+                    add_lowered(self.run, call, At::Expansion(call), out);
+                    if !bodies.is_empty() {
+                        let mut work = |s: Alloc<'_>| {
+                            if let Some(tok) = tokens {
+                                let deferred = || tok;
+                                blocks_of(self.base, self.run, &bodies, Some(made), s, Some(&deferred));
+                            } else {
+                                blocks_of(self.base, self.run, &bodies, Some(made), s, None);
+                            }
+                        };
+                        if (self.scratch)(&mut work) == crate::task::Scratch::Kept {
+                            work(home);
+                        }
+                    }
+                    if (!mods.is_empty() || !bodies.is_empty())
+                        && held(self.run.tables.read(), "tables").macros.len() > before_macros
+                    {
+                        any_extra_macro = true;
+                    }
+                    let expansion = Expansion::from_decls(decls, Some(made), self.base.bump);
+                    held(self.run.expansions.lock(), "expansions").insert(call, expansion);
+                }
+            }
+        }
+        (self.mark)(crate::task::Stage::Solve);
+    }
+}
+
+/// Pure, thread-safe expansion of one macro call during Phase 2 of wave-batched expansion.
+/// Working temporaries live in per-worker `alloc` (reset after each call); outputs that outlive
+/// the call live in `par_bump` (thread-safe `Root`, lifetime `'a`).
+#[expect(clippy::too_many_arguments, reason = "parallel macro expansion inputs, each named")]
+fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
+    base: &Base<'_, 'a, S>,
+    run: &Run<'a, '_, 'p>,
+    in_call: &ParCallInput<'_, 'a>,
+    crate_env: Option<&crate::crate_env::CrateEnv<'a>>,
+    base_shadowed: &[&'a str],
+    attr_plant: AttrPlant,
+    attr_order: AttrOrder,
+    alloc: Alloc<'_>,
+    par_bump: Bump<'a>,
+) -> ParCallResult<'a> {
+    let par_alloc = par_bump.alloc();
+    let call = in_call.call;
+    let src = in_call.src;
+    let mac = in_call.mac;
+    let def_key = in_call.def_key;
+    let edition = base.edition;
+    let mut notes: AVec<'a, NamesNote<'a>> = AVec::new_in(par_alloc);
+    let mut last: Option<ExpandNote<'a>> = None;
+    let eager_checked_cell: core::cell::RefCell<AVec<'a, &'a str>> = core::cell::RefCell::new(AVec::new_in(par_alloc));
+    let refused_env = crate::refused::EnvRefusal::new_in(par_bump);
+
+    if src.kind == CallShape::FnLike && in_call.in_block {
+        if matches!(mac.body, MacroBody::BuiltinFn(name) if LITERAL_BUILTINS.iter().any(|b| *b == name)) {
+            return ParCallResult::Empty { notes, eager_checked: eager_checked_cell.into_inner(), called_seen: false };
+        }
+        let def_may = match mac.body {
+            MacroBody::Rules(rules) => Some(run.prepares.may_declare(def_key, &[rules])),
+            MacroBody::Macro2 { params, body } => Some(run.prepares.may_declare(def_key, &[params.unwrap_or(""), body])),
+            MacroBody::BuiltinFn(name) => Some(match BuiltinFn::of_library(name) {
+                Some(BuiltinFn::Include | BuiltinFn::GlobalAsm) => true,
+                Some(BuiltinFn::Assert) => src.input.contains(','),
+                Some(BuiltinFn::Panic | BuiltinFn::Unreachable) => !src.input.trim().is_empty(),
+                _ => false,
+            }),
+            MacroBody::BuiltinDerive { .. } | MacroBody::BuiltinOther(_) | MacroBody::Proc { .. } => None,
+        };
+        if def_may == Some(false) && !blaze_file_items::nested::may_declare(src.input) {
+            return ParCallResult::Empty { notes, eager_checked: eager_checked_cell.into_inner(), called_seen: false };
+        }
+    }
+
+    let fail_with = |note_val: ExpandNote<'a>, notes: &mut AVec<'a, NamesNote<'a>>, last: &mut Option<ExpandNote<'a>>, eager_checked: AVec<'a, &'a str>| {
+        *last = Some(note_val);
+        notes.push(NamesNote::Expand { call, at: Some(src.loc), note: note_val });
+        ParCallResult::Failed { notes: core::mem::replace(notes, AVec::new_in(par_alloc)), last: *last, env_first: refused_env.first(), eager_checked }
+    };
+
+    let declarative = matches!(mac.body, MacroBody::Rules(_) | MacroBody::Macro2 { .. });
+    let written;
+    let def: Kept<'_> = match run.prepares.get(def_key).filter(|_| declarative) {
+        Some(kept) => kept,
+        None if declarative => match definition_of_in(mac, in_call.def_krate, in_call.runner, in_call.def_edition, src.kind, run.prepares.alloc()) {
+            Ok(def) => run.prepares.keep(def_key, def),
+            Err(why) => return fail_with(why, &mut notes, &mut last, eager_checked_cell.into_inner()),
+        },
+        None => match definition_of_in(mac, in_call.def_krate, in_call.runner, in_call.def_edition, src.kind, par_alloc) {
+            Ok(def) => {
+                written = def;
+                Kept::Written(&written)
+            }
+            Err(ExpandNote::NoDefinition { .. }) if matches!(mac.body, MacroBody::Proc { .. }) && in_call.runner.is_none() => {
+                return fail_with(ExpandNote::ProcModule { macro_name: mac.name, why: ProcUnusable::NoRunner }, &mut notes, &mut last, eager_checked_cell.into_inner());
+            }
+            Err(why) => return fail_with(why, &mut notes, &mut last, eager_checked_cell.into_inner()),
+        },
+    };
+
+    let input = match src.tokens {
+        crate::nested_input::CallTokens::Expansion(tokens) => match tokens.copy_in(alloc) {
+            Ok(stream) => stream,
+            Err(error) => {
+                return fail_with(ExpandNote::Expand { macro_name: mac.name, error: ExpandError::Stream { stream: None, error } }, &mut notes, &mut last, eager_checked_cell.into_inner());
+            }
+        },
+        crate::nested_input::CallTokens::Refused(error) => {
+            return fail_with(ExpandNote::NestedInput { macro_name: mac.name, error }, &mut notes, &mut last, eager_checked_cell.into_inner());
+        }
+        crate::nested_input::CallTokens::Text => match src.kind {
+            CallShape::FnLike => match blaze_expand::lex_inside(src.input, edition, alloc) {
+                Ok(stream) => stream,
+                Err(error) => return fail_with(ExpandNote::Lex { macro_name: mac.name, what: Lexed::Input, error }, &mut notes, &mut last, eager_checked_cell.into_inner()),
+            },
+            CallShape::Attr | CallShape::Derive => match lex(src.input, edition, alloc) {
+                Ok(stream) => stream,
+                Err(error) => return fail_with(ExpandNote::Lex { macro_name: mac.name, what: Lexed::Input, error }, &mut notes, &mut last, eager_checked_cell.into_inner()),
+            },
+        },
+    };
+
+    let site = CallSite { edition, panic_edition: edition, ctx: Ctx::root(edition) };
+    let cfg_atom = |name: &str, value: Option<&str>| base.cfg.atoms().binary_search(&(name, value)).is_ok();
+    let atom = &mut |name: &str, value: Option<&str>| Ok::<bool, Infallible>(cfg_atom(name, value));
+    let (args, item): (Option<TokenStream<'_>>, TokenStream<'_>);
+    let derive_facts;
+    let call_of = match src.kind {
+        CallShape::FnLike => Call::fn_like(&input, site),
+        CallShape::Attr if src.implicit => {
+            let made = match ItemAttrs::new(input).implicit_call(atom) {
+                Ok(made) => made,
+                Err(error) => return fail_with(ExpandNote::ItemAttrs { macro_name: mac.name, error }, &mut notes, &mut last, eager_checked_cell.into_inner()),
+            };
+            (args, item) = (made.args, made.item);
+            Call::attr(args.as_ref(), &item, site)
+        }
+        CallShape::Attr => {
+            let named = match lex(src.name, edition, alloc) {
+                Ok(stream) => stream,
+                Err(error) => return fail_with(ExpandNote::Lex { macro_name: mac.name, what: Lexed::Path, error }, &mut notes, &mut last, eager_checked_cell.into_inner()),
+            };
+            let mut walk = ItemAttrs::new(input);
+            let attr = loop {
+                match walk.next(atom) {
+                    Ok(NextAttr::Call { path, attr })
+                        if match attr_plant {
+                            AttrPlant::None => walk.attr_is(attr.start..attr.end, &named),
+                            AttrPlant::Spelling => same_spelling(&path, src.name),
+                        } =>
+                    {
+                        break attr;
+                    }
+                    Ok(NextAttr::Call { .. }) => {}
+                    Ok(NextAttr::Removed | NextAttr::End) => {
+                        return fail_with(ExpandNote::AttrNotFound { name: src.name }, &mut notes, &mut last, eager_checked_cell.into_inner());
+                    }
+                    Err(error) => return fail_with(ExpandNote::ItemAttrs { macro_name: mac.name, error }, &mut notes, &mut last, eager_checked_cell.into_inner()),
+                }
+            };
+            let made = match walk.attr_call(attr) {
+                Ok(made) => made,
+                Err(error) => return fail_with(ExpandNote::ItemAttrs { macro_name: mac.name, error: ItemAttrsError::Stream(error) }, &mut notes, &mut last, eager_checked_cell.into_inner()),
+            };
+            (args, item) = (made.args, made.item);
+            Call::attr(args.as_ref(), &item, site)
+        }
+        CallShape::Derive => {
+            let derives = match ItemAttrs::new(input).derives(atom) {
+                Ok(Some(derives)) => derives,
+                Ok(None) => return ParCallResult::Empty { notes, eager_checked: eager_checked_cell.into_inner(), called_seen: true },
+                Err(error) => return fail_with(ExpandNote::ItemAttrs { macro_name: mac.name, error }, &mut notes, &mut last, eager_checked_cell.into_inner()),
+            };
+            let named = match lex(src.name, edition, alloc) {
+                Ok(stream) => stream,
+                Err(error) => return fail_with(ExpandNote::Lex { macro_name: mac.name, what: Lexed::Path, error }, &mut notes, &mut last, eager_checked_cell.into_inner()),
+            };
+            let Some(used) = derives.uses.iter().find(|u| match attr_plant {
+                AttrPlant::None => blaze_expand::same_path(&u.tokens, 0..u.tokens.len(), &named, 0..named.len()),
+                AttrPlant::Spelling => same_spelling(&u.path, src.name),
+            }) else {
+                return fail_with(ExpandNote::AttrNotFound { name: src.name }, &mut notes, &mut last, eager_checked_cell.into_inner());
+            };
+            derive_facts = derives.facts(used);
+            item = derives.input;
+            Call::derive(&item, derive_facts, site)
+        }
+    };
+
+    let own_key = blaze_expand::call_key(def.def(), &call_of);
+    let needs_serial = core::cell::Cell::new(false);
+    let par_host = ParHost {
+        cfg: base.cfg,
+        crate_env,
+        file: shown(in_call.file_path, base.shown_from),
+        shown_file: core::cell::OnceCell::new(),
+        krate: base.index,
+        text: in_call.file_text,
+        call_at: src.loc.offset,
+        module_path: in_call.module_path,
+        sources: base.sources,
+        alloc: par_alloc,
+        needs_serial: &needs_serial,
+    };
+    let shadowed = |name: &str| {
+        eager_checked_cell.borrow_mut().push(par_bump.alloc_str(name));
+        base_shadowed.binary_search(&name).is_ok()
+    };
+    let nested_at = DefAt {
+        site: DefSite { krate: in_call.def_krate, module: None },
+        edition: in_call.def_edition,
+        export: Export::Exported,
+        local_inner: LocalInner::No,
+        transparency: None,
+    };
+    let eager = EagerDriver { macro_name: mac.name, def_at: nested_at, shadowed: &shadowed, keep: par_bump, alloc };
+    let expanded = match base.script {
+        Some(out) => {
+            let script_host = ScriptCx { inner: par_host, out };
+            eager.expand(def, &call_of, &crate::refused::Watched { inner: &script_host, env: &refused_env })
+        }
+        None => eager.expand(def, &call_of, &crate::refused::Watched { inner: &par_host, env: &refused_env }),
+    };
+    if needs_serial.get() {
+        return ParCallResult::Serial;
+    }
+    let expansion = match expanded {
+        Ok(expansion) => expansion,
+        Err(why) => {
+            if matches!(why, ExpandNote::Expand { error: ExpandError::Host(HostError { ask: HostAsk::ProcMacro, .. }), .. }) {
+                return ParCallResult::Serial;
+            }
+            return fail_with(why, &mut notes, &mut last, eager_checked_cell.into_inner());
+        }
+    };
+
+    if let Some(failed) = blaze_expand::Failed::of(&expansion, par_bump) {
+        return fail_with(ExpandNote::Failed { path: src.name, implicit: src.implicit, failed }, &mut notes, &mut last, eager_checked_cell.into_inner());
+    }
+    for diagnostic in expansion.diagnostics.iter() {
+        let diag_note = ExpandNote::Diagnostic { macro_name: mac.name, diagnostic: *diagnostic };
+        last = Some(diag_note);
+        notes.push(NamesNote::Expand { call, at: Some(src.loc), note: diag_note });
+    }
+
+    let here = base.key;
+    let mut def_crate_starts: AVec<'_, u32> = AVec::new_in(alloc);
+    def_crate_starts.extend(expansion.nested.iter().filter(|c| c.scope == PathScope::DefCrate).map(|c| c.path.start));
+    def_crate_starts.sort_unstable();
+    let def_crate = |at: usize| u32::try_from(at).ok().is_some_and(|pos| def_crate_starts.binary_search(&pos).is_ok());
+
+    let written_input = match (call_of.kind, src.tokens) {
+        (CallKind::FnLike { .. }, crate::nested_input::CallTokens::Expansion(tokens)) => Some(tokens.written(alloc)),
+        (CallKind::FnLike { .. }, _) => None,
+        (CallKind::Attr { item, .. } | CallKind::Derive { item, .. }, crate::nested_input::CallTokens::Expansion(tokens)) => {
+            let whole = match tokens.copy_in(alloc) {
+                Ok(whole) => whole,
+                Err(error) => {
+                    return fail_with(ExpandNote::Expand { macro_name: mac.name, error: ExpandError::Stream { stream: None, error } }, &mut notes, &mut last, eager_checked_cell.into_inner());
+                }
+            };
+            let words = tokens.written(alloc);
+            let aligned = blaze_expand::origin_column::align_suffix(item, &whole, alloc);
+            let mut map = AVec::with_capacity_in(aligned.len(), alloc);
+            map.extend(aligned.iter().map(|at| at.and_then(|pos| usize::try_from(pos).ok().and_then(|ix| words.get(ix).copied().flatten()))));
+            Some(map)
+        }
+        (CallKind::Attr { item, .. } | CallKind::Derive { item, .. }, _) => {
+            let written = match lex(src.input, edition, alloc) {
+                Ok(stream) => stream,
+                Err(error) => return fail_with(ExpandNote::Lex { macro_name: mac.name, what: Lexed::Input, error }, &mut notes, &mut last, eager_checked_cell.into_inner()),
+            };
+            Some(blaze_expand::origin_column::align_suffix(item, &written, alloc))
+        }
+    };
+
+    let mut placed: AVec<'_, (u32, u32, u32)> = AVec::with_capacity_in(expansion.tokens.len(), alloc);
+    let mut roots: AVec<'_, (u32, CrateItemKey)> = AVec::new_in(alloc);
+    let mut too_large = false;
+    let mut words: AVec<'_, Option<u32>> = AVec::with_capacity_in(expansion.tokens.len(), alloc);
+    let rendered = render_with(
+        &expansion.tokens,
+        Some(here),
+        |at| expansion.hygiene(at).mark.map(|mark| mark.site.krate),
+        def_crate,
+        &mut |token, start, end, root| match (u32::try_from(token), u32::try_from(start), u32::try_from(end), u32::try_from(placed.len())) {
+            (Ok(token), Ok(start), Ok(end), Ok(place)) => {
+                if let Some(root) = root {
+                    roots.push((place, root));
+                }
+                placed.push((start, end, token));
+            }
+            _ => too_large = true,
+        },
+        Some(&mut words),
+        alloc,
+    );
+    let rendered = match rendered {
+        Ok(rendered) => rendered,
+        Err(foreign) => return fail_with(ExpandNote::ForeignDollarCrate { macro_name: mac.name, krate: foreign.krate }, &mut notes, &mut last, eager_checked_cell.into_inner()),
+    };
+    if too_large {
+        return fail_with(ExpandNote::NestedInput { macro_name: mac.name, error: crate::nested_input::NestedInputError::TooLarge }, &mut notes, &mut last, eager_checked_cell.into_inner());
+    }
+
+    let roots_written = roots.iter().filter(|(_, k)| *k != here).count();
+    let mut pre_block_items: Option<(AString<'_>, AVec<'_, crate::crate_roots::Copied>, AVec<'_, u32>)> = None;
+    if in_call.in_block {
+        let probe = outline(rendered.as_str(), edition, alloc);
+        if probe.errors().first().is_some() {
+            match crate::expanded_blocks::statements_as_items(rendered.as_str(), call, alloc) {
+                Ok(None) => return ParCallResult::Empty { notes, eager_checked: eager_checked_cell.into_inner(), called_seen: true },
+                Ok(Some((items, copies, synthetic_blocks))) => {
+                    pre_block_items = Some((items, copies, synthetic_blocks));
+                }
+                Err(refused) => {
+                    let not_items = ExpandNote::NotItems { macro_name: mac.name, message: refused.message() };
+                    notes.push(NamesNote::Expand { call, at: Some(src.loc), note: not_items });
+                    return ParCallResult::Empty { notes, eager_checked: eager_checked_cell.into_inner(), called_seen: true };
+                }
+            }
+        }
+    }
+
+    let input_index = match written_input.as_deref() {
+        Some(map) => blaze_expand::origin_column::InputIndex::Aligned(map),
+        None => blaze_expand::origin_column::InputIndex::AsWritten,
+    };
+    let shape = match src.kind {
+        CallShape::FnLike => blaze_expand::origin_column::InputShape::Inside,
+        CallShape::Attr | CallShape::Derive => blaze_expand::origin_column::InputShape::Whole,
+    };
+    let mark_of = |at: usize| expansion.hygiene(at).mark.map(blaze_expand::origin_column::TextMark::of);
+    let origin_column = crate::expansion_origins::column_of(call, &placed, &roots, &expansion.origins, input_index, &mark_of, alloc);
+    let (rendered_text, text, made, column, moved_copies, synthetic_blocks): (
+        &'a str,
+        &'a str,
+        &'a ExpansionText<'a>,
+        Option<blaze_expand::origin_column::OriginsRef<'a>>,
+        Option<AVec<'_, crate::crate_roots::Copied>>,
+        AVec<'a, u32>,
+    ) = if let Some((items_str, copies, syn_blocks)) = pre_block_items {
+        let rendered_text: &'a str = keep(rendered.as_str(), par_bump);
+        let items: &'a str = keep(items_str.as_str(), par_bump);
+        let raw_origins = origin_column
+            .and_then(|column| crate::expansion_origins::write_bytes(call, src.place, shape, src.name, src.implicit, &column, alloc));
+        let raw_origins_ref: Result<&[u8], crate::expansion_origins::OriginsError> = raw_origins.as_deref().map_err(|&e| e);
+        let raw_col = match crate::crate_roots::column_in(&raw_origins_ref) {
+            Ok(col) => Some(col),
+            Err(lost) if roots_written > 0 => {
+                return fail_with(ExpandNote::RootsLost { macro_name: mac.name, lost }, &mut notes, &mut last, eager_checked_cell.into_inner());
+            }
+            Err(_) => None,
+        };
+        let origins: Result<&'a [u8], crate::expansion_origins::OriginsError> = match raw_col {
+            Some(column) => match crate::crate_roots::remap(column, &copies, alloc) {
+                Ok(moved) => crate::expansion_origins::write_bytes(call, src.place, shape, src.name, src.implicit, &moved, alloc)
+                    .map(|bytes| &*par_bump.alloc_slice_copy(&bytes)),
+                Err(error) if roots_written > 0 => {
+                    return fail_with(ExpandNote::RootsLost { macro_name: mac.name, lost: crate::crate_roots::RootsLost::Column { error } }, &mut notes, &mut last, eager_checked_cell.into_inner());
+                }
+                Err(_) => Err(crate::expansion_origins::OriginsError::Rewritten { what: "a call's statements read as items" }),
+            },
+            None => Err(crate::expansion_origins::OriginsError::Rewritten { what: "a call's statements read as items" }),
+        };
+        let again: &'a ExpansionText<'a> = par_bump.alloc_val(ExpansionText::new(items, outline(items, edition, par_alloc), origins));
+        let column = match (raw_col, again.column) {
+            (Some(_), Ok(moved)) => Some(moved),
+            (Some(_), Err(lost)) if roots_written > 0 => {
+                return fail_with(ExpandNote::RootsLost { macro_name: mac.name, lost }, &mut notes, &mut last, eager_checked_cell.into_inner());
+            }
+            _ => None,
+        };
+        if let Some(error) = again.outline.errors().first() {
+            let not_items = ExpandNote::NotItems { macro_name: mac.name, message: again.outline.message(error) };
+            notes.push(NamesNote::Expand { call, at: Some(src.loc), note: not_items });
+            return ParCallResult::Empty { notes, eager_checked: eager_checked_cell.into_inner(), called_seen: true };
+        }
+        (rendered_text, items, again, column, Some(copies), AVec::from_slice_in(&syn_blocks, par_alloc))
+    } else {
+        let rendered_text: &'a str = keep(rendered.as_str(), par_bump);
+        let origins: Result<&'a [u8], crate::expansion_origins::OriginsError> = origin_column
+            .and_then(|column| crate::expansion_origins::write_bytes(call, src.place, shape, src.name, src.implicit, &column, alloc))
+            .map(|bytes| &*par_bump.alloc_slice_copy(&bytes));
+        let made: &'a ExpansionText<'a> = par_bump.alloc_val(ExpansionText::new(rendered_text, outline(rendered_text, edition, par_alloc), origins));
+        let column = match made.column {
+            Ok(column) => Some(column),
+            Err(lost) if roots_written > 0 => {
+                return fail_with(ExpandNote::RootsLost { macro_name: mac.name, lost }, &mut notes, &mut last, eager_checked_cell.into_inner());
+            }
+            Err(_) => None,
+        };
+        if let Some(error) = made.outline.errors().first() {
+            let not_items = ExpandNote::NotItems { macro_name: mac.name, message: made.outline.message(error) };
+            notes.push(NamesNote::Expand { call, at: Some(src.loc), note: not_items });
+        }
+        (rendered_text, rendered_text, made, column, None, AVec::new_in(par_alloc))
+    };
+
+    let cached_tokens: core::cell::OnceCell<crate::nested_input::ExpansionTokens<'a>> = core::cell::OnceCell::new();
+    let get_tokens = || -> crate::nested_input::ExpansionTokens<'a> {
+        *cached_tokens.get_or_init(|| {
+            let mut sealed = expansion.tokens.clone_in(par_alloc);
+            sealed.seal(own_key.0);
+            let sealed: &'a TokenStream<'a> = par_bump.alloc_val(sealed);
+            let placed_home: &'a [(u32, u32, u32)] = par_bump.alloc_slice_copy(&placed);
+            let words_home: &'a [Option<u32>] = par_bump.alloc_slice_copy(&words);
+            let base_tok = crate::nested_input::ExpansionTokens { stream: sealed, text: rendered_text, places: placed_home, words: words_home };
+            match moved_copies.as_deref() {
+                Some(copies) => base_tok.moved(text, copies, par_bump),
+                None => base_tok,
+            }
+        })
+    };
+    let fragment = Fragment {
+        tokens: FragmentTokens::LazyDeferBody(&get_tokens),
+        module: src.module,
+        owner: call,
+        text,
+        outline: &made.outline,
+        items: None,
+        at: Where::Expansion(src.loc),
+        depth: src.depth + 1,
+        made: false,
+        members_of: src.owner,
+        written: src.written,
+        kept: None,
+        marks: column.map(|col| crate::crate_roots::TextMarks { text, column: col }),
+    };
+    let mut out = crate::task::lower_in_out(
+        LowerCx {
+            krate: base.key,
+            tools: &base.root.tools,
+            edition,
+            cfg: base.cfg,
+            walked: base.tree,
+            procs: base.expansion_procs(),
+            entry: false,
+            harness: false,
+            order: attr_order,
+        },
+        fragment,
+        par_alloc,
+        alloc,
+        par_bump,
+    );
+    let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(par_alloc));
+    let bodies = core::mem::replace(&mut out.bodies, AVec::new_in(par_alloc));
+    let tokens = if !mods.is_empty() || !bodies.is_empty() { Some(get_tokens()) } else { cached_tokens.get().copied() };
+    let decls = core::mem::replace(&mut out.decls, DeclsBuilder::new_in(par_alloc));
+    ParCallResult::Ready {
+        src,
+        decls,
+        made,
+        column,
+        out,
+        mods,
+        bodies,
+        tokens,
+        synthetic_blocks,
+        notes,
+        eager_checked: eager_checked_cell.into_inner(),
+    }
+}
+
+impl<'r, 'a, 'rp, 'p: 'a, S: SourceTexts<'a>> FillEnv<&'a str> for FillCx<'r, 'a, 'rp, 'p, S> {
+    type Facts = Facts<'r, 'a, 'rp, 'p, S>;
+
+    fn facts(&self) -> &Facts<'r, 'a, 'rp, 'p, S> {
         &self.facts
     }
 
@@ -2890,7 +4074,11 @@ impl<'r, 'a, S: SourceTexts<'a>> FillEnv<&'a str> for FillCx<'r, 'a, S> {
     }
 
     fn derive_helpers(&self, derive: ItemKey) -> Option<&str> {
-        let src = self.base.macro_src(derive)?;
+        let src = held(self.run.tables.read(), "tables")
+            .macros
+            .get(&derive)
+            .copied()
+            .or_else(|| self.base.macro_src(derive))?;
         match src.body {
             MacroBody::Proc { kind: ProcKind::Derive, helpers } | MacroBody::BuiltinDerive { helpers } => Some(helpers),
             _ => None,
@@ -2948,14 +4136,23 @@ impl<'a, S: SourceTexts<'a>> ExpandCx for Host<'_, 'a, S> {
     /// (rule 3), never answered unset.
     fn env(&self, name: &str) -> Result<Option<&str>, HostError> {
         let refused = HostError { ask: HostAsk::Env, why: HostWhy::Refused };
-        self.sources.crate_env(self.krate).ok_or(refused)?.get(name).map_err(|_| refused)
+        let env = self.sources.crate_env(self.krate).ok_or(refused)?;
+        let value = env.get(name).map_err(|_| refused)?;
+        if value.is_none()
+            && name == "STD_ENV_ARCH"
+            && env.get("CARGO_CRATE_NAME").ok().flatten() == Some("std")
+            && let Some(arch) = self.cfg.atoms().iter().find_map(|&(k, v)| (k == "target_arch").then_some(v).flatten())
+        {
+            return Ok(Some(arch));
+        }
+        Ok(value)
     }
 
     /// A predicate the cfg does not read is false, as the lowering takes it.
     fn cfg(&self, predicate: &TokenStream<'_>) -> Result<bool, HostError> {
         // No `here` and no mark: a predicate writes no definition's `$crate`; a refusal would
         // still be one, never read as false.
-        let text = render_with(predicate, None, |_| None, |_| false, &mut |_, _, _, _| {}, None, self.alloc)
+        let text = render_with(predicate, None, |_| None, |_| false, &mut |_, _, _, _| {}, Option::<&mut AVec<'_, Option<u32>>>::None, self.alloc)
             .map_err(|_| HostError { ask: HostAsk::Cfg, why: HostWhy::Refused })?;
         Ok(self.cfg.eval(&text).unwrap_or(false))
     }
@@ -3080,7 +4277,7 @@ impl<'a, S: SourceTexts<'a>> ExpandCx for Host<'_, 'a, S> {
 /// `$crate::` before it. The Reference, "Macros By Example", "Hygiene": "Additionally, the
 /// `local_inner_macros` key [of `macro_export`] can be used to automatically prefix all
 /// contained macro invocations with `$crate::`."
-pub(crate) fn render_with<'a>(
+pub(crate) fn render_with<'a, W: core::alloc::Allocator>(
     stream: &TokenStream<'_>,
     here: Option<CrateItemKey>,
     dollar: impl Fn(usize) -> Option<CrateItemKey>,
@@ -3092,7 +4289,7 @@ pub(crate) fn render_with<'a>(
     // word in the text as a lexer reads it back (`None`: an invisible delimiter, which writes
     // none). The one place that knows how many words each token is written as
     // ([`crate::nested_input::InputTokens::written`]: a nested call's input indexes as written).
-    mut words: Option<&mut AVec<'_, Option<u32>>>,
+    mut words: Option<&mut blaze_own::Vec<Option<u32>, W>>,
     alloc: Alloc<'a>,
 ) -> Result<AString<'a>, crate::crate_roots::ForeignDollarCrate> {
     let tokens = stream.tokens();
@@ -3102,7 +4299,7 @@ pub(crate) fn render_with<'a>(
     // The words written so far: `$crate` as `crate` is one, as `$crate` two (`$`, `crate`);
     // a `local_inner_macros` prefix is its crate's word(s) and `::`'s two.
     let mut word = 0u32;
-    fn note_word(words: &mut Option<&mut AVec<'_, Option<u32>>>, at: Option<u32>) {
+    fn note_word<W: core::alloc::Allocator>(words: &mut Option<&mut blaze_own::Vec<Option<u32>, W>>, at: Option<u32>) {
         if let Some(words) = words {
             words.push(at);
         }
@@ -3255,9 +4452,9 @@ pub(crate) fn render_with<'a>(
 /// itself (`base.alloc`), each piece at its exact size: so the frame's peak is what is kept
 /// plus one call's scratch, and the two answers write equal bytes.
 #[allow(clippy::too_many_arguments, reason = "the call's context, each named")]
-fn expand_decls<'a, S: SourceTexts<'a>>(
+fn expand_decls<'a, 'p: 'a, S: SourceTexts<'a>>(
     base: &Base<'_, 'a, S>,
-    run: &Run<'a>,
+    run: &Run<'a, '_, 'p>,
     request: ExpandRequest,
     part: PartMark<'_>,
     seen: &dyn Fn(ItemKey, &str),
@@ -3276,9 +4473,9 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
 /// [`expand_decls`]'s one call, its work in `alloc` (a scratch or the crate's allocator), what
 /// it keeps in `base.alloc` (`home`).
 #[allow(clippy::too_many_arguments, reason = "the call's context, each named")]
-fn expand_call<'a, S: SourceTexts<'a>>(
+fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
     base: &Base<'_, 'a, S>,
-    run: &Run<'a>,
+    run: &Run<'a, '_, 'p>,
     request: ExpandRequest,
     part: PartMark<'_>,
     seen: &dyn Fn(ItemKey, &str),
@@ -3288,6 +4485,7 @@ fn expand_call<'a, S: SourceTexts<'a>>(
 ) -> Option<(DeclsBuilder<'a, &'a str>, Option<&'a ExpansionText<'a>>)> {
     // `home` keeps what outlives the call; `alloc` is the call's work.
     let home = base.alloc;
+    let home_bump = base.bump;
     let call = request.call;
     let src = base.tables.calls.get(&call).copied().or_else(|| held(run.tables.read(), "tables").calls.get(&call).copied());
     let Some(src) = src else {
@@ -3363,7 +4561,16 @@ fn expand_call<'a, S: SourceTexts<'a>>(
         let def_may = match mac.body {
             MacroBody::Rules(rules) => Some(run.prepares.may_declare(def_key, &[rules])),
             MacroBody::Macro2 { params, body } => Some(run.prepares.may_declare(def_key, &[params.unwrap_or(""), body])),
-            MacroBody::BuiltinFn(name) => Some(matches!(name, "include" | "global_asm")),
+            MacroBody::BuiltinFn(name) => Some(match BuiltinFn::of_library(name) {
+                Some(BuiltinFn::Include | BuiltinFn::GlobalAsm) => true,
+                // `assert!(cond, msg..)` expands to `if !(cond) { $crate::panic::panic_2021!(msg..) }`,
+                // whose block holds a macro call; `assert!(cond)` without `,` writes no call in its block.
+                Some(BuiltinFn::Assert) => src.input.contains(','),
+                // Non-empty `panic!(..)` / `unreachable!(..)` expand via `panic_2021!` /
+                // `unreachable_2021!` to a block holding `const_format_args!` / `format_args!`.
+                Some(BuiltinFn::Panic | BuiltinFn::Unreachable) => !src.input.trim().is_empty(),
+                _ => false,
+            }),
             MacroBody::BuiltinDerive { .. } | MacroBody::BuiltinOther(_) | MacroBody::Proc { .. } => None,
         };
         if def_may == Some(false) && !blaze_file_items::nested::may_declare(src.input) {
@@ -3437,10 +4644,16 @@ fn expand_call<'a, S: SourceTexts<'a>>(
     let written;
     let def: Kept<'_> = match run.prepares.get(def_key).filter(|_| declarative) {
         Some(kept) => kept,
-        // In `home`: a declarative definition is kept for every call of it (`prepares`), and
-        // its refusal is a note; a builtin's or a proc macro's is a few words.
-        None => match definition_of(mac, def_krate, runner, def_edition, src.kind, home) {
-            Ok(def) if declarative => run.prepares.keep(def_key, def),
+        // Declarative definitions live in `run.prepares.alloc()` (which may be shared across all
+        // crates in a stage, lifetime `'p: 'a`); non-declarative definitions stay in `home`.
+        None if declarative => match definition_of_in(mac, def_krate, runner, def_edition, src.kind, run.prepares.alloc()) {
+            Ok(def) => run.prepares.keep(def_key, def),
+            Err(why) => {
+                note(why);
+                return None;
+            }
+        },
+        None => match definition_of_in(mac, def_krate, runner, def_edition, src.kind, home) {
             Ok(def) => {
                 written = def;
                 Kept::Written(&written)
@@ -3531,7 +4744,7 @@ fn expand_call<'a, S: SourceTexts<'a>>(
                 match walk.next(atom) {
                     Ok(NextAttr::Call { path, attr })
                         if match plant {
-                            AttrPlant::None => walk.attr_is(attr.clone(), &named),
+                            AttrPlant::None => walk.attr_is(attr.start..attr.end, &named),
                             AttrPlant::Spelling => same_spelling(&path, src.name),
                         } =>
                     {
@@ -3633,9 +4846,12 @@ fn expand_call<'a, S: SourceTexts<'a>>(
     // A nested call of an eager builtin names a library builtin unless this crate defines a
     // macro of that name (then the name may be the crate's: refused, never guessed); the
     // library's own `#[rustc_builtin_macro]` definition (core's) is that builtin.
-    let shadowed = |name: &str| base.tables.macros.values().any(|m| m.name == name && !matches!(m.body, MacroBody::BuiltinFn(b) if b == name));
+    let shadowed = |name: &str| {
+        base.tables.macros.values().any(|m| m.name == name && !matches!(m.body, MacroBody::BuiltinFn(b) if b == name))
+            || held(run.tables.read(), "tables").macros.values().any(|m| m.name == name && !matches!(m.body, MacroBody::BuiltinFn(b) if b == name))
+    };
     let nested_at = DefAt { site: DefSite { krate: def_krate, module: None }, edition: def_edition, export: Export::Exported, local_inner: LocalInner::No, transparency: None };
-    let eager = EagerDriver { macro_name: mac.name, def_at: nested_at, shadowed: &shadowed, keep: home, alloc };
+    let eager = EagerDriver { macro_name: mac.name, def_at: nested_at, shadowed: &shadowed, keep: home_bump, alloc };
     let run_part = match mac.body {
         MacroBody::Rules(_) | MacroBody::Macro2 { .. } => ExpandPart::RunRules,
         MacroBody::BuiltinFn(_) => ExpandPart::RunBuiltin,
@@ -3680,7 +4896,7 @@ fn expand_call<'a, S: SourceTexts<'a>>(
             // Written in the call's work, kept at its exact size: an entry grows as it is
             // written, and its growth stays behind in the scratch, never in `home`.
             match entry {
-                Some(entry) => kept.made(key, AVec::from_slice_in(&entry[..], home).leak()),
+                Some(entry) => kept.made(key, home_bump.alloc_slice_copy(&entry[..])),
                 None => kept.unkept(),
             }
         }
@@ -3694,7 +4910,7 @@ fn expand_call<'a, S: SourceTexts<'a>>(
     // rule matches, "an error is reported"): it writes nothing, and what it might have written
     // is unknown because of it, never absent (rules 19 and 54). Returning `None` stores it
     // refused (`FillCx::expand`, `crate::refused`); the note keeps the matcher's own reason.
-    if let Some(failed) = blaze_expand::Failed::of(&expansion, home) {
+    if let Some(failed) = blaze_expand::Failed::of(&expansion, home_bump) {
         note(ExpandNote::Failed { path: src.name, implicit: src.implicit, failed });
         return None;
     }
@@ -3735,16 +4951,14 @@ fn expand_call<'a, S: SourceTexts<'a>>(
         }
     };
     part(ExpandPart::Render, mac.name, expansion.tokens.len());
-    // Each placed piece as the nested input keeps it, `(start, end, token)`, made once at its
-    // final size (at most one a token), and the `crate` written for another crate's `$crate`
-    // beside it, sparse, by its place's index: no wide row per token is held or grown (the
-    // frame's largest stretch in tempo's core, `scope frame by stretch`).
-    // `placed` and `words` are kept (the nested input reads them), sized once in `home`; the
-    // rendering, `roots` and the column grow in the call's work.
-    let mut placed: AVec<'a, (u32, u32, u32)> = AVec::with_capacity_in(expansion.tokens.len(), home);
+    // `placed`, `words`, `roots` and the rendered string live in the call's resettable scratch
+    // (`alloc`). Only if lowering actually encounters a nested macro call, an attribute-value
+    // call, an inline module, or a body that may write a block module are `sealed`, `placed` and
+    // `words` materialized into `home_bump` via `FragmentTokens::Lazy` (rule 11).
+    let mut placed: AVec<'_, (u32, u32, u32)> = AVec::with_capacity_in(expansion.tokens.len(), alloc);
     let mut roots: AVec<'_, (u32, CrateItemKey)> = AVec::new_in(alloc);
     let mut too_large = false;
-    let mut words: AVec<'a, Option<u32>> = AVec::with_capacity_in(expansion.tokens.len(), home);
+    let mut words: AVec<'_, Option<u32>> = AVec::with_capacity_in(expansion.tokens.len(), alloc);
     let rendered = render_with(
         &expansion.tokens,
         Some(here),
@@ -3776,8 +4990,31 @@ fn expand_call<'a, S: SourceTexts<'a>>(
     // How many `crate`s the text writes for another crate's `$crate`: such a text is read only
     // with its marks (crate::crate_roots).
     let roots_written = roots.iter().filter(|(_, k)| *k != here).count();
-    // Rendered in the call's work (the text grows as it is written), kept at its exact size.
-    let text: &'a str = keep(rendered.as_str(), home);
+    let in_block = held(run.made.read(), "made modules")
+        .get(&src.module)
+        .is_some_and(|m| m.info.name.is_some_and(crate::blocks::is_block_module));
+    // Fast-path statement-position calls (`assert!`, `debug_assert!`, `panic!`, etc.) in
+    // resettable `call_scratch`: if outlining fails and `statements_as_items` yields no items (or
+    // refuses), return without ever building `origin_column` or copying `rendered`/`Outline` into
+    // `home_bump` (saves ~15% of all expansion renders & outlines on `core`).
+    let mut pre_block_items: Option<(AString<'_>, AVec<'_, crate::crate_roots::Copied>, AVec<'_, u32>)> = None;
+    if in_block {
+        part(ExpandPart::Outline, mac.name, rendered.len());
+        let probe = outline(rendered.as_str(), edition, alloc);
+        if probe.errors().first().is_some() {
+            part(ExpandPart::Lower, mac.name, rendered.len());
+            match crate::expanded_blocks::statements_as_items(rendered.as_str(), call, alloc) {
+                Ok(None) => return Some((DeclsBuilder::new_in(home), None)),
+                Ok(Some((items, copies, synthetic_blocks))) => {
+                    pre_block_items = Some((items, copies, synthetic_blocks));
+                }
+                Err(refused) => {
+                    note(ExpandNote::NotItems { macro_name: mac.name, message: refused.message() });
+                    return Some((DeclsBuilder::new_in(home), None));
+                }
+            }
+        }
+    }
     let input_index = match written_input.as_deref() {
         Some(map) => blaze_expand::origin_column::InputIndex::Aligned(map),
         None => blaze_expand::origin_column::InputIndex::AsWritten,
@@ -3787,126 +5024,108 @@ fn expand_call<'a, S: SourceTexts<'a>>(
         CallShape::Attr | CallShape::Derive => blaze_expand::origin_column::InputShape::Whole,
     };
     let mark_of = |at: usize| expansion.hygiene(at).mark.map(blaze_expand::origin_column::TextMark::of);
-    // The column and its bytes are made in the call's work; the bytes are kept at their size.
     let origin_column = crate::expansion_origins::column_of(call, &placed, &roots, &expansion.origins, input_index, &mark_of, alloc);
-    let origins: Result<&'a [u8], crate::expansion_origins::OriginsError> = origin_column
-        .and_then(|column| crate::expansion_origins::write(call, src.place, shape, src.name, src.implicit, &column, alloc))
-        .map(|bytes| &*AVec::from_slice_in(bytes, home).leak());
-    // What a call written in this text takes its input from (crate::nested_input): the
-    // expansion's tokens sealed with its key, each placed piece's bytes, each token's word. The
-    // stream was made in the call's work: it is kept as one exact copy in `home` (each table
-    // sized once, `TokenStream::clone_in`), sealed there.
-    let expansion_tokens = {
-        let mut sealed = expansion.tokens.clone_in(home);
-        sealed.seal(own_key.0);
-        let sealed: &'a TokenStream<'a> = Box::leak(Box::new_in(sealed, home));
-        let placed: &'a [(u32, u32, u32)] = placed.leak();
-        let words: &'a [Option<u32>] = words.leak();
-        crate::nested_input::ExpansionTokens { stream: sealed, text, places: placed, words }
-    };
-    part(ExpandPart::Outline, mac.name, text.len());
-    let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText::new(text, outline(text, edition, home), origins), home));
-    part(ExpandPart::Lower, mac.name, text.len());
-    // The marks a lowered path's first segment resolves by (token-mark-2): the text's column,
-    // opened once in `ExpansionText::new`.
-    let column = match made.column {
-        Ok(column) => Some(column),
-        Err(lost) if roots_written > 0 => {
-            note(ExpandNote::RootsLost { macro_name: mac.name, lost });
-            return None;
-        }
-        // No root of another crate: every `crate` in it is this crate's (or a `macro` item's
-        // own, read as before this piece).
-        Err(_) => None,
-    };
-    // With the tokens that place the text lowered: the rendered text's own, or, for statements
-    // read as items, the same tokens moved with the slices that text copied
-    // ([`crate::nested_input::ExpansionTokens::moved`]), so a call there takes its input as the
-    // expansion's tokens, never as its text lexed again.
-    #[allow(clippy::type_complexity)]
-    let (text, made, column, fragment_tokens): (&'a str, &'a ExpansionText<'a>, Option<blaze_expand::origin_column::OriginsRef<'a>>, crate::nested_input::ExpansionTokens<'a>) = match made.outline.errors().first() {
-        None => (text, made, column, expansion_tokens),
-        Some(error) => {
-            // A call a block's module holds ([`crate::blocks`]) stands in STATEMENT position:
-            // the Reference, "Macro invocation", "Statements": its expansion is statements of
-            // the calling block. One that is an expression or a `let` (`assert!(..)`,
-            // `println!(..)`) declares nothing: nothing is lowered from it. One whose
-            // statements hold items or statement calls beside what is not an item, or that is
-            // a block expression declaring items (`tokio::select!`), is read as statements
-            // (crate::expanded_blocks `statements_as_items`): its top-level items and calls,
-            // and a module per block inside it that holds one, are the call's fragment, lowered
-            // below like any expansion's items (one key, the call's; one record, its
-            // expansion). An expansion nested in it is a call of that fragment: the same step
-            // again, driven by the solve, `src.depth + 1` deep.
-            let in_block = held(run.made.read(), "made modules")
-                .get(&src.module)
-                .is_some_and(|m| m.info.name.is_some_and(crate::blocks::is_block_module));
-            if !in_block {
-                note(ExpandNote::NotItems { macro_name: mac.name, message: made.outline.message(error) });
-                (text, made, column, expansion_tokens)
-            } else {
-                match crate::expanded_blocks::statements_as_items(text, call, alloc) {
-                    Ok(None) => return Some((DeclsBuilder::new_in(home), None)),
-                    Ok(Some((items, copies))) => {
-                        let items: &'a str = keep(items.as_str(), home);
-                        // The column moved with the slices the items text copied, written with
-                        // the call's own part (its call, place, shape and macro, as the
-                        // rendered text's): an item of the items text walks from its place to
-                        // the call that wrote it (blaze-cli body_types/covered.rs
-                        // `written_path`), as an item of any expansion does. The rows are those
-                        // `remapped` carried before (one remap, read back in place).
-                        let origins: Result<&'a [u8], crate::expansion_origins::OriginsError> = match made.column {
-                            Ok(column) => match crate::crate_roots::remap(column, &copies, alloc) {
-                                Ok(moved) => crate::expansion_origins::write(call, src.place, shape, src.name, src.implicit, &moved, alloc)
-                                    .map(|bytes| &*AVec::from_slice_in(bytes, home).leak()),
-                                Err(error) if roots_written > 0 => {
-                                    note(ExpandNote::RootsLost { macro_name: mac.name, lost: crate::crate_roots::RootsLost::Column { error } });
-                                    return None;
-                                }
-                                Err(_) => Err(crate::expansion_origins::OriginsError::Rewritten { what: "a call's statements read as items" }),
-                            },
-                            Err(_) => Err(crate::expansion_origins::OriginsError::Rewritten { what: "a call's statements read as items" }),
-                        };
-                        let again: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText::new(items, outline(items, edition, home), origins), home));
-                        // The marks a lowered path reads: the moved column, as before; none
-                        // when the rendered text had none (refused above when it wrote
-                        // another crate's root).
-                        let column = match (column, again.column) {
-                            (Some(_), Ok(moved)) => Some(moved),
-                            (Some(_), Err(lost)) if roots_written > 0 => {
-                                note(ExpandNote::RootsLost { macro_name: mac.name, lost });
-                                return None;
-                            }
-                            _ => None,
-                        };
-                        if let Some(error) = again.outline.errors().first() {
-                            note(ExpandNote::NotItems { macro_name: mac.name, message: again.outline.message(error) });
-                            return Some((DeclsBuilder::new_in(home), None));
-                        }
-                        (items, again, column, expansion_tokens.moved(items, &copies, home))
-                    }
-                    Err(refused) => {
-                        note(ExpandNote::NotItems { macro_name: mac.name, message: refused.message() });
-                        return Some((DeclsBuilder::new_in(home), None));
-                    }
+    let (rendered_text, text, made, column, moved_copies, synthetic_blocks): (
+        &'a str,
+        &'a str,
+        &'a ExpansionText<'a>,
+        Option<blaze_expand::origin_column::OriginsRef<'a>>,
+        Option<AVec<'_, crate::crate_roots::Copied>>,
+        AVec<'_, u32>,
+    ) =
+        if let Some((items_str, copies, synthetic_blocks)) = pre_block_items {
+            let rendered_text: &'a str = keep(rendered.as_str(), home_bump);
+            let items: &'a str = keep(items_str.as_str(), home_bump);
+            let raw_origins = origin_column
+                .and_then(|column| crate::expansion_origins::write_bytes(call, src.place, shape, src.name, src.implicit, &column, alloc));
+            let raw_origins_ref: Result<&[u8], crate::expansion_origins::OriginsError> = raw_origins.as_deref().map_err(|&e| e);
+            let raw_col = match crate::crate_roots::column_in(&raw_origins_ref) {
+                Ok(col) => Some(col),
+                Err(lost) if roots_written > 0 => {
+                    note(ExpandNote::RootsLost { macro_name: mac.name, lost });
+                    return None;
                 }
+                Err(_) => None,
+            };
+            let origins: Result<&'a [u8], crate::expansion_origins::OriginsError> = match raw_col {
+                Some(column) => match crate::crate_roots::remap(column, &copies, alloc) {
+                    Ok(moved) => crate::expansion_origins::write_bytes(call, src.place, shape, src.name, src.implicit, &moved, alloc)
+                        .map(|bytes| &*home_bump.alloc_slice_copy(&bytes)),
+                    Err(error) if roots_written > 0 => {
+                        note(ExpandNote::RootsLost { macro_name: mac.name, lost: crate::crate_roots::RootsLost::Column { error } });
+                        return None;
+                    }
+                    Err(_) => Err(crate::expansion_origins::OriginsError::Rewritten { what: "a call's statements read as items" }),
+                },
+                None => Err(crate::expansion_origins::OriginsError::Rewritten { what: "a call's statements read as items" }),
+            };
+            let again: &'a ExpansionText<'a> = home_bump.alloc_val(ExpansionText::new(items, outline(items, edition, home), origins));
+            let column = match (raw_col, again.column) {
+                (Some(_), Ok(moved)) => Some(moved),
+                (Some(_), Err(lost)) if roots_written > 0 => {
+                    note(ExpandNote::RootsLost { macro_name: mac.name, lost });
+                    return None;
+                }
+                _ => None,
+            };
+            if let Some(error) = again.outline.errors().first() {
+                note(ExpandNote::NotItems { macro_name: mac.name, message: again.outline.message(error) });
+                return Some((DeclsBuilder::new_in(home), None));
             }
-        }
-    };
+            (rendered_text, items, again, column, Some(copies), synthetic_blocks)
+        } else {
+            // Rendered in the call's work (the text grows as it is written), kept at its exact size.
+            let rendered_text: &'a str = keep(rendered.as_str(), home_bump);
+            let origins: Result<&'a [u8], crate::expansion_origins::OriginsError> = origin_column
+                .and_then(|column| crate::expansion_origins::write_bytes(call, src.place, shape, src.name, src.implicit, &column, alloc))
+                .map(|bytes| &*home_bump.alloc_slice_copy(&bytes));
+            if !in_block {
+                part(ExpandPart::Outline, mac.name, rendered_text.len());
+            }
+            let made: &'a ExpansionText<'a> = home_bump.alloc_val(ExpansionText::new(rendered_text, outline(rendered_text, edition, home), origins));
+            part(ExpandPart::Lower, mac.name, rendered_text.len());
+            let column = match made.column {
+                Ok(column) => Some(column),
+                Err(lost) if roots_written > 0 => {
+                    note(ExpandNote::RootsLost { macro_name: mac.name, lost });
+                    return None;
+                }
+                Err(_) => None,
+            };
+            if let Some(error) = made.outline.errors().first() {
+                note(ExpandNote::NotItems { macro_name: mac.name, message: made.outline.message(error) });
+            }
+            (rendered_text, rendered_text, made, column, None, AVec::new_in(alloc))
+        };
     // An `include!`'s file is the current file of what it writes ([`crate::included`]): the
     // calls in it read from it, and a `mod x;` at its top is found from its folder. A file
     // outside the package (a build script's output) has no such path: the calling file stays.
     let included: Option<&'a str> = match mac.body {
         MacroBody::BuiltinFn("include") => {
             let seen = base.sources.crate_env(base.index).map(|env| env.seen());
-            crate::included::included_read(base.shown_from, seen, calling, &expansion.reads, alloc).map(|path| keep(&path, home))
+            crate::included::included_read(base.shown_from, seen, calling, &expansion.reads, alloc).map(|path| keep(&path, home_bump))
         }
         _ => None,
     };
     let written = included.unwrap_or(calling);
-    let fragment_tokens = Some(fragment_tokens);
+    // Materialize `ExpansionTokens` into `home_bump` AT MOST ONCE, ONLY when a consumer needs it.
+    let cached_tokens: core::cell::OnceCell<crate::nested_input::ExpansionTokens<'a>> = core::cell::OnceCell::new();
+    let get_tokens = || -> crate::nested_input::ExpansionTokens<'a> {
+        *cached_tokens.get_or_init(|| {
+            let mut sealed = expansion.tokens.clone_in(home);
+            sealed.seal(own_key.0);
+            let sealed: &'a TokenStream<'a> = home_bump.alloc_val(sealed);
+            let placed_home: &'a [(u32, u32, u32)] = home_bump.alloc_slice_copy(&placed);
+            let words_home: &'a [Option<u32>] = home_bump.alloc_slice_copy(&words);
+            let base = crate::nested_input::ExpansionTokens { stream: sealed, text: rendered_text, places: placed_home, words: words_home };
+            match moved_copies.as_deref() {
+                Some(copies) => base.moved(text, copies, home_bump),
+                None => base,
+            }
+        })
+    };
     let fragment = Fragment {
-        tokens: fragment_tokens,
+        tokens: FragmentTokens::LazyDeferBody(&get_tokens),
         module: src.module,
         owner: call,
         text,
@@ -3920,39 +5139,52 @@ fn expand_call<'a, S: SourceTexts<'a>>(
         kept: None,
         marks: column.map(|column| crate::crate_roots::TextMarks { text, column }),
     };
-    // The lowering is kept (the call's declarations and modules): in `home`.
-    let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() }, fragment, home);
+    // The lowering is kept (the call's declarations and modules): output in `home`, scratch in
+    // resettable `call_scratch` (`alloc`).
+    let mut out = lower_in(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() }, fragment, alloc, home_bump);
     // Entered only by a call that makes modules: one that makes none stays in `Lower` for the
     // few moves below (what the part costs is what `make_modules` does: a module's file read,
     // outlined and lowered).
-    if !out.mods_made.is_empty() {
-        part(ExpandPart::Modules, mac.name, out.mods_made.len());
-    }
-    let mods =core::mem::replace(&mut out.mods_made, AVec::new_in(home));
-    // An `include!`'s file is the current file of what it writes ([`crate::included`]): a
-    // `mod x;` in it is found from the INCLUDED file's folder, not the calling module's.
-    let included_dir: Option<&'a str> = included.filter(|_| !mods.is_empty()).map(|path| {
-        let mut dir = AString::from_str_in(path, alloc);
-        pop_dir(&mut dir);
-        keep(&dir, home)
-    });
-    let place = Made {
-        text,
-        outline: &made.outline,
-        at: Where::Expansion(src.loc),
-        place: At::Expansion(call),
-        dir: included_dir,
-        written,
-        marks: column.map(|column| crate::crate_roots::TextMarks { text, column }),
-        tokens: fragment_tokens,
-    };
+    let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(home));
     let mut bodies = core::mem::replace(&mut out.bodies, AVec::new_in(home));
-    make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies);
+    // An `include!`'s file is the current file of what it writes ([`crate::included`]): a
+    // `mod x;` at its top or inside a body at its top is found from the INCLUDED file's folder,
+    // not the calling module's. Bodies lowered inside modules that `make_modules` creates below
+    // already inherit that folder from their own made module's `dir`/`path_dir`.
+    let included_dir: Option<&'a str> = if !mods.is_empty() || !bodies.is_empty() {
+        included.map(|path| {
+            let mut dir = AString::from_str_in(path, alloc);
+            pop_dir(&mut dir);
+            keep(&dir, home_bump)
+        })
+    } else {
+        None
+    };
+    if included_dir.is_some() {
+        for body in bodies.iter_mut() {
+            body.included_dir = included_dir;
+        }
+    }
+    if !mods.is_empty() {
+        part(ExpandPart::Modules, mac.name, mods.len());
+        let place = Made {
+            text,
+            outline: &made.outline,
+            at: Where::Expansion(src.loc),
+            place: At::Expansion(call),
+            dir: included_dir,
+            written,
+            marks: column.map(|column| crate::crate_roots::TextMarks { text, column }),
+            tokens: FragmentTokens::LazyDeferBody(&get_tokens),
+            synthetic_blocks: &synthetic_blocks,
+        };
+        make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies, alloc);
+    }
     let decls = core::mem::replace(&mut out.decls, DeclsBuilder::new_in(home));
     part(ExpandPart::Tables, mac.name, 0);
     add_lowered(run, call, At::Expansion(call), out);
     part(ExpandPart::Blocks, mac.name, bodies.len());
-    blocks_of(base, run, &bodies, Some(made));
+    blocks_of(base, run, &bodies, Some(made), alloc, Some(&get_tokens));
     Some((decls, Some(made)))
 }
 
@@ -3991,7 +5223,7 @@ const LITERAL_BUILTINS: [&str; 15] = [
 /// key is under the call's (as any expansion's).
 fn keep_item<'a, S: SourceTexts<'a>>(
     base: &Base<'_, 'a, S>,
-    run: &Run<'a>,
+    run: &Run<'a, '_, '_>,
     call: ItemKey,
     src: CallSrc<'a>,
     part: PartMark<'_>,
@@ -3999,6 +5231,7 @@ fn keep_item<'a, S: SourceTexts<'a>>(
     note: &dyn Fn(ExpandNote<'a>),
 ) -> Option<(DeclsBuilder<'a, &'a str>, Option<&'a ExpansionText<'a>>)> {
     let alloc = base.alloc;
+    let bump = base.bump;
     let text = src.input;
     let name = match keep {
         KeepAs::Item => KEPT_ITEM_NAME,
@@ -4018,10 +5251,10 @@ fn keep_item<'a, S: SourceTexts<'a>>(
     // read at the module with no marks (front2 item_site.rs `marks_of_column`: `Rewritten` is
     // `None`), a finding in it filed at its own place.
     let origins = match keep {
-        KeepAs::Item => crate::expansion_origins::kept(call, src.place, text, src.name, base.edition, alloc),
+        KeepAs::Item => crate::expansion_origins::kept(call, src.place, text, src.name, base.edition, bump),
         KeepAs::Harness => Err(crate::expansion_origins::OriginsError::Rewritten { what: "a proc-macro crate's harness (`_DECLS`)" }),
     };
-    let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText::new(text, outline(text, base.edition, alloc), origins), alloc));
+    let made: &'a ExpansionText<'a> = bump.alloc_val(ExpansionText::new(text, outline(text, base.edition, alloc), origins));
     if let Some(error) = made.outline.errors().first() {
         note(ExpandNote::NotItems { macro_name: name, message: made.outline.message(error) });
         return None;
@@ -4048,19 +5281,20 @@ fn keep_item<'a, S: SourceTexts<'a>>(
         marks: None,
         // A slice of the calling text: written in an expansion, its calls take their inputs
         // from that expansion's tokens, placed in the same text.
-        tokens: kept_tokens,
+        tokens: FragmentTokens::from_option(kept_tokens),
     };
-    let mut out = lower(
+    let mut out = lower_in(
         LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() },
         fragment,
         alloc,
+        bump,
     );
     // A struct, an enum or a union makes no module; moved as `expand_decls` moves them so a
     // change there stays one shape.
     let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
-    let place = Made { text, outline: &made.outline, at: Where::Expansion(src.loc), place: At::Expansion(call), dir: None, written: src.written, marks: None, tokens: kept_tokens };
+    let place = Made { text, outline: &made.outline, at: Where::Expansion(src.loc), place: At::Expansion(call), dir: None, written: src.written, marks: None, tokens: FragmentTokens::from_option(kept_tokens), synthetic_blocks: &[] };
     let mut bodies = core::mem::replace(&mut out.bodies, AVec::new_in(alloc));
-    make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies);
+    make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies, alloc);
     let decls = core::mem::replace(&mut out.decls, DeclsBuilder::new_in(alloc));
     // The harness declares no name: rustc writes `_DECLS` def-site, so no path of the crate
     // reaches it. Its text, key and body are the call's (`add_lowered` below), named by its
@@ -4072,7 +5306,7 @@ fn keep_item<'a, S: SourceTexts<'a>>(
     part(ExpandPart::Tables, name, 0);
     add_lowered(run, call, At::Expansion(call), out);
     part(ExpandPart::Blocks, name, bodies.len());
-    blocks_of(base, run, &bodies, Some(made));
+    blocks_of(base, run, &bodies, Some(made), alloc, None);
     Some((decls, Some(made)))
 }
 
@@ -4087,9 +5321,12 @@ enum KeepAs {
 /// What [`ExpandNote`]s and part marks name a proc-macro harness's expansion by.
 const HARNESS_NAME: &str = "proc-macro harness";
 
-/// The most bodies deep (with expansions) a block's module is made: a body in a block of a
-/// body in a block, each level one more (rule 18).
-const MAX_BLOCK_DEPTH: u16 = 64;
+/// The most bodies deep (past macro expansions up to [`crate::RECURSION_LIMIT`]) a block's module
+/// is made: `body.depth` accumulates both macro-expansion depth (e.g. `pin_project!` peeling 90+
+/// doc-comment attributes on `tokio::time::Sleep` before emitting `const _: () = { impl Sleep .. }`)
+/// and block-in-block nesting, so a block written at expansion depth `< RECURSION_LIMIT` must still
+/// be allowed to make its block module (rule 18).
+const MAX_BLOCK_DEPTH: u16 = crate::RECURSION_LIMIT + 64;
 
 /// Makes the modules of the blocks of `bodies` that hold an `impl` ([`crate::blocks`]): each
 /// body's text is scanned once by syntax; one that writes an impl in a block gets a fragment
@@ -4100,16 +5337,19 @@ const MAX_BLOCK_DEPTH: u16 = 64;
 /// lowered inside a block's module is scanned in turn: a work list, no recursion.
 fn make_blocks<'a, S: SourceTexts<'a>>(
     base: &Base<'_, 'a, S>,
-    run: &Run<'a>,
+    run: &Run<'a, '_, '_>,
     bodies: &[crate::task::BodySrc<'a>],
     writer: Option<&ExpansionText<'a>>,
+    scratch: Alloc<'_>,
+    deferred_tokens: Option<&dyn Fn() -> crate::nested_input::ExpansionTokens<'a>>,
 ) {
     use crate::expansion_origins::OriginsError;
 
     let alloc = base.alloc;
-    let mut work: AVec<'a, crate::task::BodySrc<'a>> = AVec::from_slice_in(bodies, alloc);
+    let bump = base.bump;
+    let mut work: AVec<'_, crate::task::BodySrc<'a>> = AVec::from_slice_in(bodies, scratch);
     while let Some(body) = work.pop() {
-        let nested = blaze_file_items::nested::scan(body.text, alloc);
+        let nested = blaze_file_items::nested::scan(body.text, scratch);
         // An unbalanced body is the parser's error to report; nothing is read from it.
         // A block is a module when it holds an item that makes one (its head is made in the
         // block's module by the ordinary code; front2's `Locals::keep` derives the same module
@@ -4124,9 +5364,10 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
             run.note(NamesNote::Made { name: crate::blocks::BLOCK_MODULE, at: body.loc, note: MadeNote::TooMany });
             continue;
         }
-        let mut copies: AVec<'a, crate::crate_roots::Copied> = AVec::new_in(alloc);
-        let rendered = crate::blocks::module_text(body.text, &nested, &mut |c| copies.push(c), alloc);
-        let text: &'a str = Box::leak(rendered.into_boxed_str());
+        let mut copies: AVec<'_, crate::crate_roots::Copied> = AVec::new_in(scratch);
+        let mut synthetic_blocks: AVec<'_, u32> = AVec::new_in(scratch);
+        let rendered = crate::blocks::module_text_with_blocks(body.text, &nested, &mut |c| copies.push(c), &mut synthetic_blocks, scratch);
+        let text: &'a str = bump.alloc_str(&rendered);
         let call = crate::task::key_of(base.key, body.key, "blocks", "", 0);
         // Copied tokens keep their indexes in the writing call's input, even when this
         // body came from another block module on the work list. Remap only their places.
@@ -4135,14 +5376,14 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
             let writer = writer.ok_or(OriginsError::Unplaced { call })?;
             let (call_part, _) = crate::expansion_origins::split(writer.origins?)?;
             let at = crate::expansion_origins::offset_in(of.text, body.text).ok_or(OriginsError::InputNotInText { call })?;
-            let shifted = AVec::from_iter_in(copies.iter().map(|c| crate::crate_roots::Copied { from: at + c.from, ..*c }), alloc);
+            let shifted = AVec::from_iter_in(copies.iter().map(|c| crate::crate_roots::Copied { from: at + c.from, ..*c }), scratch);
             let column_error = |error| OriginsError::Column { call: Some(call), error };
-            let column = crate::crate_roots::remap(of.column, &shifted, alloc).map_err(column_error)?;
-            let mut bytes = AVec::from_slice_in(call_part, alloc);
+            let column = crate::crate_roots::remap(of.column, &shifted, scratch).map_err(column_error)?;
+            let mut bytes = AVec::from_slice_in(call_part, scratch);
             column.write(&mut bytes).map_err(column_error)?;
-            Ok(&*Box::leak(bytes.into_boxed_slice()))
+            Ok(&*bump.alloc_slice_copy(&bytes))
         })();
-        let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText::new(text, outline(text, base.edition, alloc), origins), alloc));
+        let made: &'a ExpansionText<'a> = bump.alloc_val(ExpansionText::new(text, outline(text, base.edition, alloc), origins));
         let marks = match (body.marks, made.column) {
             (None, _) => None,
             (Some(_), Ok(column)) => Some(crate::crate_roots::TextMarks { text, column }),
@@ -4159,13 +5400,23 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
         // call in the block's module takes its input as the expansion's tokens (bitflags'
         // `fn all() { .. $crate::__bitflags_expr_safe_attrs!(..) .. }`, written through
         // `__impl_bitflags!`'s argument). A body outside the text they place is no
-        // expansion's: none.
-        let tokens = body.tokens.and_then(|of| {
-            let at = crate::expansion_origins::offset_in(of.text, body.text)?;
-            let mut shifted: AVec<'a, crate::crate_roots::Copied> = AVec::with_capacity_in(copies.len(), alloc);
-            shifted.extend(copies.iter().map(|c| crate::crate_roots::Copied { from: c.from + at, ..*c }));
-            Some(of.moved(text, &shifted, alloc))
-        });
+        // expansion's: none. Materialized lazily on first nested call or inner body inside the
+        // block so blocks with only items/impls allocate zero token streams in `home_bump` (rule 11).
+        let moved_tokens: core::cell::OnceCell<Option<crate::nested_input::ExpansionTokens<'a>>> = core::cell::OnceCell::new();
+        let make_moved_tokens = || {
+            *moved_tokens.get_or_init(|| {
+                let of = body.tokens.or_else(|| deferred_tokens.map(|f| f()))?;
+                let at = crate::expansion_origins::offset_in(of.text, body.text)?;
+                let mut shifted: AVec<'_, crate::crate_roots::Copied> = AVec::with_capacity_in(copies.len(), scratch);
+                shifted.extend(copies.iter().map(|c| crate::crate_roots::Copied { from: c.from + at, ..*c }));
+                Some(of.moved(text, &shifted, bump))
+            })
+        };
+        let frag_tokens = if body.tokens.is_some() || deferred_tokens.is_some() {
+            FragmentTokens::LazyOpt(&make_moved_tokens)
+        } else {
+            FragmentTokens::None
+        };
         let fragment = Fragment {
             module: body.module,
             owner: call,
@@ -4179,22 +5430,22 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
             written: body.written,
             kept: None,
             marks,
-            tokens,
+            tokens: frag_tokens,
         };
-        let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() }, fragment, alloc);
-        let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
-        let place = Made { text, outline: &made.outline, at: Where::Expansion(body.loc), place: At::Expansion(call), dir: None, written: body.written, marks, tokens };
+        let mut out = lower_in(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() }, fragment, scratch, bump);
+        let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(scratch));
+        let place = Made { text, outline: &made.outline, at: Where::Expansion(body.loc), place: At::Expansion(call), dir: body.included_dir, written: body.written, marks, tokens: frag_tokens, synthetic_blocks: &synthetic_blocks };
         {
             let mut places = held(run.block_places.lock(), "block places");
             for m in mods.iter() {
                 places.insert(m.key, body.place);
             }
         }
-        make_modules(base, run, body.module, &mods, place, body.depth + 1, &mut work);
+        make_modules(base, run, body.module, &mods, place, body.depth + 1, &mut work, scratch);
         // The outermost block's `mod` declaration: dropped, so the body's module binds nothing.
         out.decls = DeclsBuilder::new_in(alloc);
         add_lowered(run, call, At::Expansion(call), out);
-        held(run.expansions.lock(), "expansions").insert(call, Expansion { decls: DeclsBuilder::new_in(alloc), made: Some(made), refused: None, refused_by: None });
+        held(run.expansions.lock(), "expansions").insert(call, Expansion::empty_with(Some(made)));
     }
 }
 
@@ -4215,8 +5466,8 @@ struct EagerDriver<'s, 'a, 'w> {
     /// Where the builtins the nested calls name are defined.
     def_at: DefAt,
     shadowed: &'s dyn Fn(&str) -> bool,
-    /// Where a note's text is kept: the crate's allocator (a note outlives the call).
-    keep: Alloc<'a>,
+    /// Where a note's text is kept: the crate's bump arena (a note outlives the call).
+    keep: Bump<'a>,
     /// Where the work is done: the call's scratch ([`crate::task::Par::call_scratch`]), or the
     /// crate's allocator when the Par gave none.
     alloc: Alloc<'w>,
@@ -4356,6 +5607,17 @@ pub fn definition_of<'a>(
     shape: CallShape,
     alloc: Alloc<'a>,
 ) -> Result<MacroDefinition<'a>, ExpandNote<'a>> {
+    definition_of_in(mac, krate, runner, edition, shape, alloc)
+}
+
+fn definition_of_in<'m, 'd>(
+    mac: MacroSrc<'m>,
+    krate: CrateItemKey,
+    runner: Option<CrateItemKey>,
+    edition: Edition,
+    shape: CallShape,
+    alloc: Alloc<'d>,
+) -> Result<MacroDefinition<'d>, ExpandNote<'m>> {
     let module = matches!(mac.body, MacroBody::Macro2 { .. }).then_some(mac.module);
     let def_at = DefAt {
         site: DefSite { krate, module },
@@ -4394,7 +5656,7 @@ pub fn definition_of<'a>(
         MacroBody::Proc { kind, helpers } => {
             // No runner holds its crate: the call has no definition here.
             let Some(runner) = runner else { return Err(ExpandNote::NoDefinition { shape, name: mac.name }) };
-            let mut names: AVec<'a, &str> = AVec::new_in(alloc);
+            let mut names: AVec<'d, &str> = AVec::new_in(alloc);
             names.extend(ProcAttr::helper_names(helpers));
             let at = DefAt { site: DefSite { krate: runner, module: None }, ..def_at };
             MacroDefinition::proc_macro(runner, kind, mac.name, &names, at, alloc)
@@ -4423,12 +5685,12 @@ fn same_spelling(a: &str, b: &str) -> bool {
 }
 
 /// The files' lock (a function so a guard is never held across a call that takes it).
-fn base_files<'r, 'a>(run: &'r Run<'a>) -> LockResult<std::sync::MutexGuard<'r, FileSet<'a>>> {
+fn base_files<'r, 'a>(run: &'r Run<'a, '_, '_>) -> LockResult<std::sync::MutexGuard<'r, FileSet<'a>>> {
     run.files.lock()
 }
 
 /// A fragment's tables added to the run's.
-fn add_lowered<'a>(run: &Run<'a>, owner: ItemKey, at: At, out: Lowered<'a, 'a>) {
+fn add_lowered<'a, 's>(run: &Run<'a, '_, '_>, owner: ItemKey, at: At, out: Lowered<'a, 'a, 's>) {
     let notes = held(run.tables.write(), "tables").add(owner, at, out);
     let mut held_notes = held(run.notes.lock(), "notes");
     held_notes.extend(notes.into_iter().map(NamesNote::Lower));
@@ -4437,7 +5699,7 @@ fn add_lowered<'a>(run: &Run<'a>, owner: ItemKey, at: At, out: Lowered<'a, 'a>) 
 /// The text a fragment that writes modules is: its text and outline, the lowering's `Where`
 /// and the place its items are given.
 #[derive(Clone, Copy)]
-struct Made<'a> {
+struct Made<'c, 'a> {
     text: &'a str,
     outline: &'a Outline<'a>,
     at: Where,
@@ -4450,35 +5712,40 @@ struct Made<'a> {
     written: &'a str,
     /// [`Fragment::marks`] of this text.
     marks: Option<crate::crate_roots::TextMarks<'a>>,
-    /// [`Fragment::tokens`] of this text.
-    tokens: Option<crate::nested_input::ExpansionTokens<'a>>,
+    /// [`Fragment::tokens`] of this text (kept lazy until an inline module lowers a nested call).
+    tokens: FragmentTokens<'c, 'a>,
+    /// Sorted byte offsets in `text` of synthetic block module names written by
+    /// `expanded_blocks::render` (`make_blocks` / `statements_as_items`). Empty for all real
+    /// source files and ordinary macro expansions, so a user or macro module legitimately named
+    /// `__blaze_block_*` is never mistaken for a synthetic block.
+    synthetic_blocks: &'c [u32],
 }
 
 /// Where a module of this crate is: its children's directory, what their `#[path]` is relative
-/// to, its chain up to the root, and its path; walked or made by a macro.
-fn place_of<'a, S>(base: &Base<'_, 'a, S>, run: &Run<'a>, module: ItemKey) -> Option<(&'a str, &'a str, AVec<'a, ItemKey>, &'a str)> {
-    let alloc = base.alloc;
+/// to, its chain up to the root, and its path; walked or made by a macro. Temporary copies live
+/// in `scratch` so `home_bump` never retains throwaway parent chains or paths (rule 11).
+fn place_of<'s, 'a, S>(base: &Base<'_, 'a, S>, run: &Run<'a, '_, '_>, module: ItemKey, scratch: Alloc<'s>) -> Option<(AString<'s>, AString<'s>, AVec<'s, ItemKey>, AString<'s>)> {
     if let Some(&i) = base.tree.by_key.get(&module) {
         let m = &base.tree.modules[i];
-        let chain = AVec::from_slice_in(base.chains.get(&module)?, alloc);
-        return Some((keep(&m.dir, alloc), keep(&m.path_dir, alloc), chain, keep(&m.path, alloc)));
+        let chain = AVec::from_slice_in(base.chains.get(&module)?, scratch);
+        return Some((AString::from_str_in(&m.dir, scratch), AString::from_str_in(&m.path_dir, scratch), chain, AString::from_str_in(&m.path, scratch)));
     }
     if let Some(it) = base.made_before.and_then(|m| m.get(&module)) {
-        return Some((it.dir, it.path_dir, it.chain.clone(), it.path));
+        return Some((AString::from_str_in(it.dir, scratch), AString::from_str_in(it.path_dir, scratch), AVec::from_slice_in(&it.chain, scratch), AString::from_str_in(it.path, scratch)));
     }
     let made = held(run.made.read(), "made modules");
-    made.get(&module).map(|it| (it.dir, it.path_dir, it.chain.clone(), it.path))
+    made.get(&module).map(|it| (AString::from_str_in(it.dir, scratch), AString::from_str_in(it.path_dir, scratch), AVec::from_slice_in(&it.chain, scratch), AString::from_str_in(it.path, scratch)))
 }
 
 /// The file at `path`, read and outlined the first time a module names it.
-fn file_at<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, path: &str) -> Option<(u32, &'a SourceFile<'a>)> {
+fn file_at<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a, '_, '_>, path: &str) -> Option<(u32, &'a SourceFile<'a>)> {
     let mut files = held(base_files(run), "files");
     if let Some(at) = files.find(path) {
         return Some((at, files.at(at as usize)));
     }
-    let path = keep(path, base.alloc);
+    let path = keep(path, base.bump);
     let text = base.sources.read(base.index, path)?;
-    let file = file_of(path, text, outline(text, base.edition, base.alloc), base.shown_from, base.alloc);
+    let file = file_of(path, text, outline(text, base.edition, base.alloc), base.shown_from, base.bump);
     Some((files.add(file), file))
 }
 
@@ -4487,19 +5754,21 @@ fn file_at<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, path: 
 /// body, a `mod x;` one's from its file, found as the walk finds one), its place recorded in
 /// `run.made`, and its key queued for the fill. A worklist, not recursion: a module inside a
 /// made one is pushed once its parent is recorded.
-fn make_modules<'a, S: SourceTexts<'a>>(
+fn make_modules<'c, 'a, S: SourceTexts<'a>>(
     base: &Base<'_, 'a, S>,
-    run: &Run<'a>,
+    run: &Run<'a, '_, '_>,
     parent: ItemKey,
     mods: &[ModMade<'a>],
-    made: Made<'a>,
+    made: Made<'c, 'a>,
     depth: u16,
     // The bodies lowered in the made modules that may write an impl in a block, added.
-    bodies: &mut AVec<'a, crate::task::BodySrc<'a>>,
+    bodies: &mut AVec<'_, crate::task::BodySrc<'a>>,
+    scratch: Alloc<'_>,
 ) {
     let alloc = base.alloc;
+    let bump = base.bump;
     let top = parent;
-    let mut work: AVec<'a, (ItemKey, ModMade<'a>, Made<'a>)> = AVec::with_capacity_in(mods.len(), alloc);
+    let mut work: AVec<'_, (ItemKey, ModMade<'a>, Made<'c, 'a>)> = AVec::with_capacity_in(mods.len(), scratch);
     work.extend(mods.iter().map(|m| (parent, *m, made)));
     while let Some((parent, m, made)) = work.pop() {
         let note = |note: MadeNote<'a>| run.note(NamesNote::Made { name: m.name, at: m.loc, note });
@@ -4514,7 +5783,7 @@ fn make_modules<'a, S: SourceTexts<'a>>(
                 continue;
             }
         }
-        let Some((dir, path_dir, parent_chain, parent_path)) = place_of(base, run, parent) else {
+        let Some((dir, path_dir, parent_chain, parent_path)) = place_of(base, run, parent, scratch) else {
             note(MadeNote::NoPlace);
             continue;
         };
@@ -4523,34 +5792,54 @@ fn make_modules<'a, S: SourceTexts<'a>>(
         // that module as its parent, whose folder was made from this one.
         let (dir, path_dir) = match made.dir {
             Some(included) if parent == top => (included, included),
-            _ => (dir, path_dir),
+            _ => (dir.as_str(), path_dir.as_str()),
         };
-        let (fragment_of, item, mdir, mpdir): (Made<'a>, Option<ItemIndex>, &'a str, &'a str) = if m.inline {
-            let d = keep(&joined(dir, &[m.path_attr.unwrap_or(m.name)], alloc), alloc);
+        let (fragment_of, item, mdir, mpdir): (Made<'c, 'a>, Option<ItemIndex>, &'a str, &'a str) = if m.inline {
+            // A synthetic block module emitted by `expanded_blocks::render` is an anonymous scope,
+            // never a folder segment: rustc (`DirectoryOwnership::UnownedViaBlock`) resolves both
+            // `#[path]` and nested inline modules inside a block against the enclosing module's
+            // `path_dir`. Identified structurally by its rendered name offset rather than by name
+            // prefix so a genuine user/macro `mod __blaze_block_*` keeps its own folder segment.
+            // For any real inline module, `#[path]` resolves against `path_dir` and a bare `mod m`
+            // against `dir`, matching `walk` (`task/lower.rs`).
+            let outline_item = made.outline.item(m.item);
+            let is_synthetic_block = outline_item
+                .name
+                .and_then(|name| outline_item.range.start.checked_add(name.start))
+                .is_some_and(|at| made.synthetic_blocks.binary_search(&at).is_ok());
+            let d = if is_synthetic_block {
+                keep(path_dir, bump)
+            } else {
+                let d = match m.path_attr {
+                    Some(p) => joined(path_dir, &[p], scratch),
+                    None => joined(dir, &[m.name], scratch),
+                };
+                keep(&d, bump)
+            };
             (made, Some(m.item), d, d)
         } else {
-            let sub = keep(&joined(dir, &[m.name], alloc), alloc);
+            let sub = keep(&joined(dir, &[m.name], scratch), bump);
             let (file, mdir, mpdir) = if let Some(p) = m.path_attr {
-                let target = joined(path_dir, &[p], alloc);
-                let mut parent_dir = target.clone();
+                let target = joined(path_dir, &[p], scratch);
+                let mut parent_dir = target.clone_in(scratch);
                 pop_dir(&mut parent_dir);
-                let parent_dir = keep(&parent_dir, alloc);
+                let parent_dir = keep(&parent_dir, bump);
                 let Some(file) = file_at(base, run, &target) else {
-                    note(MadeNote::FileNotFound { path: keep(&target, alloc) });
+                    note(MadeNote::FileNotFound { path: keep(&target, bump) });
                     continue;
                 };
                 (file, parent_dir, parent_dir)
             } else {
-                let mut file_name = AString::new_in(alloc);
+                let mut file_name = AString::new_in(scratch);
                 file_name.push_str(m.name);
                 file_name.push_str(".rs");
-                let a = joined(dir, &[&*file_name], alloc);
+                let a = joined(dir, &[&*file_name], scratch);
                 match file_at(base, run, &a) {
-                    Some(file) => (file, sub, dir),
+                    Some(file) => (file, sub, keep(dir, bump)),
                     None => {
-                        let b = joined(dir, &[m.name, "mod.rs"], alloc);
+                        let b = joined(dir, &[m.name, "mod.rs"], scratch);
                         let Some(file) = file_at(base, run, &b) else {
-                            note(MadeNote::FileNotFound { path: keep(&b, alloc) });
+                            note(MadeNote::FileNotFound { path: keep(&b, bump) });
                             continue;
                         };
                         (file, sub, sub)
@@ -4558,11 +5847,11 @@ fn make_modules<'a, S: SourceTexts<'a>>(
                 }
             };
             let (at, file) = file;
-            if !file_attrs(base.cfg, &file.outline, file.text, alloc).cfg_ok {
+            if !file_attrs(base.cfg, &file.outline, file.text, scratch).cfg_ok {
                 note(MadeNote::CfgOff);
                 continue;
             }
-            (Made { text: file.text, outline: &file.outline, at: Where::File(at), place: At::File(at), dir: None, written: file.path, marks: None, tokens: None }, None, mdir, mpdir)
+            (Made { text: file.text, outline: &file.outline, at: Where::File(at), place: At::File(at), dir: None, written: file.path, marks: None, tokens: FragmentTokens::None, synthetic_blocks: &[] }, None, mdir, mpdir)
         };
         let fragment = Fragment {
             module: m.key,
@@ -4579,19 +5868,20 @@ fn make_modules<'a, S: SourceTexts<'a>>(
             marks: fragment_of.marks,
             tokens: fragment_of.tokens,
         };
-        let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() }, fragment, alloc);
+        let mut out = lower_in(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() }, fragment, scratch, bump);
         bodies.extend(out.bodies.iter().copied());
         let mut chain = AVec::with_capacity_in(parent_chain.len() + 1, alloc);
         chain.push(m.key);
         chain.extend_from_slice(&parent_chain);
-        let mut path = AString::from_str_in(parent_path, alloc);
+        let mut path = BString::with_capacity_in(parent_path.len() + 2 + m.name.len(), bump);
+        path.push_str(&parent_path);
         path.push_str("::");
         path.push_str(m.name);
         let module = MadeModule {
             info: ModuleInfo { krate: base.key, parent: Some(parent), name: Some(m.name), no_implicit_prelude: m.no_implicit_prelude },
             decls: core::mem::replace(&mut out.decls, DeclsBuilder::new_in(alloc)),
             chain,
-            path: Box::leak(path.into_boxed_str()),
+            path: path.into_bump_str(),
             dir: mdir,
             path_dir: mpdir,
             at: fragment_of.place,
@@ -4603,5 +5893,437 @@ fn make_modules<'a, S: SourceTexts<'a>>(
             work.push((m.key, *inner, fragment_of));
         }
         add_lowered(run, m.key, fragment_of.place, out);
+    }
+}
+
+/// Shared read-only view of an immutable [`CrateNames`] across concurrent section-encoding workers.
+/// Constructible only after resolution finishes via [`CrateNames::frozen`].
+pub struct FrozenCrateNames<'a>(&'a CrateNames<'a>);
+
+impl<'a> FrozenCrateNames<'a> {
+    #[inline]
+    pub fn get(self) -> &'a CrateNames<'a> {
+        self.0
+    }
+}
+
+impl Copy for FrozenCrateNames<'_> {}
+
+impl Clone for FrozenCrateNames<'_> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+// SAFETY: `CrateNames` and every structure reachable from it after resolution completes contains
+// no interior mutability (`Cell`/`RefCell`/`OnceCell`/`UnsafeCell`); readers only borrow `&self`.
+unsafe impl Send for FrozenCrateNames<'_> {}
+unsafe impl Sync for FrozenCrateNames<'_> {}
+
+impl<'a> CrateNames<'a> {
+    /// Returns a `Send + Sync` read-only view for concurrent section encoding after resolution.
+    #[inline]
+    pub fn frozen(&self) -> FrozenCrateNames<'_> {
+        FrozenCrateNames(self)
+    }
+}
+
+struct SharedPreparesInner<B: blaze_own::Headed + blaze_own::BumpAlloc + Send + Sync + 'static> {
+    /// Lives inside `bump` (created by `Prepares::new_in`); dropped first in `Drop::drop`
+    /// before `bump` unmaps its backing region.
+    prepares: *const Prepares<'static>,
+    bump: blaze_own::Box<B, blaze_own::SharedAlloc<'static>>,
+}
+
+// SAFETY: `Prepares<'static>` is `Sync` (internal mutexes) and `B: Send + Sync`.
+unsafe impl<B: blaze_own::Headed + blaze_own::BumpAlloc + Send + Sync + 'static> Send for SharedPreparesInner<B> {}
+unsafe impl<B: blaze_own::Headed + blaze_own::BumpAlloc + Send + Sync + 'static> Sync for SharedPreparesInner<B> {}
+
+impl<B: blaze_own::Headed + blaze_own::BumpAlloc + Send + Sync + 'static> Drop for SharedPreparesInner<B> {
+    fn drop(&mut self) {
+        // SAFETY: `self.prepares` was allocated inside `self.bump`, which stays alive until
+        // after `Drop::drop` finishes, and this is the last `Arc` reference so no reader exists.
+        unsafe {
+            core::ptr::drop_in_place(self.prepares.cast_mut());
+        }
+    }
+}
+
+/// Stage-scoped compiled declarative macro cache (`Prepares`), shared across all crates in one
+/// `Names` stage so `core`/`std`/`serde`/`cfg_if!` macros are lexed and compiled once per build
+/// and freed cleanly when the stage finishes (rule 70).
+pub struct SharedPrepares<B: blaze_own::Headed + blaze_own::BumpAlloc + Send + Sync + 'static>(
+    blaze_own::Arc<SharedPreparesInner<B>, blaze_own::SharedAlloc<'static>>,
+);
+
+impl<B: blaze_own::Headed + blaze_own::BumpAlloc + Send + Sync + 'static> SharedPrepares<B> {
+    pub fn new(bump: B, kept: blaze_own::SharedAlloc<'static>) -> Self {
+        let bump = blaze_own::Box::new_in(bump, kept);
+        // SAFETY: `bump` is heap-allocated in `Box` and stored in `SharedPreparesInner` right
+        // alongside `prepares`; its address never moves, and `Drop::drop` drops `prepares`
+        // before `bump`.
+        let bump_ref: &'static B = unsafe { &*core::ptr::from_ref(&*bump) };
+        let prepares: *const Prepares<'static> = core::ptr::from_ref(Prepares::new_in(Bump::of(bump_ref)));
+        Self(blaze_own::Arc::new_in(SharedPreparesInner { prepares, bump }, kept))
+    }
+
+    pub fn share(&self) -> Self {
+        Self(blaze_own::Share::share(&self.0))
+    }
+
+    pub fn prepares(&self) -> &Prepares<'static> {
+        // SAFETY: `self.0.prepares` is live inside `self.0.bump` for the lifetime of `&self`.
+        unsafe { &*self.0.prepares }
+    }
+}
+
+/// Work-stealing cursor for parallel `Par::map` implementations over `blaze-scope`'s three
+/// audited thread-safe parallel sites (`lower_modules`, `expand_batch`, `NamesPart::Scopes`).
+pub struct ParMapWork<'a, F, T> {
+    f: *const F,
+    slots: *const core::cell::UnsafeCell<Option<T>>,
+    len: usize,
+    next: *const core::sync::atomic::AtomicUsize,
+    stride: usize,
+    _borrow: core::marker::PhantomData<&'a ()>,
+}
+
+impl<F, T> Copy for ParMapWork<'_, F, T> {}
+
+impl<F, T> Clone for ParMapWork<'_, F, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+// SAFETY: `ParMapWork` is created only for a scoped join barrier (`'a`) inside `Par::map` on
+// `blaze-scope`'s audited parallel sites whose closures read immutable/`Sync` data and allocate
+// outputs into `parallel_bump`. Each index `0..len` is claimed atomically by at most one worker.
+unsafe impl<F, T> Send for ParMapWork<'_, F, T> {}
+unsafe impl<F, T> Sync for ParMapWork<'_, F, T> {}
+
+impl<'a, F: Fn(usize) -> T, T> ParMapWork<'a, F, T> {
+    pub fn new(
+        f: &'a F,
+        slots: &'a [core::cell::UnsafeCell<Option<T>>],
+        next: &'a core::sync::atomic::AtomicUsize,
+        stride: usize,
+    ) -> Self {
+        Self {
+            f: core::ptr::from_ref(f),
+            slots: slots.as_ptr(),
+            len: slots.len(),
+            next: core::ptr::from_ref(next),
+            stride: stride.max(1),
+            _borrow: core::marker::PhantomData,
+        }
+    }
+
+    pub fn drain(self) {
+        // SAFETY: `self.next`, `self.f`, and `self.slots[..self.len]` are borrowed for `'a`, and
+        // each index `idx` is claimed exclusively by one worker via `fetch_add(self.stride)`.
+        let next = unsafe { &*self.next };
+        let f = unsafe { &*self.f };
+        loop {
+            let start = next.fetch_add(self.stride, core::sync::atomic::Ordering::Relaxed);
+            if start >= self.len {
+                break;
+            }
+            let end = start.saturating_add(self.stride).min(self.len);
+            for idx in start..end {
+                let value = f(idx);
+                // SAFETY: `idx < self.len`, exclusively claimed by this worker.
+                unsafe {
+                    *(*self.slots.add(idx)).get() = Some(value);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod parallel_determinism_tests {
+    use super::*;
+    use crate::crate_scope::resolve_crate_verified_with;
+    use crate::task::Serial;
+    use blaze_mem::{Frame, LiveAtDrop, Root, RootOpts, Tag};
+    use blaze_own::{BumpAlloc, Erased, Headed, Header};
+    use blaze_unit_graph::{Implicit, Prelude, StdIs};
+    use core::alloc::{AllocError, Allocator, Layout};
+    use core::cell::UnsafeCell;
+    use core::ptr::NonNull;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    #[repr(C)]
+    struct TestSharedBump {
+        header: Header,
+        root: Root,
+    }
+
+    impl TestSharedBump {
+        fn new() -> Self {
+            let root = Root::new(RootOpts {
+                reserve: 512 << 20,
+                tag: Tag::Nameres,
+                live_at_drop: LiveAtDrop::Freed,
+            })
+            .expect("test shared bump root");
+            Self { header: Header::of::<Self>(), root }
+        }
+    }
+
+    // SAFETY: delegates directly to `blaze_mem::Root`.
+    unsafe impl Allocator for TestSharedBump {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            self.root.allocate(layout)
+        }
+        fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            self.root.allocate_zeroed(layout)
+        }
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+            unsafe { self.root.deallocate(ptr, layout) }
+        }
+        unsafe fn grow(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            unsafe { self.root.grow(ptr, old, new) }
+        }
+        unsafe fn grow_zeroed(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            unsafe { self.root.grow_zeroed(ptr, old, new) }
+        }
+        unsafe fn shrink(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            unsafe { self.root.shrink(ptr, old, new) }
+        }
+    }
+
+    // SAFETY: `#[repr(C)]` with `Header::of::<Self>()` first, pinned in `Box` before `Bump::of`.
+    unsafe impl Headed for TestSharedBump {}
+    // SAFETY: `Root` configured with `LiveAtDrop::Freed`.
+    unsafe impl BumpAlloc for TestSharedBump {}
+
+    struct ThreadPar {
+        workers: usize,
+        in_map: AtomicUsize,
+        map_calls: AtomicUsize,
+    }
+
+    impl ThreadPar {
+        fn new(workers: usize) -> Self {
+            Self { workers, in_map: AtomicUsize::new(0), map_calls: AtomicUsize::new(0) }
+        }
+    }
+
+    struct RawMap<F, T> {
+        f: *const F,
+        slots: *const UnsafeCell<Option<T>>,
+        len: usize,
+        next: *const AtomicUsize,
+    }
+
+    impl<F, T> Copy for RawMap<F, T> {}
+    impl<F, T> Clone for RawMap<F, T> {
+        fn clone(&self) -> Self {
+            *self
+        }
+    }
+
+    // SAFETY: test-only `ThreadPar` used exclusively with `resolve_crate_verified_with` and a
+    // `TestSharedBump` (`Root`) parallel bump arena; every `par.map` site is thread-safe and each
+    // index `0..len` is claimed exclusively by one thread via `next`.
+    unsafe impl<F, T> Send for RawMap<F, T> {}
+    unsafe impl<F, T> Sync for RawMap<F, T> {}
+
+    impl Par for ThreadPar {
+        fn map<T, F: Fn(usize) -> T>(&self, n: usize, f: F, out: &mut AVec<'_, T>) {
+            if self.workers <= 1 || n < 4 {
+                for i in 0..n {
+                    out.push(f(i));
+                }
+                return;
+            }
+            self.map_calls.fetch_add(1, Ordering::Relaxed);
+            let slot_root = Root::new(RootOpts::TEST_ARENA).expect("slot root");
+            let mut slots: blaze_own::Vec<UnsafeCell<Option<T>>, _> = blaze_own::Vec::with_capacity_in(n, slot_root.shared());
+            slots.resize_with(n, || UnsafeCell::new(None));
+            let next = AtomicUsize::new(0);
+            let raw = RawMap { f: core::ptr::from_ref(&f), slots: slots.as_ptr(), len: n, next: core::ptr::from_ref(&next) };
+            let raw_ref = &raw;
+            self.in_map.fetch_add(1, Ordering::AcqRel);
+            std::thread::scope(|s| {
+                for _ in 0..self.workers {
+                    s.spawn(move || {
+                        let f_ref = unsafe { &*raw_ref.f };
+                        let next_ref = unsafe { &*raw_ref.next };
+                        loop {
+                            let idx = next_ref.fetch_add(1, Ordering::Relaxed);
+                            if idx >= raw_ref.len {
+                                break;
+                            }
+                            let val = f_ref(idx);
+                            unsafe {
+                                *(*raw_ref.slots.add(idx)).get() = Some(val);
+                            }
+                        }
+                    });
+                }
+            });
+            self.in_map.fetch_sub(1, Ordering::Release);
+            out.reserve(n);
+            for slot in slots {
+                if let Some(v) = slot.into_inner() {
+                    out.push(v);
+                }
+            }
+        }
+
+        fn call_scratch(&self, work: &mut dyn FnMut(Alloc<'_>)) -> crate::task::Scratch {
+            if self.in_map.load(Ordering::Acquire) > 0 {
+                let local = Frame::with_reserve(32 << 20, Tag::Expand).expect("worker scratch");
+                let erased = Erased::new(&local);
+                work(erased.handle());
+                return crate::task::Scratch::Reset;
+            }
+            crate::task::Scratch::Kept
+        }
+    }
+
+    struct FixtureSources<'a>(&'a [(&'a str, &'a str)]);
+
+    impl<'a> SourceTexts<'a> for FixtureSources<'a> {
+        fn read(&self, _krate: usize, path: &str) -> Option<&'a str> {
+            self.0.iter().find(|(p, _)| *p == path).map(|(_, t)| *t)
+        }
+    }
+
+    #[test]
+    fn parallel_lower_modules_scopes_and_macro_waves_match_serial_byte_for_byte() {
+        let holder_root = Root::new(RootOpts::TEST_ARENA).expect("fixture holder root");
+        let h_alloc = holder_root.shared();
+        let fixture_frame = Frame::new(Tag::Nameres).expect("fixture frame");
+        let fixture_erased = Erased::new(&fixture_frame);
+        let fixture_bump = fixture_erased.bump();
+
+        // Build a 20-module crate (hits `lower_modules >= 8` and `Cells::scope >= 16`) with
+        // wave-batched declarative macro calls (`>= 4` per wave), nested macro-made modules,
+        // an `include!` inside a batch, and a macro defining `macro_rules! concat` in the same
+        // wave as an eager `concat!` consumer (testing both soundness guards).
+        let mut file_entries: blaze_own::Vec<(&str, &str), _> = blaze_own::Vec::new_in(h_alloc);
+        let mut root_src = blaze_own::String::from_str_in(
+            "#![no_core]\n\
+            macro_rules! gen_pair {\n\
+                ($a:ident, $b:ident) => {\n\
+                    pub struct $a;\n\
+                    pub mod $b { pub struct Inner; }\n\
+                };\n\
+            }\n\
+            macro_rules! def_concat_shadow {\n\
+                () => {\n\
+                    macro_rules! concat { ($x:expr) => { $x }; }\n\
+                    pub struct ShadowDefined;\n\
+                };\n\
+            }\n\
+            macro_rules! use_lit {\n\
+                ($name:ident, $val:expr) => {\n\
+                    pub const $name: &str = $val;\n\
+                };\n\
+            }\n\
+            def_concat_shadow!();\n\
+            gen_pair!(RootA, mod_a);\n\
+            gen_pair!(RootB, mod_b);\n\
+            gen_pair!(RootC, mod_c);\n\
+            gen_pair!(RootD, mod_d);\n\
+            gen_pair!(RootE, mod_e);\n\
+            include!(\"included.rs\");\n\
+            use_lit!(LIT_A, \"hello\");\n",
+            h_alloc,
+        );
+        for i in 0..20usize {
+            let line = blaze_own::format_in!(h_alloc, "pub mod m{i};\n");
+            root_src.push_str(&line);
+        }
+        let root_text: &str = fixture_bump.alloc_str(&root_src);
+        file_entries.push(("/pkg/src/lib.rs", root_text));
+        file_entries.push(("/pkg/src/included.rs", "pub struct FromInclude;\n"));
+        for i in 0..20usize {
+            let path_s = blaze_own::format_in!(h_alloc, "/pkg/src/m{i}.rs");
+            let path: &str = fixture_bump.alloc_str(&path_s);
+            let body_s = blaze_own::format_in!(
+                h_alloc,
+                "macro_rules! local_m{i} {{ ($t:ident) => {{ pub struct $t; }}; }}\n\
+                local_m{i}!(Item{i}A);\n\
+                local_m{i}!(Item{i}B);\n\
+                pub enum E{i} {{ V0, V1 }}\n\
+                pub fn f{i}() -> E{i} {{ E{i}::V0 }}\n"
+            );
+            let body: &str = fixture_bump.alloc_str(&body_s);
+            file_entries.push((path, body));
+        }
+        let sources = FixtureSources(&file_entries);
+        let input = CrateInput {
+            name: "par_det_crate",
+            key: CrateItemKey(ContentId::of("blaze-scope par determinism", b"crate")),
+            edition: Edition::E2021,
+            implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false },
+            root: "/pkg/src/lib.rs",
+            shown_from: "/pkg",
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        };
+
+        // Serial baseline (workers = 1).
+        let serial_frame = Frame::new(Tag::Nameres).expect("serial frame");
+        let serial_erased = Erased::new(&serial_frame);
+        let serial_bump = serial_erased.bump();
+        let serial_prepares = Prepares::new_in(serial_bump);
+        let serial = resolve_crate_verified_with(
+            &input,
+            &[],
+            Sysroot::default(),
+            &sources,
+            0,
+            &Serial,
+            serial_prepares,
+            ResolveOpts { write_inner: false, parallel_bump: None, par_workers: 1 },
+            serial_bump,
+        )
+        .expect("serial resolve");
+        let serial_names = crate::names_record::encode(serial.names, serial_bump.alloc()).expect("serial names record");
+        let serial_items = crate::items_record::encode(serial.names, serial_bump.alloc()).expect("serial items record");
+
+        // Parallel run (4 real OS threads, shared Root-backed Prepares + parallel_bump).
+        let shared_prepares_box = blaze_own::Box::new_in(TestSharedBump::new(), h_alloc);
+        let shared_prepares = Prepares::new_in(Bump::of(&*shared_prepares_box));
+        let par_bump_box = blaze_own::Box::new_in(TestSharedBump::new(), h_alloc);
+        let par_bump = Bump::of(&*par_bump_box);
+        let par_frame = Frame::new(Tag::Nameres).expect("par frame");
+        let par_erased = Erased::new(&par_frame);
+        let par_bump_local = par_erased.bump();
+        let par = ThreadPar::new(4);
+        let parallel = resolve_crate_verified_with(
+            &input,
+            &[],
+            Sysroot::default(),
+            &sources,
+            0,
+            &par,
+            shared_prepares,
+            ResolveOpts { write_inner: false, parallel_bump: Some(par_bump), par_workers: 4 },
+            par_bump_local,
+        )
+        .expect("parallel resolve");
+        let par_names = crate::names_record::encode(parallel.names, par_bump_local.alloc()).expect("par names record");
+        let par_items = crate::items_record::encode(parallel.names, par_bump_local.alloc()).expect("par items record");
+
+        // Verify all 3 parallel stages (lower_modules, macro wave, Cells::scope) actually ran.
+        assert!(par.map_calls.load(Ordering::Relaxed) >= 3, "expected >= 3 parallel map calls, got {}", par.map_calls.load(Ordering::Relaxed));
+        assert_eq!(&*parallel.record, &*serial.record, "exports record must be byte-identical");
+        assert_eq!(&*par_names, &*serial_names, "names_record must be byte-identical");
+        assert_eq!(&*par_items, &*serial_items, "items_record must be byte-identical");
+        assert_eq!(parallel.names.expansions.len(), serial.names.expansions.len(), "expansion count must match");
+        for (call, s_exp) in serial.names.expansions.iter() {
+            let p_exp = parallel.names.expansions.get(call).expect("missing expansion in parallel run");
+            assert_eq!(p_exp.made.map(|m| m.text), s_exp.made.map(|m| m.text), "expansion text for {call:?} must match");
+            assert_eq!(p_exp.made.and_then(|m| m.origins.ok()), s_exp.made.and_then(|m| m.origins.ok()), "expansion origins for {call:?} must match");
+        }
     }
 }

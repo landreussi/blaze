@@ -37,6 +37,60 @@ mod def_site;
 /// `asm!`'s `target_arch`, read as `cfg` atoms at the `asm!` (INTRINSICS.md P9b).
 mod asm_arch;
 
+/// Parses the parenthesized arguments of `#[blaze::cost(..)]` on a loop expression:
+/// `bounded`, `amortized`, or `reset`, each optionally followed by `= "non-empty reason"`.
+fn parse_loop_cost(args: &str) -> LoopCost {
+    let Some(inner) = args.trim().strip_prefix('(').and_then(|s| s.strip_suffix(')')) else {
+        return LoopCost::Invalid;
+    };
+    let inner = inner.trim();
+    let kind = match inner.split_once('=') {
+        Some((lhs, rhs)) => {
+            if !is_nonempty_quoted_str(rhs.trim()) {
+                return LoopCost::Invalid;
+            }
+            lhs.trim()
+        }
+        None => inner,
+    };
+    match kind {
+        "bounded" => LoopCost::Bounded,
+        "amortized" => LoopCost::Amortized,
+        "reset" => LoopCost::Reset,
+        _ => LoopCost::Invalid,
+    }
+}
+
+/// Whether `s` is a single Rust double-quoted string literal with non-whitespace content.
+fn is_nonempty_quoted_str(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'"' {
+        return false;
+    }
+    let mut i = 1usize;
+    let mut has_non_ws = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i += 1;
+                if i >= bytes.len() {
+                    return false;
+                }
+                has_non_ws = true;
+                i += 1;
+            }
+            b'"' => return i + 1 == bytes.len() && has_non_ws,
+            b => {
+                if !b.is_ascii_whitespace() {
+                    has_non_ws = true;
+                }
+                i += 1;
+            }
+        }
+    }
+    false
+}
+
 /// What an item declared in one of the body's blocks makes `name` at `scope`, for a pattern:
 /// `None` when no such item is in the value namespace there (the module's answer is asked).
 fn local_value(v: &View<'_>, scope: ScopeId, name: NameIdx) -> Option<ValueName> {
@@ -144,6 +198,9 @@ const F_POPPED: u32 = 1 << 18;
 /// among them removes the item, as it removes a statement; at its first other child or token
 /// the rest of it is skipped wholesale (`Machine::attrs_read`).
 const F_ATTRS: u32 = 1 << 19;
+/// Comptime field-unrolling `inline for pat in iter { body }`: preserved as `Expr::InlineFor`
+/// instead of desugared to `IntoIterator`.
+const F_INLINE: u32 = 1 << 20;
 
 const NO_RANGE: Range = Range::new(NONE, NONE);
 
@@ -200,6 +257,8 @@ pub(crate) enum V {
     Guard,
     /// `node.a`/`node.b` the statements, `node.c` the tail, `node.d` the scope.
     StmtList,
+    /// `for<F in fields(T)>`: `id` the bound parameter's `NameIdx`, `node.a` the container's `TypeId`.
+    ForFields,
 }
 
 /// What a placed list holds.
@@ -271,8 +330,9 @@ pub(crate) struct Entry {
     pub(crate) jumps: u32,
 }
 
-/// The machine. `'t` the item's text, `'c` the cfg set, `'a` the allocator of its output.
-pub struct Machine<'t, 'c, 'a> {
+/// The machine. `'t` the item's text, `'c` the cfg set, `'a` the allocator of its output, `'s`
+/// the allocator of its temporary stacks (dropped on [`Machine::finish`]).
+pub struct Machine<'t, 'c, 'a, 's> {
     text: &'t str,
     pub(crate) mode: Mode,
     pub(crate) edition: Edition,
@@ -283,10 +343,10 @@ pub struct Machine<'t, 'c, 'a> {
     /// or a type, whose patterns (a signature's parameters) no check reads.
     values: Option<&'c mut dyn ValueNames>,
     /// Every identifier pattern, settled by [`Machine::settle_patterns`] at the end.
-    idents: AVec<'a, Ident>,
+    idents: AVec<'s, Ident>,
     pub(crate) out: Columns<'a>,
-    frames: AVec<'a, Frame>,
-    pub(crate) vals: AVec<'a, Val>,
+    frames: AVec<'s, Frame>,
+    pub(crate) vals: AVec<'s, Val>,
     last_end: u32,
     /// Inside a node skipped wholesale: the depth below it, 0 outside.
     skip: u32,
@@ -294,38 +354,39 @@ pub struct Machine<'t, 'c, 'a> {
     skip_arm: bool,
     /// The frame of the item lowered; `usize::MAX` for an anonymous constant.
     root_depth: usize,
-    locals: AVec<'a, Local>,
-    top: HashMap<u64, u32, Alloc<'a>>,
-    pending: AVec<'a, (u64, u32)>,
+    locals: AVec<'s, Local>,
+    top: HashMap<u64, u32, Alloc<'s>>,
+    pending: AVec<'s, (u64, u32)>,
     /// Locals below it are hidden.
     barrier: u32,
-    pub(crate) entries: AVec<'a, Entry>,
+    pub(crate) entries: AVec<'s, Entry>,
     /// (entry, break or continue expression) waiting for the entry's node to close.
-    jumps: AVec<'a, (u32, u32)>,
+    jumps: AVec<'s, (u32, u32)>,
     /// The bodies open that `.await` and `yield` see: each a coroutine's kind (its `F_ASYNC`
     /// and `F_GEN` flags), or [`NOT_CORO`] for a plain closure, which hides the coroutine
     /// around it.
-    pub(crate) coros: AVec<'a, u32>,
-    scopes: AVec<'a, u32>,
+    pub(crate) coros: AVec<'s, u32>,
+    scopes: AVec<'s, u32>,
     needs: AVec<'a, Range>,
     /// The expression a closing frame's entry targets, set by its handler.
     pub(crate) loop_target: u32,
     alloc: Alloc<'a>,
+    scratch: Alloc<'s>,
     /// The item's text and, past its end, each expansion lowered in place, one after another:
     /// made at the first expansion; until then the item's text is read where it is.
     grown: Option<AString<'a>>,
     /// The words of the expansions in `grown`, in order: where each starts, its local
     /// hygiene ([`blaze_expand::local_hygiene`]), and which expansion and token it is.
-    words: AVec<'a, ExpWord>,
+    words: AVec<'s, ExpWord>,
     /// A body's macro call the feed is to expand, set when the call's node closes.
     request: Option<Request>,
     /// The `macro_rules!` the body has defined so far, in textual order, each with the depth
     /// of `scopes` it was written at: the Reference's textual scope ("Macros By Example",
     /// Scoping): visible after its statement, in nested blocks too, until its block ends.
-    local_macros: AVec<'a, LocalMacroAt>,
+    local_macros: AVec<'s, LocalMacroAt>,
     /// Each local hygiene an expansion's words carry, with the definition its template
     /// resolves locals and labels at (def_site.rs).
-    template_sites: AVec<'a, def_site::TemplateSite>,
+    template_sites: AVec<'s, def_site::TemplateSite>,
     /// Whether the feed has an expander: without one a call stays a macro call node.
     pub(crate) expanding: bool,
 }
@@ -454,7 +515,7 @@ fn bin_op(kind: SyntaxKind) -> Option<(BinOp, bool)> {
     })
 }
 
-impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
+impl<'t, 'c, 'a, 's> Machine<'t, 'c, 'a, 's> {
     pub(crate) fn new(
         text: &'t str,
         mode: Mode,
@@ -462,7 +523,19 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         cfg: &'c mut dyn Cfg,
         values: Option<&'c mut dyn ValueNames>,
         alloc: Alloc<'a>,
-    ) -> Machine<'t, 'c, 'a> {
+    ) -> Machine<'t, 'c, 'a, 'a> {
+        Machine::new_with_scratch(text, mode, edition, cfg, values, alloc, alloc)
+    }
+
+    pub(crate) fn new_with_scratch(
+        text: &'t str,
+        mode: Mode,
+        edition: Edition,
+        cfg: &'c mut dyn Cfg,
+        values: Option<&'c mut dyn ValueNames>,
+        alloc: Alloc<'a>,
+        scratch: Alloc<'s>,
+    ) -> Machine<'t, 'c, 'a, 's> {
         let mut out = Columns::new_in(alloc);
         out.head[head::MODE] = match mode {
             Mode::Signature => 0,
@@ -484,31 +557,32 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             edition,
             cfg: Some(cfg),
             values,
-            idents: Vec::new_in(alloc),
+            idents: Vec::new_in(scratch),
             out,
-            frames: Vec::new_in(alloc),
-            vals: Vec::new_in(alloc),
+            frames: Vec::new_in(scratch),
+            vals: Vec::new_in(scratch),
             last_end: 0,
             skip: 0,
             skip_name: NO_RANGE,
             skip_arm: false,
             root_depth: usize::MAX,
-            locals: Vec::new_in(alloc),
-            top: HashMap::new_in(alloc),
-            pending: Vec::new_in(alloc),
+            locals: Vec::new_in(scratch),
+            top: HashMap::new_in(scratch),
+            pending: Vec::new_in(scratch),
             barrier: 0,
-            entries: Vec::new_in(alloc),
-            jumps: Vec::new_in(alloc),
-            coros: Vec::new_in(alloc),
-            scopes: Vec::new_in(alloc),
+            entries: Vec::new_in(scratch),
+            jumps: Vec::new_in(scratch),
+            coros: Vec::new_in(scratch),
+            scopes: Vec::new_in(scratch),
             needs: Vec::new_in(alloc),
             loop_target: NONE,
             alloc,
+            scratch,
             grown: None,
-            words: Vec::new_in(alloc),
+            words: Vec::new_in(scratch),
             request: None,
-            local_macros: Vec::new_in(alloc),
-            template_sites: Vec::new_in(alloc),
+            local_macros: Vec::new_in(scratch),
+            template_sites: Vec::new_in(scratch),
             expanding: false,
         };
         if matches!(mode, Mode::Body | Mode::AnonConst) {
@@ -529,6 +603,10 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
 
     pub(crate) fn allocator(&self) -> Alloc<'a> {
         self.alloc
+    }
+
+    pub(crate) fn scratch_allocator(&self) -> Alloc<'s> {
+        self.scratch
     }
 
     /// Which text wrote the block whose `{` is at `open` of the machine's text
@@ -552,7 +630,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
     /// names a substring of a string token and inherits the hygiene of that literal.
     fn hygiene_at(&self, byte: u32) -> u64 {
         if (byte as usize) < self.text.len() {
-            return 0;
+            return self.mark_at(byte).map_or(0, blaze_expand::origin_column::TextMark::local_hygiene);
         }
         let i = self.words.partition_point(|w| w.text.end <= byte);
         self.words.get(i).filter(|w| w.text.start <= byte).map_or(0, |w| w.hygiene)
@@ -584,24 +662,28 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
     }
 
     /// The `macro_rules!` and `macro` the body wrote that are in scope here, in the order
-    /// written: each one's name and its definition's text ([`def_site::form_of`]).
+    /// written: each one's name and its definition's form ([`Machine::local_form`]).
     pub(crate) fn local_macros(&self) -> impl Iterator<Item = crate::driver::LocalMacro<'_>> + '_ {
         let text = self.text();
         self.local_macros
             .iter()
-            .filter_map(move |l| def_site::form_of(text, l).map(|form| crate::driver::LocalMacro { name: l.name.of(text), form }))
+            .filter_map(move |l| self.local_form(l).map(|form| crate::driver::LocalMacro { name: l.name.of(text), form }))
+    }
+
+    /// The marks of the words starting inside `r`, as [`Machine::mark_at`] reads them.
+    pub(super) fn marks_in(&self, r: Range) -> crate::driver::InputMarks<'_> {
+        use blaze_expand::origin_column::MARK;
+        let starts = &self.out.mark_starts;
+        let first = starts.partition_point(|&s| s < r.start);
+        let past = starts.partition_point(|&s| s < r.end);
+        crate::driver::InputMarks::new(r.start, &starts[first..past], &self.out.mark_bytes[first * MARK..past * MARK])
     }
 
     /// The marks of `request`'s input's words, as [`Machine::mark_at`] reads them: the rows
     /// whose start is inside the input (the item's own words', or an expansion's when the input
     /// text spans one; [`Machine::call_input`]).
     pub(crate) fn input_marks(&self, request: &Request) -> crate::driver::InputMarks<'_> {
-        use blaze_expand::origin_column::MARK;
-        let r = request.input;
-        let starts = &self.out.mark_starts;
-        let first = starts.partition_point(|&s| s < r.start);
-        let past = starts.partition_point(|&s| s < r.end);
-        crate::driver::InputMarks::new(r.start, &starts[first..past], &self.out.mark_bytes[first * MARK..past * MARK])
+        self.marks_in(request.input)
     }
 
     /// Where `request`'s input is: the item's text, or tokens of an expansion lowered here.
@@ -679,7 +761,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
     /// Appends an expansion's words to the text: each word's text, its first token and its
     /// local hygiene; records the call's read (its range and the expansion's key). Gives each
     /// word's range, for the feed.
-    pub(crate) fn append_expansion(&mut self, request: &Request, out: &crate::driver::BodyOut<'_>) -> AVec<'a, Range> {
+    pub(crate) fn append_expansion(&mut self, request: &Request, out: &crate::driver::BodyOut<'_>) -> AVec<'s, Range> {
         let grown = self.grown.get_or_insert_with(|| {
             let mut s = AString::new_in(self.alloc);
             s.push_str(self.text);
@@ -689,7 +771,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         self.out.expansion_calls.push(request.range);
         self.out.expansion_keys.push(out.key);
         self.out.expansion_starts.push(idx(grown.len() - self.text.len()));
-        let mut ranges = Vec::with_capacity_in(out.words.words.len(), self.alloc);
+        let mut ranges = Vec::with_capacity_in(out.words.words.len(), self.scratch);
         for w in out.words.words.iter() {
             // A space before each word that may take one: two words lex again as they were
             // (`a b` stays two, `::` stays one), as `format_args!` reads its input's text.
@@ -849,10 +931,10 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             }
         }
         for p in self.out.pats.iter_mut() {
-            if let Ok(Pat::Bind { ann, name, sub, shadows: Some(s) }) = Pat::decode(*p)
+            if let Ok(Pat::Bind { ann, name, sub, shadows: Some(s), ty }) = Pat::decode(*p)
                 && let Some(hid) = find(s)
             {
-                *p = Pat::Bind { ann, name, sub, shadows: hid }.encode();
+                *p = Pat::Bind { ann, name, sub, shadows: hid, ty }.encode();
             }
         }
     }
@@ -1084,12 +1166,16 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             FOR_EXPR if p.flags & F_FOR == 0 && self.count(&p, |v| matches!(v, V::Pat | V::Expr)) == 2 => {
                 // The body: the pattern's bindings come into scope, and the loop opens.
                 self.activate(p.pending);
-                let label = match p.aux {
-                    NONE => 0,
-                    name => self.local_key(NameIdx(name)),
-                };
-                self.push_entry(Jk::Loop, label);
-                self.top_mut().flags |= F_FOR | F_LOOP;
+                if p.flags & F_INLINE != 0 {
+                    self.top_mut().flags |= F_FOR;
+                } else {
+                    let label = match p.aux {
+                        NONE => 0,
+                        name => self.local_key(NameIdx(name)),
+                    };
+                    self.push_entry(Jk::Loop, label);
+                    self.top_mut().flags |= F_FOR | F_LOOP;
+                }
             }
             ARRAY_EXPR if p.flags & F_SEMI != 0 => {
                 // A repeat's length is an anonymous constant: no local of the body.
@@ -1173,6 +1259,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             (FN, ASYNC_KW) if depth == root => top.flags |= F_ASYNC,
             (FN, GEN_KW) if depth == root => top.flags |= F_GEN,
             (ARRAY_EXPR, SEMICOLON) => top.flags |= F_SEMI,
+            (FOR_EXPR, INLINE_KW) => top.flags |= F_INLINE,
             _ => {}
         }
     }
@@ -1612,7 +1699,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             }
             REF_TYPE => {
                 let lifetime = self.first(f, V::Lifetime).map(|v| NameIdx(v.id));
-                let mutbl = if self.has_tok(f, MUT_KW) { Mutbl::Mut } else { Mutbl::Not };
+                let mutbl = if self.has_tok(f, MUT_KW) || self.has_tok(f, UNIQ_KW) { Mutbl::Mut } else { Mutbl::Not };
                 let inner = self.first(f, V::Type);
                 self.done(f);
                 self.type_of(inner, r, |inner| TypeRef::Ref { mutbl, lifetime, inner });
@@ -1699,11 +1786,20 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 // expanded, its expansion's, lowered in place (statements stay in their
                 // block's values, each one of its statements).
             }
-            // `builtin # pattern_type(base is pat)`: core's `pattern_type!` expanded.
+            // `builtin # pattern_type(base is pat)`, `base is pat`, or `base is in CONST_EXPR`.
             PATTERN_TYPE => {
                 let base = self.first(f, V::Type).map(|v| TypeId(v.id));
-                let pat = if self.has_tok(f, NOT_NULL) { Some(TyPat::NotNull) } else { self.first(f, V::Pat).map(|v| TyPat::Of(PatId(v.id))) };
+                let not_null = self.has_tok(f, NOT_NULL);
+                let const_set = self.first(f, V::Skipped(CONST_ARG)).map(|v| v.range);
+                let pat_id = self.first(f, V::Pat).map(|v| PatId(v.id));
                 self.done(f);
+                let pat = if not_null {
+                    Some(TyPat::NotNull)
+                } else if let Some(range) = const_set {
+                    Some(TyPat::In(self.put_const(range)))
+                } else {
+                    pat_id.map(TyPat::Of)
+                };
                 let t = match (base, pat) {
                     (Some(base), Some(pat)) => TypeRef::Pat { base, pat },
                     _ => {
@@ -1714,7 +1810,19 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let t = self.put_type(t, r);
                 self.push(V::Type, t.0, r);
             }
-            UNSAFE_BINDER_TYPE | UNION_TYPE | RECORD_TYPE => {
+            RECORD_TYPE => {
+                let fields = self.list_of(f, L::Fields(Shape::Record)).map_or(List { start: 0, len: 0 }, |l| l.0);
+                self.done(f);
+                let t = self.put_type(TypeRef::Record(fields), r);
+                self.push(V::Type, t.0, r);
+            }
+            UNION_TYPE => {
+                let members = self.put_ids(f, V::Type);
+                self.done(f);
+                let t = self.put_type(TypeRef::Union(members), r);
+                self.push(V::Type, t.0, r);
+            }
+            UNSAFE_BINDER_TYPE => {
                 self.done(f);
                 self.unhandled(f.kind, r, Why::Kind);
                 let t = self.put_type(TypeRef::Error, r);
@@ -1724,7 +1832,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let s = self.kid(f, 0, |v| matches!(v, V::Tok(STRING)));
                 self.done(f);
                 let mut node = Node::of(0);
-                node.a = s.is_some() as u32;
+                node.a = u32::from(s.is_some());
                 self.vals.push(Val { v: V::Abi, id: NONE, node, range: s.map_or(r, |s| s.range) });
             }
             // Bounds and generics.
@@ -1747,7 +1855,23 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 self.push_list(L::Names, l, r);
             }
             // Read through: their children's values are their parent's.
-            FOR_BINDER | VISIBILITY_INNER => {}
+            VISIBILITY_INNER => {}
+            FOR_BINDER => {
+                if self.has_tok(f, IN_KW) {
+                    let param = self.first(f, V::Name);
+                    let kind = self.first(f, V::Tok(IDENT));
+                    let container = self.first(f, V::Type);
+                    let is_fields = kind.is_some_and(|k| k.range.of(self.text()) == "fields");
+                    self.done(f);
+                    if is_fields && let (Some(param), Some(container)) = (param, container) {
+                        let mut node = Node::of(0);
+                        node.a = container.id;
+                        self.vals.push(Val { v: V::ForFields, id: param.id, node, range: r });
+                    } else {
+                        self.diag(DiagKind::Syntax, r);
+                    }
+                }
+            }
             GENERIC_PARAM_LIST => {
                 let l = self.put_rows(f, ROW_GENERIC_PARAM);
                 self.done(f);
@@ -1801,19 +1925,27 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 self.push_list(L::Where, l, r);
             }
             WHERE_PRED => {
+                let for_fields = self.first(f, V::ForFields);
                 let binder = self.list_of(f, L::GParams).map_or(List { start: 0, len: 0 }, |l| l.0);
                 let ty = self.first(f, V::Type);
                 let lifetime = self.first(f, V::Lifetime);
                 let bounds = self.list_of(f, L::Bounds).map_or(List { start: 0, len: 0 }, |l| l.0);
                 let cond = self.first(f, V::Skipped(BLOCK_EXPR));
                 self.done(f);
-                let p = match (ty, lifetime) {
-                    (Some(t), _) => WherePred::Type { binder, ty: TypeId(t.id), bounds },
-                    (None, Some(l)) => WherePred::Lifetime { name: NameIdx(l.id), bounds },
-                    (None, None) => match cond {
+                let p = match (for_fields, ty, lifetime) {
+                    (Some(ff), Some(t), _) => WherePred::ForFields {
+                        param: NameIdx(ff.id),
+                        container: TypeId(ff.node.a),
+                        subject: TypeId(t.id),
+                        bounds,
+                    },
+                    (None, Some(t), _) => WherePred::Type { binder, ty: TypeId(t.id), bounds },
+                    (None, None, Some(l)) => WherePred::Lifetime { name: NameIdx(l.id), bounds },
+                    (None, None, None) => match cond {
                         Some(c) => WherePred::Const { cond: self.put_const(c.range) },
                         None => return,
                     },
+                    (Some(_), None, _) => return,
                 };
                 self.push_node(V::Row(ROW_WHERE), p.encode(), r);
             }
@@ -2045,10 +2177,14 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 }
             }
             EXPR_STMT => {
+                let stmt_cost = self.loop_cost_attr(f);
                 let e = self.first(f, V::Expr);
                 let semi = self.has_tok(f, SEMICOLON);
                 self.done(f);
                 if let Some(e) = e {
+                    if let Some(cost) = stmt_cost {
+                        self.apply_stmt_loop_cost(ExprId(e.id), cost);
+                    }
                     if semi {
                         let s = self.put_stmt(Stmt::Expr { expr: ExprId(e.id), semi: true });
                         self.push(V::Stmt, s.0, r);
@@ -2185,7 +2321,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             }
             REF_EXPR => {
                 let raw = self.has_tok(f, RAW_KW);
-                let mutbl = if self.has_tok(f, MUT_KW) { Mutbl::Mut } else { Mutbl::Not };
+                let mutbl = if self.has_tok(f, MUT_KW) || self.has_tok(f, UNIQ_KW) { Mutbl::Mut } else { Mutbl::Not };
                 let e = self.first(f, V::Expr);
                 self.done(f);
                 e.map_or(Expr::Missing, |e| Expr::Ref { mutbl, raw, operand: ExprId(e.id) })
@@ -2232,6 +2368,14 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                             _ => StructBase::None,
                         };
                         Expr::Struct { path: PathIdx(p.id), fields: List { start: l.id, len: l.node.a }, base }
+                    }
+                    (None, Some(l)) => {
+                        let base = match l.node.b {
+                            1 => StructBase::Expr(ExprId(l.node.c)),
+                            2 => StructBase::Defaults,
+                            _ => StructBase::None,
+                        };
+                        Expr::Record { fields: List { start: l.id, len: l.node.a }, base }
                     }
                     _ => Expr::Missing,
                 }
@@ -2312,26 +2456,29 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 return;
             }
             LOOP_EXPR => {
+                let cost = self.loop_cost_attr(f).unwrap_or(LoopCost::Normal);
                 let b = self.first(f, V::Expr);
                 self.done(f);
                 let body = b.map_or_else(|| self.put_expr(Expr::Missing, r), |b| ExprId(b.id));
-                let e = self.put_expr(Expr::Loop { body, source: LoopSource::Loop }, r);
+                let e = self.put_expr(Expr::Loop { body, source: LoopSource::Loop, cost }, r);
                 self.loop_target = e.0;
                 self.push(V::Expr, e.0, r);
                 return;
             }
             WHILE_EXPR => {
+                let cost = self.loop_cost_attr(f).unwrap_or(LoopCost::Normal);
                 let cond = self.kid(f, 0, |v| v == V::Expr).map(|v| ExprId(v.id));
                 let body = self.kid(f, 1, |v| v == V::Expr).map(|v| ExprId(v.id));
                 self.done(f);
                 let cond = cond.unwrap_or_else(|| self.put_expr(Expr::Missing, r));
                 let body = body.unwrap_or_else(|| self.put_expr(Expr::Missing, r));
-                let e = self.while_loop(cond, body, r);
+                let e = self.while_loop(cond, body, cost, r);
                 self.loop_target = e.0;
                 self.push(V::Expr, e.0, r);
                 return;
             }
             FOR_EXPR => {
+                let cost = self.loop_cost_attr(f).unwrap_or(LoopCost::Normal);
                 let pat = self.first(f, V::Pat).map(|v| PatId(v.id));
                 let head = self.kid(f, 0, |v| v == V::Expr).map(|v| ExprId(v.id));
                 let body = self.kid(f, 1, |v| v == V::Expr).map(|v| ExprId(v.id));
@@ -2339,7 +2486,12 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let pat = pat.unwrap_or_else(|| self.put_pat(Pat::Missing, r));
                 let head = head.unwrap_or_else(|| self.put_expr(Expr::Missing, r));
                 let body = body.unwrap_or_else(|| self.put_expr(Expr::Missing, r));
-                let e = self.for_loop(pat, head, body, r);
+                if f.flags & F_INLINE != 0 {
+                    let e = self.put_expr(Expr::InlineFor { pat, iter: head, body }, r);
+                    self.push(V::Expr, e.0, r);
+                    return;
+                }
+                let e = self.for_loop(pat, head, body, cost, r);
                 if f.flags & F_LOOP != 0 {
                     self.loop_target = e.inner_loop.0;
                 }
@@ -2497,17 +2649,18 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         let p = match f.kind {
             IDENT_PAT => {
                 let by_ref = self.has_tok(f, REF_KW);
-                let mutable = self.has_tok(f, MUT_KW);
+                let mutable = self.has_tok(f, MUT_KW) || (by_ref && self.has_tok(f, UNIQ_KW));
                 let name = self.first(f, V::Name);
                 let sub = self.first(f, V::Pat).map(|v| PatId(v.id));
+                let ty = self.first(f, V::Type).map(|v| TypeId(v.id));
                 self.done(f);
                 let Some(name) = name else { return };
                 let ann = BindAnn { by_ref: by_ref.then_some(if mutable { Mutbl::Mut } else { Mutbl::Not }), mutable: mutable && !by_ref };
                 let name = NameIdx(name.id);
-                let p = self.put_pat(Pat::Bind { ann, name, sub, shadows: None }, r);
+                let p = self.put_pat(Pat::Bind { ann, name, sub, shadows: None, ty }, r);
                 // Settled at the end, when every block's items are known: a bare name that
                 // is a constant, a unit struct or a unit variant becomes a path pattern.
-                let bare = !by_ref && !mutable && sub.is_none();
+                let bare = !by_ref && !mutable && sub.is_none() && ty.is_none();
                 self.idents.push(Ident { pat: p.0, scope: self.scope().0, bare });
                 let hash = self.local_key(name);
                 self.push_pending(hash, p);
@@ -2541,7 +2694,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 return;
             }
             REF_PAT => {
-                let mutbl = if self.has_tok(f, MUT_KW) { Mutbl::Mut } else { Mutbl::Not };
+                let mutbl = if self.has_tok(f, MUT_KW) || self.has_tok(f, UNIQ_KW) { Mutbl::Mut } else { Mutbl::Not };
                 let p = self.first(f, V::Pat);
                 self.done(f);
                 p.map_or(Pat::Missing, |p| Pat::Ref { mutbl, inner: PatId(p.id) })
@@ -2573,6 +2726,10 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 match (path, fields) {
                     (Some(p), Some(l)) => Pat::Struct {
                         path: PathIdx(p.id),
+                        fields: List { start: l.id, len: l.node.a },
+                        rest: l.node.b == 1,
+                    },
+                    (None, Some(l)) => Pat::Record {
                         fields: List { start: l.id, len: l.node.a },
                         rest: l.node.b == 1,
                     },
@@ -2728,11 +2885,13 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             .any(|n| Param::decode(*n).is_ok_and(|p| p.variadic))
     }
 
-    fn bound_name(&self, p: PatId) -> Option<NameIdx> {
-        match Pat::decode(self.out.pats[p.0 as usize]).ok()? {
-            Pat::Bind { name, .. } => Some(name),
-            Pat::Box(inner) => self.bound_name(inner),
-            _ => None,
+    fn bound_name(&self, mut p: PatId) -> Option<NameIdx> {
+        loop {
+            match Pat::decode(*self.out.pats.get(p.0 as usize)?).ok()? {
+                Pat::Bind { name, .. } => return Some(name),
+                Pat::Box(inner) => p = inner,
+                _ => return None,
+            }
         }
     }
 
@@ -2979,7 +3138,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
 
     fn self_param(&mut self, f: &Frame, r: Range) {
         let amp = self.has_tok(f, AMP);
-        let mutable = self.has_tok(f, MUT_KW);
+        let mutable = self.has_tok(f, MUT_KW) || (amp && self.has_tok(f, UNIQ_KW));
         let lifetime = self.first(f, V::Lifetime).map(|v| NameIdx(v.id));
         let name = self.first(f, V::Name);
         let ty = self.first(f, V::Type).map(|v| TypeId(v.id));
@@ -2994,7 +3153,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             None => self.synth_name("self", r),
         };
         let ann = BindAnn { by_ref: None, mutable: mutable && !amp };
-        let pat = self.put_pat(Pat::Bind { ann, name, sub: None, shadows: None }, r);
+        let pat = self.put_pat(Pat::Bind { ann, name, sub: None, shadows: None, ty: None }, r);
         let hash = self.local_key(name);
         self.push_pending(hash, pat);
         let p = Param { pat: Some(pat), ty, self_kind, lifetime, variadic: false, attrs: List { start: 0, len: 0 } };
@@ -3028,6 +3187,56 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             }
         }
         self.keep(f, |v| v == V::Row(ROW_ATTR));
+    }
+
+    /// Reads outer `#[blaze::cost(..)]` attributes attached to a loop frame (`LOOP_EXPR`,
+    /// `WHILE_EXPR`, `FOR_EXPR`, or an `EXPR_STMT` wrapping one). Duplicate or malformed cost
+    /// attributes yield `Some(LoopCost::Invalid)` (Rule 3: never silently ignored).
+    fn loop_cost_attr(&self, f: &Frame) -> Option<LoopCost> {
+        let mut found: Option<LoopCost> = None;
+        let text = self.text();
+        for v in &self.vals[f.base as usize..] {
+            if v.v != V::Row(ROW_ATTR) {
+                continue;
+            }
+            let Ok(a) = Attr::decode(v.node, Lens::BUILDING) else { continue };
+            if a.inner {
+                continue;
+            }
+            let path = a.path.raw().of(text).trim();
+            if !path.split_once("::").is_some_and(|(tool, rest)| tool.trim() == "blaze" && rest.trim() == "cost") {
+                continue;
+            }
+            let parsed = if a.meta == AttrMeta::Tokens {
+                parse_loop_cost(a.args.raw().of(text))
+            } else {
+                LoopCost::Invalid
+            };
+            found = Some(if found.is_some() { LoopCost::Invalid } else { parsed });
+        }
+        found
+    }
+
+    /// Propagates a `#[blaze::cost(..)]` attribute attached to an `EXPR_STMT` onto its wrapped
+    /// `Expr::Loop` (or the `inner_loop` of a desugared `for` loop).
+    fn apply_stmt_loop_cost(&mut self, e: ExprId, cost: LoopCost) {
+        let Some(&node) = self.out.exprs.get(e.0 as usize) else { return };
+        match Expr::decode(node) {
+            Ok(Expr::Loop { body, source, cost: existing }) => {
+                let merged = if existing == LoopCost::Normal { cost } else { LoopCost::Invalid };
+                self.out.exprs[e.0 as usize] = Expr::Loop { body, source, cost: merged }.encode();
+            }
+            Ok(Expr::Match { arms, source: MatchSource::ForLoop, .. }) => {
+                let Some(&arm_node) = self.out.rows.get(arms.start as usize) else { return };
+                let Ok(arm) = Arm::decode(arm_node) else { return };
+                let Some(&lp_node) = self.out.exprs.get(arm.body.0 as usize) else { return };
+                if let Ok(Expr::Loop { body, source, cost: existing }) = Expr::decode(lp_node) {
+                    let merged = if existing == LoopCost::Normal { cost } else { LoopCost::Invalid };
+                    self.out.exprs[arm.body.0 as usize] = Expr::Loop { body, source, cost: merged }.encode();
+                }
+            }
+            _ => {}
+        }
     }
 
     fn first_pred(&self, f: &Frame) -> CfgAnswer {
@@ -3304,7 +3513,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         let place = match self.parent_kind() {
             Some(MACRO_PAT) => MacroPlace::Pat,
             Some(MACRO_TYPE) => MacroPlace::Type,
-            Some(STMT_LIST) => MacroPlace::Stmt,
+            Some(STMT_LIST | MACRO_STMTS) => MacroPlace::Stmt,
             Some(MACRO_EXPR) => MacroPlace::Expr,
             _ => MacroPlace::Item,
         };
@@ -3340,16 +3549,17 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         // a statement, the MacroInvocationSemi form is used where a semicolon is required at
         // the end when not using curly braces", so a braced call needs no `;` to be one; its
         // expansion is statements whose last expression, with nothing after it, is the block's
-        // tail (`stmt_list`). A tail call in parentheses or brackets stays an expression.
+        // tail (`stmt_list`). A tail call in parentheses or brackets stays an expression in a
+        // block, while ANY direct call inside `MACRO_STMTS` (already inside a statement-position
+        // macro expansion, e.g. `cmov`'s `cseleq64!();` expanding to unbraced `cseleq!(...)` with
+        // no trailing `;`) remains in statement position.
+        let grand = (self.frames.len() >= 2).then(|| self.frames[self.frames.len() - 2].kind);
         let braced_tail = place == MacroPlace::Expr
-            && self.frames.len() >= 2
-            && matches!(self.frames[self.frames.len() - 2].kind, STMT_LIST | MACRO_STMTS)
+            && grand == Some(STMT_LIST)
             && input.of(self.text()).starts_with('{');
         let in_stmt = place == MacroPlace::Stmt
             || braced_tail
-            || place == MacroPlace::Expr
-                && self.frames.len() >= 2
-                && self.frames[self.frames.len() - 2].kind == EXPR_STMT;
+            || place == MacroPlace::Expr && matches!(grand, Some(EXPR_STMT | MACRO_STMTS));
         let fragment = match place {
             MacroPlace::Pat => blaze_expand::Fragment::Pat,
             MacroPlace::Type => blaze_expand::Fragment::Type,

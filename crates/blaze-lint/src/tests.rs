@@ -646,6 +646,17 @@ fn new_rules_are_off_until_named() {
         Rule::LockWithoutReason,
         Rule::DoubleIndirectionArc,
         Rule::RawSandboxExec,
+        Rule::MutRef,
+        Rule::MagicSliceLen,
+        Rule::BoolAsInt,
+        Rule::ManualSliceIdioms,
+        Rule::TestAmbientLeak,
+        Rule::MutForUniqBorrow,
+        Rule::IoRef,
+        Rule::UnusedImport,
+        Rule::UnusedMut,
+        Rule::HeapLeak,
+        Rule::ParallelVecs,
     ] {
         assert!(!Step::Strict.rules().runs(rule), "{} runs in strict", rule.name());
         assert!(Step::Strict.rules().with(rule).runs(rule));
@@ -1120,10 +1131,14 @@ fn rule_trie_equals_a_scan_per_sequence() {
 
 /// The fixes of `text`'s findings applied.
 fn fixed(text: &str) -> StdString {
+    fixed_rules(&RuleSet::ALL, text)
+}
+
+fn fixed_rules(rules: &RuleSet, text: &str) -> StdString {
     let alloc = blaze_own::testing::heap().alloc();
     let mut out = Findings::new_in(alloc);
     let unit = Unit { text, holes: &[], scope: FILE };
-    assert!(lint(&RuleSet::ALL, &unit, alloc, &mut out).is_ok());
+    assert!(lint(rules, &unit, alloc, &mut out).is_ok());
     match apply_all(text, &out, alloc) {
         Ok(new) => new.as_str().to_string(),
         Err(error) => panic!("fixes refused on {text:?}: {error:?}"),
@@ -1133,14 +1148,17 @@ fn fixed(text: &str) -> StdString {
 #[test]
 fn renamed() {
     let rule = Rule::Renamed;
+    let only = RuleSet::only(&[rule]);
     let typed = "fn f(al: A) {\n    let mut v: AVec<'_, u8> = AVec::new_in(al);\n    v.insert(0, 1);\n}";
     assert_eq!(kinds(rule, typed), ["fixed"]);
     assert_eq!(fixed(typed), "fn f(al: A) {\n    let mut v: AVec<'_, u8> = AVec::new_in(al);\n    v.insert_shift(0, 1);\n}");
     let param = "fn f(v: &mut AVec<'_, u8>) -> bool {\n    v.contains(&1)\n}";
-    assert_eq!(fixed(param), "fn f(v: &mut AVec<'_, u8>) -> bool {\n    v.scan_for(&1).is_some()\n}");
+    assert_eq!(fixed_rules(&only, param), "fn f(v: &mut AVec<'_, u8>) -> bool {\n    v.scan_for(&1).is_some()\n}");
+    assert_eq!(fixed(param), "fn f(v: &uniq AVec<'_, u8>) -> bool {\n    v.scan_for(&1).is_some()\n}");
     let init = "fn f(al: A) {\n    let mut d = ADeque::new_in(al);\n    d.remove(0);\n}";
     assert_eq!(fixed(init), "fn f(al: A) {\n    let mut d = ADeque::new_in(al);\n    d.remove_shift(0);\n}");
-    assert_eq!(fixed("fn f() { AVec::swap_remove(&mut v, 0); }"), "fn f() { AVec::remove_swap(&mut v, 0); }");
+    assert_eq!(fixed_rules(&only, "fn f() { AVec::swap_remove(&mut v, 0); }"), "fn f() { AVec::remove_swap(&mut v, 0); }");
+    assert_eq!(fixed("fn f() { AVec::swap_remove(&mut v, 0); }"), "fn f() { AVec::remove_swap(&uniq v, 0); }");
     assert_eq!(kinds(rule, "fn f(x: &mut X) {\n    x.insert_many(0, &[1]);\n}"), ["for-a-person"]);
     none(rule, &[
         "fn f(m: &mut HashMap<u8, u8>) {\n    m.insert(1, 2);\n}",
@@ -1497,22 +1515,66 @@ fn check_fixes(text: &str, scope: Scope, plant: Plant) -> Result<(), Broke> {
     let (old_tokens, _) = significant(text);
     let mut expected: StdVec<StdString> = StdVec::new();
     let mut used = vec![false; edits.len()];
-    for (start, end) in &old_tokens {
-        match edits.iter().position(|(r, _)| !r.is_empty() && (r.start, r.end) == (*start, *end)) {
-            Some(at) => {
-                used[at] = true;
-                let (put, _) = significant(edits[at].1);
-                expected.extend(put.iter().map(|(a, b)| edits[at].1[*a as usize..*b as usize].to_string()));
+    // Every non-empty edit must cover one or more whole significant tokens without splitting
+    // any neighbouring token (trailing/leading whitespace inside the edit is allowed so fixes
+    // like removing `mut ` or a whole `use` line leave clean formatting).
+    for (at, (r, _)) in edits.iter().enumerate() {
+        if r.is_empty() {
+            continue;
+        }
+        for &(ts, te) in &old_tokens {
+            let splits_start = r.start > ts && r.start < te;
+            let splits_end = r.end > ts && r.end < te;
+            if splits_start || splits_end {
+                return Err(Broke::Oracle(format!(
+                    "a fix changes a neighbouring token: edit {:?} splits token {ts}..{te} in\n{text}",
+                    edits[at].0
+                )));
             }
-            None => expected.push(text[*start as usize..*end as usize].to_string()),
+        }
+        // Also ensure the edit covers at least one token and ends no further than the start of
+        // the next token (so eating into a 1-byte neighbour like `(` is rejected).
+        if let Some(first_covered) = old_tokens.iter().position(|&(ts, te)| ts >= r.start && te <= r.end) {
+            let last_covered = old_tokens
+                .iter()
+                .rposition(|&(ts, te)| ts >= r.start && te <= r.end)
+                .unwrap_or(first_covered);
+            let covered = last_covered - first_covered + 1;
+            // Single-token rename/strip edits must cover exactly 1 token; multi-token fixes
+            // (unused-import line/brace rewrites) start on `use`, `::`, or `{`.
+            let multi_ok = matches!(
+                text.get(old_tokens[first_covered].0 as usize..old_tokens[first_covered].1 as usize),
+                Some("use" | "{" | ":")
+            );
+            if covered > 1 && !multi_ok {
+                return Err(Broke::Oracle(format!(
+                    "a fix changes a neighbouring token: edit {:?} covers {covered} tokens in\n{text}",
+                    edits[at].0
+                )));
+            }
+        }
+    }
+    let mut tok_idx = 0usize;
+    while tok_idx < old_tokens.len() {
+        let (start, end) = old_tokens[tok_idx];
+        match edits.iter().position(|(r, _)| !r.is_empty() && r.start <= start && end <= r.end) {
+            Some(at) => {
+                if !used[at] {
+                    used[at] = true;
+                    let (put, _) = significant(edits[at].1);
+                    expected.extend(put.iter().map(|(a, b)| edits[at].1[*a as usize..*b as usize].to_string()));
+                }
+            }
+            None => expected.push(text[start as usize..end as usize].to_string()),
         }
         for (at, (r, put)) in edits.iter().enumerate() {
-            if r.is_empty() && r.start == *end {
+            if r.is_empty() && r.start == end {
                 used[at] = true;
                 let (tokens, _) = significant(put);
                 expected.extend(tokens.iter().map(|(a, b)| put[*a as usize..*b as usize].to_string()));
             }
         }
+        tok_idx += 1;
     }
     if let Some(at) = used.iter().position(|u| !u) {
         return Err(Broke::Oracle(format!(
@@ -2083,4 +2145,593 @@ fn raw_sandbox_exec() {
         "#[test]\nfn t() { Command::new(\"/usr/bin/sandbox-exec\"); }",
         "#[cfg(test)]\nmod t {\n    const S: &str = \"sandbox-exec\";\n}",
     ]);
+}
+
+#[test]
+fn mut_ref_deprecated_with_autofix() {
+    let rule = Rule::MutRef;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(Rule::from_name("mut-ref"), Some(rule));
+    assert_eq!(Rule::from_lint("mut_ref"), Some(rule));
+    assert_eq!(Template::MutRef.rule(), rule);
+    assert_eq!(Template::RefMut.rule(), rule);
+    assert!(Step::Edition.rules().runs(rule), "Step::Edition runs mut-ref deprecation");
+    assert!(!Step::Rust.rules().runs(rule));
+
+    // RootMarks turns on mut-ref via `#![blaze::uniq]` or `#![deny(blaze::mut_ref)]`.
+    let uniq_marks = RootMarks::read("#![blaze::uniq]\nfn f() {}");
+    assert!(uniq_marks.uniq);
+    assert!(uniq_marks.rules(Step::Rust.rules()).runs(rule));
+    assert_ne!(uniq_marks.key(), RootMarks::NONE.key());
+
+    let deny_marks = RootMarks::read("#![deny(blaze::mut_ref)]\nfn f() {}");
+    assert!(deny_marks.denies(rule));
+    assert!(deny_marks.rules(Step::Rust.rules()).runs(rule));
+    assert_eq!(deny_marks.levels(Step::Rust.levels()).of(rule), Level::Error);
+
+    // Detection across `&mut`, `&'a mut`, `&&mut`, and `ref mut`.
+    let src = "fn obj_row<'a>(&'a mut self, ui: &mut UiWorld, x: &&mut i32) { let mut n = 0; let r = &mut n; let ref mut y = n; let &mut z = r; }";
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+    assert!(lint(&only, &Unit { text: src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    let matched: StdVec<(&str, &str)> =
+        out.list.iter().map(|f| (f.template.kind(), f.range.of(src))).collect();
+    assert_eq!(
+        matched,
+        [
+            ("mut-ref", "&'a mut"),
+            ("mut-ref", "&mut"),
+            ("mut-ref", "&mut"),
+            ("mut-ref", "&mut"),
+            ("ref-mut", "ref mut"),
+            ("mut-ref", "&mut"),
+        ]
+    );
+
+    // Mechanical auto-fix converts every `&mut` / `ref mut` to `&uniq` / `ref uniq`,
+    // leaving `let mut n = 0;` untouched.
+    let fixed = apply_all(src, &out, alloc).expect("autofix applies cleanly");
+    assert_eq!(
+        fixed.as_str(),
+        "fn obj_row<'a>(&'a uniq self, ui: &uniq UiWorld, x: &&uniq i32) { let mut n = 0; let r = &uniq n; let ref uniq y = n; let &uniq z = r; }"
+    );
+
+    // Re-linting the fixed output produces zero findings!
+    out.clear();
+    assert!(lint(&only, &Unit { text: fixed.as_str(), holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert!(out.list.is_empty(), "fixed code must have zero mut-ref findings");
+
+    // Deprecation message mentions `&uniq`.
+    out.clear();
+    let msg_src = "fn f(x: &mut i32) {}";
+    assert!(lint(&only, &Unit { text: msg_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    let mut msg = OwnString::new_in(alloc);
+    show_message(&only, msg_src, &out, &out.list[0], &mut msg);
+    assert!(msg.as_str().contains("deprecated") && msg.as_str().contains("&uniq"), "{}", msg.as_str());
+
+    // Negative controls: `let mut`, `*mut`, `&raw mut`, `mut` bindings, raw idents, strings, comments.
+    none(rule, &[
+        "fn f(mut x: i32) { let mut y = x; y += 1; }",
+        "fn f(p: *mut u8) -> *mut u8 { p }",
+        "fn f(mut x: i32) { let _ = &raw mut x; }",
+        "fn f(ui: &uniq UiWorld) { let ref uniq y = *ui; }",
+        "fn f() { let s = \"&mut ref mut\"; /* &mut */ // ref mut\n }",
+        "fn f(r#mut: i32) { let _ = &r#mut; }",
+    ]);
+}
+
+#[test]
+fn clone_handle_autofixes_rc_to_local_share_and_arc_to_share() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let only = RuleSet::only(&[Rule::Clones]);
+    let src = "fn f(a: &Arc<u8>, r: &Rc<u8>) {\n    let a2 = a.clone();\n    let r2 = r.clone();\n    let r3 = Rc::new_in(1, alloc);\n    let r4 = r3.clone();\n}\n";
+    let mut out = Findings::new_in(alloc);
+    assert!(lint(&only, &Unit { text: src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 3);
+    let fixed = apply_all(src, &out, alloc).expect("autofix applies cleanly");
+    assert_eq!(
+        fixed.as_str(),
+        "fn f(a: &Arc<u8>, r: &Rc<u8>) {\n    let a2 = a.share();\n    let r2 = r.local_share();\n    let r3 = Rc::new_in(1, alloc);\n    let r4 = r3.local_share();\n}\n"
+    );
+    // Re-linting the fixed code produces zero CloneHandle findings!
+    out.clear();
+    assert!(lint(&only, &Unit { text: fixed.as_str(), holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert!(out.list.is_empty(), "fixed code must have zero clone findings");
+}
+
+#[test]
+fn magic_slice_len_detects_and_autofixes() {
+    let rule = Rule::MagicSliceLen;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(Rule::from_name("magic-slice-len"), Some(rule));
+    assert_eq!(Rule::from_lint("magic_slice_len"), Some(rule));
+    assert_eq!(Template::MagicSlicePrefix.rule(), rule);
+    assert_eq!(Template::MagicSlicePrefixMismatch.rule(), rule);
+    assert_eq!(Template::MagicSliceAdvance.rule(), rule);
+    assert_eq!(Template::MagicSliceBytes.rule(), rule);
+    assert_eq!(Template::MagicSliceRange.rule(), rule);
+    assert!(Step::Edition.rules().runs(rule), "Step::Edition runs magic-slice-len");
+    assert!(!Step::Rust.rules().runs(rule));
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+
+    // 1. Auto-fixable prefix comparisons (`0..3`, `..4`, `&x[..7] == b".."`, `.get(..4).is_some_and`).
+    let autofix_src = "fn f(bytes: &[u8], sect: &[u8]) -> bool { bytes.get(0..3) == Some(&[0xEF, 0xBB, 0xBF]) && bytes.get(..4) == Some(b\"RIFF\") && &sect[..7] == b\"__text\\0\" && bytes.get(..4).is_some_and(|m| m == b\"WEBP\") }";
+    assert!(lint(&only, &Unit { text: autofix_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 4, "expected 4 prefix findings");
+    assert!(out.list.iter().all(|f| f.template == Template::MagicSlicePrefix));
+    let mut msg = OwnString::new_in(alloc);
+    show_message(&only, autofix_src, &out, &out.list[0], &mut msg);
+    assert!(msg.as_str().contains("strip_prefix(&[0xEF, 0xBB, 0xBF])"), "{}", msg.as_str());
+    let fixed = apply_all(autofix_src, &out, alloc).expect("autofix applies cleanly");
+    assert_eq!(
+        fixed.as_str(),
+        "fn f(bytes: &[u8], sect: &[u8]) -> bool { bytes.starts_with(&[0xEF, 0xBB, 0xBF]) && bytes.starts_with(b\"RIFF\") && sect.starts_with(b\"__text\\0\") && bytes.starts_with(b\"WEBP\") }"
+    );
+    // Re-linting fixed output produces zero findings!
+    out.clear();
+    assert!(lint(&only, &Unit { text: fixed.as_str(), holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert!(out.list.is_empty(), "fixed code must have zero magic-slice-len findings");
+
+    // 2. Cursor prefix (`at..at + 2 == Some(b"//")`), `&sect[..7] == b"__text\0"`, and `.is_some_and`.
+    let cursor_src = r#"fn f(bytes: &[u8], at: usize, entry: &[u8]) -> bool {
+        if bytes.get(at..at + 2) == Some(b"//") { return true; }
+        if &bytes[..7] == b"__text\0" { return true; }
+        entry.get(..8).is_some_and(|m| m == MAGIC)
+    }"#;
+    out.clear();
+    assert!(lint(&only, &Unit { text: cursor_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 3, "expected 3 prefix findings");
+    assert!(out.list.iter().all(|f| f.template == Template::MagicSlicePrefix));
+
+    // 3. Bug detector: hardcoded length mismatches literal length (`0..4` vs `b"//"`).
+    let mismatch_src = "fn f(bytes: &[u8]) -> bool { bytes.get(0..4) == Some(b\"//\") }";
+    out.clear();
+    assert!(lint(&only, &Unit { text: mismatch_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 1);
+    assert_eq!(out.list[0].template, Template::MagicSlicePrefixMismatch);
+    assert!(out.list[0].fixes.is_empty(), "mismatched length bug must not silently autofix");
+
+    // 4. `starts_with` followed by hardcoded `[N..]` or `+= N` advance.
+    let adv_src = r#"fn f(s: &str, mut at: usize) -> &str {
+        if s.starts_with("0x") { return &s[2..]; }
+        if s.starts_with("//") { at += 2; }
+        let _ = at;
+        s
+    }"#;
+    out.clear();
+    assert!(lint(&only, &Unit { text: adv_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 2);
+    assert!(out.list.iter().all(|f| f.template == Template::MagicSliceAdvance));
+
+    // 5. Standalone byte-width `.get(at..at + 4)?.try_into()` vs general `.get(0..3)`.
+    let standalone_src = r#"fn f(bytes: &[u8], at: usize) -> Option<&[u8]> {
+        let _w: [u8; 4] = bytes.get(at..at + 4)?.try_into().ok()?;
+        bytes.get(0..3)
+    }"#;
+    out.clear();
+    assert!(lint(&only, &Unit { text: standalone_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 2);
+    assert_eq!(out.list[0].template, Template::MagicSliceBytes);
+    assert_eq!(out.list[1].template, Template::MagicSliceRange);
+
+    // 6. Negative controls: clean derived code & tests must produce zero findings.
+    none(rule, &[
+        "fn f(text: &str) -> Option<&str> { text.strip_prefix(\"//\") }",
+        "fn f(bytes: &[u8]) -> bool { bytes.starts_with(&[0xEF, 0xBB, 0xBF]) }",
+        "fn f(bytes: &[u8]) -> Option<&[u8]> { bytes.get(..MAGIC.len()) }",
+        "fn f(bytes: &[u8], at: usize) -> Option<&[u8]> { bytes.get(at..at + HEADER_LEN) }",
+        "fn f(bytes: &[u8], at: usize) -> Option<&[u8]> { bytes.get(at..at + size_of::<u32>()) }",
+        "fn f(bytes: &[u8], start: usize, end: usize) -> Option<&[u8]> { bytes.get(start..end) }",
+        "fn f(bytes: &[u8]) -> Option<&u8> { bytes.get(0) }",
+        "#[test]\nfn t() { let b = b\"abc\"; assert!(b.get(0..3) == Some(b\"abc\")); }",
+    ]);
+}
+
+#[test]
+fn bool_as_int_detects_and_autofixes() {
+    let rule = Rule::BoolAsInt;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(Rule::from_name("bool-as-int"), Some(rule));
+    assert_eq!(Rule::from_lint("bool_as_int"), Some(rule));
+    assert_eq!(Template::BoolAsInt.rule(), rule);
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+    let src = "fn f(a: u32, b: u32, opt: Option<u8>) -> usize { (a == b) as usize + opt.is_some() as usize + (a < b) as usize + true as usize }";
+    assert!(lint(&only, &Unit { text: src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 4);
+    let fixed = apply_all(src, &out, alloc).expect("autofix applies cleanly");
+    assert_eq!(
+        fixed.as_str(),
+        "fn f(a: u32, b: u32, opt: Option<u8>) -> usize { usize::from(a == b) + usize::from(opt.is_some()) + usize::from(a < b) + usize::from(true) }"
+    );
+    out.clear();
+    assert!(lint(&only, &Unit { text: fixed.as_str(), holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert!(out.list.is_empty());
+
+    none(rule, &[
+        "fn f(x: u32) -> u64 { x as u64 }",
+        "fn f(x: usize) -> u32 { (x + 1) as u32 }",
+        "fn f(x: u32) -> usize { (x << 2) as usize }",
+        "fn f(mask: u32) -> u64 { (!mask) as u64 }",
+        "fn f() -> u32 { (size_of::<u64>() / size_of::<u32>()) as u32 }",
+        "const fn f(a: u32, b: u32) -> u32 { (a == b) as u32 }",
+        "fn f(b: bool) -> usize { usize::from(b) }",
+    ]);
+}
+
+#[test]
+fn manual_slice_idioms_detects_and_autofixes() {
+    let rule = Rule::ManualSliceIdioms;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(Rule::from_name("manual-slice-idioms"), Some(rule));
+    assert_eq!(Rule::from_lint("manual_slice_idioms"), Some(rule));
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+
+    // 1. `.len() == 0` / `.len() > 0` / `.len() != 0` / `.len() >= 1` -> `is_empty()` / `!is_empty()`.
+    let len_src = "fn f(xs: &[u8], ys: &[u8]) -> bool { xs.len() == 0 && ys.len() > 0 && xs.len() != 0 && ys.len() >= 1 }";
+    assert!(lint(&only, &Unit { text: len_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 4);
+    assert!(out.list.iter().all(|f| f.template == Template::LenZeroCheck));
+    let fixed = apply_all(len_src, &out, alloc).expect("autofix applies cleanly");
+    assert_eq!(
+        fixed.as_str(),
+        "fn f(xs: &[u8], ys: &[u8]) -> bool { xs.is_empty() && !ys.is_empty() && !xs.is_empty() && !ys.is_empty() }"
+    );
+    out.clear();
+    assert!(lint(&only, &Unit { text: fixed.as_str(), holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert!(out.list.is_empty());
+
+    // 2. Index loop `for i in 0..xs.len() { let _ = xs[i]; }`.
+    let loop_src = "fn f(xs: &[u8]) -> u8 { let mut s = 0; for i in 0..xs.len() { s += xs[i]; } s }";
+    out.clear();
+    assert!(lint(&only, &Unit { text: loop_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 1);
+    assert_eq!(out.list[0].template, Template::IndexLoop);
+
+    // 3. `.find('\n')` followed by `[..pos]` / `[pos + 1..]`.
+    let find_src = "fn f(s: &str) -> (&str, &str) { if let Some(pos) = s.find(':') { (&s[..pos], &s[pos + 1..]) } else { (s, \"\") } }";
+    out.clear();
+    assert!(lint(&only, &Unit { text: find_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 1);
+    assert_eq!(out.list[0].template, Template::ManualFindSplit);
+
+    none(rule, &[
+        "fn f(xs: &[u8], ys: &[u8]) -> bool { xs.is_empty() || xs.len() == 2 || xs.len() >= 1 << 20 || xs.len() + ys.len() >= 1 }",
+        "impl S { pub fn is_empty(&self) -> bool { self.len() == 0 } }",
+        "fn f(xs: &[u8]) -> u8 { let mut s = 0; for &x in xs { s += x; } s }",
+        "fn f(s: &str) -> Option<(&str, &str)> { s.split_once(':') }",
+    ]);
+}
+
+#[test]
+fn test_ambient_leak_catches_test_global_alloc_and_extern_std() {
+    let rule = Rule::TestAmbientLeak;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(Rule::from_name("test-ambient-leak"), Some(rule));
+    assert_eq!(Rule::from_lint("test_ambient_leak"), Some(rule));
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+    let src = "#[cfg(test)]\nextern crate std;\n#[test]\nfn t() { let _a = Alloc::global(); }\n";
+    assert!(lint(&only, &Unit { text: src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 2);
+    assert_eq!(out.list[0].template, Template::TestExternStd);
+    assert_eq!(out.list[1].template, Template::TestGlobalAlloc);
+
+    // Outside tests, `test-ambient-leak` stays silent (other rules cover production code).
+    none(rule, &[
+        "extern crate std;\nfn prod() { let _a = Alloc::global(); }",
+        "#[test]\nfn clean() { let heap = blaze_own::testing::heap(); let _a = heap.alloc(); }",
+    ]);
+}
+
+#[test]
+fn mut_for_uniq_borrow_autofixes_non_rebound_let_mut_and_keeps_rebindings() {
+    let rule = Rule::MutForUniqBorrow;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(Rule::from_name("mut-for-uniq-borrow"), Some(rule));
+    assert_eq!(Rule::from_lint("mut_for_uniq_borrow"), Some(rule));
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+    let src = "fn demo() -> i32 { let mut n = 41; bump(&uniq n); n }";
+    assert!(lint(&only, &Unit { text: src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 1);
+    assert_eq!(out.list[0].template, Template::MutForUniqBorrow);
+    let fixed = apply_all(src, &out, alloc).expect("autofix applies cleanly");
+    assert_eq!(fixed.as_str(), "fn demo() -> i32 { let n = 41; bump(&uniq n); n }");
+
+    // Actual local rebinding (`n = ..`, `n += ..`) keeps `let mut`.
+    none(rule, &[
+        "fn rebound() -> i32 { let mut n = 0; bump(&uniq n); n = 5; n }",
+        "fn compound() -> i32 { let mut n = 0; bump(&uniq n); n += 1; n }",
+        "fn no_borrow() -> i32 { let mut n = 0; n }",
+    ]);
+}
+
+#[test]
+fn io_ref_denies_general_io_bundle() {
+    let rule = Rule::IoRef;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(rule.name(), "io-ref");
+    assert_eq!(Rule::from_name("io-ref"), Some(rule));
+    assert_eq!(rule.lint(), Some("io_ref"));
+    assert_eq!(Rule::from_lint("io_ref"), Some(rule));
+    assert_eq!(Template::IoRef.rule(), rule);
+
+    assert_eq!(found(&only, "fn f(io: &Io) {}", FILE), [("io-ref", "&Io")]);
+    assert_eq!(found(&only, "struct S<'a> { io: &'a Io }", FILE), [("io-ref", "&'a Io")]);
+    assert_eq!(found(&only, "fn f(io: &mut Io) {}", FILE), [("io-ref", "&mut Io")]);
+    assert_eq!(found(&only, "fn f(io: &bstd::io::Io) {}", FILE), [("io-ref", "&bstd::io::Io")]);
+    assert_eq!(found(&only, "fn f(io: &bstd::Io) {}", FILE), [("io-ref", "&bstd::Io")]);
+
+    // Local private `struct Io` exempts unqualified `&Io`, but still flags `&bstd::io::Io`.
+    assert!(found(&only, "struct Io;\nfn f(io: &Io) {}", FILE).is_empty());
+    assert_eq!(
+        found(&only, "struct Io;\nfn f(io: &bstd::io::Io) {}", FILE),
+        [("io-ref", "&bstd::io::Io")]
+    );
+
+    // Narrow capabilities, owned `Io`, and tests are clean.
+    none(rule, &[
+        "fn f(out: &Out, fs: &Fs) {}",
+        "fn main(io: Io) { drop(io); }",
+        "fn f() { let _ = mask & Io; }",
+        "#[test]\nfn t(io: &Io) {}",
+        "#[cfg(test)]\nmod t { fn f(io: &Io) {} }",
+    ]);
+}
+
+#[test]
+fn unused_import_minimizes_and_autofixes() {
+    let rule = Rule::UnusedImport;
+    let only = RuleSet::only(&[rule]);
+    let alloc = blaze_own::testing::heap().alloc();
+
+    let fix = |src: &str| {
+        let mut out = Findings::new_in(alloc);
+        crate::lint_file_imports(src, FILE, alloc, &mut out).unwrap();
+        lint(&only, &Unit { text: src, holes: &[], scope: FILE }, alloc, &mut out).unwrap();
+        apply_all(src, &out, alloc).unwrap()
+    };
+
+    // Collapse braced import down to minimal single import (`{Io, Missing}` -> `Missing`).
+    assert_eq!(
+        fix("use bstd::io::{Io, Missing};\nfn f() -> Missing { todo!() }\n").as_str(),
+        "use bstd::io::Missing;\nfn f() -> Missing { todo!() }\n"
+    );
+
+    // Collapse `{self, Io}` down to bare module import `use bstd::io;`.
+    assert_eq!(
+        fix("use bstd::io::{self, Io};\nfn f() { io::init(); }\n").as_str(),
+        "use bstd::io;\nfn f() { io::init(); }\n"
+    );
+
+    // Prune middle entry from 3-item braced group.
+    assert_eq!(
+        fix("use bstd::io::{Fs, Io, Out};\nfn f(fs: &Fs, out: &Out) {}\n").as_str(),
+        "use bstd::io::{Fs, Out};\nfn f(fs: &Fs, out: &Out) {}\n"
+    );
+
+    // Remove redundant braces on single-item braced import.
+    assert_eq!(
+        fix("use bstd::io::{Missing};\nfn f() -> Missing { todo!() }\n").as_str(),
+        "use bstd::io::Missing;\nfn f() -> Missing { todo!() }\n"
+    );
+
+    // Delete completely unused single or braced `use` lines cleanly.
+    assert_eq!(
+        fix("use bstd::io::Io;\nuse bstd::io::Missing;\nfn f() -> Missing { todo!() }\n").as_str(),
+        "use bstd::io::Missing;\nfn f() -> Missing { todo!() }\n"
+    );
+    assert_eq!(
+        fix("use bstd::io::{Io, Foo};\nfn f() {}\n").as_str(),
+        "fn f() {}\n"
+    );
+
+    // Renamed import checks alias; `as _`, `pub use`, globs, and `#[cfg]`/`#[allow]` are untouched.
+    assert_eq!(
+        fix("use bstd::io::{Io as Unused, Missing as M};\nfn f() -> M { todo!() }\n").as_str(),
+        "use bstd::io::Missing as M;\nfn f() -> M { todo!() }\n"
+    );
+    for clean in [
+        "pub use bstd::io::Io;\nfn f() {}\n",
+        "pub(crate) use bstd::io::Io;\nfn f() {}\n",
+        "use core::fmt::Write as _;\nfn f() {}\n",
+        "use bstd::io::*;\nfn f() {}\n",
+        "#[cfg(unix)]\nuse bstd::io::Io;\nfn f() {}\n",
+        "#[allow(unused_imports)]\nuse bstd::io::Io;\nfn f() {}\n",
+    ] {
+        assert_eq!(fix(clean).as_str(), clean, "should leave untouched: {clean}");
+    }
+}
+
+#[test]
+fn unused_mut_autofixes_and_preserves_mutations() {
+    let rule = Rule::UnusedMut;
+    let only = RuleSet::only(&[rule]);
+    let alloc = blaze_own::testing::heap().alloc();
+
+    let fix = |src: &str| {
+        let mut out = Findings::new_in(alloc);
+        lint(&only, &Unit { text: src, holes: &[], scope: FILE }, alloc, &mut out).unwrap();
+        apply_all(src, &out, alloc).unwrap()
+    };
+
+    // Unnecessary `mut` on `let mut` and `fn` parameter is removed cleanly.
+    assert_eq!(
+        fix("fn f(mut n: u32) -> u32 {\n    let mut x = n + 1;\n    let mut y: u32 = x + 2;\n    y\n}\n").as_str(),
+        "fn f(n: u32) -> u32 {\n    let x = n + 1;\n    let y: u32 = x + 2;\n    y\n}\n"
+    );
+
+    // Format string read (`"{x}"`) does not mutate `x`.
+    assert_eq!(
+        fix("fn f() {\n    let mut x = 42;\n    println!(\"{x}\");\n}\n").as_str(),
+        "fn f() {\n    let x = 42;\n    println!(\"{x}\");\n}\n"
+    );
+
+    // Every genuinely mutating pattern is preserved untouched.
+    for mutated in [
+        "fn f() { let mut x = 0; x = 1; }",
+        "fn f() { let mut x = 0; x += 1; }",
+        "fn f() { let mut x = 0; take(&mut x); }",
+        "fn f() { let mut v = Vec::new(); v.push(1); }",
+        "fn f() { let mut a = [0; 4]; a[0] = 1; }",
+        "fn f() { let mut b = Box::new(0); *b = 1; }",
+        "fn f() { let mut x = 0; inc!(x); }",
+        "fn f(mut x: u32) -> u32 { x += 1; x }",
+        "fn f() { let mut _x = 0; }",
+        "fn f() { #[allow(unused_mut)] let mut x = 0; let _ = x; }",
+        "fn f() { let mut x = 0; let x = bump(&mut x); let _ = x; }",
+    ] {
+        assert_eq!(fix(mutated).as_str(), mutated, "should keep mut: {mutated}");
+    }
+}
+
+#[test]
+fn heap_leak_flags_leak_and_allows_root_and_bump() {
+    let rule = Rule::HeapLeak;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(rule.name(), "heap-leak");
+    assert_eq!(Rule::from_name("heap-leak"), Some(rule));
+    assert_eq!(rule.lint(), Some("heap_leak"));
+    assert_eq!(Rule::from_lint("heap_leak"), Some(rule));
+    assert_eq!(Template::HeapLeak.rule(), rule);
+
+    assert_eq!(found(&only, "fn f() { let _ = v.leak(); }", FILE), [("heap-leak", ".leak")]);
+    assert_eq!(found(&only, "fn f() { let _ = Box::leak(b); }", FILE), [("heap-leak", "Box::leak")]);
+    assert_eq!(found(&only, "fn f() { let _ = Vec::leak(v); }", FILE), [("heap-leak", "Vec::leak")]);
+
+    none(rule, &[
+        "fn f(frame: &Frame) { let _ = v.into_bump_slice(); }",
+        "fn f(frame: &Frame) { let _ = s.into_bump_str(); }",
+        "fn f(root: Root) { let _ = Root::leak(root); }",
+        "#[test]\nfn t() { let _ = v.leak(); }",
+    ]);
+}
+
+#[test]
+fn parallel_vecs_flags_adjacent_avecs_and_struct_fields() {
+    let rule = Rule::ParallelVecs;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(rule.name(), "parallel-vecs");
+    assert_eq!(Rule::from_name("parallel-vecs"), Some(rule));
+    assert_eq!(rule.lint(), Some("parallel_vecs"));
+    assert_eq!(Rule::from_lint("parallel_vecs"), Some(rule));
+    assert_eq!(Template::ParallelVecs.rule(), rule);
+
+    let locals = "\
+fn build<'b>(alloc: Alloc<'b>) {
+    let mut m_code: AVec<'b, u64> = AVec::new_in(alloc);
+    let mut m_outline: AVec<'b, u64> = AVec::new_in(alloc);
+    let mut m_name_at: AVec<'b, u64> = AVec::new_in(alloc);
+    let mut m_meta: AVec<'b, u64> = AVec::new_in(alloc);
+}";
+    let hits = found(&only, locals, FILE);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0, "parallel-vecs");
+    assert!(hits[0].1.contains("m_code") && hits[0].1.contains("m_meta"));
+
+    let fields = "\
+struct Columns<'a> {
+    pub code: AVec<'a, u64>,
+    pub outline: AVec<'a, u64>,
+    pub name_at: blaze_own::Vec<u64, Alloc<'a>>,
+}";
+    let field_hits = found(&only, fields, FILE);
+    assert_eq!(field_hits.len(), 1);
+    assert_eq!(field_hits[0].0, "parallel-vecs");
+
+    none(rule, &[
+        "fn f(alloc: Alloc<'_>) { let mut a: AVec<'_, u64> = AVec::new_in(alloc); let mut b: AVec<'_, u64> = AVec::new_in(alloc); }",
+        "struct Two<'a> { a: AVec<'a, u64>, b: AVec<'a, u64>, c: u64 }",
+        "fn f(alloc: Alloc<'_>) { let a = AVec::new_in(alloc); let x = 1; let b = AVec::new_in(alloc); let y = 2; let c = AVec::new_in(alloc); }",
+    ]);
+}
+
+#[test]
+fn jit_telemetry_driven_perf_lints_rank_soa_and_hot_paths() {
+    use crate::pgo::{AdviceKind, Heat, HotSite, JitObservation, JitTelemetryKind, PgoHints, suggest_from_jit};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let hints = PgoHints::from_sites(
+        &[
+            HotSite::for_symbol("sim::step_particles", 900_000, 120_000), // Critical (12%)
+            HotSite::for_symbol("rpc::decode_frame", 200_000, 25_000),    // Hot (2.5%)
+            HotSite::for_symbol("cli::rare_help", 10, 50),                // Cold (0.005%)
+        ],
+        alloc,
+    );
+
+    let obs = [
+        // Critical 64B AoS loop touching only 8B (87.5% cache-line waste -> UseSoaLayout!)
+        JitObservation::for_symbol(
+            "sim::step_particles",
+            Span::new(10, 60),
+            JitTelemetryKind::AosStrideLoop { stride_bytes: 64, accessed_bytes: 8, trip_count: 500_000 },
+        ),
+        // Critical non-escaping heap alloc in hot loop
+        JitObservation::for_symbol(
+            "sim::step_particles",
+            Span::new(70, 90),
+            JitTelemetryKind::NonEscapingHeapAlloc { alloc_bytes: 256, executions: 100_000 },
+        ),
+        // Hot 99.9% skewed error branch -> UseColdErrorPath / Conv::BlazeResult
+        JitObservation::for_symbol(
+            "rpc::decode_frame",
+            Span::new(100, 140),
+            JitTelemetryKind::SkewedBranch { taken_ppm: 1_000, executions: 250_000 },
+        ),
+        // Hot oversized async frame (512 B -> graph-colored 128 B)
+        JitObservation::for_symbol(
+            "rpc::decode_frame",
+            Span::new(150, 200),
+            JitTelemetryKind::OversizedAsyncFrame { frame_bytes: 512, colored_bytes: 128, polls: 80_000 },
+        ),
+        // Hot skewed integer divisor (95% divisor == 10)
+        JitObservation::for_symbol(
+            "rpc::decode_frame",
+            Span::new(210, 240),
+            JitTelemetryKind::SkewedDivisor { dominant_divisor: 10, dominant_ppm: 950_000, executions: 100_000 },
+        ),
+        // Hot indirect gather loop with 25% cache miss rate
+        JitObservation::for_symbol(
+            "rpc::decode_frame",
+            Span::new(250, 300),
+            JitTelemetryKind::IndirectGatherLoop { miss_rate_ppm: 250_000, trip_count: 50_000 },
+        ),
+        // Negative controls: cold AoS loop (filtered by min_heat), and dense AoS (48/64 = 75% accessed)
+        JitObservation::for_symbol(
+            "cli::rare_help",
+            Span::new(400, 440),
+            JitTelemetryKind::AosStrideLoop { stride_bytes: 64, accessed_bytes: 8, trip_count: 500_000 },
+        ),
+        JitObservation::for_symbol(
+            "sim::step_particles",
+            Span::new(450, 490),
+            JitTelemetryKind::AosStrideLoop { stride_bytes: 64, accessed_bytes: 48, trip_count: 500_000 },
+        ),
+    ];
+
+    let adv = suggest_from_jit(&obs, &hints, Heat::Hot, alloc);
+    assert_eq!(adv.len(), 6, "expected exactly 6 hot JIT findings, got {adv:?}");
+    // Critical findings come strictly before Hot findings.
+    assert_eq!(adv[0].heat, Heat::Critical);
+    assert_eq!(adv[1].heat, Heat::Critical);
+    assert!(adv[0].impact_score >= adv[1].impact_score);
+    let soa = adv.iter().find(|a| a.kind == AdviceKind::UseSoaLayout).expect("missing UseSoaLayout");
+    assert_eq!(soa.waste_pct, 87);
+    assert_eq!(soa.est_speedup_x10, 80); // 64/8 = 8.0x capped at 80
+    assert!(soa.kind.message().contains("Struct-of-Arrays"));
+
+    assert!(adv.iter().any(|a| a.kind == AdviceKind::PromoteHotHeapAlloc));
+    assert!(adv.iter().any(|a| a.kind == AdviceKind::UseColdErrorPath));
+    assert!(adv.iter().any(|a| a.kind == AdviceKind::ShrinkAsyncFrame && a.waste_pct == 75));
+    assert!(adv.iter().any(|a| a.kind == AdviceKind::SpecializeHotDivisor));
+    assert!(adv.iter().any(|a| a.kind == AdviceKind::PrefetchHotGather));
 }

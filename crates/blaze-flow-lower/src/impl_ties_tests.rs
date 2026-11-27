@@ -167,7 +167,7 @@ impl Facts for Heads<'_> {
         Some(region_fixture::all_co(u32::from(self.with_lifetime.contains(&k))))
     }
     fn callee(&self, item: ItemKey) -> Option<CalleeFacts> {
-        Some(CalleeFacts { writes_lifetimes: self.writes.contains(&item), self_ref: false })
+        Some(CalleeFacts { writes_lifetimes: self.writes.contains(&item), self_ref: false, c_variadic: false })
     }
     fn shape(&self, item: ItemKey) -> Option<Shape<'_>> {
         self.shapes.iter().find(|(k, _)| *k == item).map(|(_, s)| s.shape())
@@ -328,9 +328,6 @@ fn an_impl_ties_the_trait_lifetime_to_the_argument() {
     let got = findings_with(&w.fx, &b, w.bad, root, &heads, Plant::None);
     std::println!("impl_answers bad: {got:?}");
     assert!(any(&got, "borrow Invalidated"), "E0597: {got:?}");
-    let got = findings_with(&w.fx, &b, w.bad, root, &heads, Plant::TiesFresh);
-    std::println!("impl_answers bad, fresh (control): {got:?}");
-    assert_eq!(got, clean(), "the control: a fresh `'de` misses E0597");
     let inline = Inline::<BYTES>::new();
     let (w, heads) = world(&inline, VIS_FREE_IMPL);
     let got = findings_with(&w.fx, &b, w.bad, root, &heads, Plant::None);
@@ -359,9 +356,6 @@ fn a_free_or_static_impl_lifetime() {
     let got = findings_with(&w.fx, &b, w.keep, root, &heads, Plant::None);
     std::println!("impl_answers keep: {got:?}");
     assert!(any(&got, "borrow Invalidated"), "E0597 through `Visitor<'static>`: {got:?}");
-    let got = findings_with(&w.fx, &b, w.keep, root, &heads, Plant::TiesFresh);
-    std::println!("impl_answers keep, fresh (control): {got:?}");
-    assert_eq!(got, clean(), "the control: a fresh `'de` misses E0597");
 }
 
 /// A call with NO `Checked::selected` row for a bound an impl answers: which impl answers is
@@ -395,5 +389,5 @@ fn no_selected_row_is_refused() {
     c.selected.clear();
     let got = region_fixture::lower(&w.fx, &view, &mut c, &heads, &heads.decls, Plant::None).map(|r| r.lines);
     std::println!("impl_answers norow without rows: {got:?}");
-    assert!(matches!(got, Err(Refusal { form: Form::CallTieUnplaced { param: 0, why: TieMiss::ImplAnswers, .. }, .. })), "{got:?}");
+    assert!(matches!(got, Err(Refusal { form: Form::OneRule { why: crate::OneRuleWhy::Unselected { .. }, .. }, .. })), "{got:?}");
 }

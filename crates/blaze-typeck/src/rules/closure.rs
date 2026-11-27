@@ -559,10 +559,24 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 self.closure_kinds.push((owner, kind, upvars));
             }
             self.capture_uses.truncate(first_use);
-            if let Some(f) = self.futures.iter_mut().find(|f| f.expr == owner) {
-                // An AsyncFnOnce-only closure consumes its environment. There
-                // is no borrowing call variant with a different stored type.
-                let owns_environment = params.is_none() || rows.is_empty() || kind == crate::ty::ClosureKind::FnOnce;
+            if let Some(fi) = self.futures.iter().position(|f| f.expr == owner) {
+                // An AsyncFnOnce-only closure — or one whose obligations in this body are
+                // exclusively by-value `FnOnce` / `AsyncFnOnce` (e.g. `spawn(async move |s| ..)`)
+                // — consumes its environment; there is no borrowing `CallRefFuture` variant with
+                // a different stored type.
+                let once_only = if params.is_some() {
+                    let once_traits = [self.lang(LangItem::FnOnce)?, self.lang(LangItem::AsyncFnOnce)?];
+                    let ref_traits = [
+                        self.lang(LangItem::Fn)?,
+                        self.lang(LangItem::FnMut)?,
+                        self.lang(LangItem::AsyncFn)?,
+                        self.lang(LangItem::AsyncFnMut)?,
+                    ];
+                    self.ty.closure_used_only_once(owner, once_traits, ref_traits)
+                } else {
+                    false
+                };
+                let owns_environment = params.is_none() || rows.is_empty() || kind == crate::ty::ClosureKind::FnOnce || once_only;
                 // RFC 3668 ("Async closures"), rustc `CoroutineClosureSignature::
                 // tupled_upvars_by_closure_kind`: an `Fn`/`FnMut` async closure has two call
                 // futures. `async_call_once(self)`'s (the by-move body) stores the closure's own
@@ -589,7 +603,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     // are the same under either layout. A decided owner's places are known, an
                     // undecided one's are its whole-binding rows: the flow's saved locals are
                     // all that is missing either way.
-                    f.witness = if !suspends {
+                    self.futures[fi].witness = if !suspends {
                         crate::CoroutineWitness::Complete
                     } else {
                         crate::CoroutineWitness::NeedsSavedLocals
@@ -597,7 +611,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     // The places' environment: async_fn.rs `analyze_coroutine_captures` holds it
                     // in the unpolled state in place of the whole-binding rows.
                     if decided {
-                        f.initial = upvars;
+                        self.futures[fi].initial = upvars;
                     }
                 }
             }
@@ -762,6 +776,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     exprs.push((v, USE_MOVE));
                 }
             }
+            Expr::Become { value } => exprs.push((value, USE_MOVE)),
             Expr::Call { callee, args } => {
                 // An overloaded call has a checked receiver just like a method call.
                 // FnOnce consumes it. Fn and FnMut leave a borrow adjustment.
@@ -830,7 +845,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
             }
             Expr::Repeat { elem, .. } => exprs.push((elem, 0)),
-            Expr::Struct { fields, base, .. } => {
+            Expr::Struct { fields, base, .. } | Expr::Record { fields, base } => {
                 for fi in self.body.field_init_list(fields)? {
                     exprs.push((fi.expr, USE_MOVE));
                 }
@@ -878,16 +893,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// captured by value). An unknown type (`Copy` may hold) is not a move; with no `Copy`
     /// lang item in the world no type is known `Copy`-free, so nothing moves.
     pub(super) fn moved_out(&mut self, x: ExprId) -> Result<bool, Stop> {
-        let exprs = self.adjust.column::<0>();
         let kinds = self.adjust.column::<1>();
-        if exprs.iter().zip(kinds).any(|(&e, k)| e == x && matches!(k, crate::columns::AdjustKind::Borrow { .. })) {
+        if self.adjust.rows_rev(x).any(|i| matches!(kinds[i], crate::columns::AdjustKind::Borrow { .. })) {
             return Ok(false);
         }
         // A by-value method may autoderef to a Copy receiver. The value taken
         // is that adjusted value, while the pointer used to reach it stays put.
-        let t = exprs.iter().zip(self.adjust.column::<2>()).rev()
-            .find_map(|(&e, &t)| (e == x).then_some(t))
-            .unwrap_or(self.expr_ty[x.ix()]);
+        let t = self.adjust.last_ty(x).unwrap_or(self.expr_ty[x.ix()]);
         // Without `Copy` nothing can be told copied: the finding names the lang item (the body
         // is tainted), and the use counts as a move, the Reference's case for a non-`Copy` place.
         let Some(copy) = self.need_lang(LangItem::Copy, At::Expr(x))? else { return Ok(true) };
@@ -899,7 +911,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// A wildcard does not read a local place. A call or a coercion in the
     /// discarded expression still evaluates its operands.
     pub(super) fn discarded_local(&self, e: ExprId) -> Result<bool, Stop> {
-        Ok(matches!(self.body.expr(e)?, Expr::Local(_)) && !self.adjust.column::<0>().contains(&e))
+        Ok(matches!(self.body.expr(e)?, Expr::Local(_)) && !self.adjust.has(e))
     }
 
     /// Calls on a concrete closure use its inferred kind without an overloaded
@@ -924,9 +936,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
 
     /// An autoref uses its borrow mode. A by-value receiver consumes or copies the place.
     fn receiver_usage(&self, receiver: ExprId) -> u8 {
-        self.adjust.column::<0>().iter().zip(self.adjust.column::<1>()).rev()
-            .find_map(|(&e, k)| match k {
-                crate::columns::AdjustKind::Borrow { mutbl, .. } if e == receiver => Some(u8::from(*mutbl == Mutbl::Mut)),
+        let kinds = self.adjust.column::<1>();
+        self.adjust
+            .rows_rev(receiver)
+            .find_map(|i| match kinds[i] {
+                crate::columns::AdjustKind::Borrow { mutbl, .. } => Some(u8::from(mutbl == Mutbl::Mut)),
                 _ => None,
             })
             .unwrap_or(USE_MOVE)
@@ -948,7 +962,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Or { alts: elems } | Pat::Slice { elems, .. } => {
                     stack.extend_from_slice(self.body.pat_list(elems)?);
                 }
-                Pat::Struct { fields, .. } => {
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                     for fp in self.body.field_pat_list(fields)? {
                         stack.push(fp.pat);
                     }

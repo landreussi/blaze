@@ -44,7 +44,7 @@ const CALL_FILE_SHOWN: &str = "src/lib.rs";
 /// The expansion records under the folder `store`, through a world over that folder.
 fn records_at(store: &Path) -> DirStore {
     let (io, root) = crate::record::native_world(store).unwrap_or_else(|error| panic!("the records at {}: {error}", store.display()));
-    DirStore::expansions(&io, &root)
+    DirStore::expansions(io.spawner(), io.boot().ok(), &root)
 }
 
 /// A fresh folder under the system's temporary one, by this process and a count.
@@ -805,7 +805,7 @@ fn an_attribute_without_arguments_gets_an_empty_stream() {
 /// An answer kept by another host version is never read: the version is in the base key. The
 /// control finds the same answer kept under this version.
 #[test]
-fn an_answer_of_another_host_version_is_not_read() {
+fn an_answer_of_a_previous_host_version_is_not_read() {
     let setup = setup(&[], 1);
     let root = folder("host-version");
     let pkg = package(&root, &[]);
@@ -918,6 +918,81 @@ fn a_missing_module_is_one_finding_per_crate() {
         matches!(&findings[..], [crate::hook::Finding::MissingModule { name, version, .. }] if name == "gone-macros" && version == "1.2.3"),
         "{findings:?}"
     );
+}
+
+/// Default built-in comptime patch library: `serde_derive` expands `Serialize` and `Deserialize`
+/// in-process by default even with NO compiled proc-macro module, falls back cleanly on exotic
+/// attributes, and can be disabled via `set_comptime_patch(false)`.
+#[test]
+fn comptime_patch_expands_serde_by_default_without_module_and_tracks_fallbacks() {
+    let runtime = Runtime::new(blaze_own::testing::heap()).expect("the runtime");
+    let store_dir = folder("comptime-patch-serde");
+    let records = records_at(&store_dir);
+    let key = crate::hook::crate_key("serde-derive-absent");
+    let mut procs = crate::hook::ProcMacros::new(&runtime, &records, Limits::STANDARD);
+    assert!(procs.comptime_patch_enabled(), "comptime patch must be enabled by default");
+    let missing = crate::module::ModuleError::Missing {
+        name: "serde_derive".to_owned(),
+        version: "1.0.219".to_owned(),
+        key: "serde-derive-absent".to_owned(),
+    };
+    procs.add_crate(key, "serde_derive", "1.0.219", Err(missing));
+
+    let at = blaze_expand::DefAt {
+        site: blaze_expand::DefSite { krate: key, module: None },
+        edition: EDITION,
+        export: blaze_expand::Export::Exported,
+        local_inner: blaze_expand::LocalInner::No,
+        transparency: None,
+    };
+    let ser_def = blaze_expand::MacroDefinition::proc_macro(
+        key,
+        ProcKind::Derive,
+        "Serialize",
+        &["serde"],
+        at,
+        Alloc::global(),
+    )
+    .expect("Serialize def");
+    let de_def = blaze_expand::MacroDefinition::proc_macro(
+        key,
+        ProcKind::Derive,
+        "Deserialize",
+        &["serde"],
+        at,
+        Alloc::global(),
+    )
+    .expect("Deserialize def");
+
+    assert!(procs.refusal_of(&ser_def).is_none(), "patched Serialize must not be refused");
+    assert!(procs.refusal_of(&de_def).is_none(), "patched Deserialize must not be refused");
+
+    let input = lex(
+        "#[serde(rename_all = \"camelCase\")] pub struct Config { pub max_retries: u32, pub endpoint: String }",
+        EDITION,
+        Alloc::global(),
+    )
+    .expect("input lexes");
+    let call = ProcCall { kind: ProcKind::Derive, input: &input, attr_args: None, file: Ok(CALL_FILE_SHOWN) };
+    let pkg = package(&store_dir, &[]);
+
+    let ser_out = procs.run(&ser_def, &call, EDITION, &pkg, Alloc::global()).expect("Serialize expands at comptime");
+    assert!(!ser_out.tokens.is_empty());
+    let de_out = procs.run(&de_def, &call, EDITION, &pkg, Alloc::global()).expect("Deserialize expands at comptime");
+    assert!(!de_out.tokens.is_empty());
+    assert_eq!(procs.comptime_patch_stats().hits, 2);
+    assert_eq!(procs.comptime_patch_stats().fallbacks, 0);
+
+    // Exotic `#[serde(tag = "type")]` cleanly falls back (and since module is missing, refuses).
+    let exotic = lex("#[serde(tag = \"type\")] pub enum Msg { A { x: u32 } }", EDITION, Alloc::global()).unwrap();
+    let exotic_call = ProcCall { kind: ProcKind::Derive, input: &exotic, attr_args: None, file: Ok(CALL_FILE_SHOWN) };
+    assert!(procs.run(&ser_def, &exotic_call, EDITION, &pkg, Alloc::global()).is_err());
+    assert_eq!(procs.comptime_patch_stats().fallbacks, 1);
+
+    // Disabling comptime patch restores normal MissingModule refusal.
+    procs.set_comptime_patch(false);
+    assert!(procs.refusal_of(&ser_def).is_some());
+    assert!(procs.run(&ser_def, &call, EDITION, &pkg, Alloc::global()).is_err());
 }
 
 /// A module whose output is not the bridge's (ten bytes of a path where a stream's encoding
@@ -1126,7 +1201,10 @@ fn forged_proc_macro_output_is_refused_by_the_expander() {
 fn a_fetched_package_s_macro_reads_its_own_manifest_and_nothing_above_it() {
     use blaze_wasi::{Open, ROOT_FD, System};
     const MANIFEST: &[u8] = b"[package]\nname = \"reth-rpc-api\"\n[dependencies]\njsonrpsee = \"0.26\"\n";
-    let files: Arc<[(String, &'static [u8])]> = Arc::from(vec![("Cargo.toml".to_owned(), MANIFEST), ("src/lib.rs".to_owned(), &b"//"[..])]);
+    let files: Arc<[(String, crate::sandbox::ListedBytes)]> = Arc::from(vec![
+        ("Cargo.toml".to_owned(), crate::sandbox::ListedBytes::Static(MANIFEST)),
+        ("src/lib.rs".to_owned(), crate::sandbox::ListedBytes::Static(&b"//"[..])),
+    ]);
     let env = crate::package_env::PackageEnv::set_only(vec![("CARGO_MANIFEST_DIR".to_owned(), PACKAGE.to_owned())]).unwrap_or_else(|e| panic!("{e}"));
     let package = Arc::new(Package::new(Files::Listed(files), env).unwrap_or_else(|e| panic!("{e}")));
     let mut sandbox = Sandbox::new(package);

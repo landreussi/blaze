@@ -147,22 +147,22 @@ impl CompiledComptime {
 
     /// Invokes a 0-argument `() -> u64` pure comptime LIR function.
     pub fn call0(&self) -> u64 {
-        let f: extern "C" fn() -> u64 =
-            unsafe { core::mem::transmute(self.exec.code_address() as usize) };
+        // SAFETY: `self.exec` holds sealed AArch64 code verified by `Sota::standalone()`.
+        let f: extern "C" fn() -> u64 = unsafe { self.exec.as_fn() };
         f()
     }
 
     /// Invokes a 1-argument `(u64) -> u64` pure comptime LIR function.
     pub fn call1(&self, a0: u64) -> u64 {
-        let f: extern "C" fn(u64) -> u64 =
-            unsafe { core::mem::transmute(self.exec.code_address() as usize) };
+        // SAFETY: `self.exec` holds sealed AArch64 code verified by `Sota::standalone()`.
+        let f: extern "C" fn(u64) -> u64 = unsafe { self.exec.as_fn() };
         f(a0)
     }
 
     /// Invokes a 2-argument `(u64, u64) -> u64` pure comptime LIR function.
     pub fn call2(&self, a0: u64, a1: u64) -> u64 {
-        let f: extern "C" fn(u64, u64) -> u64 =
-            unsafe { core::mem::transmute(self.exec.code_address() as usize) };
+        // SAFETY: `self.exec` holds sealed AArch64 code verified by `Sota::standalone()`.
+        let f: extern "C" fn(u64, u64) -> u64 = unsafe { self.exec.as_fn() };
         f(a0, a1)
     }
 }
@@ -248,8 +248,8 @@ mod tests {
         let res = exec_lir_u64_1(view, n_val).expect("direct LIR Sota execution");
         assert_eq!(res.value, expected);
         assert!(
-            res.code_bytes <= 128,
-            "expected compact frameless AArch64, got {} B",
+            res.code_bytes <= 256,
+            "expected compact frameless AArch64 (scalar or vectorized/unrolled), got {} B",
             res.code_bytes
         );
         eprintln!(

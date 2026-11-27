@@ -82,7 +82,7 @@ fn hex(digest: &[u8; 32]) -> std::string::String {
 
 fn producer() -> DepProducer {
     DepProducer {
-        tree: Tree::Mem { files: Arc::new(vec![("inc/b.h".to_owned(), b"int b;\n".to_vec())]), git: None },
+        tree: Tree::Mem { files: Arc::new(vec![("inc/b.h".to_owned(), b"int b;\n".to_vec())]), submodules: Arc::from([]), git: None },
         root: ScriptRoot::package(),
         out_dir: LZ4_OUT.to_owned(),
         out: Arc::new(vec![("include/lz4.h".to_owned(), HEADER.to_vec())]),
@@ -164,6 +164,7 @@ fn run_once(name: &str, resolved: bool) -> Result<std::vec::Vec<(std::string::St
         host_tools: &[],
         facts: None,
         jobs: None,
+        confined: None,
         limits: RunLimits::STANDARD,
         deadline: Duration::from_secs(60),
         files: &files,

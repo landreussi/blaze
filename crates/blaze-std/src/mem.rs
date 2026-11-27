@@ -47,11 +47,17 @@ use core::{
     ptr::NonNull,
 };
 
-pub use blaze_own::{Alloc, Erased, SharedAlloc};
+pub use blaze_own::{
+    Alloc, BBox, BString, BVec, Bump, BumpAlloc, CloneIn, DefaultIn, Erased, FromIn, FromStrIn,
+    IntoIn, LocalShare, ParseIn, Share, SharedAlloc, ToOwnedIn,
+};
+pub use blaze_own::pod::{
+    self, AnyBitPattern, CastError, CheckedBitPattern, NoUninit, Pod, TransparentWrapper, Zeroable,
+};
 pub use blaze_mem::{
     AppendVec, ArenaLocal, Block, Built, Cache, Column, Frame, FromUtf8Error, HUGE_PAGE, Handle,
-    Kept, Marker, MemError, Pool, Pooled, Region, RegionVec, Revisions, Slab, String, Tag,
-    format_in, page_size,
+    Kept, Marker, MemError, Pool, Pooled, Region, RegionVec, Revisions, SharedBump, Slab, String,
+    Tag, format_in, page_size,
 };
 pub use blaze_mem::Arena as RequestArena;
 pub mod fast;
@@ -383,12 +389,25 @@ impl Arena {
     }
 
     /// The allocator, for a collection of the caller's (`Vec::new_in(arena.alloc())`), grown
-    /// through its `try_` forms.
+    /// through its `try_` forms. Implements [`BumpAlloc`], so containers can freeze directly into
+    /// arena-lifetime slices via `.into_bump_slice()` / `.into_bump_str()`.
     #[blaze::nopanic]
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub fn alloc(&self) -> &Frame {
         &self.frame
+    }
+
+    /// Copies `text` into this arena, returning a `&mut str` reclaimed when the arena drops.
+    #[blaze::nonblocking]
+    pub fn alloc_str(&self, text: &str) -> &mut str {
+        self.frame.alloc_str(text)
+    }
+
+    /// Copies `values` into this arena, returning a `&mut [T]` reclaimed when the arena drops.
+    #[blaze::nonblocking]
+    pub fn alloc_slice_copy<T: Copy>(&self, values: &[T]) -> &mut [T] {
+        self.frame.alloc_slice_copy(values)
     }
 }
 

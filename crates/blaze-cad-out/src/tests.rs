@@ -178,7 +178,17 @@ const UNSIGNED_SHORT: u64 = 5123;
 const UNSIGNED_INT: u64 = 5125;
 const ARRAY_BUFFER: u64 = 34962;
 const ELEMENT_ARRAY_BUFFER: u64 = 34963;
-const KNOWN_EXTENSIONS: [&str; 3] = ["KHR_materials_clearcoat", "KHR_materials_emissive_strength", "KHR_mesh_quantization"];
+const KNOWN_EXTENSIONS: [&str; 9] = [
+    "KHR_materials_clearcoat",
+    "KHR_materials_emissive_strength",
+    "KHR_materials_anisotropy",
+    "KHR_materials_sheen",
+    "KHR_materials_transmission",
+    "KHR_materials_ior",
+    "KHR_materials_volume",
+    "KHR_texture_transform",
+    "KHR_mesh_quantization",
+];
 
 struct View {
     offset: u64,
@@ -505,7 +515,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed, Invalid> {
                 if g.views[acc.view].target.is_some_and(|t| t != ARRAY_BUFFER) {
                     return Err(Invalid::Field { at: format!("{here}.{name}"), why: "a vertex view not ARRAY_BUFFER" });
                 }
-                if acc.component != FLOAT {
+                if (name == "POSITION" || name == "NORMAL") && acc.component != FLOAT {
                     quantized = true;
                 }
                 match name {
@@ -529,6 +539,31 @@ fn parse(bytes: &[u8]) -> Result<Parsed, Invalid> {
                             if (length - 1.0).abs() > tolerance {
                                 return Err(Invalid::NotUnit { accessor: a, element: at(i), length });
                             }
+                        }
+                    }
+                    "TEXCOORD_0" => {
+                        if acc.comps != 2 || acc.component != FLOAT || acc.normalized {
+                            return Err(Invalid::Field { at: format!("{here}.TEXCOORD_0"), why: "not VEC2 of float" });
+                        }
+                    }
+                    "TANGENT" => {
+                        if acc.comps != 4 || acc.component != FLOAT || acc.normalized {
+                            return Err(Invalid::Field { at: format!("{here}.TANGENT"), why: "not VEC4 of float" });
+                        }
+                        for i in 0..acc.count {
+                            let t = g.vector(a, i);
+                            let length = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt();
+                            if (length - 1.0).abs() > 1e-5 {
+                                return Err(Invalid::NotUnit { accessor: a, element: at(i), length });
+                            }
+                            if t[3] != 1.0 && t[3] != -1.0 {
+                                return Err(Invalid::Field { at: format!("{here}.TANGENT"), why: "handedness w not +-1" });
+                            }
+                        }
+                    }
+                    "COLOR_0" => {
+                        if acc.comps != 4 || acc.component != 5121 || !acc.normalized {
+                            return Err(Invalid::Field { at: format!("{here}.COLOR_0"), why: "not normalized RGBA8 VEC4" });
                         }
                     }
                     _ => return Err(Invalid::Field { at: format!("{here}.{name}"), why: "an attribute this writer never writes" }),
@@ -631,6 +666,28 @@ fn parse(bytes: &[u8]) -> Result<Parsed, Invalid> {
     if quantized && !required.contains(&"KHR_mesh_quantization") {
         return Err(Invalid::Extension { name: "KHR_mesh_quantization".to_string(), why: "needed but not required" });
     }
+    // Images, samplers, and textures.
+    let images_len = g.list("images").len();
+    for (im, image) in g.list("images").iter().enumerate() {
+        let here = format!("images[{im}]");
+        let bv = reference(whole(image, "bufferView", &here)?, g.views.len(), format!("{here}.bufferView"))?;
+        if g.views[bv].target.is_some() {
+            return Err(Invalid::Field { at: format!("{here}.bufferView"), why: "image bufferView must omit target" });
+        }
+        if image.get("mimeType").and_then(|v| v.as_str()) != Some("image/png") {
+            return Err(Invalid::Field { at: format!("{here}.mimeType"), why: "not image/png" });
+        }
+    }
+    let samplers_len = g.list("samplers").len();
+    let textures_len = g.list("textures").len();
+    for (ti, tex) in g.list("textures").iter().enumerate() {
+        let here = format!("textures[{ti}]");
+        reference(whole(tex, "source", &here)?, images_len, format!("{here}.source"))?;
+        if let Some(s) = tex.get("sampler") {
+            reference(s.as_u64().unwrap_or(u64::MAX), samplers_len, format!("{here}.sampler"))?;
+        }
+    }
+
     for (m, material) in g.list("materials").iter().enumerate() {
         let here = format!("materials[{m}]");
         let bad = |why| Invalid::Field { at: here.clone(), why };
@@ -642,6 +699,21 @@ fn parse(bytes: &[u8]) -> Result<Parsed, Invalid> {
                 if !pbr.get(key).is_none_or(|x| x.as_f64().is_some_and(|x| in_unit(&[x]))) {
                     return Err(bad("a factor outside 0 to 1"));
                 }
+            }
+            for key in ["baseColorTexture", "metallicRoughnessTexture"] {
+                if let Some(info) = pbr.get(key) {
+                    let ti = whole(info, "index", &format!("{here}.{key}"))?;
+                    reference(ti, textures_len, format!("{here}.{key}.index"))?;
+                }
+            }
+        }
+        if let Some(nt) = material.get("normalTexture") {
+            let ti = whole(nt, "index", &format!("{here}.normalTexture"))?;
+            reference(ti, textures_len, format!("{here}.normalTexture.index"))?;
+            if let Some(sc) = nt.get("scale")
+                && !sc.as_f64().is_some_and(|x| x.is_finite() && x >= 0.0)
+            {
+                return Err(bad("normalTexture.scale"));
             }
         }
         if !numbers(material, "emissiveFactor", &here)?.is_none_or(|e| e.len() == 3 && in_unit(&e)) {
@@ -763,6 +835,7 @@ fn materials() -> [Material<'static>; 3] {
             emissive_strength: None,
             clearcoat: Some(Clearcoat { factor: 1.0, roughness: 0.125 }),
             double_sided: false,
+            ..
         },
         Material {
             name: "glass.canopy",
@@ -773,6 +846,7 @@ fn materials() -> [Material<'static>; 3] {
             emissive_strength: None,
             clearcoat: None,
             double_sided: true,
+            ..
         },
         Material {
             name: "light.nav",
@@ -783,6 +857,7 @@ fn materials() -> [Material<'static>; 3] {
             emissive_strength: Some(4.0),
             clearcoat: None,
             double_sided: false,
+            ..
         },
     ]
 }
@@ -880,10 +955,11 @@ impl Drawn {
                     ColliderPick::OwnMesh => Collider::Mesh,
                     ColliderPick::Hulls(_) => Collider::Hulls(&hulls[i]),
                 }),
+                ..
             })
             .collect();
         let materials = materials();
-        body(&Scene { parts: &parts, materials: &materials })
+        body(&Scene { parts: &parts, materials: &materials, .. })
     }
 }
 
@@ -1206,6 +1282,7 @@ fn golden_case(plant: GlbPlant) -> Result<(), Broken<OutBroken>> {
         mass: None,
         joint: None,
         collider: None,
+        ..
     }];
     let materials = [Material {
         name: "paint.hull",
@@ -1216,8 +1293,9 @@ fn golden_case(plant: GlbPlant) -> Result<(), Broken<OutBroken>> {
         emissive_strength: None,
         clearcoat: None,
         double_sided: false,
+        ..
     }];
-    let scene = Scene { parts: &parts, materials: &materials };
+    let scene = Scene { parts: &parts, materials: &materials, .. };
     let opts = GlbOpts { encoding: Encoding::Float, up: Up::Y, limits: Limits::SHIPPED, alloc: heap(), scratch: heap() };
     let got = glb_planted(&scene, opts, plant).map_err(harness)?;
     parse(&got).map_err(|why| Broken::Oracle(OutBroken::Invalid { why }))?;
@@ -1282,7 +1360,7 @@ fn paeth(a: u8, b: u8, c: u8) -> u8 {
 }
 
 /// A PNG decoder for what the encoder writes: every chunk's CRC checked over its type and data.
-fn decode_png(file: &[u8]) -> Result<Decoded, OutBroken> {
+fn decode_png_oracle(file: &[u8]) -> Result<Decoded, OutBroken> {
     let bad = |why| OutBroken::PngInvalid { why };
     if file.len() < 8 || file[..8] != SIGNATURE {
         return Err(bad("no signature"));
@@ -1403,7 +1481,7 @@ fn png_case(tape: &Tape, plant: PngPlant) -> Result<(), Broken<OutBroken>> {
     if file[..] != again[..] {
         return Err(Broken::Oracle(OutBroken::NotDeterministic { what: "two encodings of one image" }));
     }
-    let decoded = decode_png(&file).map_err(Broken::Oracle)?;
+    let decoded = decode_png_oracle(&file).map_err(Broken::Oracle)?;
     if !file.ends_with(&IEND) {
         return Err(Broken::Oracle(OutBroken::CrcMismatch { chunk: *b"IEND" }));
     }
@@ -2305,4 +2383,664 @@ fn svg_edge_cases_open_empty_zero_and_errors() {
         svg(&SectionGrid { nx: 4, ny: 4, origin: [0.0, 0.0], step: 0.01, values: &vals_empty }, bad_style),
         Err(SvgError::BadStyle),
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// PNG decoder & textured GLB export / read_glb round-trip.
+
+/// Build a hand-crafted PNG with an explicit filter byte per row (supports colour types 0, 2, 6)
+/// so `decode_png` is guaranteed to exercise every filter type 0..=4 and RGB8 expansion.
+fn craft_png_with_filters(width: u32, height: u32, colour_type: u8, row_filters: &[u8], pixels: &[u8]) -> StdVec<u8> {
+    let bpp: usize = match colour_type {
+        0 => 1,
+        2 => 3,
+        6 => 4,
+        _ => panic!("unsupported test colour_type"),
+    };
+    let stride = blaze_int::idx(width) * bpp;
+    let rows = blaze_int::idx(height);
+    assert_eq!(row_filters.len(), rows);
+    assert_eq!(pixels.len(), stride * rows);
+
+    let mut raw = StdVec::with_capacity((stride + 1) * rows);
+    for y in 0..rows {
+        let f = row_filters[y];
+        raw.push(f);
+        for x in 0..stride {
+            let cur = pixels[y * stride + x];
+            let a = if x >= bpp { pixels[y * stride + x - bpp] } else { 0 };
+            let b = if y > 0 { pixels[(y - 1) * stride + x] } else { 0 };
+            let c = if y > 0 && x >= bpp { pixels[(y - 1) * stride + x - bpp] } else { 0 };
+            let pred = match f {
+                0 => 0,
+                1 => a,
+                2 => b,
+                3 => ((u16::from(a) + u16::from(b)) / 2) as u8,
+                4 => paeth(a, b, c),
+                _ => panic!("bad test filter"),
+            };
+            raw.push(cur.wrapping_sub(pred));
+        }
+    }
+    let mut zdata = blaze_own::Vec::new_in(heap());
+    blaze_deflate::zlib(&raw, Level::Default, heap(), &mut zdata).expect("zlib");
+
+    let mut out = StdVec::new();
+    out.extend_from_slice(&SIGNATURE);
+    let push_chunk = |buf: &mut StdVec<u8>, kind: &[u8; 4], data: &[u8]| {
+        buf.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+        buf.extend_from_slice(kind);
+        buf.extend_from_slice(data);
+        let mut crc = Crc32::new();
+        crc.update(kind);
+        crc.update(data);
+        buf.extend_from_slice(&crc.finish().to_be_bytes());
+    };
+    let mut ihdr = [0u8; 13];
+    ihdr[0..4].copy_from_slice(&width.to_be_bytes());
+    ihdr[4..8].copy_from_slice(&height.to_be_bytes());
+    ihdr[8] = 8;
+    ihdr[9] = colour_type;
+    push_chunk(&mut out, b"IHDR", &ihdr);
+    push_chunk(&mut out, b"IDAT", &zdata);
+    push_chunk(&mut out, b"IEND", &[]);
+    out
+}
+
+#[test]
+fn png_round_trips_rgba8_and_grey8_all_filters() {
+    // 1. Round-trip RGBA8 and Grey8 images encoded by `png()` across multiple patterns.
+    let (w, h) = (13u32, 10u32);
+    let mut rgba = StdVec::with_capacity(blaze_int::idx(w * h * 4));
+    let mut grey = StdVec::with_capacity(blaze_int::idx(w * h));
+    for y in 0..h {
+        for x in 0..w {
+            let r = ((x * 19 + y * 37) & 0xFF) as u8;
+            let g = ((x * 53 ^ y * 17) & 0xFF) as u8;
+            let b = ((x.wrapping_mul(x) + y * 11) & 0xFF) as u8;
+            let a = if (x + y) % 3 == 0 { 255 } else { ((x * 23 + y * 7) & 0xFF) as u8 };
+            rgba.extend_from_slice(&[r, g, b, a]);
+            grey.push(r.wrapping_add(g));
+        }
+    }
+
+    for (kind, pixels) in [(PngKind::Rgba8, &rgba[..]), (PngKind::Grey8, &grey[..])] {
+        for level in [Level::Store, Level::Fast, Level::Default] {
+            let encoded = png(
+                Image { width: w, height: h, kind, pixels },
+                PngOpts { level, limits: Limits::SHIPPED, alloc: heap(), scratch: heap() },
+            )
+            .expect("png encode");
+            let decoded = crate::decode_png(&encoded, Limits::SHIPPED, heap(), heap()).expect("png decode");
+            assert_eq!(decoded.width, w);
+            assert_eq!(decoded.height, h);
+            assert_eq!(decoded.kind, kind);
+            assert_eq!(&decoded.pixels[..], pixels);
+        }
+    }
+
+    // 2. Explicitly exercise every filter type 0..=4 for Grey8, RGBA8, and RGB8 (expanded to RGBA8).
+    let filters = [0u8, 1, 2, 3, 4, 4, 3, 2, 1, 0];
+    let grey_all = craft_png_with_filters(w, h, 0, &filters, &grey);
+    let dec_grey = crate::decode_png(&grey_all, Limits::SHIPPED, heap(), heap()).expect("decode grey all filters");
+    assert_eq!(dec_grey.kind, PngKind::Grey8);
+    assert_eq!(&dec_grey.pixels[..], &grey[..]);
+
+    let rgba_all = craft_png_with_filters(w, h, 6, &filters, &rgba);
+    let dec_rgba = crate::decode_png(&rgba_all, Limits::SHIPPED, heap(), heap()).expect("decode rgba all filters");
+    assert_eq!(dec_rgba.kind, PngKind::Rgba8);
+    assert_eq!(&dec_rgba.pixels[..], &rgba[..]);
+
+    let mut rgb = StdVec::with_capacity(blaze_int::idx(w * h * 3));
+    let mut rgb_as_rgba = StdVec::with_capacity(blaze_int::idx(w * h * 4));
+    for chunk in rgba.chunks_exact(4) {
+        rgb.extend_from_slice(&chunk[0..3]);
+        rgb_as_rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+    }
+    let rgb_all = craft_png_with_filters(w, h, 2, &filters, &rgb);
+    let dec_rgb = crate::decode_png(&rgb_all, Limits::SHIPPED, heap(), heap()).expect("decode rgb8 all filters");
+    assert_eq!(dec_rgb.kind, PngKind::Rgba8);
+    assert_eq!(&dec_rgb.pixels[..], &rgb_as_rgba[..]);
+
+    // 3. Reject corrupted signature, corrupted CRC, truncated payload, trailing bytes, and pixel cap.
+    let mut bad_sig = rgba_all.clone();
+    bad_sig[0] ^= 0xFF;
+    assert_eq!(crate::decode_png(&bad_sig, Limits::SHIPPED, heap(), heap()), Err(PngError::BadSignature));
+
+    let mut bad_crc = rgba_all.clone();
+    // Flip a bit in IHDR's CRC (bytes 29..33).
+    bad_crc[30] ^= 0x01;
+    assert!(matches!(
+        crate::decode_png(&bad_crc, Limits::SHIPPED, heap(), heap()),
+        Err(PngError::CrcMismatch { chunk, .. }) if chunk == *b"IHDR"
+    ));
+
+    let truncated = &rgba_all[..rgba_all.len() - 5];
+    assert!(matches!(crate::decode_png(truncated, Limits::SHIPPED, heap(), heap()), Err(PngError::Truncated { .. })));
+
+    let mut trailing = rgba_all.clone();
+    trailing.push(0x42);
+    assert_eq!(
+        crate::decode_png(&trailing, Limits::SHIPPED, heap(), heap()),
+        Err(PngError::TrailingBytes { extra: 1 }),
+    );
+
+    let mut tight = Limits::SHIPPED;
+    tight.most_pixels = 50;
+    assert_eq!(
+        crate::decode_png(&rgba_all, tight, heap(), heap()),
+        Err(PngError::TooManyPixels { pixels: 130, most: 50 }),
+    );
+}
+
+#[test]
+fn glb_textured_writes_uvs_tangents_embedded_pngs_and_round_trips_through_read_glb() {
+    // 1. Create 3 deterministic PNG textures: baseColor (RGBA8 4x4), metallicRoughness (RGBA8 2x2), normal (Grey8 2x2 -> expanded).
+    let base_pixels: StdVec<u8> = (0u8..64).map(|i| i.wrapping_mul(7).wrapping_add(13)).collect();
+    let mr_pixels: StdVec<u8> = vec![0, 128, 64, 255, 0, 200, 32, 255, 0, 96, 192, 255, 0, 160, 240, 255];
+    let norm_pixels: StdVec<u8> = vec![128, 128, 255, 255, 140, 118, 250, 255, 118, 140, 250, 255, 128, 128, 255, 255];
+
+    let base_png = png(
+        Image { width: 4, height: 4, kind: PngKind::Rgba8, pixels: &base_pixels },
+        PngOpts { level: Level::Default, limits: Limits::SHIPPED, alloc: heap(), scratch: heap() },
+    )
+    .expect("base png");
+    let mr_png = png(
+        Image { width: 2, height: 2, kind: PngKind::Rgba8, pixels: &mr_pixels },
+        PngOpts { level: Level::Default, limits: Limits::SHIPPED, alloc: heap(), scratch: heap() },
+    )
+    .expect("mr png");
+    let norm_png = png(
+        Image { width: 2, height: 2, kind: PngKind::Rgba8, pixels: &norm_pixels },
+        PngOpts { level: Level::Default, limits: Limits::SHIPPED, alloc: heap(), scratch: heap() },
+    )
+    .expect("norm png");
+
+    // 2. Multi-material mesh on a non-cubic bounding box (so quantized normal inverse-transpose scaling is exercised!).
+    let positions: [P3; 6] = [
+        [0.0, 0.0, 0.0],
+        [4.0, 0.0, 0.0],
+        [4.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [2.0, 0.5, 2.0],
+        [2.0, 0.5, -0.5],
+    ];
+    let normals: [P3; 6] = [
+        [0.0, 0.0, 1.0],
+        [0.0, 0.6, 0.8],
+        [0.6, 0.0, 0.8],
+        [0.0, -0.8, 0.6],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, -1.0],
+    ];
+    let uvs: [[f32; 2]; 6] = [
+        [0.0, 0.0],
+        [1.0, 0.0],
+        [1.0, 1.0],
+        [0.0, 1.0],
+        [0.5, 0.5],
+        [0.25, 0.75],
+    ];
+    let tangents: [[f32; 4]; 6] = [
+        [1.0, 0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0, -1.0],
+        [0.0, 1.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0, -1.0],
+        [0.6, 0.8, 0.0, 1.0],
+        [0.0, 0.6, 0.8, -1.0],
+    ];
+    let triangles: [[u32; 3]; 4] = [[0, 1, 2], [0, 2, 3], [0, 1, 4], [2, 3, 5]];
+    let tri_parts = [PartId(0); 4];
+    let tri_roles = [MaterialRole(0), MaterialRole(0), MaterialRole(1), MaterialRole(1)];
+    let main_view = MeshView::new(Columns {
+        positions: &positions,
+        normals: &normals,
+        tangents: &tangents,
+        uvs: &uvs,
+        colours: &[],
+        triangles: &triangles,
+        parts: &tri_parts,
+        roles: &tri_roles,
+        creases: &[],
+    })
+    .expect("main view");
+
+    // Child part mesh (1 triangle, role 1, UVs + tangents).
+    let child_pos: [P3; 3] = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 2.0, 0.5]];
+    let child_norm: [P3; 3] = [[0.0, 0.0, 1.0]; 3];
+    let child_uvs: [[f32; 2]; 3] = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+    let child_tan: [[f32; 4]; 3] = [[1.0, 0.0, 0.0, 1.0]; 3];
+    let child_view = MeshView::new(Columns {
+        positions: &child_pos,
+        normals: &child_norm,
+        tangents: &child_tan,
+        uvs: &child_uvs,
+        colours: &[],
+        triangles: &[[0, 1, 2]],
+        parts: &[PartId(0)],
+        roles: &[MaterialRole(1)],
+        creases: &[],
+    })
+    .expect("child view");
+
+    let root_trs = Transform::Trs(Trs {
+        translation: [1.5, -2.0, 0.75],
+        rotation: [0.0, 0.6, 0.0, 0.8],
+        scale: [2.0, 1.0, 0.5],
+    });
+    let child_mat = Transform::Matrix(Matrix {
+        linear: [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]],
+        translation: [0.25, 0.5, -0.75],
+    });
+    let root_mass = MassFacts {
+        mass: 12.5,
+        centre: [1.0, 0.5, 0.25],
+        inertia: [[2.0, 0.25, -0.5], [0.25, 3.0, 0.125], [-0.5, 0.125, 4.0]],
+    };
+    let lods = [Lod {
+        mesh: child_view,
+        error: blaze_units::Length::mm(5.0),
+        switch_distance: blaze_units::Length::m(15.0),
+    }];
+
+    let parts = [
+        Part {
+            name: "hull",
+            parent: None,
+            transform: root_trs,
+            mesh: Some(main_view),
+            lods: &lods,
+            mass: Some(root_mass),
+            joint: None,
+            collider: None,
+            ..
+        },
+        Part {
+            name: "mount",
+            parent: Some(0),
+            transform: child_mat,
+            mesh: Some(child_view),
+            lods: &[],
+            mass: None,
+            joint: None,
+            collider: None,
+            ..
+        },
+        Part {
+            name: "sensor_group",
+            parent: Some(1),
+            transform: Transform::IDENTITY,
+            mesh: None,
+            lods: &[],
+            mass: None,
+            joint: None,
+            collider: None,
+            ..
+        },
+    ];
+    let mats = [
+        Material {
+            name: "painted_steel",
+            base_colour: [0.8, 0.2, 0.1, 1.0],
+            metallic: 0.75,
+            roughness: 0.375,
+            emissive: [0.0; 3],
+            emissive_strength: None,
+            clearcoat: Some(Clearcoat { factor: 0.5, roughness: 0.125 }),
+            double_sided: false,
+            ..
+        },
+        Material {
+            name: "beacon_glass",
+            base_colour: [0.25, 0.75, 1.0, 0.5],
+            metallic: 0.0,
+            roughness: 0.125,
+            emissive: [0.5, 0.25, 0.125],
+            emissive_strength: Some(3.0),
+            clearcoat: None,
+            double_sided: true,
+            ..
+        },
+    ];
+    let mat_textures = [
+        MaterialTextures {
+            base_colour: Some(0),
+            metallic_roughness: Some(1),
+            normal: Some(2),
+            normal_scale: 0.75,
+        },
+        MaterialTextures {
+            base_colour: Some(0),
+            metallic_roughness: None,
+            normal: Some(2),
+            normal_scale: 1.0,
+        },
+    ];
+    let png_slices: [&[u8]; 3] = [&base_png[..], &mr_png[..], &norm_png[..]];
+    let scene = Scene { parts: &parts, materials: &mats, .. };
+    let tex_pack = TexturePack { png_images: &png_slices, material_textures: &mat_textures };
+
+    for encoding in [
+        Encoding::Float,
+        Encoding::Quantized { normals: NormalBits::Sixteen },
+        Encoding::Quantized { normals: NormalBits::Eight },
+    ] {
+        for up in [Up::Z, Up::Y] {
+            let opts = GlbOpts { encoding, up, limits: Limits::SHIPPED, alloc: heap(), scratch: heap() };
+            let first = glb_textured(&scene, &tex_pack, opts).expect("glb_textured");
+            let second = glb_textured(&scene, &tex_pack, opts).expect("glb_textured deterministic");
+            assert_eq!(&first[..], &second[..], "textured GLB must be byte-deterministic");
+
+            // Validate against independent glTF 2.0 parser.
+            parse(&first).expect("validating glTF parser");
+
+            // Read back through `read_glb` in the same `up` frame.
+            let loaded = read_glb(
+                &first,
+                GlbReadOpts { up, limits: Limits::SHIPPED, alloc: heap(), scratch: heap() },
+            )
+            .expect("read_glb");
+
+            // Hierarchy & transforms.
+            assert_eq!(loaded.parts.len(), 3);
+            assert_eq!(loaded.parts[0].name.as_str(), "hull");
+            assert_eq!(loaded.parts[0].parent, None);
+            assert_eq!(loaded.parts[0].transform, root_trs);
+            assert_eq!(loaded.parts[0].mass, Some(root_mass));
+            assert_eq!(loaded.parts[0].lods.len(), 1);
+            assert_eq!(loaded.parts[0].lods[0].error, blaze_units::Length::mm(5.0));
+            assert_eq!(loaded.parts[0].lods[0].switch_distance, blaze_units::Length::m(15.0));
+
+            assert_eq!(loaded.parts[1].name.as_str(), "mount");
+            assert_eq!(loaded.parts[1].parent, Some(0));
+            assert_eq!(loaded.parts[1].transform, child_mat);
+
+            assert_eq!(loaded.parts[2].name.as_str(), "sensor_group");
+            assert_eq!(loaded.parts[2].parent, Some(1));
+            assert!(loaded.parts[2].mesh.is_none());
+
+            // Verify composed world_matrix on child part matches parent * child.
+            let want_world = root_trs.to_matrix().compose(child_mat.to_matrix());
+            assert_eq!(loaded.world_matrix(1), want_world);
+
+            // Materials & texture bindings.
+            assert_eq!(loaded.materials.len(), 2);
+            assert_eq!(loaded.materials[0].as_material(), mats[0]);
+            assert_eq!(loaded.materials[0].textures, mat_textures[0]);
+            assert_eq!(loaded.materials[1].as_material(), mats[1]);
+            assert_eq!(loaded.materials[1].textures, mat_textures[1]);
+
+            // Decoded embedded PNG images.
+            assert_eq!(loaded.images.len(), 3);
+            assert_eq!((loaded.images[0].width, loaded.images[0].height), (4, 4));
+            assert_eq!(&loaded.images[0].rgba[..], &base_pixels[..]);
+            assert_eq!((loaded.images[1].width, loaded.images[1].height), (2, 2));
+            assert_eq!(&loaded.images[1].rgba[..], &mr_pixels[..]);
+            assert_eq!((loaded.images[2].width, loaded.images[2].height), (2, 2));
+            assert_eq!(&loaded.images[2].rgba[..], &norm_pixels[..]);
+
+            // Main mesh positions, normals, UVs, tangents, triangles & material roles.
+            let mesh = loaded.parts[0].mesh.as_ref().expect("hull mesh");
+            let mv = mesh.view();
+            assert_eq!(mv.vertex_count(), 6);
+            assert_eq!(mv.triangle_count(), 4);
+            let pos_tol = match encoding {
+                Encoding::Float => 0.0f64,
+                Encoding::Quantized { .. } => 2e-4,
+            };
+            let norm_tol = match encoding {
+                Encoding::Float => 1e-6f64,
+                Encoding::Quantized { normals: NormalBits::Sixteen } => 2e-3,
+                Encoding::Quantized { normals: NormalBits::Eight } => 4e-2,
+            };
+            for (v, (&got_p, &want_p)) in mv.positions().iter().zip(positions.iter()).enumerate() {
+                for a in 0..3 {
+                    let diff = (f64::from(got_p[a]) - f64::from(want_p[a])).abs();
+                    assert!(diff <= pos_tol, "pos[{v}][{a}] mismatch ({encoding:?}, {up:?}): got {} want {}", got_p[a], want_p[a]);
+                }
+            }
+            for (v, (&got_n, &want_n)) in mv.normals().iter().zip(normals.iter()).enumerate() {
+                for a in 0..3 {
+                    let diff = (f64::from(got_n[a]) - f64::from(want_n[a])).abs();
+                    assert!(diff <= norm_tol, "norm[{v}][{a}] mismatch ({encoding:?}, {up:?}): got {} want {}", got_n[a], want_n[a]);
+                }
+            }
+            let got_uvs = mv.uvs().expect("TEXCOORD_0 round-tripped");
+            assert_eq!(got_uvs, &uvs[..]);
+            let got_tangents = mv.tangents().expect("TANGENT round-tripped");
+            for (v, (&got_t, &want_t)) in got_tangents.iter().zip(tangents.iter()).enumerate() {
+                for a in 0..3 {
+                    assert!(
+                        (f64::from(got_t[a]) - f64::from(want_t[a])).abs() <= 1e-6,
+                        "tangent[{v}][{a}] mismatch: got {} want {}",
+                        got_t[a],
+                        want_t[a]
+                    );
+                }
+                assert_eq!(got_t[3], want_t[3], "tangent handedness w must match");
+            }
+            let mut got_tris: StdVec<(MaterialRole, [u32; 3])> =
+                mv.roles().iter().copied().zip(mv.triangles().iter().copied()).collect();
+            let mut want_tris: StdVec<(MaterialRole, [u32; 3])> =
+                tri_roles.iter().copied().zip(triangles.iter().copied()).collect();
+            got_tris.sort_unstable();
+            want_tris.sort_unstable();
+            assert_eq!(got_tris, want_tris);
+        }
+    }
+
+    // 3. Error refusals on invalid textures / UVs / tangents / GLB container.
+    let bad_img: [&[u8]; 1] = [b"not a png"];
+    let bad_pack = TexturePack { png_images: &bad_img, material_textures: &[] };
+    assert_eq!(
+        glb_textured(
+            &scene,
+            &bad_pack,
+            GlbOpts { encoding: Encoding::Float, up: Up::Y, limits: Limits::SHIPPED, alloc: heap(), scratch: heap() }
+        ),
+        Err(GlbError::InvalidPngImage { image: 0 }),
+    );
+    let oob_mt = [MaterialTextures { base_colour: Some(9), ..MaterialTextures::NONE }];
+    assert_eq!(
+        glb_textured(
+            &scene,
+            &TexturePack { png_images: &png_slices, material_textures: &oob_mt },
+            GlbOpts { encoding: Encoding::Float, up: Up::Y, limits: Limits::SHIPPED, alloc: heap(), scratch: heap() }
+        ),
+        Err(GlbError::UnknownTexture { material: 0, index: 9, count: 3 }),
+    );
+    let neg_scale_mt = [MaterialTextures { normal: Some(2), normal_scale: -0.5, ..MaterialTextures::NONE }];
+    assert_eq!(
+        glb_textured(
+            &scene,
+            &TexturePack { png_images: &png_slices, material_textures: &neg_scale_mt },
+            GlbOpts { encoding: Encoding::Float, up: Up::Y, limits: Limits::SHIPPED, alloc: heap(), scratch: heap() }
+        ),
+        Err(GlbError::BadMaterial { material: 0, field: MaterialField::NormalScale }),
+    );
+    let too_many_mt = [MaterialTextures::NONE; 3];
+    assert_eq!(
+        glb_textured(
+            &scene,
+            &TexturePack { png_images: &png_slices, material_textures: &too_many_mt },
+            GlbOpts { encoding: Encoding::Float, up: Up::Y, limits: Limits::SHIPPED, alloc: heap(), scratch: heap() }
+        ),
+        Err(GlbError::TooManyMaterialTextures { got: 3, materials: 2 }),
+    );
+    assert_eq!(
+        read_glb(b"short", GlbReadOpts { up: Up::Y, limits: Limits::SHIPPED, alloc: heap(), scratch: heap() }).unwrap_err(),
+        GlbReadError::TooShort { len: 5 },
+    );
+    assert_eq!(
+        read_glb(
+            b"NOPE\x02\x00\x00\x00\x14\x00\x00\x00\x00\x00\x00\x00JSON",
+            GlbReadOpts { up: Up::Y, limits: Limits::SHIPPED, alloc: heap(), scratch: heap() }
+        )
+        .unwrap_err(),
+        GlbReadError::BadMagic,
+    );
+}
+
+#[test]
+fn glb_emits_uvs_tangents_colors_textures_pbr_extensions_and_sockets() {
+    let view = MeshView::new(Columns {
+        positions: &[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        normals: &[[0.0, 0.0, 1.0]; 3],
+        tangents: &[[1.0, 0.0, 0.0, 1.0]; 3],
+        uvs: &[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+        colours: &[[240, 180, 220, 128]; 3],
+        triangles: &[[0, 1, 2]],
+        parts: &[PartId(0)],
+        roles: &[MaterialRole(0)],
+        creases: &[],
+    })
+    .unwrap();
+
+    let albedo_px = [180u8, 120, 80, 255, 190, 130, 90, 255, 170, 110, 70, 255, 185, 125, 85, 255];
+    let normal_px = [128u8, 128, 255, 255, 132, 126, 255, 255, 124, 130, 255, 255, 128, 128, 255, 255];
+    let images = [
+        TextureImage { name: "wood_albedo", data: ImageData::Rgba8 { width: 2, height: 2, pixels: &albedo_px } },
+        TextureImage { name: "wood_normal", data: ImageData::Rgba8 { width: 2, height: 2, pixels: &normal_px } },
+    ];
+    let sockets = [Socket { name: "light.port", transform: Transform::Trs(Trs { translation: [0.5, 0.2, 0.1], ..Trs::IDENTITY }) }];
+    let parts = [Part {
+        name: "hull.plate",
+        parent: None,
+        transform: Transform::IDENTITY,
+        mesh: Some(view),
+        lods: &[],
+        mass: None,
+        joint: None,
+        collider: None,
+        sockets: &sockets,
+    }];
+    let materials = [Material {
+        name: "hull.painted",
+        base_colour: [0.7, 0.72, 0.75, 1.0],
+        metallic: 0.8,
+        roughness: 0.35,
+        pbr_textures: PbrTextures {
+            base_colour: Some(TextureRef { image: ImageId(0), scale: [2.0, 2.0], .. }),
+            normal: Some(NormalTexture { image: ImageId(1), scale: 0.85, .. }),
+            ..PbrTextures::NONE
+        },
+        anisotropy: Some(Anisotropy { strength: 0.6, rotation: 0.25 }),
+        sheen: Some(Sheen { colour: [0.9, 0.9, 0.95], roughness: 0.4 }),
+        transmission: Some(Transmission { factor: 0.15, ior: 1.52, thickness: 0.02, .. }),
+        cc0_pack: Some("cc0://ambientcg/Metal042A_2K"),
+        ..
+    }];
+    let scene = Scene { parts: &parts, materials: &materials, images: &images };
+    let opts = GlbOpts { encoding: Encoding::Float, up: Up::Z, limits: Limits::SHIPPED, alloc: heap(), scratch: heap() };
+    let a = glb(&scene, opts).expect("textured glb");
+    let b = glb(&scene, opts).expect("deterministic glb");
+    assert_eq!(&*a, &*b, "textured GLB must be byte-for-byte deterministic");
+
+    let parsed = parse(&a).expect("valid glTF 2.0");
+    let root = &parsed.json;
+    let prim = &root.get("meshes").unwrap().as_list().unwrap()[0]
+        .get("primitives").unwrap().as_list().unwrap()[0];
+    let attrs = prim.get("attributes").unwrap();
+    assert!(attrs.get("TEXCOORD_0").is_some(), "TEXCOORD_0 must be emitted");
+    assert!(attrs.get("TANGENT").is_some(), "TANGENT must be emitted");
+    assert!(attrs.get("COLOR_0").is_some(), "COLOR_0 must be emitted");
+    assert_eq!(root.get("images").unwrap().as_list().unwrap().len(), 2);
+    assert_eq!(root.get("textures").unwrap().as_list().unwrap().len(), 2);
+    assert_eq!(root.get("samplers").unwrap().as_list().unwrap().len(), 1);
+    let exts = root.get("extensionsUsed").unwrap().as_list().unwrap();
+    let has_ext = |name: &str| exts.iter().any(|v| v.as_str() == Some(name));
+    assert!(has_ext("KHR_materials_anisotropy"));
+    assert!(has_ext("KHR_materials_sheen"));
+    assert!(has_ext("KHR_materials_transmission"));
+    assert!(has_ext("KHR_materials_ior"));
+    assert!(has_ext("KHR_materials_volume"));
+    assert!(has_ext("KHR_texture_transform"));
+
+    let bad_mat = [Material {
+        name: "bad",
+        base_colour: [1.0; 4],
+        metallic: 0.0,
+        roughness: 0.5,
+        pbr_textures: PbrTextures { base_colour: Some(TextureRef { image: ImageId(99), .. }), ..PbrTextures::NONE },
+        ..
+    }];
+    let bad_scene = Scene { parts: &parts, materials: &bad_mat, images: &images };
+    assert_eq!(glb(&bad_scene, opts), Err(GlbError::UnknownImage { material: 0, image: ImageId(99) }));
+}
+
+#[test]
+fn flecs_v42_prefab_emits_hierarchy_materials_sockets_and_catches_planted_bugs() {
+    let view = MeshView::new(Columns {
+        positions: &[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        normals: &[[0.0, 0.0, 1.0]; 3],
+        tangents: &[],
+        uvs: &[],
+        colours: &[],
+        triangles: &[[0, 1, 2]],
+        parts: &[PartId(0)],
+        roles: &[MaterialRole(0)],
+        creases: &[],
+    })
+    .unwrap();
+    let sockets = [Socket { name: "nav.port", transform: Transform::IDENTITY }];
+    let parts = [
+        Part {
+            name: "ship.hull",
+            parent: None,
+            transform: Transform::IDENTITY,
+            mesh: Some(view),
+            lods: &[],
+            mass: Some(MassFacts { mass: 420.0, centre: [0.0; 3], inertia: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]] }),
+            joint: None,
+            collider: Some(Collider::Mesh),
+            sockets: &sockets,
+        },
+        Part {
+            name: "ship.turret",
+            parent: Some(0),
+            transform: Transform::Trs(Trs { translation: [0.0, 0.0, 1.2], ..Trs::IDENTITY }),
+            mesh: Some(view),
+            lods: &[],
+            mass: None,
+            joint: Some(Joint { name: "yaw", kind: JointKind::Revolute, axis: [0.0, 0.0, 1.0], limits: Some([-3.14, 3.14]) }),
+            collider: None,
+            sockets: &[],
+        },
+    ];
+    let materials = [Material {
+        name: "paint.hull",
+        base_colour: [0.22, 0.28, 0.34, 1.0],
+        metallic: 0.75,
+        roughness: 0.32,
+        cc0_pack: Some("cc0://ambientcg/PaintedMetal017_2K"),
+        ..
+    }];
+    let scene = Scene { parts: &parts, materials: &materials, .. };
+    let opts = FlecsOpts {
+        module: Some("ships"),
+        prefab_name: "Frigate",
+        asset_uri: "assets/frigate.glb",
+        up: Up::Y,
+        include_schema: true,
+        alloc: heap(),
+        scratch: heap(),
+    };
+    let a = flecs_prefab(&scene, opts).expect("flecs prefab");
+    let b = flecs_prefab(&scene, opts).expect("deterministic flecs prefab");
+    assert_eq!(&*a, &*b, "Flecs prefab must be byte-for-byte deterministic");
+    let text = core::str::from_utf8(&a).expect("valid UTF-8");
+    assert!(text.contains("@tree ChildOf"), "Flecs 4.2 prefab must carry @tree ChildOf");
+    assert!(text.contains("(OnInstantiate, Copy)"), "per-instance overrides must use Flecs 4.2 Copy");
+    assert!(!text.contains("Override"), "must never emit removed pre-4.2 Override trait");
+    assert!(text.contains("prefab Frigate"));
+    assert!(text.contains("ship_hull {"));
+    assert!(text.contains("ship_turret {"));
+    assert!(text.contains("socket_nav_port {"));
+    assert!(text.contains("cc0://ambientcg/PaintedMetal017_2K"));
+    assert!(text.contains("(cad.UsesMaterial, materials_Frigate.paint_hull)"));
+
+    let no_tree = flecs_prefab_planted(&scene, opts, FlecsPlant::OmitTreeChildOf).unwrap();
+    assert!(!core::str::from_utf8(&no_tree).unwrap().contains("@tree ChildOf"));
+    let no_sock = flecs_prefab_planted(&scene, opts, FlecsPlant::SkipSockets).unwrap();
+    assert!(!core::str::from_utf8(&no_sock).unwrap().contains("socket_nav_port"));
 }

@@ -61,10 +61,15 @@ mod tool_attrs {
         assert!(TOOLS.windows(2).all(|w| w[0] < w[1]), "TOOLS sorted, no name twice");
         assert!(TOOLS.contains(&BLAZE), "blaze is a registered tool");
         assert!(KNOWN.windows(2).all(|w| w[0].name < w[1].name), "KNOWN sorted, no name twice");
-        // `args` is the one a stage checks (the body check's `args-inline`, rule 83).
+        // `args` (rule 83), `capability` (sans-IO firewall), and `cost` (complexity contracts) are checked by a stage.
         assert!(
-            KNOWN.iter().all(|k| k.state == State::Unchecked || (k.name == "args" && k.state == State::Checked(crate::tool_attrs::Stage::Syntax))),
-            "no stage checks a blaze attribute in this build yet but `args`"
+            KNOWN.iter().all(|k| {
+                k.state == State::Unchecked
+                    || (k.name == "args" && k.state == State::Checked(crate::tool_attrs::Stage::Syntax))
+                    || (k.name == "capability" && k.state == State::Checked(crate::tool_attrs::Stage::Ownership))
+                    || (k.name == "cost" && k.state == State::Checked(crate::tool_attrs::Stage::Proofs))
+            }),
+            "no stage checks a blaze attribute in this build yet but `args`, `capability`, and `cost`"
         );
     }
 
@@ -92,7 +97,7 @@ mod tool_attrs {
     }
 }
 
-/// The refinement: a key index page answers each key with its entry, in any order given.
+/// Refinement: a key index page answers each key with its entry, in any order given.
 #[test]
 fn a_key_index_answers_each_key_in_one_probe() {
     blaze_sim::check(Config::cases(300), |tape| {
@@ -158,7 +163,7 @@ fn surface(rows: &[ScopeEntry<&str>]) -> MemSurface<'static> {
     surface
 }
 
-/// The refinement: through `Items`, `lookup` finds exactly what `scope` lists.
+/// Refinement: through `Items`, `lookup` finds exactly what `scope` lists.
 #[test]
 fn lookup_finds_what_scope_lists() {
     blaze_sim::check(Config::cases(200), |tape| {

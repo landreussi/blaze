@@ -248,10 +248,15 @@ impl Scope {
         Scope { names: Vec::new_in(alloc), params: 0, elided: None }
     }
 
+    /// A copy of this scope in `alloc`.
+    pub fn clone_in(&self, alloc: Mem) -> Scope {
+        Scope { names: self.names.clone_in(alloc), params: self.params, elided: self.elided }
+    }
+
     /// This scope, with `'_` naming `elided` (the position's elision rule's answer, or why
     /// it has none): a return opaque's bounds' scope.
     pub fn with_elided(&self, elided: Result<Region, RegionRefusal>) -> Scope {
-        let mut s = self.clone();
+        let mut s = self.clone_in(self.alloc());
         s.elided = Some(elided);
         s
     }
@@ -262,7 +267,7 @@ impl Scope {
     /// `HeadRegions::params.count()`), a trait's own.
     pub fn item(v: &View<'_>, container: Option<&Scope>, base: u32, alloc: Mem) -> Result<Scope, RegionsRefusal> {
         let mut s = match container {
-            Some(c) => c.clone(),
+            Some(c) => c.clone_in(alloc),
             None => Scope::new_in(alloc),
         };
         s.params = base;
@@ -271,6 +276,22 @@ impl Scope {
                 let h = read(v.name(name), "a lifetime's name")?;
                 s.names.push((h, Region::Param(s.params)));
                 s.params = s.params.checked_add(1).ok_or(RegionError::LifetimePast { index: u32::MAX, count: u32::MAX })?;
+            }
+        }
+        Ok(s)
+    }
+
+    /// This scope extended with a GAT's own lifetime parameters of `v` (its GENERICS), each
+    /// mapped to `Region::Late { binder: u32::MAX, var: j }` so `impl_assoc` can lay GAT values
+    /// without altering the impl's own `Param` count.
+    pub fn with_gat_lifetimes(&self, v: &View<'_>, alloc: Mem) -> Result<Scope, RegionsRefusal> {
+        let mut s = self.clone_in(alloc);
+        let mut gat = 0u32;
+        for &n in read(v.rows(v.list(head::GENERICS)), "a GAT's generics")? {
+            if let lf::GenericParam::Lifetime { name, .. } = read(lf::GenericParam::decode(n), "a GAT generic parameter")? {
+                let h = read(v.name(name), "a GAT lifetime's name")?;
+                s.names.push((h, Region::Late { binder: u32::MAX, var: gat }));
+                gat = gat.checked_add(1).ok_or(RegionError::LifetimePast { index: u32::MAX, count: u32::MAX })?;
             }
         }
         Ok(s)
@@ -318,6 +339,10 @@ struct ClauseBinder {
 impl ClauseBinder {
     fn none(alloc: Mem) -> ClauseBinder {
         ClauseBinder { names: Vec::new_in(alloc), vars: 0 }
+    }
+
+    fn clone_in(&self, alloc: Mem) -> ClauseBinder {
+        ClauseBinder { names: self.names.clone_in(alloc), vars: self.vars }
     }
 
     fn of(v: &View<'_>, b: Binders, alloc: Mem) -> Result<ClauseBinder, RegionsRefusal> {
@@ -628,6 +653,40 @@ pub fn written_types(v: &View<'_>, preds: &Preds, out: &mut Vec<lf::TypeId, Mem>
             Src::Binding { term: Some(t), .. } => add(t, out),
             Src::TypeOutlives { on: On::Written(t), .. } => add(t, out),
             Src::Binding { term: None, .. } | Src::TypeOutlives { .. } | Src::RegionOutlives { .. } | Src::Derived | Src::Inherited { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+/// Written types of non-higher-ranked `Param(p): Trait<...>` clauses of `preds`, collected for
+/// pre-laying local parameter bounds before laying the item's other types (e.g. `M::Visitor`
+/// under `where M: MakeOutput<Writer<'writer>, Out>`).
+pub fn param_bound_types(v: &View<'_>, tys: PTys<'_>, preds: &Preds, out: &mut Vec<lf::TypeId, Mem>) -> Result<(), RegionsRefusal> {
+    let add = |t: lf::TypeId, out: &mut Vec<lf::TypeId, Mem>| {
+        if out.scan_for(&t).is_none() {
+            out.push(t);
+        }
+    };
+    for (&c, &src) in preds.clauses.iter().zip(preds.sources.iter()) {
+        let PClause::Trait { args, .. } = c else { continue };
+        let Src::Trait { on, bound, binders } = src else { continue };
+        if binders != Binders::NONE {
+            continue;
+        }
+        let Ok(list) = tys.list(args) else { continue };
+        if !list.first().is_some_and(|&f| matches!(tys.node(f), Ok(PNode::Param(_)))) {
+            continue;
+        }
+        if let On::Written(t) = on {
+            add(t, out);
+        }
+        let seg = last_segment(v, bound)?;
+        if seg.has_args || seg.parenthesized {
+            for &n in read(v.rows(seg.args), "a bound's arguments")? {
+                if let lf::GenericArg::Type(t) = read(lf::GenericArg::decode(n), "a generic argument")? {
+                    add(t, out);
+                }
+            }
         }
     }
     Ok(())
@@ -959,7 +1018,7 @@ fn binding(
 ) -> Result<(RegionCol<Mem>, u32), RegionsRefusal> {
     let node_ty = intern(tys, PNode::ExProj { trait_: owner, name, args: oargs, term })?;
     let view = tys.view();
-    let mut st = St { binder: parent.binder.clone(), anon: 0, next_binder: parent.next_binder };
+    let mut st = St { binder: parent.binder.clone_in(cx.alloc), anon: 0, next_binder: parent.next_binder };
     let mut out: Vec<Region, Mem> = Vec::new_in(cx.alloc);
     // The owner's lifetimes are the bound's when the owner is the bound's trait at the same
     // arguments; else (`Fn(..)`'s `Output` is `FnOnce`'s) the owner's arguments must carry none
@@ -1035,11 +1094,11 @@ pub fn fill_clauses(cx: &Cx<'_, '_>, tys: &mut PortableTys<'_>, preds: &Preds, c
                 head.outlives.push(Outlives::Region { long, short });
                 head.params.add_outlives(long, short)?;
             }
-            PClause::Trait { .. } | PClause::Projection { .. } | PClause::Const { .. } => {}
+            PClause::Trait { .. } | PClause::Projection { .. } | PClause::Const { .. } | PClause::ForFields { .. } => {}
         }
         let mut part = None;
         let laid = match (c, src) {
-            (PClause::Const { .. } | PClause::RegionOutlives { .. }, _) => None,
+            (PClause::Const { .. } | PClause::RegionOutlives { .. } | PClause::ForFields { .. }, _) => None,
             (_, Src::Inherited { nth: k }) => {
                 // The container's columns were filled by this same function (or
                 // `trait_inherited`): a trait, projection or type-outlives clause there with no
@@ -1078,6 +1137,32 @@ pub fn fill_clauses(cx: &Cx<'_, '_>, tys: &mut PortableTys<'_>, preds: &Preds, c
         parts.push(part);
     }
     Ok(())
+}
+
+/// Pre-lays non-higher-ranked `Param(p): Trait<...>` clauses from `preds` into `out`. Any clause
+/// whose bound type itself cannot yet be laid (e.g. chained projections) is skipped here and
+/// handled by the full [`fill_clauses`] pass.
+pub fn param_bound_clauses(cx: &Cx<'_, '_>, tys: &mut PortableTys<'_>, preds: &Preds, out: &mut Vec<ClauseRegions<Mem>, Mem>) {
+    if preds.sources.len() != preds.clauses.len() || preds.regions_gap.is_some() {
+        return;
+    }
+    for (i, (&c, &src)) in preds.clauses.iter().zip(preds.sources.iter()).enumerate() {
+        let PClause::Trait { trait_, args } = c else { continue };
+        let Src::Trait { on, bound, binders } = src else { continue };
+        if binders != Binders::NONE {
+            continue;
+        }
+        let Ok(list) = tys.view().list(args) else { continue };
+        if !list.first().is_some_and(|&f| matches!(tys.view().node(f), Ok(PNode::Param(_)))) {
+            continue;
+        }
+        let Ok(nth) = index(i) else { continue };
+        if let Ok((col, p)) = trait_clause(cx, tys, nth, trait_, args, on, bound, binders, &[])
+            && p.binder.vars == 0
+        {
+            out.push(ClauseRegions { nth, binders: 0, col });
+        }
+    }
 }
 
 /// A head with only clauses (a trait's, an associated type's or const's, a type alias's): `count`
@@ -1477,7 +1562,12 @@ fn named_in_bounds((v, scope, alloc): (&View<'_>, &Scope, Mem), bounds: lf::List
                 lf::TypeRef::Ptr { inner, .. } | lf::TypeRef::Slice(inner) => todo.push(Work::Ty(inner, in_fn)),
                 lf::TypeRef::Array { elem, .. } => todo.push(Work::Ty(elem, in_fn)),
                 lf::TypeRef::Pat { base, .. } => todo.push(Work::Ty(base, in_fn)),
-                lf::TypeRef::Tuple(l) => {
+                lf::TypeRef::Record(fields) => {
+                    for &n in read(v.rows(fields), "a record's fields")? {
+                        todo.push(Work::Ty(read(lf::Field::decode(n), "a record's field")?.ty, in_fn));
+                    }
+                }
+                lf::TypeRef::Tuple(l) | lf::TypeRef::Union(l) => {
                     for &id in read(v.ids(l), "a tuple's elements")? {
                         todo.push(Work::Ty(lf::TypeId(id), in_fn));
                     }

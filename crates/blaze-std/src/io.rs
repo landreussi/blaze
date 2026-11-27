@@ -292,6 +292,11 @@ pub(crate) enum Ends {
 struct World {
     driver: Backend,
     next: u64,
+    temp_nonce: Option<u64>,
+    peer_temps: [(u64, Option<u64>); 32],
+    peer_next: usize,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    native_root_dir: Option<blaze_own::Arc<crate::rt::NativeRootDir, blaze_own::SharedAlloc<'static>>>,
     /// Effects made and not yet handed to the driver.
     effects: Vec<Effect>,
     /// What the last poll moved, before it is sorted into `got`.
@@ -346,6 +351,8 @@ pub struct Io {
     limits: Limits,
     /// The tests' planted bug: [`Plant::None`] but in their controls.
     plant: Plant,
+    /// Optional peer-world temp-file slot index inside `World::peer_temps` (DST only).
+    peer_temp: Option<usize>,
 }
 
 // Written out, not derived: a derived `Clone` calls each field's `clone`, three functions
@@ -353,9 +360,12 @@ pub struct Io {
 // `Copy` fields are copied.
 impl Clone for Io {
     fn clone(&self) -> Io {
-        Io { reach: self.reach.clone(), offers: self.offers, limits: self.limits, plant: self.plant }
+        Io { reach: blaze_own::Share::share(&self.reach), offers: self.offers, limits: self.limits, plant: self.plant, peer_temp: self.peer_temp }
     }
 }
+
+impl blaze_own::Share for Io {}
+impl blaze_own::Share for Reach {}
 
 /// Where an [`Io`]'s world is.
 #[derive(Clone)]
@@ -407,6 +417,8 @@ impl Escape {
             hosted: None,
             disk: None,
             plant: Plant::None,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            native_root_dir: None,
         });
         Escape(Lock::new("bstd.io.world", world))
     }
@@ -642,6 +654,8 @@ struct Start {
     hosted: Option<Box<SimHost>>,
     disk: Option<Box<Disk>>,
     plant: Plant,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    native_root_dir: Option<blaze_own::Arc<crate::rt::NativeRootDir, blaze_own::SharedAlloc<'static>>>,
 }
 
 /// The target's driver could not be made over a root.
@@ -741,6 +755,8 @@ impl Io {
             // alloc: once per simulated world, its disk's ledger.
             disk: Some(Box::new(Disk::new())),
             plant,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            native_root_dir: None,
         }, workers)
     }
 
@@ -761,7 +777,7 @@ impl Io {
     /// panic naming that. The wire carries no host facts yet, so `offers` withholds `host`.
     pub(crate) fn hosted(offers: Offers, limits: Limits) -> Io {
         debug_assert!(!offers.host, "a hosted world has no host facts to offer");
-        Io { reach: Reach::Hosted, offers, limits, plant: Plant::None }
+        Io { reach: Reach::Hosted, offers, limits, plant: Plant::None, peer_temp: None }
     }
 
     /// Whether a hosted world's host grants the parameter `name` of kind `kind`: what a
@@ -806,6 +822,7 @@ impl Io {
             offers,
             limits,
             plant,
+            peer_temp: None,
         }
     }
 }
@@ -884,11 +901,30 @@ fn written(
 
 impl World {
     fn new(start: Start) -> World {
-        let Start { driver, seed, above, env: _, args: _, host, offers: _, limits, hosted, disk, plant: _ } = start;
+        let Start {
+            driver,
+            seed,
+            above,
+            env: _,
+            args: _,
+            host,
+            offers: _,
+            limits,
+            hosted,
+            disk,
+            plant: _,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            native_root_dir,
+        } = start;
         World {
             driver,
             above,
             next: 0,
+            temp_nonce: None,
+            peer_temps: [(0, None); 32],
+            peer_next: 0,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            native_root_dir,
             // alloc: the effects' queue, grown once to the most made between waits.
             effects: Vec::new(),
             // alloc: the poll's buffer, grown once to the most a poll moves.
@@ -940,6 +976,12 @@ impl Io {
             budget => Some(Deadline::after(self.now(), budget)),
         };
         Ok(Cx::root(deadline, scratch, self.clone()))
+    }
+
+    /// Narrow `Send + Sync + Clone` capability that only spawns root [`Cx`] values (no `Fs`,
+    /// `Env`, `Net`, `Clock`, `Out`, `Args`, `Host`, or `Rng`).
+    pub fn spawner(&self) -> crate::cx::CxSpawn {
+        crate::cx::CxSpawn::new(self.clone())
     }
 
     /// What the host offers: fixed when this `Io` was made.
@@ -1761,9 +1803,90 @@ impl Io {
     /// another (a publish's temporary file).
     pub(crate) fn fresh(&self) -> u64 {
         let mut world = self.world().lock();
+        if let Some(slot) = self.peer_temp
+            && let Some(entry) = world.peer_temps.get_mut(slot)
+        {
+            let fresh = entry.0;
+            entry.0 += 1;
+            return fresh;
+        }
         let fresh = world.next;
         world.next += 1;
         fresh
+    }
+
+    /// An inter-process-unique 64-bit nonce for temporary filenames in a native world, drawn lazily
+    /// once via `Effect::Random` so independent processes sharing a directory (such as `~/.blaze`)
+    /// never collide on sibling `.bstd-new` temporary files. Returns `None` in simulated and
+    /// hosted worlds by default so simulated temporary names stay deterministic (unless a
+    /// cross-process simulation peer was constructed via [`Io::peer_world_for_test`]).
+    pub(crate) fn fresh_nonce(&self) -> Option<u64> {
+        let Reach::Shared { world, .. } = &self.reach else {
+            return None;
+        };
+        if let Some(slot) = self.peer_temp {
+            return world.lock().peer_temps.get(slot).and_then(|entry| entry.1);
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
+        let is_native = matches!(world.lock().driver, Backend::Native(_));
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi")))]
+        let is_native = false;
+        if !is_native {
+            return None;
+        }
+        if let Some(nonce) = world.lock().temp_nonce {
+            return Some(nonce);
+        }
+        let drawn = self.draw_seed();
+        let mut locked = world.lock();
+        Some(*locked.temp_nonce.get_or_insert(drawn))
+    }
+
+    /// Opened native filesystem root directory descriptor of this world when running on a real
+    /// Unix OS driver, or `None` in simulated/hosted worlds.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn native_root_dir(&self) -> Option<blaze_own::Arc<crate::rt::NativeRootDir, blaze_own::SharedAlloc<'static>>> {
+        let Reach::Shared { world, .. } = &self.reach else {
+            return None;
+        };
+        world
+            .lock()
+            .native_root_dir
+            .as_ref()
+            .map(blaze_own::Share::share)
+    }
+
+    /// Whether this `Io` is backed by a real native OS driver (never silently falls back to
+    /// inline driver `Effect::Lock`).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn is_native_driver(&self) -> bool {
+        let Reach::Shared { world, .. } = &self.reach else {
+            return false;
+        };
+        matches!(world.lock().driver, Backend::Native(_))
+    }
+
+    /// Creates a peer [`Io`] handle sharing the same simulated disk and fault injector as `self`
+    /// while resetting its temporary-filename counter to `0` with `peer_nonce` — modeling an
+    /// independent OS process sharing the same directory for cross-process publication DSTs.
+    /// Returns `None` outside a simulated world so production native worlds can never disable
+    /// their OS-random temporary-filename nonces.
+    pub fn peer_world_for_test(&self, peer_nonce: Option<u64>) -> Option<Io> {
+        if !self.is_sim() {
+            return None;
+        }
+        let slot = {
+            let mut world = self.world().lock();
+            let idx = world.peer_next % world.peer_temps.len();
+            world.peer_next = world.peer_next.wrapping_add(1);
+            if let Some(entry) = world.peer_temps.get_mut(idx) {
+                *entry = (0, peer_nonce);
+            }
+            idx
+        };
+        let mut peer = blaze_own::Share::share(self);
+        peer.peer_temp = Some(slot);
+        Some(peer)
     }
 
     /// What the simulated disk was asked to do so far ([`DiskCounts`]): bytes written and
@@ -1877,6 +2000,31 @@ impl Io {
             }
         }
         None
+    }
+
+    /// Checks for an already-polled completion of `tag` and, only if none is waiting, runs one
+    /// poll of the driver under the same world lock — preventing a multi-thread lost-wakeup where
+    /// another task reaps `tag` between `take` and `poll`.
+    pub(crate) fn take_or_poll(&self, tag: Tag, until: Deadline) -> Result<Done, usize> {
+        let mut world = self.world().lock();
+        if let Some(at) = world.got.iter().position(|it| it.tag == tag) {
+            return Ok(world.got.remove(at).done);
+        }
+        let World { driver, polled, got, abandoned, disk, .. } = &mut *world;
+        let moved = driver.poll(polled, until);
+        for completion in polled.drain(..) {
+            if let Some(disk) = disk.as_deref_mut() {
+                disk.completed(&completion);
+            }
+            keep(got, abandoned, completion);
+        }
+        if moved == 0 {
+            driver.idle_until(until);
+        }
+        if let Some(at) = world.got.iter().position(|it| it.tag == tag) {
+            return Ok(world.got.remove(at).done);
+        }
+        Err(moved)
     }
 
     /// One poll of the driver, waiting at most until `until`: what it brought kept for each

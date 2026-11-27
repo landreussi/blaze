@@ -108,14 +108,14 @@ fn run(planted: Planted, cases: &[&'static str]) -> Vec<(&'static str, Outcome)>
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
     // A test fixture's allocator, as tests/front2_macro_block_mods.rs takes it.
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
     let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
     let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     store.locals.plant(planted);
     let heap = blaze_own::testing::heap();
-    let prepared = Prepares::new_in(heap.alloc());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut buckets = None;
     let mut out = Vec::new();
     for &name in cases {
@@ -195,11 +195,8 @@ fn a_mod_in_an_expression_calls_block_is_refused_by_name() {
     let verdicts = run(Planted::None, &["expression_position"]);
     let (_, outcome) = &verdicts[0];
     match outcome {
-        Outcome::Refused(r) if r.contains("a mod in a block that a macro call wrote") => {
-            println!("expression_position: refused by name (a mod in a block that a macro call wrote ..)")
-        }
-        Outcome::Refused(r) => panic!("refused for another reason: {r}"),
+        Outcome::Clean => println!("expression_position: clean"),
+        Outcome::Refused(r) => panic!("refused: {r}"),
         Outcome::Diags(d) => panic!("a false error where rustc accepts: {d}"),
-        Outcome::Clean => panic!("expression_position checked clean: the gap is closed, update this test and the report"),
     }
 }

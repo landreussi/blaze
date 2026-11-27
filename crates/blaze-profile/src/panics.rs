@@ -378,9 +378,8 @@ fn thread_name(out: &mut [u8; NAME_BYTES]) -> usize {
 /// many bytes, 0 for none. Async-signal-safe: for the calling thread `pthread_getname_np` copies
 /// the name it keeps (Linux: `prctl`, a system call), with no lock and no allocation.
 pub(crate) fn system_thread_name(out: &mut [u8]) -> usize {
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     {
-        // SAFETY: `out` is live and its length is passed; see above.
         // SAFETY: the calling thread is live and `out` is writable for its passed length.
         let named = unsafe {
             blaze_sys::posix::thread::pthread_getname_np(
@@ -394,7 +393,22 @@ pub(crate) fn system_thread_name(out: &mut [u8]) -> usize {
         }
         out.iter().position(|&it| it == 0).unwrap_or(out.len())
     }
-    #[cfg(not(unix))]
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(name) = blaze_sys::linux::thread_name() else {
+            return 0;
+        };
+        let mut len = 0;
+        for (dst, &src) in out.iter_mut().zip(name.iter()) {
+            if src == 0 {
+                break;
+            }
+            *dst = src;
+            len += 1;
+        }
+        len
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         _ = out;
         0
@@ -582,7 +596,7 @@ pub struct PanicRow {
 }
 
 /// The rows of `raised`, panics of this process, their frames named once for them all.
-pub(crate) fn rows(raised: &[Raised]) -> Vec<PanicRow> {
+pub(crate) fn rows(raised: &mut Vec<Raised>) -> Vec<PanicRow> {
     if raised.is_empty() {
         // alloc: none: an empty `Vec` holds nothing
         return Vec::new();
@@ -591,28 +605,24 @@ pub(crate) fn rows(raised: &[Raised]) -> Vec<PanicRow> {
     let boot = ix_prof::images::boot();
     let process = std::process::id();
     raised
-        .iter()
+        .drain(..)
         .map(|it| PanicRow {
             build_id: (it.build != 0).then_some(it.build),
             process,
             thread: it.tid as u32,
-            // clone: a panic's row, once a flush
-            thread_name: it.thread.clone(),
+            thread_name: it.thread,
             t_ns: it.t_ns,
             kind: Kind::Panic,
             job: (it.job != 0).then_some(it.job),
             span_id: (it.span != 0 && it.span != flight::UNRECORDED).then_some(it.span),
-            // clone: a panic's row, once a flush
-            message: it.message.clone(),
-            // clone: a panic's row, once a flush
-            location: it.location.clone(),
+            message: it.message,
+            location: it.location,
             stack: crate::symbols::stack(&it.pcs, &frames),
             // alloc: a panic's row, once a flush
             stack_pcs: it.pcs.iter().rev().copied().collect(),
             boot,
             caught: it.caught,
-            // clone: a panic's row, once a flush
-            open_spans: it.open.clone(),
+            open_spans: it.open,
             signal: None,
             fault_addr: None,
         })
@@ -747,7 +757,7 @@ mod tests {
         // alloc: a test
         let mut raised = Vec::new();
         since(&mut next, &mut raised);
-        let rows = rows(&raised);
+        let rows = rows(&mut raised);
         let ours: Vec<&PanicRow> =
             rows.iter().filter(|it| it.message.as_deref() == Some(text.as_str())).collect();
         let [row] = &ours[..] else { panic!("one row of the panic: {ours:?}") };

@@ -18,11 +18,13 @@
 //! those no entry covers) is the member's listing row (engine_member_rows.rs), read by key; a
 //! member none of whose files is owed is not opened.
 //!
-//! THE RUNS: the bodies of one member cut into runs of at most [`RUN`], each run a task of one
-//! bstd scope; a run opens its own `Records` over the shared bytes (`Records` opens lazily
-//! through `RefCell`s: never shared between threads, view.rs), and every body of the run is
-//! checked over one `Tables` with its own recorder (task.rs). The stretch memoizes the IDs
-//! of distinct questions over those tables. A panic fails its body alone (rule 20).
+//! THE RUNS: entered bodies are scheduled as LPT (largest-first) work-stealing items across long-
+//! lived pool workers; each worker keeps its current member's stretch frame (`BODIES_FRAME`) and
+//! `Records` alive across consecutive stolen items of the same member group (`Records` opens lazily
+//! through `RefCell`s: never shared between threads, view.rs), resetting its per-body scratch frame
+//! (`BODY_SCRATCH`, trimmed to `SCRATCH_KEEP`) between bodies. The stretch memoizes the IDs of
+//! distinct questions over those tables. A panic fails its body alone (rule 20). Results are
+//! reassembled in exact original order before merging (rule 25).
 //!
 //! WHAT A BODY READS, as the engine keys its readers: the view records names, lang, head and
 //! impl-bucket cells. A crate's `ImplBucket` cell is read as read: the Heads stage defines it
@@ -39,6 +41,7 @@
 
 use core::convert::Infallible;
 use core::num::NonZeroU32;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use blaze_drive::cells::Cell;
 use blaze_drive::key::ABSENT;
@@ -49,14 +52,14 @@ use blaze_id::ItemKey;
 use blaze_ids::{ContentId, Hasher};
 use blaze_ladder::front2::buckets::{ImplShelf, ImplShelfOpts, TableSet};
 use blaze_ladder::front2::heads::NeedsMet;
-use blaze_ladder::front2::project_records::{BodySource, Listing, index_outlined_by_chain, list_files_with};
+use blaze_ladder::front2::project_records::{BodySource, index_outlined_by_chain, index_view_by_chain};
 use blaze_ladder::front2::source::NamesSource;
 use blaze_ladder::front2::tables::cost::{Cost, Gauge};
 use blaze_ladder::front2::heads::Want;
 use blaze_ladder::front2::tables::head::{CellFailure, ConstValues, FreezeError, NotTheirs, SeededHeads, SeededHeadsOpts, cell_id as head_cell_id};
 use blaze_ladder::front2::tables::recorder::{PlacedCell, Recorder, RecorderOpts, TableRead};
 use blaze_ladder::front2::tables::seeds::{HeadSeed, RequestSeedOpts, SeedError};
-use blaze_ladder::front2::tables::task::{BodyFrame, ReadIds, ReadKeyer, Said as Line, SaidWhat, TaskError, WorkBytes, check_body_item};
+use blaze_ladder::front2::tables::task::{BodyFrame, ReadIds, ReadKeyer, Said as Line, SaidWhat, StretchStore, StretchStoreOpts, TaskError, WorkBytes, check_body_item};
 use blaze_ladder::front2::tables::view::{Tables, TablesOpts};
 use blaze_own::{SharedAlloc, Vec};
 use blaze_scope::crate_env::EnvLent;
@@ -66,6 +69,7 @@ use bstd::clock::Clock;
 use bstd::cx::Cx;
 use bstd::fs::{Dir, ReadWrite};
 use bstd::mem::Frame;
+use bstd::sync::CachePadded;
 use bstd::task::Class;
 use std::alloc::Global;
 
@@ -89,23 +93,29 @@ use crate::work;
 /// Where the rule that refuses a body on this path is.
 const RULE: &str = "engine_bodies.rs";
 
-/// The most bodies one run checks: a run opens its own records once, and its frame holds every
-/// body's lowering until the run ends (a body's frame is the records' lifetime in `check_body`,
-/// so it cannot be reset per body yet: see the report's brief), so runs are short.
-const RUN: usize = 32;
+/// Threshold in predicted bytes above which a body is always scheduled as its own single-body
+/// work item in the dynamic LPT work-stealing queue (so no two medium/heavy bodies can ever
+/// serialize on one core).
+const SINGLE_BODY_BYTES: u64 = 1024;
 
-/// The most predicted cost one run checks, in bytes of its bodies' text (D167 (a): work at item
-/// grain, a batch sized by predicted cost and capped, never grouped by origin). A run of short
-/// entries ends at [`RUN`] entries or at this; an entry whose bodies are predicted past it (one
-/// `storable_nested_arrays!()` call: 704 bodies) is cut into slices of at most this, each its own
-/// run on its own worker, joined into the entry's one result after the join ([`join_slices`]);
-/// a body predicted past it alone is a slice alone. The predictor is each body's text length,
-/// known at plan time from the items record's rows with no text read ([`text_bytes`]); a cap by
-/// body COUNT (64) left one slice of 64 bodies at 4,693 ms, 73 ms a body against a mean of 12
-/// (profile score-c1725wave42). The cap in ms is this times the measured ms a byte, which the
-/// profile's `bodies cost:` line prints each run from the slices it ran (the fit is what states
-/// it; 48 KiB is chosen from no fit yet: UNSURE until that line is read).
-const SLICE_BYTES: u64 = 48 << 10;
+/// Maximum number of consecutive tiny bodies (`< SINGLE_BODY_BYTES`) of the same member group
+/// grouped into one tiny work-stealing batch, and the predicted byte cap on such a batch.
+const TINY_BATCH_MAX: usize = 4;
+const TINY_BATCH_BYTES: u64 = 1024;
+
+/// Bodies with predicted cost at or above this threshold are ordered by exact descending cost
+/// (strict LPT) in the work-stealing queue; smaller items are quantized into 512-byte tiers so
+/// same-group, same-file items stay contiguous for worker-local stretch and cache reuse.
+const LPT_EXACT_BYTES: u64 = 4 << 10;
+
+/// The most predicted cost one macro-expansion slice checks, in bytes of its bodies' text (D167
+/// (a): work at item grain, sized by predicted cost and capped, never grouped by origin). An entry
+/// of multiple macro-written bodies predicted past this (e.g. one `storable_nested_arrays!()`
+/// call: 704 bodies) is cut into slices of at most this, each its own work-stealing item joined
+/// back into the entry's one result after the phase ([`join_slices`]); a body predicted past it
+/// alone is a slice alone. Sized to 4 KiB so dense macro expansions scale across 18–128 cores
+/// without creating a tail straggler.
+const SLICE_BYTES: u64 = 4 << 10;
 
 /// A body's least predicted cost: what checking any body costs beside its text (its stretch's
 /// questions, its row), so a slice of many tiny bodies is still cut.
@@ -119,7 +129,7 @@ const MIN_BODY_BYTES: u32 = 256;
 fn text_bytes(
     items: &ItemsRecord<'_>,
     members: &mut Option<Vec<(ItemKey, u32), blaze_own::Alloc<'static>>>,
-    outline: &blaze_file_items::Outline<'_>,
+    item_len: impl Fn(blaze_surface::ItemIndex) -> u32,
     file: u32,
     key: ItemKey,
     g: blaze_own::Alloc<'static>,
@@ -127,7 +137,7 @@ fn text_bytes(
     use blaze_scope::resolve::At;
     let len = match items.identity(key) {
         Ok(Some(id)) => match id.at {
-            Some(At::File(at)) if at == file => outline.items().get(id.outline.0 as usize).map_or(0, |entry| entry.range.len()),
+            Some(At::File(at)) if at == file => item_len(id.outline),
             Some(At::Expansion(_)) => items.item(key).ok().flatten().and_then(|row| row.text).map_or(0, |span| span.len),
             _ => 0,
         },
@@ -168,11 +178,123 @@ fn member_lens(items: &ItemsRecord<'_>, g: blaze_own::Alloc<'static>) -> Vec<(It
 /// A run's frame: its records' decoded parts and its bodies' lowerings (reserved, not touched).
 const BODIES_FRAME: usize = 1 << 30;
 
+/// Committed cap kept in a worker's reusable stretch frame between stretches after reset/trim:
+/// avoids per-stretch `mmap`/`munmap` (`mmap_lock`) churn while returning peak pages above this
+/// cap to the kernel.
+const STRETCH_KEEP: usize = 16 << 20;
+
+/// Small-phase inline execution thresholds: when a Bodies phase has at most `INLINE_RUNS_MAX`
+/// scheduled runs and at most `INLINE_BYTES_MAX` total predicted bytes (e.g. 1–4 tiny
+/// incremental body tasks), run them inline on the caller thread reusing one pair of stretch
+/// and scratch frames and skip both the `pre_open_lang` and work-stealing pool spawns.
+const INLINE_RUNS_MAX: usize = 4;
+const INLINE_BYTES_MAX: u64 = 4 << 10;
+
+/// Direct single-pass listing of a member crate's owed files' file-entry bodies from `items`,
+/// sorted by `(file, body)`: identical to filtering `list_files_with(records,
+/// Listing::FnsAndInitializers, owed_files, alloc)` to `entry.is_some()` and sorting by file,
+/// without redundant `place_of` binary searches or a second copy/sort (`owed_files` must be
+/// sorted ascending).
+fn list_owed_files<'n, 'a>(
+    records: &'n blaze_ladder::front2::source::Records<'n>,
+    items: &ItemsRecord<'_>,
+    owed_files: &[u32],
+    alloc: blaze_own::Alloc<'a>,
+) -> blaze_own::AVec<'a, blaze_ladder::front2::project_records::Listed<'n>> {
+    use blaze_ladder::front2::keys::MemberKind;
+    use blaze_ladder::front2::project::{BodyAt, BodyRef};
+    use blaze_ladder::front2::project_records::Listed;
+    use blaze_scope::resolve::At;
+    use blaze_surface::ItemKind;
+
+    let mut files: blaze_own::AVec<'a, (u32, Option<&'n str>)> = blaze_own::AVec::with_capacity_in(owed_files.len(), alloc);
+    let mut start_in = |file: u32, text: &str| -> Option<u32> {
+        let base = match files.iter().find(|(f, _)| *f == file) {
+            Some((_, base)) => *base,
+            None => {
+                let base = BodySource::own_file(records, file);
+                files.push((file, base));
+                base
+            }
+        }?;
+        let base_start = base.as_ptr().addr();
+        let base_end = base_start.checked_add(base.len())?;
+        let text_start = text.as_ptr().addr();
+        let text_end = text_start.checked_add(text.len())?;
+        if text_start >= base_start && text_end <= base_end {
+            u32::try_from(text_start - base_start).ok()
+        } else {
+            None
+        }
+    };
+
+    let mut out: blaze_own::AVec<'a, Listed<'n>> = blaze_own::AVec::new_in(alloc);
+    let mut members: blaze_own::AVec<'a, ItemKey> = blaze_own::AVec::new_in(alloc);
+    let mut prev_file: Option<u32> = None;
+    for &wanted_file in owed_files.iter() {
+        if prev_file == Some(wanted_file) {
+            continue;
+        }
+        prev_file = Some(wanted_file);
+        let Ok(indices) = items.file_item_indices(wanted_file) else { continue };
+        for idx in indices {
+            let Ok(Some(id)) = items.identity_at(idx) else { continue };
+            let Some(At::File(file)) = id.at else { continue };
+            if file != wanted_file {
+                continue;
+            }
+            let key = id.key;
+            match id.kind {
+                ItemKind::Function | ItemKind::Const | ItemKind::Static => {
+                    let value = matches!(id.kind, ItemKind::Const | ItemKind::Static);
+                    let Some(it) = NamesSource::text_of(records, key) else { continue };
+                    if !value && it.text.trim_end().ends_with(';') {
+                        continue;
+                    }
+                    let Some(start) = start_in(file, it.text) else { continue };
+                    out.push(Listed { body: BodyRef::Free(key), at: Some(BodyAt { file, start }), entry: Some((file, it.item)) });
+                }
+                ItemKind::Impl | ItemKind::Trait => {
+                    let is_trait = id.kind == ItemKind::Trait;
+                    NamesSource::each_member(records, key, &mut |m| {
+                        members.push(m.key);
+                        if m.written_by.is_some() {
+                            return;
+                        }
+                        let (kind, name) = match (m.kind, m.name) {
+                            (ItemKind::Function, Some(name)) => (MemberKind::Fn, name),
+                            (ItemKind::Const, Some(name)) => (MemberKind::Const, name),
+                            _ => return,
+                        };
+                        if is_trait && kind == MemberKind::Fn && m.text.trim_end().ends_with(';') {
+                            return;
+                        }
+                        let Some(start) = start_in(file, m.text) else { return };
+                        out.push(Listed {
+                            body: BodyRef::Member { container: key, is_trait, kind, name },
+                            at: Some(BodyAt { file, start }),
+                            entry: Some((file, m.item)),
+                        });
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    members.sort_unstable();
+    out.retain(|l| !matches!(l.body, BodyRef::Free(k) if members.binary_search(&k).is_ok()));
+    out.sort_unstable_by(|a, b| a.entry.map(|(f, _)| f).cmp(&b.entry.map(|(f, _)| f)).then_with(|| a.body.cmp(&b.body)));
+    out
+}
+
 /// The domain of the out of a body no crate of the graph holds.
 const OWNERLESS_DOMAIN: &str = "blaze-cli engine bodies ownerless 1";
 
 /// The domain of the verdict of an entry whose expansion wrote several bodies (or none).
 const ENTRY_DOMAIN: &str = "blaze-cli engine bodies expansion entry 1";
+
+/// The domain of the CAS key for a member group's persisted `BSF1` [`StretchFront`] record.
+const STRETCH_FRONT_KEY_DOMAIN: &str = "blaze-cli engine stretch front 1";
 
 // The most bodies a macro wrote that no entry covers named by label in the request's note
 // (the rest counted in it): a cap on the note, never on what is counted (rule 18). Its one
@@ -181,7 +303,7 @@ use crate::engine_member_rows::MOST_UNCOVERED_NAMED;
 
 /// The lines block of the note of bodies a macro wrote that no entry covers: no task's (its
 /// domain is no task name's), stable across requests.
-const UNCOVERED_NOTE: &[u8] = b"{bodies a macro wrote that no entry covers}";
+pub(crate) const UNCOVERED_NOTE: &[u8] = b"{bodies a macro wrote that no entry covers}";
 
 /// The label of the root's `fn main` that D104's launcher replaced (body_types/covered.rs
 /// `Root::label`): its findings are at the entry's start, said so (`WRITTEN_UNPLACED`).
@@ -206,14 +328,14 @@ const REFUSED_CAUSES_SHOWN: usize = 16;
 /// plan time does not know) has no row of it: a `#[cfg(test)]` body is the test build's alone,
 /// at its plain name when the test build is its first holder; a body a unit reaching its file
 /// cuts everywhere has no row at all. What plan time cannot decide keeps every reacher's row.
-pub(crate) fn plan_views<'h, P: ViewPlan>(outlined: &[Outlined<'_>], skipped: &[Name], reach: Option<&Reach>, alloc: SharedAlloc<'h>) -> SVec<'h, Planned> {
+pub(crate) fn plan_views<'h, P: ViewPlan>(outlined: &[Outlined<'_>], skipped: &[Name], external: &[Name], reach: Option<&Reach>, alloc: SharedAlloc<'h>) -> SVec<'h, Planned> {
     let mut planned: SVec<'h, Planned> = SVec::new_in(alloc);
     // The holders' views of the body at hand, in rank: what `P` is asked over.
     let mut views: SVec<'h, ViewKey> = SVec::new_in(alloc);
     for one in outlined.iter() {
         // Outlines are retained for the module closure and its note, but a file exclusive to a
-        // skipped target has no Bodies task and therefore cannot become ownerless.
-        if skipped.binary_search(&one.name).is_ok() {
+        // skipped target or an external checkout path package has no Bodies task.
+        if skipped.binary_search(&one.name).is_ok() || external.binary_search(&one.name).is_ok() {
             continue;
         }
         let Ok(record) = &one.made else { continue };
@@ -231,16 +353,23 @@ pub(crate) fn plan_views<'h, P: ViewPlan>(outlined: &[Outlined<'_>], skipped: &[
                     None => views.clear(),
                 }
                 let source = crate::engine_tasks::edition_source(source, one.edition);
-                // A body two units or more hold: its units are in each row's key (rule 21).
-                let source = match views.len() {
-                    0 | 1 => source,
-                    _ => crate::engine_body_plan::source_at_views(source, &views),
+                // Fold any enclosing/file/own `#[cfg]` / `#[cfg_attr]` attributes into the row's
+                // key so editing an enclosing `#[cfg]` enters the row directly without needing
+                // `Decision::Absent` to read `Section::Items` (rule 21).
+                let source = match crate::engine_plan_cfg::part_cfg(cuts.as_ref(), part) {
+                    Some(cfg) => crate::engine_body_plan::source_with_cfg(source, cfg),
+                    None => source,
                 };
+                // Each row's key covers ONLY its own unit's view (rule 21: distinguishes two units
+                // taking the base slot under different scopes) without folding sibling units, so
+                // narrowing from whole-workspace to scoped checks preserves every standing unit's
+                // body key; standing findings refresh their `VIEW` header from today's reach.
                 if !reached {
                     planned.push(Planned { name: part.name, phase: Phase::new(Stage::Bodies, 0), source, file: one.name });
                 }
-                for at in 0..views.len() {
-                    planned.push(Planned { name: at_view(part.name, P::view_of(&views, at)), phase: Phase::new(Stage::Bodies, 0), source, file: one.name });
+                for (at, &view) in views.iter().enumerate() {
+                    let row_source = crate::engine_body_plan::source_at_views(source, &[view]);
+                    planned.push(Planned { name: at_view(part.name, P::view_of(&views, at)), phase: Phase::new(Stage::Bodies, 0), source: row_source, file: one.name });
                 }
             }
         }
@@ -458,9 +587,9 @@ struct BodyFinding<'f> {
 }
 
 /// Still private to the body. Its findings borrow its scratch until the run appends them.
-struct BodyResult<'a, 's> {
+struct BodyResult<'a, 'b, 's> {
     done: Done<'a>,
-    note: Option<(Said<blaze_own::Box<TaskError, SharedAlloc<'a>>>, Option<crate::engine_seeds::FirstFailure>)>,
+    note: Option<(Said<blaze_own::Box<TaskError, SharedAlloc<'b>>>, Option<crate::engine_seeds::FirstFailure>)>,
     found: Vec<BodyFinding<'s>, &'s Frame>,
     /// The fns declared in the entry's bodies that its check reached (front2 tables/task.rs
     /// `BodyReads::locals`): in its scratch until the run appends them to [`RunOut::locals`].
@@ -477,7 +606,7 @@ struct BodyResult<'a, 's> {
     stands: Stands,
 }
 
-/// What a stretch's setup took before its first body began ([`run_stretch`]'s opening), in
+/// What a stretch's setup took before its first body began ([`run_stretch_with`]'s opening), in
 /// wall ns, by part, summed over the stretches: the profile's `bodies: stretch setup` line.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 struct StretchSetup {
@@ -519,10 +648,12 @@ fn ns_between(from: bstd::clock::Instant, to: bstd::clock::Instant) -> u64 {
     to.since(from).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
 }
 
-/// One clean body's typed record in the phase's arena, put by [`BodiesStage::run_phase`] under
-/// `engine_body_record::typed_key(bytes)`, its key named by `check`'s run facts.
+/// One clean body's typed record in the phase's arena, hashed on its Bodies worker
+/// (`engine_body_record::typed_key(bytes)`) and put by [`BodiesStage::run_phase`], its key named
+/// by `check`'s run facts.
 struct TypedPut<'a> {
     check: Name,
+    key: Key,
     bytes: SVec<'a, u8>,
 }
 
@@ -559,95 +690,131 @@ pub(crate) struct RunOut<'a> {
     untyped_clean: u32,
     /// The run's stretches' setup ([`StretchSetup`]).
     setup: StretchSetup,
-    /// The call census's totals over the run's stretches (feature `call-census`; [`Census`]:
-    /// nothing without).
-    census: Census,
     /// Each checkout file a body of the run read as data through its `Given` cell ([`data_read`],
     /// `DataCell::Followed`), its path and the answer the body saw: the leaf rows the request
     /// saves so the sweep follows them ([`BodiesStage::data_files`]).
     data_files: SVec<'a, (blaze_own::String<SharedAlloc<'a>>, ContentId)>,
+    /// Pre-encoded run-facts payloads (`engine_body_facts::write`) built on Bodies workers for
+    /// whole (unsliced) entries so coordinator merge skips per-body cover sorting and encoding.
+    facts_bytes: SVec<'a, u8>,
+    /// `(row_index, from, to)` slices in `facts_bytes`, in ascending `row_index` order.
+    facts_index: SVec<'a, (usize, u32, u32)>,
+    /// First `engine_body_facts::write` error observed on a worker, surfaced at merge.
+    facts_error: Option<(Name, crate::engine_body_facts::BodyFactsError)>,
 }
 
 impl<'a> RunOut<'a> {
     fn new(alloc: SharedAlloc<'a>) -> RunOut<'a> {
-        RunOut { found: SVec::new_in(alloc), messages: SVec::new_in(alloc), notes: SVec::new_in(alloc), locals: SVec::new_in(alloc), clean: 0, items: 0, item_tasks: 0, outs: SVec::new_in(alloc), scratch_most: 0, frames: FramesHeld::default(), typed: SVec::new_in(alloc), untyped_clean: 0, setup: StretchSetup::default(), census: Census::NONE, data_files: SVec::new_in(alloc) }
-    }
-}
-
-/// The call census's totals (feature `call-census`) behind a handle on the request's heap: a
-/// pointer in [`RunOut`] and [`BodiesStage`], never the 62 KiB `CallCensusTotals` (its fixed
-/// `fewer` table) by value. By value it made each of `RunOut`, `BodyRun` and `BodiesStage` 62 KiB
-/// and every `Result`/`Option` of them on the stretch path as large (`-Zprint-type-sizes`, wave-1119
-/// t59): `bodies_phase` began 400 KiB above `run_bodies` (t59's stack marks; piece C, rule 54).
-/// Without the feature nothing is allocated: no stretch makes a census cell.
-// The box is in the process heap's SHARED allocator: `RunOut` crosses to a worker (`Scope::
-// may_overlap` needs `Send`), and `Alloc` is not `Send` while `SharedAlloc` is.
-pub(crate) struct Census(Option<blaze_own::Box<blaze_ladder::front2::call_census::CallCensusTotals, blaze_own::SharedAlloc<'static>>>);
-
-impl Census {
-    pub(crate) const NONE: Census = Census(None);
-
-    /// `other`'s totals added into these, `other` left empty: the first moves its box, no copy.
-    fn absorb(&mut self, other: &mut Census) {
-        let Some(more) = other.0.take() else { return };
-        match self.0.as_mut() {
-            Some(totals) => totals.add(&more),
-            None => self.0 = Some(more),
-        }
-    }
-
-    /// A stretch's cell's totals added, boxed in `g` at the first. In a call of its own: the
-    /// totals' copy (`CensusCell::totals` returns them by value) sits in this frame alone, and
-    /// only under the feature.
-    #[inline(never)]
-    fn add_cell(&mut self, cell: &blaze_ladder::front2::call_census::CensusCell, g: blaze_own::SharedAlloc<'static>) {
-        let totals = cell.totals();
-        match self.0.as_mut() {
-            Some(into) => into.add(&totals),
-            None => self.0 = Some(blaze_own::Box::new_in(totals, g)),
-        }
-    }
-
-    /// The census's report, when any body was asked about.
-    fn write(&self, into: &mut dyn core::fmt::Write) {
-        if let Some(totals) = self.0.as_deref().filter(|totals| totals.bodies > 0) {
-            let _ = totals.write(into);
+        RunOut {
+            found: SVec::new_in(alloc),
+            messages: SVec::new_in(alloc),
+            notes: SVec::new_in(alloc),
+            locals: SVec::new_in(alloc),
+            clean: 0,
+            items: 0,
+            item_tasks: 0,
+            outs: SVec::new_in(alloc),
+            scratch_most: 0,
+            frames: FramesHeld::default(),
+            typed: SVec::new_in(alloc),
+            untyped_clean: 0,
+            setup: StretchSetup::default(),
+            data_files: SVec::new_in(alloc),
+            facts_bytes: SVec::new_in(alloc),
+            facts_index: SVec::new_in(alloc),
+            facts_error: None,
         }
     }
 }
 
-// The stretch path's types, bounded where they are declared (rule 76): each was 62 KiB with the
-// census by value (wave-1119 t59 `-Zprint-type-sizes`); a regression fails the build here, at
-// its cause, and the error names the true size.
-// Two words: the box's pointer and its allocator's handle.
-const _: () = assert!(core::mem::size_of::<Census>() <= 16);
+// The stretch path's types, bounded where they are declared (rule 76).
 const _: () = assert!(core::mem::size_of::<RunOut<'static>>() <= 4 << 10);
 
-/// A body's scratch frame, reset when the body ends (rule 11): reserved once a run, nothing
+/// A body's scratch frame, reset when the body ends (rule 11): reserved once per worker, nothing
 /// committed until used. It holds every list of a body that is only a step toward its row
-/// (lane BD3): the recorder's list and `seen` set, the cells before and after widening, the
-/// verdict's words and bytes, its findings and their messages. A cap, not a size: the
-/// recorder's own cap (front2 tables/recorder.rs `MOST_READS`, 2^20 reads) fills about 150 MB of
-/// it with its cells, so 1 GiB leaves a body several times that; a body past it panics in its
-/// own job (rule 20: the alloc-error hook) and is said as such.
+/// (lane BD3): the per-body checker arenas (`Store`, `InferCtx`, `Solver`, `Buckets`), the
+/// recorder's list and `seen` set, the cells before and after widening, the verdict's words and
+/// bytes, its findings and their messages. A cap, not a size: the recorder's own cap (front2
+/// tables/recorder.rs `MOST_READS`, 2^20 reads) fills about 150 MB of it with its cells, so 1 GiB
+/// leaves a body several times that and fits per-body checker arenas comfortably; trimmed to
+/// [`SCRATCH_KEEP`] between bodies; a body past it panics in its own job (rule 20: the
+/// alloc-error hook) and is said as such.
 const BODY_SCRATCH: usize = 1 << 30;
 
 /// What a run's scratch keeps committed between two bodies: a reset keeps every block a body
 /// grew it to (blaze-mem `Frame::reset`), so a run's scratch held its largest body's high-water
 /// until the run's last body ended, once a worker. Past this the blocks ahead of the cursor go
 /// back to the kernel as the next body begins (`Frame::trim`): a worker holds at most this
-/// between bodies, and a large body pays its own page faults. 32 MiB holds the scratch of every
-/// body of the ladder's projects whose profile line names one (the recorder's cells for about
-/// 200,000 reads).
-const SCRATCH_KEEP: usize = 32 << 20;
+/// between bodies, and a large body pays its own page faults. 8 MiB holds the scratch of typical
+/// bodies without pinning 576 MiB across 18 workers.
+const SCRATCH_KEEP: usize = 8 << 20;
+
+/// Virtual address-space reservation for a stretch's reusable heads store (`StretchStore`).
+/// Reserved once per stretch and committed only as frozen heads are imported; rolled over past
+/// [`HEADS_STRETCH_CAP`] and trimmed back to [`HEADS_STRETCH_KEEP`].
+const HEADS_STRETCH_FRAME: usize = 512 << 20;
+const HEADS_STRETCH_CAP: usize = 64 << 20;
+const HEADS_STRETCH_KEEP: usize = 8 << 20;
+
+/// Virtual address-space reservation for a Bodies worker's reusable dependency-head freeze
+/// scratch frame ([`LazyBodySeed`]'s `SeededHeads`), reset and trimmed back to
+/// [`WorkerFrameCaps::freeze_scratch_keep`] after every freeze call so cold dependency head freezes
+/// never churn the `Global` heap.
+const FREEZE_SCRATCH: usize = 256 << 20;
+const FREEZE_SCRATCH_KEEP: usize = 4 << 20;
+
+/// Baseline worker count where per-worker frame retention caps remain at full Mac working-set
+/// sizes (`18` cores = M3/M4 Max); past this count, per-worker caps scale inversely so 64–128 core
+/// machines stay within a fixed aggregate frame budget instead of pinning gigabytes of idle frames.
+const FRAME_CAP_BASE_WORKERS: usize = 18;
+const SCRATCH_KEEP_MIN: usize = 1 << 20;
+const STRETCH_KEEP_MIN: usize = 2 << 20;
+const HEADS_STRETCH_CAP_MIN: usize = 8 << 20;
+const HEADS_STRETCH_KEEP_MIN: usize = 1 << 20;
+const FREEZE_SCRATCH_KEEP_MIN: usize = 512 << 10;
+
+/// Scales a per-worker byte cap inversely with `workers`, preserving `base` up to
+/// [`FRAME_CAP_BASE_WORKERS`] cores and clamping at `min_cap` on very large core counts.
+const fn scaled_worker_cap(base: usize, min_cap: usize, workers: usize) -> usize {
+    let w = if workers == 0 { 1 } else { workers };
+    if w <= FRAME_CAP_BASE_WORKERS {
+        return base;
+    }
+    let scaled = base.saturating_mul(FRAME_CAP_BASE_WORKERS) / w;
+    if scaled < min_cap { min_cap } else { scaled }
+}
+
+/// Worker-count-scaled frame retention caps for Bodies stretches and scratch frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WorkerFrameCaps {
+    scratch_keep: usize,
+    stretch_keep: usize,
+    heads_stretch_cap: usize,
+    heads_stretch_keep: usize,
+    freeze_scratch_keep: usize,
+}
+
+impl WorkerFrameCaps {
+    const fn for_workers(workers: usize) -> Self {
+        Self {
+            scratch_keep: scaled_worker_cap(SCRATCH_KEEP, SCRATCH_KEEP_MIN, workers),
+            stretch_keep: scaled_worker_cap(STRETCH_KEEP, STRETCH_KEEP_MIN, workers),
+            heads_stretch_cap: scaled_worker_cap(HEADS_STRETCH_CAP, HEADS_STRETCH_CAP_MIN, workers),
+            heads_stretch_keep: scaled_worker_cap(HEADS_STRETCH_KEEP, HEADS_STRETCH_KEEP_MIN, workers),
+            freeze_scratch_keep: scaled_worker_cap(FREEZE_SCRATCH_KEEP, FREEZE_SCRATCH_KEEP_MIN, workers),
+        }
+    }
+}
 
 /// What the runs' frames held committed (rule 16): the scratch's most at a body's end, the
-/// stretch frame's most at a stretch's end, and how many times a scratch was trimmed back to
-/// [`SCRATCH_KEEP`]. The floor a worker: one body's scratch and one stretch's records, together.
+/// stretch frame's most at a stretch's end, the stretch heads frame's most, and how many times a
+/// scratch was trimmed back to [`SCRATCH_KEEP`]. The floor a worker: one body's scratch and one
+/// stretch's records, together.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct FramesHeld {
     scratch_committed_most: u64,
     stretch_committed_most: u64,
+    heads_committed_most: u64,
     scratch_trims: u64,
 }
 
@@ -655,6 +822,7 @@ impl FramesHeld {
     fn fold(&mut self, other: FramesHeld) {
         self.scratch_committed_most = self.scratch_committed_most.max(other.scratch_committed_most);
         self.stretch_committed_most = self.stretch_committed_most.max(other.stretch_committed_most);
+        self.heads_committed_most = self.heads_committed_most.max(other.heads_committed_most);
         self.scratch_trims = self.scratch_trims.saturating_add(other.scratch_trims);
     }
 }
@@ -710,7 +878,7 @@ const MEM_PARTS: usize = 23;
 
 /// The first representative of each retained recorder cell, before row placement.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct KeptKinds([u32; 18]);
+struct KeptKinds([u32; 24]);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TopKept {
@@ -719,9 +887,9 @@ pub(crate) struct TopKept {
 }
 
 impl KeptKinds {
-    const NAMES: [&'static str; 18] = [
+    const NAMES: [&'static str; 24] = [
         "Binding", "Module", "Root", "Variants", "Item", "Members", "Expansion", "MemberOf",
-        "VariantOf", "Beginning", "Lang", "Incoherent", "Textual", "Whole", "Signature", "Text", "Head", "Impls",
+        "VariantOf", "Beginning", "Lang", "Incoherent", "InternalSymbols", "Links", "ImplRows", "Files", "Extensions", "CfgAtoms", "Textual", "Whole", "Signature", "Text", "Head", "Impls",
     ];
 
     fn add(&mut self, key: TableRead) {
@@ -731,12 +899,13 @@ impl KeptKinds {
                 Binding { .. } => 0, Module { .. } => 1, Root { .. } => 2, Variants { .. } => 3,
                 Item { .. } => 4, Members { .. } => 5, Expansion { .. } => 6, MemberOf { .. } => 7,
                 VariantOf { .. } => 8, Beginning { .. } => 9, Lang { .. } => 10, Incoherent { .. } => 11,
-                Textual { .. } => 12, Whole { .. } => 13,
+                InternalSymbols { .. } => 12, Links { .. } => 13, ImplRows { .. } => 14, Files { .. } => 15,
+                Extensions { .. } => 16, CfgAtoms { .. } => 17, Textual { .. } => 18, Whole { .. } => 19,
             },
-            TableRead::Signature { .. } => 14,
-            TableRead::Text { .. } => 15,
-            TableRead::Head { .. } => 16,
-            TableRead::Impls { .. } => 17,
+            TableRead::Signature { .. } => 20,
+            TableRead::Text { .. } => 21,
+            TableRead::Head { .. } => 22,
+            TableRead::Impls { .. } => 23,
         };
         self.0[at] += 1;
     }
@@ -850,8 +1019,112 @@ impl BodyMem {
     }
 }
 
+/// How many largest bodies by recorded reads are tracked for the profile's `bodies memory:` line.
+const LARGEST_BODIES: usize = 3;
+
+/// Total deterministic ordering for ranking a body among the [`LARGEST_BODIES`] largest (rule 25):
+/// higher `recorded` first, ties broken by stable `Name`; for equal `(recorded, name)` (e.g.
+/// multiple slices of one macro entry or a second phase entering the same task), higher
+/// `(scratch, distinct, body_offers, row)` wins so worker merges are associative and commutative
+/// regardless of scheduling order.
+fn largest_better(mem: &BodyMem, name: Name, old_mem: &BodyMem, old_name: Name) -> bool {
+    match (core::cmp::Reverse(mem.recorded), name).cmp(&(core::cmp::Reverse(old_mem.recorded), old_name)) {
+        core::cmp::Ordering::Less => true,
+        core::cmp::Ordering::Greater => false,
+        core::cmp::Ordering::Equal => {
+            (mem.scratch, mem.distinct, mem.body_offers, mem.row)
+                > (old_mem.scratch, old_mem.distinct, old_mem.body_offers, old_mem.row)
+        }
+    }
+}
+
+/// One worker-local candidate among the [`LARGEST_BODIES`] largest bodies by recorded reads.
+/// Borrows `path` and `item` from the phase's outlines and entries so recording a body allocates
+/// nothing and takes no lock.
+#[derive(Clone, Copy)]
+struct LocalLargest<'p, 'i> {
+    name: Option<Name>,
+    path: &'p [u8],
+    item: &'i str,
+    mem: BodyMem,
+}
+
+impl Default for LocalLargest<'_, '_> {
+    fn default() -> Self {
+        Self { name: None, path: &[], item: "", mem: BodyMem::default() }
+    }
+}
+
+/// Per-worker accumulator for [`BodyMemLive`]: tracks count, sums, maxima, and the top
+/// [`LARGEST_BODIES`] largest bodies purely on the worker's stack with zero locking and zero
+/// shared atomic RMWs during the body loop, merged once into [`BodyMemLive`] when the worker exits.
+struct LocalBodyMem<'p, 'i> {
+    bodies: u64,
+    sums: [u64; MEM_PARTS],
+    most: [u64; MEM_PARTS],
+    largest: [LocalLargest<'p, 'i>; LARGEST_BODIES],
+}
+
+impl Default for LocalBodyMem<'_, '_> {
+    fn default() -> Self {
+        Self {
+            bodies: 0,
+            sums: [0; MEM_PARTS],
+            most: [0; MEM_PARTS],
+            largest: core::array::from_fn(|_| LocalLargest::default()),
+        }
+    }
+}
+
+impl<'p, 'i> LocalBodyMem<'p, 'i> {
+    /// Records one completed body into this worker's local totals and top-K table (zero locks).
+    fn record(&mut self, mem: &BodyMem, name: Name, path: &'p [u8], item: &'i str) {
+        self.bodies = self.bodies.saturating_add(1);
+        let parts = mem.parts();
+        for ((&part, sum), most) in parts.iter().zip(self.sums.iter_mut()).zip(self.most.iter_mut()) {
+            *sum = sum.saturating_add(part);
+            *most = (*most).max(part);
+        }
+        let end = self.largest.iter().position(|slot| slot.name == Some(name)).unwrap_or(LARGEST_BODIES - 1);
+        let Some(prefix) = self.largest.get_mut(..=end) else { return };
+        if let Some(at) = prefix.iter().position(|slot| {
+            slot.name.is_none_or(|old| largest_better(mem, name, &slot.mem, old))
+        }) && let Some(window) = prefix.get_mut(at..)
+        {
+            window.rotate_right(1);
+            if let Some(slot) = window.first_mut() {
+                slot.name = Some(name);
+                slot.path = path;
+                slot.item = item;
+                slot.mem = *mem;
+            }
+        }
+    }
+}
+
+/// RAII guard that flushes a worker's [`LocalBodyMem`] into [`BodyMemLive`] exactly once on exit
+/// (normal completion or early stop).
+struct MergeBodyMem<'p, 'i, 'b> {
+    board: &'b BodyMemLive,
+    local: LocalBodyMem<'p, 'i>,
+}
+
+impl<'p, 'i, 'b> MergeBodyMem<'p, 'i, 'b> {
+    fn new(board: &'b BodyMemLive) -> Self {
+        Self { board, local: LocalBodyMem::default() }
+    }
+}
+
+impl Drop for MergeBodyMem<'_, '_, '_> {
+    fn drop(&mut self) {
+        self.board.merge(&self.local);
+    }
+}
+
 /// One of the three largest bodies by recorded reads. The coordinator reserves the label
 /// buffers before any worker runs. Publishing a body and reporting a refusal allocate nothing.
+/// 128-byte aligned so `BodyMemLive::largest` sits on its own cache line (rule 86).
+#[repr(align(128))]
 struct LargestBody {
     name: Option<Name>,
     path: SVec<'static, u8>,
@@ -859,34 +1132,28 @@ struct LargestBody {
     mem: BodyMem,
 }
 
-/// Every body's [`BodyMem`] summed and at its most, written by the workers as each body ends
-/// (relaxed adds; the counts are a gauge, read whole only after the join or by the status
-/// line, where a body half-counted is one body's difference). Held on the status board
-/// (engine_status.rs `Board::bodies_mem`), so the status, the stop's profile and the end's
-/// profile each say it ([`BodyMemLive::line`]).
+/// Every body's [`BodyMem`] summed and at its most, merged once per worker exit from each
+/// worker's lock-free [`LocalBodyMem`]. Held on the status board (engine_status.rs
+/// `Board::bodies_mem`), so the status, the stop's profile and the end's profile each say it
+/// ([`BodyMemLive::line`]).
 pub(crate) struct BodyMemLive {
-    bodies: core::sync::atomic::AtomicU64,
+    bodies: CachePadded<core::sync::atomic::AtomicU64>,
     sums: [core::sync::atomic::AtomicU64; MEM_PARTS],
     most: [core::sync::atomic::AtomicU64; MEM_PARTS],
-    largest: blaze_core::lock::Lock<Option<[LargestBody; 3]>>,
+    largest: blaze_core::lock::Lock<Option<[LargestBody; LARGEST_BODIES]>>,
 }
 
 impl BodyMemLive {
     pub(crate) const fn new() -> BodyMemLive {
         BodyMemLive {
-            bodies: core::sync::atomic::AtomicU64::new(0),
+            bodies: CachePadded::new(core::sync::atomic::AtomicU64::new(0)),
             sums: [const { core::sync::atomic::AtomicU64::new(0) }; MEM_PARTS],
             most: [const { core::sync::atomic::AtomicU64::new(0) }; MEM_PARTS],
             largest: blaze_core::lock::Lock::new("engine.bodies.largest", None),
         }
     }
 
-    fn prepare(&self, ones: &[One<'_>], outlined: &[Outlined<'_>], alloc: SharedAlloc<'static>) -> Result<(), EngineCheckError> {
-        if ones.is_empty() {
-            return Ok(());
-        }
-        let path = ones.iter().map(|one| one.path(outlined).len()).max().unwrap_or(0);
-        let item = ones.iter().map(|one| one.label.len()).max().unwrap_or(0);
+    fn prepare_with_caps(&self, path: usize, item: usize, alloc: SharedAlloc<'static>) -> Result<(), EngineCheckError> {
         let mut largest = self.largest.lock();
         let slots = largest.get_or_insert_with(|| core::array::from_fn(|_| LargestBody {
             name: None,
@@ -903,31 +1170,59 @@ impl BodyMemLive {
         Ok(())
     }
 
-    /// One body ended with `mem`.
-    fn add(&self, mem: &BodyMem, name: Name, path: &[u8], item: &str) {
-        use core::sync::atomic::Ordering::Relaxed;
-        self.bodies.fetch_add(1, Relaxed);
-        for (at, part) in mem.parts().iter().enumerate() {
-            self.sums[at].fetch_add(*part, Relaxed);
-            self.most[at].fetch_max(*part, Relaxed);
+    fn prepare(&self, ones: &[One<'_>], outlined: &[Outlined<'_>], alloc: SharedAlloc<'static>) -> Result<(), EngineCheckError> {
+        if ones.is_empty() {
+            return Ok(());
         }
+        let path = ones.iter().map(|one| one.path(outlined).len()).max().unwrap_or(0);
+        let item = ones.iter().map(|one| one.label.len()).max().unwrap_or(0);
+        self.prepare_with_caps(path, item, alloc)
+    }
+
+    fn insert_largest(slots: &mut [LargestBody; LARGEST_BODIES], mem: &BodyMem, name: Name, path: &[u8], item: &str) {
         // Equal counts are ordered by stable task name, independent of worker scheduling.
-        // A second phase entering the same task can improve its rank but never lists it twice.
+        // A second phase or macro slice entering the same task can improve its rank but never lists it twice.
+        let end = slots.iter().position(|slot| slot.name == Some(name)).unwrap_or(LARGEST_BODIES - 1);
+        let Some(prefix) = slots.get_mut(..=end) else { return };
+        if let Some(at) = prefix.iter().position(|slot| {
+            slot.name.is_none_or(|old| largest_better(mem, name, &slot.mem, old))
+        }) && let Some(window) = prefix.get_mut(at..)
+        {
+            window.rotate_right(1);
+            if let Some(slot) = window.first_mut() {
+                slot.name = Some(name);
+                slot.mem = *mem;
+                slot.path.clear();
+                slot.path.extend_from_slice(path);
+                slot.item.clear();
+                slot.item.push_str(item);
+            }
+        }
+    }
+
+    /// Merges one worker's accumulated [`LocalBodyMem`] into the shared totals and top-K slots
+    /// once on worker exit (zero locking during the body loop).
+    fn merge(&self, local: &LocalBodyMem<'_, '_>) {
+        if local.bodies == 0 {
+            return;
+        }
+        use core::sync::atomic::Ordering::Relaxed;
+        self.bodies.fetch_add(local.bodies, Relaxed);
+        for ((&sum, &most), (dst_sum, dst_most)) in local.sums.iter().zip(local.most.iter()).zip(self.sums.iter().zip(self.most.iter())) {
+            if sum != 0 {
+                dst_sum.fetch_add(sum, Relaxed);
+            }
+            if most != 0 {
+                dst_most.fetch_max(most, Relaxed);
+            }
+        }
         let mut largest = self.largest.lock();
-        let slots = largest.as_mut().expect("the Bodies phase prepares its status slots before running bodies");
-        let end = slots.iter().position(|slot| slot.name == Some(name)).unwrap_or(slots.len() - 1);
-        let rank = (core::cmp::Reverse(mem.recorded), name);
-        if let Some(at) = slots[..=end].iter().position(|slot| {
-            slot.name.is_none_or(|old| rank < (core::cmp::Reverse(slot.mem.recorded), old))
-        }) {
-            slots[at..=end].rotate_right(1);
-            let slot = &mut slots[at];
-            slot.name = Some(name);
-            slot.mem = *mem;
-            slot.path.clear();
-            slot.path.extend_from_slice(path);
-            slot.item.clear();
-            slot.item.push_str(item);
+        let Some(slots) = largest.as_mut() else {
+            return;
+        };
+        for candidate in local.largest.iter() {
+            let Some(name) = candidate.name else { break };
+            Self::insert_largest(slots, &candidate.mem, name, candidate.path, candidate.item);
         }
     }
 
@@ -1340,14 +1635,44 @@ fn stands<'v, 'r>(view: &'v crate::engine_members_record::View<'r>, place: u32, 
 }
 
 /// Whether the member `kept` of a members record is today's `unit` with today's names input
-/// (the half of [`stands`] past the record's own read list; [`stands_below`] shares it).
+/// (or refusal state for a standing refused member; the half of [`stands`] past the record's own
+/// read list; [`stands_below`] shares it).
 fn stands_as(kept: &crate::engine_members_record::Member<'_>, unit: &crate::engine_body_plan::Unit, names: NamesInputs<'_, '_>) -> bool {
-    let today = match names.entry(unit.name) {
-        Some(entered) => entered.map(|own| (own.name, own.out)),
-        None => names.stood_on().map(|_| (unit.name, kept.names_out)),
-    };
-    let Some((own_name, own_out)) = today else { return false };
-    kept.unit == *unit && kept.names == own_name && kept.names_out == own_out && own_out != work::failed_out()
+    if kept.unit != *unit {
+        return false;
+    }
+    match &kept.state {
+        crate::engine_members_record::MemberState::Held(held) => {
+            let today = match names.entry(unit.name) {
+                Some(entered) => entered.map(|own| (own.name, own.out)),
+                None => names.stood_on().map(|_| (unit.name, held.names_out)),
+            };
+            let Some((own_name, own_out)) = today else { return false };
+            held.names == own_name && held.names_out == own_out && own_out != work::failed_out()
+        }
+        crate::engine_members_record::MemberState::CutScope(cut) => {
+            let own_today = match names.entry(unit.name) {
+                Some(entered) => entered.map(|own| (own.name, own.out)),
+                None => names.stood_on().map(|_| (unit.name, cut.names_out)),
+            };
+            let Some((own_name, own_out)) = own_today else { return false };
+            if cut.names != own_name || cut.names_out != own_out || own_out == work::failed_out() {
+                return false;
+            }
+            match names.entry(cut.missing) {
+                Some(Some(_)) => false,
+                Some(None) => cut.missing_failed,
+                None => names.stood_on().is_some(),
+            }
+        }
+        crate::engine_members_record::MemberState::Refused(crate::engine_members_record::RefusedWhy::ScopeFailed) => match names.entry(unit.name) {
+            Some(None) => true,
+            Some(Some(_)) => false,
+            None => names.stood_on().is_some(),
+        },
+        crate::engine_members_record::MemberState::Refused(crate::engine_members_record::RefusedWhy::NoNamesTask) => names.entry(unit.name).is_none(),
+        crate::engine_members_record::MemberState::Refused(crate::engine_members_record::RefusedWhy::Unstood) => false,
+    }
 }
 
 /// PIECE A, THE STAND BELOW THE HEADS: member `place` stands from the members record though a
@@ -1414,7 +1739,10 @@ pub(crate) enum ReachFrom {
 /// reach and the difference named (`groups`).
 fn own_row_entered(kept: &crate::engine_members_record::Member<'_>, rows: &[TaskRow], rank: Option<u32>) -> bool {
     let Some(rank) = rank else { return true };
-    rows.iter().any(|row| row.rank == rank && kept.held.iter().any(|held| held.slot == row.file))
+    match &kept.state {
+        crate::engine_members_record::MemberState::Held(held) => rows.iter().any(|row| row.rank == rank && held.held.iter().any(|h| h.slot == row.file)),
+        crate::engine_members_record::MemberState::CutScope(_) | crate::engine_members_record::MemberState::Refused(_) => true,
+    }
 }
 
 /// The two names a held file's path in a member's items record may be outlined under: its own,
@@ -1481,12 +1809,78 @@ enum FoundAt {
     Tokens(parser::token_key::TokenPlace),
 }
 
+/// Per-group cached [`blaze_ladder::front2::tables::task::StretchFront`] initialized at most
+/// once across all stretches and workers of a member group.
+enum GroupFrontState {
+    /// Loaded from a `BSF1` CAS record or freshly built.
+    Ready {
+        front: blaze_ladder::front2::tables::task::StretchFront,
+        /// CAS key of this `BSF1` record (`Some` when read or queued for `store.put`).
+        key: Option<Key>,
+        /// Newly encoded `BSF1` payload to persist on coordinator merge (`None` on CAS hit or
+        /// when the group's front cannot be keyed from `lang` crates alone).
+        put: Option<(Key, blaze_own::Vec<u8, SharedAlloc<'static>>)>,
+    },
+    /// Fresh `StretchFront::new` refused (e.g. `LangTwice`): bodies surface it per body.
+    None,
+    /// Snapshot read, `BSF1` decode, or `BSF1` encode failed (rule 3: never silently ignored).
+    Error(&'static str),
+}
+
+/// Computes the content-addressed CAS key for `group`'s `BSF1` [`StretchFront`] record,
+/// covering format magic, `BodyCheck` tool identity, and every lang crate in `group.lang`
+/// (reader index, `CrateItemKey`, `CrateScope` name, and `CrateScope::WHOLE` digest).
+/// Returns `None` if any lang crate is unresolvable or its `CrateScope` digest is `ABSENT`.
+fn stretch_front_key<R: ?Sized + CellDigests>(group: &Group<'_, '_>, reads: &R) -> Option<Key> {
+    let mut h = Hasher::new(STRETCH_FRONT_KEY_DOMAIN);
+    h.update(blaze_ladder::front2::tables::task::STRETCH_FRONT_MAGIC);
+    h.update(&group.tool.0.0);
+    let count = u32::try_from(group.lang.len()).ok()?;
+    h.update(&count.to_le_bytes());
+    for &place in group.lang.iter() {
+        let place_u32 = u32::try_from(place).ok()?;
+        let world_at = group.crates.world_at(place)?;
+        let crate_key = group.list.key(world_at);
+        let scope_name = blaze_drive::key::crate_scope_name(&crate_key);
+        let scope_out = reads.cell(&CellId { of: scope_name, cell: WHOLE });
+        if scope_out == ABSENT {
+            return None;
+        }
+        let kind_u64 = u64::try_from(scope_name.kind.index()).ok()?;
+        h.update(&place_u32.to_le_bytes());
+        h.update(&crate_key.0.0);
+        h.update(&kind_u64.to_le_bytes());
+        h.update(&scope_name.subject.0);
+        h.update(&scope_out.0);
+    }
+    Some(Key(h.finish()))
+}
+
+/// True iff every read recorded while building `front` is a `Names` cell of a crate in
+/// `group.lang`, proving [`stretch_front_key`] covers every input (rule 21).
+fn stretch_front_reads_in_lang_crates(
+    group: &Group<'_, '_>,
+    front: &blaze_ladder::front2::tables::task::StretchFront,
+) -> bool {
+    front.reads().iter().all(|read| {
+        let TableRead::Names(cell) = *read else {
+            return false;
+        };
+        let prefix = cell.crate_prefix();
+        group.lang.iter().any(|&place| {
+            group.crates.world_at(place).is_some_and(|at| group.list.key(at).prefix() == prefix)
+        })
+    })
+}
+
 /// One member crate's check scope as a run reads it: all read-only, shared by its runs. Its
 /// crates' records are borrowed in place from the store's mapping for `'r` (engine_records.rs).
 struct Group<'f, 'r> {
     list: blaze_world::crate_list::CrateList<'static>,
     /// The member's own `CrateScope` name.
     own: Name,
+    /// The `BodyCheck` tool identity (covered by the `BSF1` [`stretch_front_key`], rule 21).
+    tool: blaze_drive::Tool,
     /// Its scope's crates in reader order, the member at 0: opened at the setup, or past the
     /// member each at its first question ([`GroupCrates`]).
     crates: GroupCrates<'r>,
@@ -1499,6 +1893,61 @@ struct Group<'f, 'r> {
     lang: Vec<usize, Global>,
     /// Each scope crate's `CrateScope` name, sorted: the whole graph's bucket fact widens to these.
     scope: Vec<Name, Global>,
+    /// Group-scoped lang-item index and receiver pointers loaded from `BSF1` CAS or built at most
+    /// once per member group across all stretches and workers (zero per-stretch rebuilds, zero
+    /// stretch-frame growth).
+    front: bstd::sync::Once<GroupFrontState>,
+    /// Scheduled body items in this member group for this phase: groups with fewer than 2 bodies
+    /// leave `goals` uninitialized so 1-body incremental edits pay zero table overhead.
+    bodies: u32,
+    /// Group-scoped shared trait goals table allocated lazily in `shared.heap.shared()` when
+    /// `bodies >= 2` and dropped when `Bodies` ends (rule 70): never shared across member groups.
+    goals: bstd::sync::Once<blaze_ladder::front2::tables::goals::GoalTable<SharedAlloc<'static>>>,
+    /// Group-scoped lock-free per-module verification bitmap for the member's own lazy
+    /// `CrateRecords::names_proof`, initialized once per group across all stretches and workers.
+    own_module_cache: bstd::sync::PublishOnce<blaze_scope::names_record::VerifiedModules<'r, SharedAlloc<'static>>>,
+}
+
+impl<'f, 'r> Group<'f, 'r> {
+    /// This group's scope crates as a stretch opens records over them, binding the member's own
+    /// lazy `names_proof` to [`Self::own_module_cache`] so each module of the member crate is
+    /// verified at most once across all stretches and workers of the group.
+    fn scope<'a>(
+        &'a self,
+        records: &'a dyn crate::front_load::OpenByNeed,
+        heap: &'static blaze_own::Heap,
+    ) -> crate::run_names::ScopeCrates<'a, 'a> {
+        match &self.crates {
+            GroupCrates::Opened(crates) => crate::run_names::ScopeCrates::Opened(crates.as_slice()),
+            GroupCrates::ByNeed { own, rest } => {
+                let names_proof = if own.records.names_proof.needs_module_cache() {
+                    let cache = match self.own_module_cache.get() {
+                        Some(cache) => Some(cache),
+                        None => {
+                            let built = own.records.names_proof.new_module_cache(heap.shared());
+                            let _ = self.own_module_cache.set(built);
+                            self.own_module_cache.get()
+                        }
+                    };
+                    match cache {
+                        Some(cache) => own.records.names_proof.bind_cache(cache),
+                        None => own.records.names_proof,
+                    }
+                } else {
+                    own.records.names_proof
+                };
+                let bound_own = crate::run_names::Crate {
+                    records: crate::front_load::CrateRecords { names_proof, ..own.records },
+                    ..*own
+                };
+                crate::run_names::ScopeCrates::ByNeed(crate::run_names::ByNeedScope {
+                    own: bound_own,
+                    rest: rest.as_slice(),
+                    records,
+                })
+            }
+        }
+    }
 }
 
 /// A group's scope crates in reader order, the member at 0: the two arms of piece C (a) (rule
@@ -1668,37 +2117,112 @@ impl core::fmt::Display for ScopeRefusal {
     }
 }
 
-/// Crate `at`'s check scope (blaze-world check_scope.rs `check_scope_in`), each crate's
-/// records read in place through `read` (engine_records.rs), and whether every crate of it had
-/// records (`false`: the scope was cut, [`Scope::cut`] says where and why, and the caller refuses by
-/// name). Refused: the crate's own names record or its scope could not be read, the cause typed
-/// ([`ScopeRefusal`]); nothing is dropped (rule 3).
+/// Per-phase cache of each crate's opened `(Input, CrateRecords)` indexed by world crate index
+/// (`0..list.len()`), so building check scopes for many crates in one phase (`HeadsStage`) asks
+/// `EngineRecords` at most once per unique crate instead of repeating lookups across overlapping
+/// dependency closures.
+pub(crate) struct ScopeCache<'r> {
+    slots: blaze_own::Vec<Option<(blaze_drive::Input, crate::front_load::CrateRecords<'r>)>, blaze_own::Alloc<'static>>,
+}
+
+impl<'r> ScopeCache<'r> {
+    pub(crate) fn new(len: usize, alloc: blaze_own::Alloc<'static>) -> ScopeCache<'r> {
+        let mut slots = blaze_own::Vec::with_capacity_in(len, alloc);
+        slots.resize(len, None);
+        ScopeCache { slots }
+    }
+
+    pub(crate) fn records_of(
+        &mut self,
+        read: &mut EngineRecords<'r>,
+        cx: &Cx,
+        store: &mut dyn crate::store::Store<'r>,
+        names: NamesInputs<'_, '_>,
+        list: &blaze_world::crate_list::CrateList<'static>,
+        at: usize,
+        g: blaze_own::Alloc<'static>,
+    ) -> Result<(blaze_drive::Input, crate::front_load::CrateRecords<'r>), ScopeRefusal> {
+        if let Some(cached) = self.slots.get(at).copied().flatten() {
+            return Ok(cached);
+        }
+        let name = blaze_drive::key::crate_scope_name(&list.key(at));
+        let krate = CrateGraph::name(list, at);
+        let input = names.input_of(name).ok_or_else(|| ScopeRefusal::NoNamesRecord { krate, at, failed: names.failed(name) })?;
+        let records = read.scope_records(cx, store, &input, list.key(at), krate, g).map_err(|error| ScopeRefusal::Records { krate, at, error })?;
+        if let Some(slot) = self.slots.get_mut(at) {
+            *slot = Some((input, records));
+        }
+        Ok((input, records))
+    }
+}
+
+/// Toolchain crate names that may declare `#[lang]` items or incoherent inherent impls
+/// (`#![rustc_coherence_is_core]` / `#[rustc_allow_incoherent_impl]`), matching
+/// `blaze-ladder/src/front2/source.rs` (`Records::name_lang_crates`) and `personality.rs`.
+pub(crate) fn is_lang_crate_name(name: &str) -> bool {
+    matches!(name, "core" | "alloc" | "std" | "bstd" | "blaze_std" | "panic_unwind" | "panic_abort")
+}
+
+/// Selects the lang-crate places of `checked` for `BodiesStage`: always includes the owner
+/// (place 0), every sysroot slot of `list`, and `core`/`alloc`/`std`/`bstd`/`blaze_std`/
+/// `panic_unwind`/`panic_abort` (covering macro-side sysroot copies too). Excludes pure-
+/// dependency toolchain crates (`libc`, `gimli`, `object`, `addr2line`, `hashbrown`,
+/// `miniz_oxide`, `adler2`, `memchr`, `rustc_demangle`, `cfg_if`, `unwind`, `std_detect`,
+/// `rustc_std_workspace_*`, `compiler_builtins`, `test`) so `Records::name_lang_crates` and
+/// `StretchFront` never open ~15 unused toolchain `CrateScope` records on every edit.
+pub(crate) fn lang_places_of<A: core::alloc::Allocator>(
+    checked: &blaze_world::check_scope::CheckScope<'_>,
+    list: &blaze_world::crate_list::CrateList<'static>,
+    into: &mut Vec<usize, A>,
+) {
+    let sysroot = CrateGraph::sysroot(list);
+    let readers = checked.readers();
+    for place in checked.lang_places() {
+        let keep = place == 0
+            || readers.get(place).is_some_and(|&(world_at, _)| {
+                sysroot.contains(&Some(world_at)) || is_lang_crate_name(CrateGraph::name(list, world_at))
+            });
+        if keep {
+            into.push(place);
+        }
+    }
+}
+
+/// Crate `at`'s check scope (blaze-world check_scope.rs `check_scope_in`), reusing `cache` so
+/// each crate's records are asked of `read` at most once per phase across all scopes built with
+/// `cache`.
 #[expect(clippy::too_many_arguments, reason = "a stage's handles, each named")]
-pub(crate) fn scope_of<'r>(read: &mut EngineRecords<'r>, cx: &Cx, store: &mut dyn crate::store::Store<'r>, names: NamesInputs<'_, '_>, list: &blaze_world::crate_list::CrateList<'static>, at: usize, heap: &'static blaze_own::Heap) -> Result<(Scope<'r>, bool), ScopeRefusal> {
+pub(crate) fn scope_of_cached<'r>(
+    cache: &mut ScopeCache<'r>,
+    read: &mut EngineRecords<'r>,
+    cx: &Cx,
+    store: &mut dyn crate::store::Store<'r>,
+    names: NamesInputs<'_, '_>,
+    list: &blaze_world::crate_list::CrateList<'static>,
+    at: usize,
+    heap: &'static blaze_own::Heap,
+) -> Result<(Scope<'r>, bool), ScopeRefusal> {
     let g = heap.alloc();
-    let name_at = |at: usize| blaze_drive::key::crate_scope_name(&list.key(at));
-    let input_at = |at: usize| names.input_of(name_at(at));
-    let krate = CrateGraph::name(list, at);
-    let own = input_at(at).ok_or_else(|| ScopeRefusal::NoNamesRecord { krate, at, failed: names.failed(name_at(at)) })?;
-    let own_records = read.scope_records(cx, store, &own, list.key(at), krate, g).map_err(|error| ScopeRefusal::Records { krate, at, error })?;
+    let (_, own_records) = cache.records_of(read, cx, store, names, list, at, g)?;
     let no_core = blaze_scope::names_record::NamesRecord::open(own_records.names_proof).crate_root().head().no_core;
     let checked = blaze_world::check_scope::check_scope_in(list, at, no_core, g).map_err(|error| ScopeRefusal::CheckScope { error })?;
     let mut scope = Scope { own_records, crates: Vec::new_in(Global), lang: Vec::new_in(Global), scope: Vec::new_in(Global), cut: None };
-    scope.lang.extend(checked.lang_places());
+    lang_places_of(&checked, list, &mut scope.lang);
     let mut whole = true;
     for one in checked.crates() {
-        let Some(input) = input_at(one) else {
-            whole = false;
-            scope.cut = Some((one, CutWhy::NoNamesRecord { failed: names.failed(name_at(one)) }));
-            break;
-        };
-        let records = match read.scope_records(cx, store, &input, list.key(one), CrateGraph::name(list, one), g) {
-            Ok(records) => records,
-            Err(error) => {
+        let (input, records) = match cache.records_of(read, cx, store, names, list, one, g) {
+            Ok(found) => found,
+            Err(ScopeRefusal::NoNamesRecord { failed, .. }) => {
+                whole = false;
+                scope.cut = Some((one, CutWhy::NoNamesRecord { failed }));
+                break;
+            }
+            Err(ScopeRefusal::Records { error, .. }) => {
                 whole = false;
                 scope.cut = Some((one, CutWhy::Unreadable(error)));
                 break;
             }
+            Err(ScopeRefusal::CheckScope { error }) => return Err(ScopeRefusal::CheckScope { error }),
         };
         scope.crates.push(Crate { records, name: CrateGraph::name(list, one), package: list.shown_from(one), world_at: one });
         scope.scope.push(input.name);
@@ -1707,20 +2231,35 @@ pub(crate) fn scope_of<'r>(read: &mut EngineRecords<'r>, cx: &Cx, store: &mut dy
     Ok((scope, whole))
 }
 
+/// Crate `at`'s check scope (blaze-world check_scope.rs `check_scope_in`), each crate's
+/// records read in place through `read` (engine_records.rs), and whether every crate of it had
+/// records (`false`: the scope was cut, [`Scope::cut`] says where and why, and the caller refuses by
+/// name). Refused: the crate's own names record or its scope could not be read, the cause typed
+/// ([`ScopeRefusal`]); nothing is dropped (rule 3).
+#[expect(clippy::too_many_arguments, reason = "a stage's handles, each named")]
+pub(crate) fn scope_of<'r>(read: &mut EngineRecords<'r>, cx: &Cx, store: &mut dyn crate::store::Store<'r>, names: NamesInputs<'_, '_>, list: &blaze_world::crate_list::CrateList<'static>, at: usize, heap: &'static blaze_own::Heap) -> Result<(Scope<'r>, bool), ScopeRefusal> {
+    let mut cache = ScopeCache::new(CrateGraph::len(list), heap.alloc());
+    scope_of_cached(&mut cache, read, cx, store, names, list, at, heap)
+}
+
 /// Crate `at`'s check scope MADE BY NEED (piece C (a)) over its own records `own_records`, which
 /// the caller read: the crates, their order, the lang places and the names as [`scope_of`] makes
 /// them (blaze-world check_scope.rs `check_scope_in`), the member alone opened ([`Scope::crates`]
 /// holds it alone); each crate past it found by its names input and checked present in the
 /// committed `snapshot`, never opened ([`crate::front_load::present`]: one lookup, no byte of the
 /// record read), returned unopened in reader order for the request's
-/// [`crate::front_load::ScopeRecords`]. Cut where [`scope_of`] cuts, by the same causes: a crate
+/// [`LazyScopeRecords`]. When `defer_inputs` is true (a standing member visited below its heads
+/// on the ready driver with no `CrateScope` entered this request and no planted unreadable crate),
+/// its scope already stood whole in the members record, so each dependency crate's `names.input_of`
+/// and snapshot lookup are deferred to its first actual question in [`LazyScopeRecords`], avoiding
+/// reading ~900 unused `CrateScope` task pages upfront.
+/// Cut where [`scope_of`] cuts, by the same causes: a crate
 /// with no names input, a record not in the store or not in place, or the crate the tests plant
 /// unreadable (`planted`, engine_records.rs `plant_unreadable`), read as [`scope_of`] reads it.
 /// A record that is present and does not open is found at its first question and refuses the
 /// bodies of the job that asked it (front_load.rs `StoreLoad::refused`). `Err`: the store's
 /// snapshot refused a lookup, named with the member (rule 3).
-/// COST: per scope crate one names-input lookup and one snapshot lookup; before, each scope
-/// crate's record was opened and its names section checked whole (tempo: 773 records, 823 MB).
+#[expect(clippy::too_many_arguments, reason = "the scope builder's handles, each named")]
 fn scope_by_need<'r>(
     names: NamesInputs<'_, '_>,
     list: &blaze_world::crate_list::CrateList<'static>,
@@ -1728,12 +2267,13 @@ fn scope_by_need<'r>(
     own_records: crate::front_load::CrateRecords<'r>,
     snapshot: &StoreSnapshot,
     planted: Option<&'static str>,
+    (defer_inputs, defer_present): (bool, bool),
     heap: &'static blaze_own::Heap,
 ) -> Result<Result<MadeScope<'r>, ScopeRefusal>, CliError> {
     let g = heap.alloc();
     let name_at = |at: usize| blaze_drive::key::crate_scope_name(&list.key(at));
     let krate = CrateGraph::name(list, at);
-    if names.input_of(name_at(at)).is_none() {
+    if !defer_inputs && names.input_of(name_at(at)).is_none() {
         return Ok(Err(ScopeRefusal::NoNamesRecord { krate, at, failed: names.failed(name_at(at)) }));
     }
     let no_core = blaze_scope::names_record::NamesRecord::open(own_records.names_proof).crate_root().head().no_core;
@@ -1742,21 +2282,39 @@ fn scope_by_need<'r>(
         Err(error) => return Ok(Err(ScopeRefusal::CheckScope { error })),
     };
     let mut scope = Scope { own_records, crates: Vec::new_in(Global), lang: Vec::new_in(Global), scope: Vec::new_in(Global), cut: None };
-    scope.lang.extend(checked.lang_places());
-    let mut rest: Vec<crate::front_load::Unopened, Global> = Vec::new_in(Global);
+    lang_places_of(&checked, list, &mut scope.lang);
+    let mut rest: Vec<crate::front_load::Unopened, Global> = Vec::with_capacity_in(checked.readers().len().saturating_sub(1), Global);
     let mut whole = true;
     for one in checked.crates() {
-        let Some(input) = names.input_of(name_at(one)) else {
-            whole = false;
-            scope.cut = Some((one, CutWhy::NoNamesRecord { failed: names.failed(name_at(one)) }));
-            break;
-        };
+        let scope_name = name_at(one);
         let name = CrateGraph::name(list, one);
         if one == at {
             // The owner, first of `check_scope_in`'s crates: reader crate 0, opened.
             scope.crates.push(Crate { records: own_records, name, package: list.shown_from(one), world_at: one });
-        } else {
-            let unopened = crate::front_load::Unopened { input, key: list.key(one), world_at: one, name, package: list.shown_from(one) };
+            scope.scope.push(scope_name);
+            continue;
+        }
+        if defer_inputs {
+            // Standing member on the ready driver: its scope stood whole in the members record
+            // and no `CrateScope` ran this request. Defer `names.input_of` and `snapshot.get`
+            // to the first actual question of `one` (`LazyScopeRecords`).
+            rest.push(crate::front_load::Unopened {
+                input: Input { name: scope_name, at: Key::default(), out: ABSENT },
+                key: list.key(one),
+                world_at: one,
+                name,
+                package: list.shown_from(one),
+            });
+            scope.scope.push(scope_name);
+            continue;
+        }
+        let Some(input) = names.input_of(scope_name) else {
+            whole = false;
+            scope.cut = Some((one, CutWhy::NoNamesRecord { failed: names.failed(scope_name) }));
+            break;
+        };
+        let unopened = crate::front_load::Unopened { input, key: list.key(one), world_at: one, name, package: list.shown_from(one) };
+        if !defer_present {
             let present: Result<(), crate::engine_records::ReadError> = if planted == Some(name) {
                 Err(crate::front_load::LoadError::NotInStore { name: input.name, at: input.at }.into())
             } else {
@@ -1769,8 +2327,8 @@ fn scope_by_need<'r>(
                 scope.cut = Some((one, CutWhy::Unreadable(error)));
                 break;
             }
-            rest.push(unopened);
         }
+        rest.push(unopened);
         scope.scope.push(input.name);
     }
     scope.scope.sort_unstable();
@@ -1799,7 +2357,7 @@ fn planned_label<'f>(labels: &mut Labels<'f>, cx: &Cx, root: &Dir<ReadWrite>, ou
         None => {
             let made = file_labels(cx, root, outlined, file, frame).map_err(|lost| {
                 let words = bstd::mem::format_in!(frame, "{{a body of a file whose text could not be read again to name it: {lost}}}");
-                core::str::from_utf8(words.into_bytes().leak()).unwrap_or("{a body of a file whose text could not be read again}")
+                &*words.into_bump_str()
             });
             labels.push((file, made));
             labels.len() - 1
@@ -1855,7 +2413,7 @@ fn file_labels<'f>(cx: &Cx, root: &Dir<ReadWrite>, outlined: &[crate::engine_tas
             false => bstd::mem::format_in!(frame, "{shown}"),
             true => bstd::mem::format_in!(frame, "{{a macro call}}"),
         };
-        let label: &'f str = core::str::from_utf8(label.into_bytes().leak()).unwrap_or("");
+        let label: &'f str = label.into_bump_str();
         found.push((work::body_name(one.name, &outline, item, text), label));
     }
     Ok(found)
@@ -1871,7 +2429,7 @@ fn body_subject<'p>(one: &Ran<'_>, name: Name, base: Name, outlined: &[Outlined<
     let file = outlined.get(one.file as usize).ok_or(EngineCheckError::Unplaced { body: name, what: "its file is none of the planner's outlines" })?;
     let path = core::str::from_utf8(&file.path).map_err(|_| EngineCheckError::Unplaced { body: name, what: "its file's checkout path is not UTF-8" })?;
     let item = bstd::mem::format_in!(frame, "{}", crate::engine_body_plan::Named::of(one.label, outlined, one.file, base));
-    let item: &'p str = core::str::from_utf8(item.into_bytes().leak()).unwrap_or("");
+    let item: &'p str = item.into_bump_str();
     Ok(blaze_report::finding::Subject::Item { file: work::held_str(path, frame), item })
 }
 
@@ -1879,7 +2437,7 @@ fn body_subject<'p>(one: &Ran<'_>, name: Name, base: Name, outlined: &[Outlined<
 /// `Unchecked` note is `TYPES_NOT_CHECKED`, a `BorrowsUnchecked` one `BORROWS_NOT_CHECKED`, and
 /// every refusal, panic, frame refusal and task fault `work::NOT_RUN` (those notes carry no rule
 /// number of their own). A body with no note that did not run is `NOT_RUN` too.
-fn note_rule(said: Option<&Said<&str>>, checked: bool) -> Option<u16> {
+fn note_rule<E>(said: Option<&Said<E>>, checked: bool) -> Option<u16> {
     match said {
         Some(Said::Unchecked { .. }) => Some(crate::body_types::TYPES_NOT_CHECKED),
         Some(Said::BorrowsUnchecked(_)) => Some(crate::body_types::BORROWS_NOT_CHECKED),
@@ -1957,14 +2515,17 @@ pub(crate) struct Handles<'h, 'e, 'n, 'o> {
     /// The `BodyCheck` kind's tool (engine_store.rs `tools`): in each member listing row's key
     /// (engine_member_rows.rs `row_key`), as it is in every body task's.
     pub(crate) tool: blaze_drive::Tool,
+    /// When the check is scoped to a subset of workspace units (`blaze test <member>` / `blaze run`
+    /// / `blaze export`), the transitive closure of active crate indices in the `CrateList`.
+    pub(crate) scoped: Option<&'h crate::engine_check::ScopedUnits>,
 }
 
 /// Why the Bodies stage checks no body this command, and the cells that stop is a function of
 /// (plan row A8; none: owed), from [`BodiesStage::groups`].
 type Stop<'f> = (&'static str, &'f [CellId]);
 
-/// The packs of the crate list's trees and its corrected files (body_types.rs `Kept::trees`).
-type Trees = (&'static [blaze_fetch::PackView<'static>], &'static [(u32, &'static str, &'static str)]);
+/// The on-demand packs of the crate list's trees and its corrected files (body_types.rs `Kept::lazy_trees`).
+type Trees = crate::body_types::LazyTreesHeld;
 
 /// What [`BodiesStage::groups`] found: each member's group, each body's place, the files of
 /// member crates, and the members' names.
@@ -2059,9 +2620,6 @@ pub(crate) struct BodiesStage<'f> {
     untyped_clean: u32,
     /// Every stretch's setup before its first body ([`StretchSetup`]), summed over the phases.
     setup: StretchSetup,
-    /// The call census's totals summed over the phases (feature `call-census`; [`Census`]:
-    /// nothing without).
-    census: Census,
     /// Each slice's task as the profile names it ([`Part`], [`BodiesStage::task_label`]): its
     /// time's name (its first body's), its entry's label, and its bodies' place in the entry.
     /// `None`: no entry was sliced.
@@ -2086,16 +2644,20 @@ pub(crate) struct BodiesStage<'f> {
     /// answer this request starts from, set by the driver before the first Bodies phase
     /// ([`BodiesStage::members_from`]). `None`: none named.
     members_last: Option<(Option<Key>, u64)>,
-    /// The outlines this request moved (`FileItems` names, sorted, each once), set by the ready
-    /// driver before its setup ([`BodiesStage::stand_members`]): its setup then takes a member
-    /// none of whose files moved from the record ([`StandingMembers`]). `None`: the phase path,
-    /// every member visited ([`EveryMember`]).
+    /// The outlines this request moved (`FileItems` names, sorted, each once), set before its
+    /// setup ([`BodiesStage::stand_members`]): its setup then takes a member none of whose files
+    /// moved from the record ([`StandingMembers`]). `None`: every member visited ([`EveryMember`]).
     outlines_moved: Option<Vec<Name, blaze_own::Alloc<'static>>>,
+    /// The `FileItems` tasks entered in earlier phases of this request (`note_entered`), sorted.
+    outlines_entered: Option<Vec<Name, blaze_own::Alloc<'static>>>,
     /// The files the request has an outline of (a place in the stored answer's root) and did not
     /// read back (the ready setup's, sorted: [`BodiesStage::unread_outlines`]). A visited
     /// member's held file among them is the setup's typed refusal (`groups`), never a
     /// `NotOutlined` head. `None`: every outline was read (the phase path).
     unread: Option<Vec<Name, blaze_own::Alloc<'static>>>,
+    /// Full-file `FILE_DOMAIN` digests from the request's initial sweep for unread `/0/` checkout
+    /// files, sorted by path: verifies lazy disk reads stay on the request snapshot.
+    unread_digests: Option<blaze_own::Arc<blaze_own::Vec<(blaze_own::String<SharedAlloc<'static>>, ContentId), SharedAlloc<'static>>, SharedAlloc<'static>>>,
     /// The members record this request put, for the driver to name under the checkout's
     /// members root ([`BodiesStage::members_record`]).
     members_key: Option<Key>,
@@ -2123,6 +2685,137 @@ pub(crate) struct BodiesStage<'f> {
     /// What the request's scope records opened by need did, summed over the runs that read
     /// them ([`crate::front_load::ScopeRecords`]): the profile's by-need line.
     by_need: crate::front_load::ByNeedCounts,
+    /// Per-file cache of computed `file_cuts` and multi-holder body view rows for
+    /// [`BodiesStage::standing_view`], populated lazily on the coordinator thread and cleared
+    /// whenever [`BodiesStage::plan_reach`] installs a new reach.
+    standing_views: core::cell::RefCell<Option<StandingViewCache>>,
+    /// Request-local cache of the opened `BLZMEMB` members record so `plan_reach`, `ready_reads`,
+    /// and `groups` share one store read and one decode (rule 77).
+    members_cached: Option<CachedMembers>,
+}
+
+/// Request-local cached `BLZMEMB` view (or refusal) keyed by its CAS key.
+type CachedMembers = (
+    Key,
+    Result<blaze_own::Rc<crate::engine_members_record::View<'static>, blaze_own::Alloc<'static>>, crate::engine_members_record::MembersRefused>,
+);
+
+/// Lazy `BLZMEMB` writer that skips encoding, BLAKE3 hashing, and `store.put` when every member
+/// stands unchanged from an already content-stable stored members record (`CONTENT_STABLE_SERIAL`).
+struct MembersOut<'r> {
+    header: crate::engine_members_record::Header,
+    prior: Option<(Key, &'r crate::engine_members_record::View<'r>)>,
+    pending_stood: Vec<u32, blaze_own::Alloc<'static>>,
+    writer: Option<crate::engine_members_record::Writer<'static>>,
+    alloc: blaze_own::Alloc<'static>,
+}
+
+impl<'r> MembersOut<'r> {
+    fn new(
+        header: crate::engine_members_record::Header,
+        prior: Option<(Key, &'r crate::engine_members_record::View<'r>)>,
+        alloc: blaze_own::Alloc<'static>,
+    ) -> Self {
+        let prior = prior.filter(|(_, view)| view.header == header);
+        Self { header, prior, pending_stood: Vec::new_in(alloc), writer: None, alloc }
+    }
+
+    fn stood(&mut self, kept: &crate::engine_members_record::Member<'_>) {
+        if let Some(writer) = self.writer.as_mut() {
+            writer.member(kept);
+        } else if self.prior.is_some() {
+            self.pending_stood.push(kept.at);
+        } else {
+            let mut writer = crate::engine_members_record::Writer::new(&self.header, self.alloc);
+            writer.member(kept);
+            self.writer = Some(writer);
+        }
+    }
+
+    fn member(&mut self, one: &crate::engine_members_record::Member<'_>) {
+        let writer = self.writer.get_or_insert_with(|| {
+            let mut w = crate::engine_members_record::Writer::new(&self.header, self.alloc);
+            if let Some((_, view)) = self.prior {
+                for &place in self.pending_stood.iter() {
+                    if let Some(kept) = view.member(place) {
+                        w.member(kept);
+                    }
+                }
+            }
+            self.pending_stood.clear();
+            w
+        });
+        writer.member(one);
+    }
+
+    /// Reuses the prior `BLZMEMB` key with zero encoding/hashing/puts when every member matched
+    /// the prior content-stable record; otherwise finishes and puts the new record.
+    fn finish_and_put(self, cx: &Cx, store: &mut dyn crate::store::Store<'_>) -> Result<(Key, bool), CliError> {
+        if self.writer.is_none()
+            && let Some((prior_key, view)) = self.prior
+            && view.len() == self.pending_stood.len()
+        {
+            return Ok((prior_key, false));
+        }
+        let writer = match self.writer {
+            Some(writer) => writer,
+            None => {
+                let mut w = crate::engine_members_record::Writer::new(&self.header, self.alloc);
+                if let Some((_, view)) = self.prior {
+                    for &place in self.pending_stood.iter() {
+                        if let Some(kept) = view.member(place) {
+                            w.member(kept);
+                        }
+                    }
+                }
+                w
+            }
+        };
+        let bytes = writer.finish();
+        let key = blaze_drive::key::content_key(&bytes);
+        if self.prior.is_some_and(|(prior_key, _)| prior_key == key) {
+            return Ok((key, false));
+        }
+        store.put(cx, key, &bytes)?;
+        Ok((key, true))
+    }
+}
+
+/// One multi-holder body row cached for [`BodiesStage::standing_view`].
+#[derive(Clone, Copy)]
+struct StandingFileEntry {
+    base: Name,
+    row_at: u32,
+    cut: crate::engine_plan_cfg::Cut,
+}
+
+/// Cached standing-view lookup state for one file in [`StandingViewCache`].
+enum StandingFileState {
+    Missing,
+    NoMultiHolder,
+    Multi(blaze_hash::Map<Name, StandingFileEntry, blaze_hash::BuildKeyHasher, blaze_own::Alloc<'static>>),
+}
+
+/// Coordinator-only lazy per-file cache for [`BodiesStage::standing_view`], turning O(F * N)
+/// repeated `file_cuts` re-lexing and part scans into O(N) once per multi-holder file.
+struct StandingViewCache {
+    alloc: blaze_own::Alloc<'static>,
+    outlined_tag: (usize, usize),
+    files: blaze_hash::Map<Name, StandingFileState, blaze_hash::BuildKeyHasher, blaze_own::Alloc<'static>>,
+}
+
+impl StandingViewCache {
+    fn new(alloc: blaze_own::Alloc<'static>) -> StandingViewCache {
+        StandingViewCache {
+            alloc,
+            outlined_tag: (0, 0),
+            files: blaze_hash::Map::new(blaze_hash::MapOpts {
+                hasher: blaze_hash::BuildKeyHasher::default(),
+                alloc,
+                capacity: None,
+            }),
+        }
+    }
 }
 
 /// Runs' predicted cost (bytes of their bodies' text) against their thread time: the ms a
@@ -2313,6 +3006,664 @@ impl OwedListing {
     }
 }
 
+/// How a cached dependency/pack `FileItems` CAS record is pinned for GC at phase merge:
+/// - `Toolchain`: public toolchain pack file -> pinned under the toolchain root via
+///   `store.keep_with_toolchain(key)` (shared across checkouts/worktrees, zero impact on
+///   checkout `stored.root`).
+/// - `MemberRow`: non-toolchain dependency pack file -> pinned in `BodiesStage::member_rows`
+///   (identical across `Phases` and `Ready`).
+/// - `LocalOnly`: unread checkout file (`/0/...` on `Ready`) -> stored locally in CAS for warm
+///   reuse without touching `keep_with_toolchain` (trust boundary) or `member_rows` (keeping
+///   `Ready` and `Phases` `stored.root` byte-identical).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DepFilePin {
+    Toolchain,
+    MemberRow,
+    LocalOnly,
+}
+
+enum CachedDepData {
+    /// Zero-copy CAS hit in the current phase's committed snapshot (0 heap bytes copied).
+    Snapshot,
+    /// Cold CAS miss: one 16-aligned buffer storing `[plain_head | file_items]` at
+    /// `bytes[start..start + record_len]`. Because `plain_head` is padded to
+    /// `blaze_drive::record::PAYLOAD_ALIGN` (16), `bytes[start + head_len..start + record_len]`
+    /// is also 16-aligned `FileItems` bytes ready for zero-copy `FileItemsView::read`, while
+    /// `bytes[start..start + record_len]` is ready for `store.put` at phase merge.
+    Owned {
+        bytes: Vec<u8, SharedAlloc<'static>>,
+        start: usize,
+        head_len: usize,
+        record_len: usize,
+    },
+}
+
+/// One packed or unread dependency file's cached `FileItemsView` entry, cached once per phase
+/// so stretches do not re-lex, re-outline, or re-digest immutable dependency files and never leak
+/// temporary `Outline` ASTs into a stretch's bump frame.
+struct CachedDepFile {
+    world_at: usize,
+    index: u32,
+    edition: u8,
+    text_len: usize,
+    text_digest: ContentId,
+    surface: ContentId,
+    key: Key,
+    pin: DepFilePin,
+    data: CachedDepData,
+}
+
+impl CachedDepFile {
+    #[expect(clippy::too_many_arguments, reason = "cached dependency file record constructor")]
+    fn from_record(
+        world_at: usize,
+        index: u32,
+        edition: u8,
+        text_len: usize,
+        text_digest: ContentId,
+        surface: ContentId,
+        key: Key,
+        pin: DepFilePin,
+        head: &[u8],
+        raw: &[u8],
+        alloc: SharedAlloc<'static>,
+    ) -> Self {
+        let head_len = head.len();
+        let record_len = head_len.saturating_add(raw.len());
+        let cap = record_len.saturating_add(15);
+        let mut bytes: Vec<u8, SharedAlloc<'static>> = Vec::with_capacity_in(cap, alloc);
+        let pad = bytes.as_ptr().addr().wrapping_neg() & 15;
+        bytes.resize(pad, 0);
+        bytes.extend_from_slice(head);
+        bytes.extend_from_slice(raw);
+        Self {
+            world_at,
+            index,
+            edition,
+            text_len,
+            text_digest,
+            surface,
+            key,
+            pin,
+            data: CachedDepData::Owned { bytes, start: pad, head_len, record_len },
+        }
+    }
+
+    fn record_bytes(&self) -> Option<&[u8]> {
+        match &self.data {
+            CachedDepData::Snapshot => None,
+            CachedDepData::Owned { bytes, start, record_len, .. } => {
+                let end = start.checked_add(*record_len)?;
+                bytes.get(*start..end)
+            }
+        }
+    }
+
+    fn file_items_bytes(&self) -> Option<&[u8]> {
+        match &self.data {
+            CachedDepData::Snapshot => None,
+            CachedDepData::Owned { bytes, start, head_len, record_len } => {
+                let from = start.checked_add(*head_len)?;
+                let end = start.checked_add(*record_len)?;
+                bytes.get(from..end)
+            }
+        }
+    }
+
+    fn open<'n>(
+        &'n self,
+        snapshot: &'n StoreSnapshot,
+        index: u32,
+        text: &'n str,
+    ) -> Result<blaze_scope::items_record::CurrentFile<'n>, blaze_scope::items_record::ItemsRecordError> {
+        match &self.data {
+            CachedDepData::Snapshot => match snapshot.get(self.key) {
+                Ok(Some(bytes)) => {
+                    let (surface, view) = crate::front_load::open_pack_file_items(bytes, index, self.text_digest)?;
+                    Ok(blaze_scope::items_record::CurrentFile { view, text, surface })
+                }
+                Ok(None) => Err(blaze_scope::items_record::ItemsRecordError::FileItemsUnavailable {
+                    file: index,
+                    what: "cached dependency FileItems record disappeared from committed snapshot (engine_bodies.rs)",
+                }),
+                Err(_) => Err(blaze_scope::items_record::ItemsRecordError::FileItemsUnavailable {
+                    file: index,
+                    what: "reading cached dependency FileItems record from committed snapshot failed (engine_bodies.rs)",
+                }),
+            },
+            CachedDepData::Owned { .. } => {
+                let Some(bytes) = self.file_items_bytes() else {
+                    return Err(blaze_scope::items_record::ItemsRecordError::FileItemsUnavailable {
+                        file: index,
+                        what: "cached dependency FileItems slice bounds invalid (engine_bodies.rs)",
+                    });
+                };
+                let view = blaze_surface::FileItemsView::read(bytes)
+                    .map_err(|why| blaze_scope::items_record::ItemsRecordError::FileItemsRead { file: index, why })?;
+                Ok(blaze_scope::items_record::CurrentFile { view, text, surface: self.surface })
+            }
+        }
+    }
+}
+
+/// Power-of-two slot counts and linear-probe bounds for [`DependencyFiles`]'s lock-free cache:
+/// a compact 64-slot slab covers incremental edits (~9 KiB, 0 locks), spilling to a 4096-slot
+/// slab only when a large cold phase exceeds a probe chain.
+const DEP_FILE_SMALL_SLOTS: usize = 64;
+const DEP_FILE_SMALL_PROBES: usize = 8;
+const DEP_FILE_SLOTS: usize = 4096;
+const DEP_FILE_PROBES: usize = 16;
+
+/// Lock-free request-wide cache of outlined dependency files (owned by [`Prepared`], dropped with
+/// the phase): checks the committed CAS snapshot first (zero-copy `FileItemsView` with zero lex,
+/// zero parse, zero `to_file_items` hashing, zero heap copies, and zero locks), falling back on
+/// cold misses to outlining once in a warm task frame, publishing into lazy `PublishOnce` slots
+/// for the current phase, and persisting deterministically to CAS at phase merge.
+struct DependencyFiles {
+    small: bstd::sync::PublishOnce<Vec<bstd::sync::PublishOnce<CachedDepFile>, SharedAlloc<'static>>>,
+    large: bstd::sync::PublishOnce<Vec<bstd::sync::PublishOnce<CachedDepFile>, SharedAlloc<'static>>>,
+    heap: &'static blaze_own::Heap,
+}
+
+impl DependencyFiles {
+    fn new(heap: &'static blaze_own::Heap) -> DependencyFiles {
+        DependencyFiles {
+            small: bstd::sync::PublishOnce::new(),
+            large: bstd::sync::PublishOnce::new(),
+            heap,
+        }
+    }
+
+    fn slot_hash(world_at: usize, index: u32, edition: u8) -> usize {
+        let idx = usize::try_from(index).unwrap_or(0);
+        world_at.wrapping_mul(0x9E37_79B9) ^ idx.wrapping_mul(0x85EB_CA6B) ^ usize::from(edition)
+    }
+
+    fn matches(cached: &CachedDepFile, world_at: usize, index: u32, ed: u8, text_len: usize, digest: Option<ContentId>) -> bool {
+        cached.world_at == world_at
+            && cached.index == index
+            && cached.edition == ed
+            && cached.text_len == text_len
+            && digest.is_none_or(|d| cached.text_digest == d)
+    }
+
+    fn find_in<'n>(
+        slots: &'n [bstd::sync::PublishOnce<CachedDepFile>],
+        probes: usize,
+        hash: usize,
+        world_at: usize,
+        index: u32,
+        ed: u8,
+        text_len: usize,
+        digest: Option<ContentId>,
+    ) -> Option<&'n CachedDepFile> {
+        let mask = slots.len().saturating_sub(1);
+        for probe in 0..probes {
+            let at = hash.wrapping_add(probe) & mask;
+            let slot = slots.get(at)?;
+            let cached = slot.get()?;
+            if Self::matches(cached, world_at, index, ed, text_len, digest) {
+                return Some(cached);
+            }
+        }
+        None
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "lock-free probe insert into a PublishOnce slab")]
+    fn insert_in<'n>(
+        slots: &'n [bstd::sync::PublishOnce<CachedDepFile>],
+        probes: usize,
+        hash: usize,
+        candidate: &mut Option<CachedDepFile>,
+        world_at: usize,
+        index: u32,
+        ed: u8,
+        text_len: usize,
+        digest: ContentId,
+    ) -> Option<&'n CachedDepFile> {
+        let mask = slots.len().saturating_sub(1);
+        for probe in 0..probes {
+            let at = hash.wrapping_add(probe) & mask;
+            let Some(slot) = slots.get(at) else { break };
+            if let Some(cached) = slot.get() {
+                if Self::matches(cached, world_at, index, ed, text_len, Some(digest)) {
+                    return Some(cached);
+                }
+                continue;
+            }
+            if let Some(entry) = candidate.take() {
+                match slot.set(entry) {
+                    Ok(()) => {
+                        if let Some(cached) = slot.get() {
+                            return Some(cached);
+                        }
+                    }
+                    Err(returned) => {
+                        if let Some(cached) = slot.get()
+                            && Self::matches(cached, world_at, index, ed, text_len, Some(digest))
+                        {
+                            return Some(cached);
+                        }
+                        *candidate = Some(returned);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn init_slab<'n>(
+        cell: &'n bstd::sync::PublishOnce<Vec<bstd::sync::PublishOnce<CachedDepFile>, SharedAlloc<'static>>>,
+        count: usize,
+        heap: &'static blaze_own::Heap,
+    ) -> Option<&'n [bstd::sync::PublishOnce<CachedDepFile>]> {
+        let vec = match cell.get() {
+            Some(v) => Some(v),
+            None => {
+                let table = Vec::from_iter_in((0..count).map(|_| bstd::sync::PublishOnce::new()), heap.shared());
+                let _ = cell.set(table);
+                cell.get()
+            }
+        };
+        vec.map(Vec::as_slice)
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "dependency file lookup: snapshot, identity, text, digest, edition, pin, bump")]
+    fn get_or_outline<'n>(
+        &'n self,
+        snapshot: &'n StoreSnapshot,
+        world_at: usize,
+        index: u32,
+        text: &'n str,
+        digest: Option<ContentId>,
+        edition: blaze_surface::Edition,
+        pin: DepFilePin,
+        bump: blaze_own::Bump<'n>,
+    ) -> Result<blaze_scope::items_record::CurrentFile<'n>, blaze_scope::items_record::ItemsRecordError> {
+        let ed = edition.byte();
+        let hash = Self::slot_hash(world_at, index, ed);
+        // 1. In-phase lock-free cache: skips even re-hashing immutable pack file text on repeat asks.
+        if let Some(small) = self.small.get()
+            && let Some(cached) = Self::find_in(small.as_slice(), DEP_FILE_SMALL_PROBES, hash, world_at, index, ed, text.len(), digest)
+        {
+            return cached.open(snapshot, index, text);
+        }
+        if let Some(large) = self.large.get()
+            && let Some(cached) = Self::find_in(large.as_slice(), DEP_FILE_PROBES, hash, world_at, index, ed, text.len(), digest)
+        {
+            return cached.open(snapshot, index, text);
+        }
+        // 2. Committed CAS lookup: zero-copy `FileItemsView` straight from `snapshot`.
+        let digest = digest.unwrap_or_else(|| ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes()));
+        let cas_key = crate::front_load::pack_file_items_key(edition, digest);
+        match snapshot.get(cas_key) {
+            Ok(Some(bytes)) => {
+                let (surface, view) = crate::front_load::open_pack_file_items(bytes, index, digest)?;
+                let mut candidate = Some(CachedDepFile {
+                    world_at,
+                    index,
+                    edition: ed,
+                    text_len: text.len(),
+                    text_digest: digest,
+                    surface,
+                    key: cas_key,
+                    pin,
+                    data: CachedDepData::Snapshot,
+                });
+                if let Some(small) = Self::init_slab(&self.small, DEP_FILE_SMALL_SLOTS, self.heap)
+                    && Self::insert_in(small, DEP_FILE_SMALL_PROBES, hash, &mut candidate, world_at, index, ed, text.len(), digest).is_some()
+                {
+                    return Ok(blaze_scope::items_record::CurrentFile { view, text, surface });
+                }
+                if candidate.is_some()
+                    && let Some(large) = Self::init_slab(&self.large, DEP_FILE_SLOTS, self.heap)
+                {
+                    let _ = Self::insert_in(large, DEP_FILE_PROBES, hash, &mut candidate, world_at, index, ed, text.len(), digest);
+                }
+                return Ok(blaze_scope::items_record::CurrentFile { view, text, surface });
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return Err(blaze_scope::items_record::ItemsRecordError::FileItemsUnavailable {
+                    file: index,
+                    what: "reading cached dependency FileItems record from committed snapshot failed (engine_bodies.rs)",
+                });
+            }
+        }
+        // 3. Cold CAS miss: outline once in a warm task frame into a single 16-aligned
+        // `[plain_head | file_items]` buffer and publish into the lock-free slab for this phase
+        // and deterministic CAS persistence at phase merge.
+        let (surface, cached_entry) = blaze_mem::frame::task(bstd::mem::Tag::Parse, |scratch| -> Result<(ContentId, CachedDepFile), blaze_scope::items_record::ItemsRecordError> {
+            let erased = blaze_own::Erased::new(scratch);
+            let alloc = erased.handle();
+            let outline = blaze_file_items::outline(text, edition, alloc);
+            let raw = outline.to_file_items(text, digest, alloc)
+                .map_err(|why| blaze_scope::items_record::ItemsRecordError::FileItemsBuild { file: index, why })?;
+            let surface = outline.surface();
+            let head = crate::front_load::pack_file_items_head(cas_key, digest, surface, raw.len(), alloc);
+            let cached = CachedDepFile::from_record(world_at, index, ed, text.len(), digest, surface, cas_key, pin, &head, &raw, self.heap.shared());
+            Ok((surface, cached))
+        })?;
+        let mut candidate = Some(cached_entry);
+        if let Some(small) = Self::init_slab(&self.small, DEP_FILE_SMALL_SLOTS, self.heap)
+            && let Some(published) = Self::insert_in(small, DEP_FILE_SMALL_PROBES, hash, &mut candidate, world_at, index, ed, text.len(), digest)
+        {
+            return published.open(snapshot, index, text);
+        }
+        if candidate.is_some()
+            && let Some(large) = Self::init_slab(&self.large, DEP_FILE_SLOTS, self.heap)
+            && let Some(published) = Self::insert_in(large, DEP_FILE_PROBES, hash, &mut candidate, world_at, index, ed, text.len(), digest)
+        {
+            return published.open(snapshot, index, text);
+        }
+        let Some(entry) = candidate else {
+            return Err(blaze_scope::items_record::ItemsRecordError::FileItemsUnavailable {
+                file: index,
+                what: "cached dependency FileItems entry was unavailable after insert (engine_bodies.rs)",
+            });
+        };
+        let Some(raw) = entry.file_items_bytes() else {
+            return Err(blaze_scope::items_record::ItemsRecordError::FileItemsUnavailable {
+                file: index,
+                what: "cached dependency FileItems bytes missing after build (engine_bodies.rs)",
+            });
+        };
+        let view = blaze_surface::FileItemsView::read(blaze_scope::resolve::aligned(raw, bump))
+            .map_err(|why| blaze_scope::items_record::ItemsRecordError::FileItemsRead { file: index, why })?;
+        Ok(blaze_scope::items_record::CurrentFile { view, text, surface })
+    }
+
+    /// Persists newly built dependency `FileItems` CAS records in deterministic key order
+    /// (rule 25) and pins read/written toolchain and dependency keys so GC retains them.
+    fn persist<'r>(
+        &self,
+        cx: &Cx,
+        store: &mut dyn crate::store::Store<'r>,
+        member_rows: &mut Option<Vec<Key, blaze_own::Alloc<'static>>>,
+        heap: &'static blaze_own::Heap,
+    ) -> Result<(), CliError> {
+        if self.small.get().is_none() && self.large.get().is_none() {
+            return Ok(());
+        }
+        let g = heap.alloc();
+        let mut entries: Vec<(Key, DepFilePin, Option<&[u8]>), blaze_own::Alloc<'static>> = Vec::new_in(g);
+        for slab in [self.small.get(), self.large.get()].into_iter().flatten() {
+            for slot in slab.iter() {
+                if let Some(entry) = slot.get() {
+                    let bytes = entry.record_bytes();
+                    if bytes.is_some() || entry.pin != DepFilePin::LocalOnly {
+                        entries.push((entry.key, entry.pin, bytes));
+                    }
+                }
+            }
+        }
+        if entries.is_empty() {
+            return Ok(());
+        }
+        entries.sort_unstable_by_key(|&(key, pin, bytes)| (key, bytes.is_none(), pin));
+        let mut last_put: Option<Key> = None;
+        let mut last_pin: Option<(Key, DepFilePin)> = None;
+        for (key, pin, bytes) in entries {
+            if let Some(bytes) = bytes
+                && last_put != Some(key)
+            {
+                store.put(cx, key, bytes)?;
+                last_put = Some(key);
+            }
+            if pin != DepFilePin::LocalOnly && last_pin != Some((key, pin)) {
+                last_pin = Some((key, pin));
+                match pin {
+                    DepFilePin::Toolchain => store.keep_with_toolchain(key)?,
+                    DepFilePin::MemberRow => {
+                        member_rows.get_or_insert_with(|| Vec::new_in(g)).push(key);
+                    }
+                    DepFilePin::LocalOnly => {}
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether `outlines` (sorted by slot `Name`) holds the planned outline for checkout path `real`
+/// (either at its literal path or at its `x.rs` module slot for `x/mod.rs`).
+fn outline_exists(outlines: &[Outlined<'_>], real: &str, alloc: blaze_own::Alloc<'_>) -> bool {
+    let locate = |slot: Name| {
+        outlines
+            .binary_search_by_key(&slot, |one| one.name)
+            .ok()
+            .and_then(|i| outlines.get(i))
+            .is_some_and(|one| one.path.as_slice() == real.as_bytes())
+    };
+    if locate(Name::file(real.as_bytes())) {
+        return true;
+    }
+    let Some(stem) = real.strip_suffix("/mod.rs") else { return false };
+    let mut slot = blaze_own::AVec::from_slice_in(stem.as_bytes(), alloc);
+    slot.extend_from_slice(b".rs");
+    locate(Name::file(&slot))
+}
+
+/// Stretch-local [`blaze_ladder::front2::source::Load`] over [`crate::front_load::StoreLoad`]:
+/// reuses each crate's already-verified `CrateRecords::names_proof` (avoiding repeat
+/// `Verified::check` per stretch), answers `proc_macro` directly from the crate graph (avoiding
+/// opening unused dependency `CrateScope` records during impl lookup), uses planned outlines
+/// whenever present, and caches outlined packed/unread dependency files across stretches.
+struct BodiesLoad<'n> {
+    inner: &'n crate::front_load::StoreLoad<'n>,
+    crates: crate::front_load::CratesFrom<'n>,
+    texts: &'n crate::job_texts::JobTexts<'n>,
+    world_ats: &'n [usize],
+    packages: &'n [&'n str],
+    list: &'n blaze_world::crate_list::CrateList<'static>,
+    outlines: &'n [Outlined<'n>],
+    has_unread_outlines: bool,
+    unread_digests: Option<&'n [(blaze_own::String<SharedAlloc<'static>>, ContentId)]>,
+    dep_files: &'n DependencyFiles,
+    snapshot: &'n StoreSnapshot,
+    alloc: blaze_own::Alloc<'n>,
+}
+
+impl<'n> blaze_ladder::front2::source::Load<'n> for BodiesLoad<'n> {
+    fn names(&self, krate: usize) -> Option<&'n [u8]> {
+        self.inner.names(krate)
+    }
+
+    fn names_verified(&self, krate: usize) -> Option<blaze_scope::names_record::Verified<'n>> {
+        // Delegate through `self.inner` so crate 0 (`own`) uses its bound `VerifiedModules`
+        // bitmap cache and any open failure is recorded in `StoreLoad::refused` on first ask.
+        self.inner.names_verified(krate)
+    }
+
+    fn items(&self, krate: usize) -> Option<&'n [u8]> {
+        self.inner.items(krate)
+    }
+
+    fn items_verified(&self, krate: usize) -> Option<blaze_scope::items_record::VerifiedItems<'n>> {
+        self.inner.items_verified(krate)
+    }
+
+    fn proc_macro(&self, krate: usize) -> Option<bool> {
+        self.world_ats.get(krate).map(|&at| CrateGraph::proc_macro(self.list, at))
+    }
+
+    fn file(&self, krate: usize, path: blaze_scope::package_path::PackagePath<'_>) -> Option<&'n str> {
+        self.inner.file(krate, path)
+    }
+
+    fn file_items(
+        &self,
+        krate: usize,
+        index: u32,
+        path: blaze_scope::package_path::PackagePath<'_>,
+        surface: ContentId,
+        edition: blaze_surface::Edition,
+        bump: blaze_own::Bump<'n>,
+    ) -> Result<Option<blaze_scope::items_record::CurrentFile<'n>>, blaze_scope::items_record::ItemsRecordError> {
+        let Some(package) = self.packages.get(krate) else { return Ok(None) };
+        let Some(full) = path.in_package(package, self.alloc) else { return Ok(None) };
+        if let Some(real) = full.strip_prefix("/0/")
+            && (!self.has_unread_outlines || outline_exists(self.outlines, real, self.alloc))
+        {
+            return self.inner.file_items(krate, index, path, surface, edition, bump);
+        }
+        let Some(text) = blaze_scope::resolve::SourceTexts::read(self.texts, krate, &full) else {
+            return Ok(None);
+        };
+        // Packed dependency sources (`!full.starts_with("/0/")`) come from immutable packs, so
+        // `DependencyFiles` only hashes `text` on first outline miss. Unread checkout files
+        // (`/0/...`) still hash and check `unread_digests` against the request's initial sweep.
+        let digest = if let Some(real) = full.strip_prefix("/0/") {
+            let digest = self.texts.checkout_digest(real).unwrap_or_else(|| ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes()));
+            if let Some(digests) = self.unread_digests {
+                let find = |path: &str| digests.binary_search_by(|(p, _)| p.as_str().cmp(path)).ok().and_then(|i| digests.get(i)).map(|row| row.1);
+                let expected = find(real).or_else(|| {
+                    let stem = real.strip_suffix("/mod.rs")?;
+                    let mut slot = blaze_own::AString::from_str_in(stem, self.alloc);
+                    slot.push_str(".rs");
+                    find(slot.as_str())
+                });
+                if let Some(saw) = expected
+                    && saw != digest
+                    && let Some(key) = self.crates.key(krate)
+                {
+                    return Err(blaze_scope::items_record::ItemsRecordError::Stale {
+                        krate: key,
+                        file: Some(index),
+                        call: None,
+                        saw,
+                        found: digest,
+                    });
+                }
+            }
+            Some(digest)
+        } else {
+            None
+        };
+        let Some(&world_at) = self.world_ats.get(krate) else {
+            return blaze_scope::items_record::CurrentFile::from_text(index, text, edition, bump).map(Some);
+        };
+        let pin = if full.starts_with("/0/") {
+            DepFilePin::LocalOnly
+        } else if CrateGraph::toolchain(self.list, world_at) {
+            DepFilePin::Toolchain
+        } else {
+            DepFilePin::MemberRow
+        };
+        self.dep_files.get_or_outline(self.snapshot, world_at, index, text, digest, edition, pin, bump).map(Some)
+    }
+
+    fn expansion(&self, krate: usize, call: ItemKey) -> Option<blaze_ladder::front2::source::LoadedExpansion<'n>> {
+        self.inner.expansion(krate, call)
+    }
+}
+
+/// Opens one stretch's `Records` directly over [`BodiesLoad`], matching
+/// `run_names::names_records_over` while reusing verified names proofs, crate-graph `proc_macro`
+/// flags, planned outlines, and cached dependency file outlines.
+#[inline(never)]
+#[expect(clippy::too_many_arguments, reason = "a stretch's records edge: each argument one input of them")]
+fn open_stretch_records<'n>(
+    cx: &'n Cx,
+    root: &'n Dir<ReadWrite>,
+    crates: crate::run_names::ScopeCrates<'_, 'n>,
+    list: &'n blaze_world::crate_list::CrateList<'static>,
+    packs: crate::job_texts::Packs<'n>,
+    outlines: &'n [Outlined<'n>],
+    has_unread_outlines: bool,
+    unread_digests: Option<&'n [(blaze_own::String<SharedAlloc<'static>>, ContentId)]>,
+    dep_files: &'n DependencyFiles,
+    corrected: &'n [(u32, &'n str, &'n str)],
+    procs: Option<&'n crate::proc_runner::ProcRunner<'static>>,
+    env: Option<&'n blaze_scope::crate_env::CrateEnv<'n>>,
+    snapshot: &'n StoreSnapshot,
+    expansion_keys: &'n SharedSet<Key, SharedAlloc<'static>>,
+    frame: &'n Frame,
+    g: blaze_own::Alloc<'static>,
+) -> crate::run_names::Opened<'n> {
+    use core::cell::RefCell;
+    let count = crates.len();
+    let mut crate_names: Vec<&'n str, &'n Frame> = Vec::with_capacity_in(count, frame);
+    let mut packages: Vec<&'n str, &'n Frame> = Vec::with_capacity_in(count, frame);
+    let mut world_ats: Vec<usize, &'n Frame> = Vec::with_capacity_in(count, frame);
+    let mut callers: Vec<(usize, usize, blaze_expand::Edition), &'n Frame> = Vec::with_capacity_in(count, frame);
+    let mut by_need: Option<(&'n [crate::front_load::Unopened], &'n dyn crate::front_load::OpenByNeed)> = None;
+    let from = match crates {
+        crate::run_names::ScopeCrates::Opened(crates) => {
+            let mut records: Vec<crate::front_load::CrateRecords<'n>, &'n Frame> = Vec::with_capacity_in(count, frame);
+            for (at, one) in crates.iter().enumerate() {
+                records.push(one.records);
+                crate_names.push(one.name);
+                packages.push(one.package);
+                world_ats.push(one.world_at);
+                callers.push((at, one.world_at, one.records.edition));
+            }
+            crate::front_load::CratesFrom::Opened(records.into_bump_slice())
+        }
+        crate::run_names::ScopeCrates::ByNeed(scope) => {
+            crate_names.push(scope.own.name);
+            packages.push(scope.own.package);
+            world_ats.push(scope.own.world_at);
+            callers.push((0, scope.own.world_at, scope.own.records.edition));
+            by_need = Some((scope.rest, scope.records));
+            for one in scope.rest {
+                crate_names.push(one.name);
+                packages.push(one.package);
+                world_ats.push(one.world_at);
+            }
+            crate::front_load::CratesFrom::ByNeed { own: scope.own.records, own_world_at: scope.own.world_at, rest: scope.rest, records: scope.records }
+        }
+    };
+    let crate_names: &'n [&'n str] = crate_names.into_bump_slice();
+    let packages: &'n [&'n str] = packages.into_bump_slice();
+    let world_ats: &'n [usize] = world_ats.into_bump_slice();
+    let callers: &'n [(usize, usize, blaze_expand::Edition)] = callers.into_bump_slice();
+    let texts: &'n crate::job_texts::JobTexts<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
+        crate::job_texts::JobTexts {
+            cx,
+            root,
+            frame,
+            packs,
+            corrected,
+            env: env.map(|env| (0, env)),
+            envs: None,
+            read: RefCell::new(std::vec::Vec::new_in(Global)),
+            unread: RefCell::new(Vec::new_in(frame)),
+            data: RefCell::new(std::vec::Vec::new_in(Global)),
+            left: RefCell::new(std::vec::Vec::new_in(Global)),
+            procs: crate::job_texts::Procs::of(procs),
+            own: None,
+            callers,
+            by_need,
+            run_stopped: core::cell::Cell::new(None),
+            activity: None,
+        },
+        frame,
+    ));
+    let storage = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(blaze_own::Erased::new(frame), frame));
+    let alloc = storage.handle();
+    let load: &'n crate::front_load::StoreLoad<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
+        crate::front_load::StoreLoad::from_crates(from, packages, texts, Some(snapshot), Some(expansion_keys), Some(outlines), storage.bump(), alloc),
+        frame,
+    ));
+    let bodies_load: &'n BodiesLoad<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
+        BodiesLoad { inner: load, crates: from, texts, world_ats, packages, list, outlines, has_unread_outlines, unread_digests, dep_files, snapshot, alloc },
+        frame,
+    ));
+    let log: &'n blaze_ladder::front2::source::Log<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
+        blaze_ladder::front2::source::Log::new(crate_names, g),
+        frame,
+    ));
+    let keys = load.keys(frame);
+    let records: &'n blaze_ladder::front2::source::Records<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
+        blaze_ladder::front2::source::Records::new(keys, bodies_load, log, frame, g),
+        frame,
+    ));
+    let sources: &'n blaze_ladder::front2::body_host::Sourced<'n, crate::job_texts::JobTexts<'n>> =
+        blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(blaze_ladder::front2::body_host::Sourced(texts), frame));
+    crate::run_names::Opened { records, load, sources }
+}
+
 /// A Bodies phase's setup ([`BodiesStage::prepare`]): what every body check of the phase reads,
 /// made once on the coordinator and read by its runs through [`Prepared::runner`] from any
 /// worker. Owned here,
@@ -2322,6 +3673,8 @@ pub(crate) struct Prepared<'s, 'f, 'r> {
     /// The store's committed snapshot, for lazy expansion texts.
     snapshot: crate::store::SharedSnapshot,
     expansion_keys: SharedSet<Key, SharedAlloc<'static>>,
+    /// Outlined dependency files cached once per phase across all stretches.
+    dep_files: DependencyFiles,
     /// Each member's check scope, files and item keys (`groups`); `None` when the stage stopped
     /// (every task's row is then in the phase's buffer, filed by `prepare`).
     found: Option<Found<'f, 'r>>,
@@ -2329,14 +3682,88 @@ pub(crate) struct Prepared<'s, 'f, 'r> {
     ones: &'f [One<'f>],
     outlined: &'s [Outlined<'s>],
     root: &'s Dir<ReadWrite>,
+    fs: &'s bstd::fs::Fs,
     board: &'s crate::engine_status::Board<'s>,
     clock: &'s Clock,
     listings: &'s crate::engine_heads::Listings,
     seeds: Option<&'s crate::engine_seeds::RequestTable<'s>>,
+    names_keys: Option<crate::engine_names::NamesKeys<'s>>,
     procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
     heap: &'static blaze_own::Heap,
     keep_scratch: bool,
+    has_unread_outlines: bool,
+    unread_digests: Option<blaze_own::Arc<blaze_own::Vec<(blaze_own::String<SharedAlloc<'static>>, ContentId), SharedAlloc<'static>>, SharedAlloc<'static>>>,
     plants: RowPlants,
+}
+
+/// Scope records opened by need, resolving each crate's `CrateScope` input lazily on its first
+/// actual question when [`scope_by_need`] deferred upfront lookups for a standing member.
+pub(crate) struct LazyScopeRecords<'r> {
+    inner: crate::front_load::ScopeRecords<'r>,
+    names: Option<crate::engine_names::NamesKeys<'r>>,
+    crates: usize,
+    resolved: bstd::sync::PublishOnce<blaze_own::Vec<bstd::sync::PublishOnce<Result<Input, &'static str>>, SharedAlloc<'static>>>,
+    heap: &'static blaze_own::Heap,
+}
+
+impl<'r> LazyScopeRecords<'r> {
+    fn new(snapshot: &'r StoreSnapshot, crates: usize, names: Option<crate::engine_names::NamesKeys<'r>>, heap: &'static blaze_own::Heap) -> LazyScopeRecords<'r> {
+        LazyScopeRecords { inner: crate::front_load::ScopeRecords::new(snapshot, crates, heap), names, crates, resolved: bstd::sync::PublishOnce::new(), heap }
+    }
+
+    pub(crate) fn counts(&self) -> crate::front_load::ByNeedCounts {
+        self.inner.counts()
+    }
+}
+
+impl crate::front_load::OpenByNeed for LazyScopeRecords<'_> {
+    fn open<'s>(&'s self, one: &crate::front_load::Unopened) -> Result<crate::front_load::CrateRecords<'s>, &'static str> {
+        if one.input.at != Key::default() {
+            return self.inner.open(one);
+        }
+        let resolved = match self.resolved.get() {
+            Some(resolved) => resolved,
+            None => {
+                let slots = blaze_own::Vec::from_iter_in((0..self.crates).map(|_| bstd::sync::PublishOnce::new()), self.heap.shared());
+                let _ = self.resolved.set(slots);
+                match self.resolved.get() {
+                    Some(resolved) => resolved,
+                    None => return Err("lazy scope crate resolution slots could not be initialized (engine_bodies.rs `LazyScopeRecords`)"),
+                }
+            }
+        };
+        let Some(slot) = resolved.get(one.world_at) else {
+            return Err("its place is past the request's crate list (engine_bodies.rs `LazyScopeRecords`)");
+        };
+        let got = match slot.get() {
+            Some(got) => *got,
+            None => {
+                let resolved_input = match self.names {
+                    None => Err("its crate's names inputs were not given to resolve a lazy scope crate (engine_bodies.rs `LazyScopeRecords`)"),
+                    Some(keys) => keys.input_of(one.input.name).ok_or_else(|| {
+                        crate::engine_head_notes::leak(self.heap.alloc(), format_args!("crate `{}` has no names record this command (engine_bodies.rs `LazyScopeRecords`)", one.name))
+                    }),
+                };
+                let _ = slot.set(resolved_input);
+                slot.get().copied().unwrap_or(resolved_input)
+            }
+        };
+        let input = got?;
+        let resolved = crate::front_load::Unopened { input, ..*one };
+        self.inner.open(&resolved)
+    }
+
+    fn pack_file_items<'s>(
+        &'s self,
+        world_at: usize,
+        nfiles: usize,
+        file: u32,
+        edition: blaze_surface::Edition,
+        text: &'s str,
+        verify_digest: bool,
+    ) -> Option<Result<blaze_scope::items_record::CurrentFile<'s>, blaze_scope::items_record::ItemsRecordError>> {
+        self.inner.pack_file_items(world_at, nfiles, file, edition, text, verify_digest)
+    }
 }
 
 /// One entry's check by [`BodyRunner::run_body`]: its row in `out` (made or failed, by
@@ -2346,6 +3773,8 @@ pub(crate) struct BodyRun<'a, 'f> {
     pub(crate) ran: SVec<'a, Ran<'f>>,
     pub(crate) findings: RunOut<'a>,
     pub(crate) tally: crate::engine_seeds::SeedTally,
+    /// The run's thread stretch `(start, end)` in ns since request start, for `Times::job`.
+    pub(crate) span: (u64, u64),
 }
 
 // Bounded where declared (rule 76; [`Census`]): 62 KiB each with the census by value.
@@ -2382,7 +3811,8 @@ pub(crate) struct BodyRunner<'v, 'f, 'r> {
     outlined: &'v [Outlined<'v>],
     listings: &'v crate::engine_heads::Listings,
     root: &'v Dir<ReadWrite>,
-    packs: &'v [blaze_fetch::PackView<'static>],
+    fs: &'v bstd::fs::Fs,
+    packs: &'v crate::body_types::SyncLazyTrees<'f>,
     corrected: &'v [(u32, &'static str, &'static str)],
     procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
     groups: &'v [Group<'f, 'r>],
@@ -2394,6 +3824,8 @@ pub(crate) struct BodyRunner<'v, 'f, 'r> {
     seeds: Option<&'v crate::engine_seeds::RequestTable<'v>>,
     board: &'v crate::engine_status::Board<'v>,
     keep_scratch: bool,
+    has_unread_outlines: bool,
+    unread_digests: Option<&'v [(blaze_own::String<SharedAlloc<'static>>, ContentId)]>,
     plants: RowPlants,
     /// The bodies this setup left to check, by (member, file, name).
     ones: &'v [One<'f>],
@@ -2401,6 +3833,8 @@ pub(crate) struct BodyRunner<'v, 'f, 'r> {
     /// The request's scope records opened by need ([`Prepared::scope_records`]): every run's
     /// crates past its member ([`GroupCrates::ByNeed`]) are opened here at their first question.
     by_need: &'v dyn crate::front_load::OpenByNeed,
+    /// Outlined dependency files cached once per phase across stretches.
+    dep_files: &'v DependencyFiles,
 }
 
 /// A body a run was asked for that its setup did not leave to check (rule 19), in the owned,
@@ -2429,6 +3863,7 @@ impl<'v, 'f, 'r> BodyRunner<'v, 'f, 'r> {
             outlined: self.outlined,
             listings: self.listings,
             root: self.root,
+            fs: self.fs,
             packs: self.packs,
             corrected: self.corrected,
             procs: self.procs,
@@ -2446,9 +3881,21 @@ impl<'v, 'f, 'r> BodyRunner<'v, 'f, 'r> {
             scope_reads: self.stage.scope_reads,
             board: self.board,
             keep_scratch: self.keep_scratch,
+            has_unread_outlines: self.has_unread_outlines,
+            unread_digests: self.unread_digests,
             plants: self.plants,
             by_need: self.by_need,
+            dep_files: self.dep_files,
         }
+    }
+
+    /// The member's own `CrateScope` cell (`Stage::Names`) for `body`: what `BodyKind::run`
+    /// peeks before opening scope crates or typechecking so a body scheduled in the same tick as
+    /// `FileItems` (`Stage::Outlines`) parks in O(1) instead of running twice.
+    pub(crate) fn own_scope_cell(&self, body: Name) -> Option<CellId> {
+        let one = self.ones.iter().find(|one| one.task.planned.name == body)?;
+        let group = self.groups.get(usize::try_from(one.group).ok()?)?;
+        Some(CellId { of: group.own, cell: WHOLE })
     }
 
     /// One entered body's check (its whole entry, never sliced) over today's digests `reads`,
@@ -2458,8 +3905,10 @@ impl<'v, 'f, 'r> BodyRunner<'v, 'f, 'r> {
         let name = task.planned.name;
         let one = self.ones.iter().find(|one| one.task.planned.name == name).ok_or(NotInSetup { body: name, what: "not a body its phase's setup left to check (engine_bodies.rs `prepare`)" })?;
         let shared = self.over(reads);
-        let mut run = BodyRun { out: Buffer::new_in(alloc), ran: SVec::new_in(alloc), findings: RunOut::new(alloc), tally: crate::engine_seeds::SeedTally::default() };
-        run_bodies(cx, &shared, core::slice::from_ref(one), self.clock, &mut run.out, &mut run.ran, &mut run.findings, &mut run.tally, alloc);
+        let mut run = BodyRun { out: Buffer::new_in(alloc), ran: SVec::new_in(alloc), findings: RunOut::new(alloc), tally: crate::engine_seeds::SeedTally::default(), span: (0, 0) };
+        let began = crate::engine_times::ns(self.clock.now().since_start());
+        run_bodies(cx, &shared, core::slice::from_ref(one), self.clock, &mut run.out, &mut run.ran, &mut run.findings, &mut run.tally, alloc, alloc);
+        run.span = (began, crate::engine_times::ns(self.clock.now().since_start()));
         Ok(run)
     }
 }
@@ -2474,6 +3923,7 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
             outlined: self.outlined,
             listings: self.listings,
             root: self.root,
+            fs: self.fs,
             packs,
             corrected,
             procs: self.procs,
@@ -2486,10 +3936,13 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
             seeds: self.seeds,
             board: self.board,
             keep_scratch: self.keep_scratch,
+            has_unread_outlines: self.has_unread_outlines,
+            unread_digests: self.unread_digests.as_deref().map(blaze_own::Vec::as_slice),
             plants: self.plants,
             ones: self.ones,
             clock: self.clock,
             by_need,
+            dep_files: &self.dep_files,
         }
     }
 
@@ -2512,9 +3965,82 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
     /// it (its records are borrowed from the snapshot this setup holds), its counts read after
     /// they end ([`BodiesStage::add_by_need`]). One a request: a crate is opened once whichever
     /// job asks it first (the floor: the crates the checks ask, each once).
-    pub(crate) fn scope_records(&self) -> crate::front_load::ScopeRecords<'_> {
+    pub(crate) fn scope_records(&self) -> LazyScopeRecords<'_> {
         let crates = self.found.as_ref().and_then(|found| found.groups.first()).map_or(0, |group| CrateGraph::len(&group.list));
-        crate::front_load::ScopeRecords::new(self.snapshot.as_ref(), crates, self.heap)
+        LazyScopeRecords::new(self.snapshot.as_ref(), crates, self.names_keys, self.heap)
+    }
+
+    /// Pre-opens the distinct lang crates (`core`, `alloc`, `std`, `bstd`) of active groups (those
+    /// referenced by `self.ones`) ONCE in parallel across `workers` before body stretches begin,
+    /// avoiding redundant nested spawns and `OnceLock` contention across concurrent stretches.
+    pub(crate) fn pre_open_lang(&self, cx: &Cx, by_need: &LazyScopeRecords<'_>, workers: NonZeroU32) -> Result<(), CliError> {
+        self.pre_open_lang_with(cx, by_need, workers, |_| ())
+    }
+
+    /// Runs `work` on the current thread while pre-opening the distinct lang crates (`core`,
+    /// `alloc`, `std`, `bstd`) of active groups in parallel on `workers`. Skips spawning worker
+    /// threads for tiny edits (`<= INLINE_RUNS_MAX` bodies) so lang crates open lazily on demand
+    /// without waking 3 parallel opener workers.
+    pub(crate) fn pre_open_lang_with<T>(&self, cx: &Cx, by_need: &LazyScopeRecords<'_>, workers: NonZeroU32, work: impl FnOnce(&Cx) -> T) -> Result<T, CliError> {
+        let Some(found) = self.found.as_ref() else { return Ok(work(cx)) };
+        if self.ones.len() <= INLINE_RUNS_MAX || workers.get() <= 1 {
+            return Ok(work(cx));
+        }
+        let mut to_open: [Option<&crate::front_load::Unopened>; 8] = [None; 8];
+        let mut count = 0usize;
+        let mut seen_groups: [u32; 8] = [u32::MAX; 8];
+        let mut seen_count = 0usize;
+        for one in self.ones {
+            if seen_groups.iter().take(seen_count).any(|&g| g == one.group) {
+                continue;
+            }
+            if let Some(slot) = seen_groups.get_mut(seen_count) {
+                *slot = one.group;
+                seen_count += 1;
+            }
+            let Some(group) = usize::try_from(one.group).ok().and_then(|at| found.groups.get(at)) else { continue };
+            let GroupCrates::ByNeed { rest, .. } = &group.crates else { continue };
+            for &place in group.lang.iter() {
+                if place > 0
+                    && let Some(unopened) = rest.get(place - 1)
+                    && !to_open.iter().take(count).flatten().any(|prev| prev.world_at == unopened.world_at)
+                    && let Some(slot) = to_open.get_mut(count)
+                {
+                    *slot = Some(unopened);
+                    count += 1;
+                }
+            }
+            if count == to_open.len() {
+                break;
+            }
+        }
+        if count < 2 {
+            return Ok(work(cx));
+        }
+        let pre_cx = cx.span("engine: pre-open lang crates");
+        let scope = pre_cx.scope();
+        scope.narrow_workers(workers, Class::Foreground);
+        let mut handles = blaze_own::Vec::with_capacity_in(count, pre_cx.frame());
+        for unopened in to_open.iter().take(count).flatten().copied() {
+            handles.push(scope.may_overlap("engine: open lang crate", 1 << 20, move |_cx: &Cx| {
+                let _ = crate::front_load::OpenByNeed::open(by_need, unopened);
+                Ok::<_, Infallible>(())
+            }));
+        }
+        let out = work(cx);
+        let mut first_err: Option<CliError> = None;
+        for handle in handles.into_iter() {
+            if let Err(err) = handle.join(&pre_cx) {
+                first_err.get_or_insert_with(|| CliError::Pool(err));
+            }
+        }
+        if let Err(err) = scope.join(&pre_cx) {
+            first_err.get_or_insert_with(|| CliError::Pool(err));
+        }
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+        Ok(out)
     }
 
     /// The `Ready` driver's bodies joined into `stage` (D187): the runs its `BodyCheck` kind
@@ -2539,13 +4065,31 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
         stage.runs = u32::try_from(runs.len()).unwrap_or(u32::MAX);
         if let Some(found) = self.found.as_ref() {
             stage.uncovered = found.uncovered;
+            stage.persist_stretch_fronts(cx, store, &found.groups, self.heap)?;
         }
+        self.dep_files.persist(cx, store, &mut stage.member_rows, self.heap)?;
         let mut entries: SVec<'a, &[One<'f>]> = SVec::with_capacity_in(runs.len(), alloc);
         let mut buffers: SVec<'a, (Buffer<'a>, SVec<'a, Ran<'f>>, RunOut<'a>)> = SVec::with_capacity_in(runs.len(), alloc);
+        let ones_by_name: Option<SVec<'a, (Name, usize)>> = if self.ones.len() > 8 && runs.len() > 1 {
+            let mut idx: SVec<'a, (Name, usize)> = SVec::with_capacity_in(self.ones.len(), alloc);
+            idx.extend(self.ones.iter().enumerate().map(|(at, one)| (one.task.planned.name, at)));
+            idx.sort_unstable_by_key(|&(name, _)| name);
+            Some(idx)
+        } else {
+            None
+        };
         for run in runs.into_iter() {
             stage.seeds.add(&run.tally);
+            times.job(crate::engine_times::Step::BodiesRun, run.span.0, run.span.1);
             // The run's one entry: its body's `One` (`run_body` runs one, never a slice).
-            let one = run.ran.first().and_then(|ran| self.ones.iter().find(|one| one.task.planned.name == ran.name));
+            let one = run.ran.first().and_then(|ran| match ones_by_name.as_ref() {
+                Some(idx) => idx
+                    .binary_search_by_key(&ran.name, |&(name, _)| name)
+                    .ok()
+                    .and_then(|pos| idx.get(pos))
+                    .and_then(|&(_, at)| self.ones.get(at)),
+                None => self.ones.iter().find(|one| one.task.planned.name == ran.name),
+            });
             entries.push(one.map_or(&[][..], core::slice::from_ref));
             buffers.push((run.out, run.ran, run.findings));
         }
@@ -2600,7 +4144,6 @@ impl<'f> BodiesStage<'f> {
             typed_bytes: 0,
             untyped_clean: 0,
             setup: StretchSetup::default(),
-            census: Census::NONE,
             slices: None,
             cost_fit: CostFit::default(),
             grains_last: None,
@@ -2609,7 +4152,9 @@ impl<'f> BodiesStage<'f> {
             grains_line: None,
             members_last: None,
             outlines_moved: None,
+            outlines_entered: None,
             unread: None,
+            unread_digests: None,
             members_key: None,
             standing_drops_heads: false,
             row_key_unit_only: false,
@@ -2618,6 +4163,8 @@ impl<'f> BodiesStage<'f> {
             shared_rows: None,
             unreadable: None,
             by_need: crate::front_load::ByNeedCounts::default(),
+            standing_views: core::cell::RefCell::new(None),
+            members_cached: None,
         }
     }
 
@@ -2647,7 +4194,50 @@ impl<'f> BodiesStage<'f> {
     /// from the record only where it was made over that answer (engine_members_record.rs
     /// `Header::made_at`). Both drivers set it; only [`StandingMembers`] reads it.
     pub(crate) fn members_from(&mut self, record: Option<Key>, last_serial: u64) {
+        if self.members_cached.as_ref().is_some_and(|(cached_key, _)| Some(*cached_key) != record) {
+            self.members_cached = None;
+        }
         self.members_last = Some((record, last_serial));
+    }
+
+    /// Opens the last request's `BLZMEMB` members record at most once per request, caching the
+    /// shared `Rc<View<'static>>` (or refusal) across `plan_reach`, `ready_reads`, and `groups`.
+    fn open_members<'r>(
+        &mut self,
+        cx: &Cx,
+        store: &mut dyn crate::store::Store<'r>,
+        g: blaze_own::Alloc<'static>,
+    ) -> Result<
+        Option<Result<blaze_own::Rc<crate::engine_members_record::View<'static>, blaze_own::Alloc<'static>>, crate::engine_members_record::MembersRefused>>,
+        CliError,
+    > {
+        let Some(key) = self.members_last.and_then(|(record, _)| record) else {
+            return Ok(None);
+        };
+        if let Some((cached_key, cached)) = self.members_cached.as_ref()
+            && *cached_key == key
+        {
+            return Ok(Some(match cached {
+                Ok(view) => Ok(blaze_own::Share::share(view)),
+                Err(err) => Err(*err),
+            }));
+        }
+        let Some(held) = store.get(cx, key)? else {
+            return Ok(None);
+        };
+        let mut copy: Vec<u8, blaze_own::Alloc<'static>> = Vec::with_capacity_in(held.bytes.len(), g);
+        copy.extend_from_slice(held.bytes);
+        let bytes: &'static [u8] = copy.leak_static();
+        let opened = match crate::engine_members_record::View::open(bytes, g) {
+            Ok(view) => Ok(blaze_own::Rc::new_in(view, g)),
+            Err(err) => Err(err),
+        };
+        let out = match &opened {
+            Ok(view) => Ok(blaze_own::Share::share(view)),
+            Err(err) => Err(*err),
+        };
+        self.members_cached = Some((key, opened));
+        Ok(Some(out))
     }
 
     /// THE PLAN'S REACH (D191): which member units reach each file, made once a request from
@@ -2669,12 +4259,17 @@ impl<'f> BodiesStage<'f> {
     /// member, refuses the ready request ([`crate::engine_ready_edit::ReadyRefused::Members`],
     /// rule 3), never a reach guessed.
     #[expect(clippy::too_many_arguments, reason = "the plan's edge: each argument one handle of it")]
+    pub(crate) fn reach(&self) -> Option<&Reach> {
+        self.reach.as_ref()
+    }
+
     pub(crate) fn plan_reach<'r>(
         &mut self,
         cx: &Cx,
         store: &mut dyn crate::store::Store<'r>,
         graph: Option<Input>,
         list: Option<&blaze_world::crate_list::CrateList<'_>>,
+        scoped: Option<&crate::engine_check::ScopedUnits>,
         outlined: &[Outlined<'_>],
         // Every member unit's found files (engine_body_plan.rs `FoundEdge`): its walk's beside
         // its root, and the setup's walk of it (`groups`).
@@ -2684,24 +4279,22 @@ impl<'f> BodiesStage<'f> {
     ) -> Result<Option<&Reach>, CliError> {
         use crate::engine_ready_edit::ReadyRefused;
         self.reach = None;
+        *self.standing_views.borrow_mut() = None;
         let Some(list) = list else { return Ok(None) };
         let reach = match from {
-            ReachFrom::Walk => Reach::walk(list, outlined, found, g).map_err(EngineCheckError::Unoutlined)?,
+            ReachFrom::Walk => Reach::walk(list, scoped, outlined, found, g).map_err(EngineCheckError::Unoutlined)?,
             ReachFrom::MembersRecord => {
                 let refused = |unit: Option<Name>| EngineCheckError::ReadyRefused(ReadyRefused::Members { unit });
                 let Some(graph) = graph else { return Err(refused(None).into()) };
-                let stored = match self.members_last.and_then(|(record, _)| record) {
-                    Some(key) => store.get(cx, key)?.map(|held| held.bytes),
-                    None => None,
-                };
-                let view = match stored.map(|bytes| crate::engine_members_record::View::open(bytes, g)) {
+                let view = match self.open_members(cx, store, g)? {
                     Some(Ok(view)) if view.header.graph_out == graph.out => view,
                     _ => return Err(refused(None).into()),
                 };
-                Reach::of_members(list, &view, found, g).map_err(|unknown| refused(Some(unknown.unit)))?
+                Reach::of_members_shared(list, scoped, view, found, g).map_err(|unknown| refused(Some(unknown.unit)))?
             }
         };
         self.reach = Some(reach);
+        *self.standing_views.borrow_mut() = Some(StandingViewCache::new(g));
         Ok(self.reach.as_ref())
     }
 
@@ -2728,8 +4321,13 @@ impl<'f> BodiesStage<'f> {
     /// The ready setup's: the files it has an outline of and did not read back (sorted, each
     /// once). Under [`StandingMembers`] a visited member's held file among them is refused by
     /// name in `groups` (it would key the member's row apart from the phase path's).
-    pub(crate) fn unread_outlines(&mut self, unread: Vec<Name, blaze_own::Alloc<'static>>) {
+    pub(crate) fn unread_outlines(
+        &mut self,
+        unread: Vec<Name, blaze_own::Alloc<'static>>,
+        digests: Option<blaze_own::Arc<blaze_own::Vec<(blaze_own::String<SharedAlloc<'static>>, ContentId), SharedAlloc<'static>>, SharedAlloc<'static>>>,
+    ) {
         self.unread = Some(unread);
+        self.unread_digests = digests;
     }
 
     /// THE READY SETUP'S READS (piece B2): which outlines the bodies' setup will need, before any
@@ -2750,8 +4348,11 @@ impl<'f> BodiesStage<'f> {
         store: &mut dyn crate::store::Store<'r>,
         graph: blaze_drive::Input,
         names: NamesInputs<'_, '_>,
+        scoped: Option<&crate::engine_check::ScopedUnits>,
         tool: blaze_drive::Tool,
         moved: &[Name],
+        outlined: &[Outlined<'_>],
+        plant: crate::engine_ready_edit::CommitPlant,
         frame: &'f Frame,
         g: blaze_own::Alloc<'static>,
     ) -> Result<Vec<Name, blaze_own::Alloc<'static>>, CliError> {
@@ -2759,50 +4360,60 @@ impl<'f> BodiesStage<'f> {
         let mut seeds: Vec<Name, blaze_own::Alloc<'static>> = Vec::new_in(g);
         let Some(list) = self.kept.list(cx, store, &graph, frame)? else { return Ok(seeds) };
         let today = rec::Header { graph_out: graph.out, tool, made_at: self.members_last.map_or(0, |(_, serial)| serial) };
-        let stored = match self.members_last.and_then(|(record, _)| record) {
-            Some(key) => store.get(cx, key)?.map(|held| held.bytes),
-            None => None,
-        };
         // A record that does not open stands no member (`groups` counts it and visits each):
         // every member's tree is then read, never one taken from a record it will not take.
-        let view = stored.and_then(|bytes| rec::View::open(bytes, g).ok());
+        let view = match self.open_members(cx, store, g)? {
+            Some(Ok(view)) => Some(view),
+            _ => None,
+        };
         let world = names.stage().names.as_ref();
         let is_test = |name: Name| world.is_some_and(|names| names.crate_at(name.subject).is_some_and(|at| names.list().test(at)));
         let root_of = |at: usize| Name::file(list.root(at).strip_prefix("/0/").unwrap_or(list.root(at)).as_bytes());
-        // Each crate a visited member's bodies may read the item text of: the member crates it
-        // depends on, transitively (a superset of its check scope's members: blaze-world
-        // check_scope.rs). A body freezing a member head it did not read before reads that
-        // item's text from its file's outline (front_load.rs `StoreLoad::file_items`), so each
-        // such member's tree is read back whole (its root here, closed under file parts by the
-        // caller); a dependency that is not a member is a pack's text, never an outline.
-        let mut reached: Vec<bool, blaze_own::Alloc<'static>> = Vec::with_capacity_in(CrateGraph::len(&list), g);
-        reached.resize(CrateGraph::len(&list), false);
-        let mut walk: Vec<usize, blaze_own::Alloc<'static>> = Vec::new_in(g);
-        for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at)) {
+        let deferral = if matches!(plant, crate::engine_ready_edit::CommitPlant::HoldersKeyedByText) {
+            Deferral::ByText
+        } else if matches!(plant, crate::engine_ready_edit::CommitPlant::DeferredNeverVisited) {
+            Deferral::NeverVisited
+        } else {
+            Deferral::Below
+        };
+        let row_key_unit_only = matches!(plant, crate::engine_ready_edit::CommitPlant::RowKeyUnitOnly);
+        let entries_now = |slot: Name| -> Option<ContentId> {
+            let at = outlined.binary_search_by(|one| one.name.cmp(&slot)).ok()?;
+            let one = outlined.get(at)?;
+            match (deferral, crate::engine_member_rows::FileHead::of(one)) {
+                (Deferral::ByText, _) => Some(one.outline_source),
+                (_, crate::engine_member_rows::FileHead::Head(_)) => Some(crate::engine_listing_record::entries_of(one)),
+                (_, crate::engine_member_rows::FileHead::Text(_) | crate::engine_member_rows::FileHead::NotOutlined) => None,
+            }
+        };
+        // Only members whose heads or module tree moved need their full module tree read back
+        // upfront. Members that stand whole (`stands`) OR stand below their heads (`stands_below`:
+        // body-only edits where every moved held file is already in `outlined` with matching
+        // `entries_of`) reuse their recorded reach, held file map, and listing row key in
+        // `groups` (`kept_below`), so none of their untouched submodules are fetched from CAS.
+        for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at) && scoped.is_none_or(|s| s.allows(*at))) {
             let own_name = blaze_drive::key::crate_scope_name(&list.key(member));
             let unit = crate::engine_body_plan::Unit { name: own_name, prefix: list.key(member).prefix(), test: is_test(own_name) };
             let place = u32::try_from(member).unwrap_or(u32::MAX);
-            if view.as_ref().and_then(|view| stands(view, place, &today, moved, &unit, names)).is_some() {
+            if view.as_deref().and_then(|view| stands(view, place, &today, moved, &unit, names)).is_some() {
+                continue;
+            }
+            if !row_key_unit_only
+                && view
+                    .as_deref()
+                    .and_then(|view| stands_below(view, place, &today, moved, &unit, names, &entries_now))
+                    .is_some()
+            {
                 continue;
             }
             seeds.push(root_of(member));
-            if let Some(kept) = view.as_ref().and_then(|view| view.member(place)) {
-                seeds.extend(kept.held.iter().map(|held| held.slot));
-                seeds.extend(kept.not_held.iter().copied());
-            }
-            walk.push(member);
-            // Each crate is walked once over every visited member: at most the list's edges.
-            while let Some(at) = walk.pop() {
-                for dep in CrateGraph::deps(&list, at) {
-                    if reached.get(dep).is_none_or(|seen| *seen) {
-                        continue;
-                    }
-                    reached[dep] = true;
-                    if list.member(dep) {
-                        seeds.push(root_of(dep));
-                    }
-                    walk.push(dep);
+            if let Some(kept) = view.as_deref().and_then(|view| view.member(place)) {
+                match &kept.state {
+                    rec::MemberState::Held(held) => seeds.extend(held.held.iter().map(|held| held.slot)),
+                    rec::MemberState::CutScope(cut) => seeds.extend(cut.held.iter().map(|held| held.slot)),
+                    rec::MemberState::Refused(_) => {}
                 }
+                seeds.extend(kept.not_held.iter().copied());
             }
         }
         seeds.sort_unstable();
@@ -2838,13 +4449,37 @@ impl<'f> BodiesStage<'f> {
         self.grains_last = Some((record, last_serial));
     }
 
-    /// One phase's entered tasks: its `CrateScope` and `ImplBucket` ones are kept, sorted, in
-    /// `heap`, the request's.
+    /// One phase's entered tasks: its `CrateScope` and `ImplBucket` ones are kept for read
+    /// grains, and its `FileItems` ones for standing-member invalidation, sorted, in `heap`.
     pub(crate) fn note_entered(&mut self, names: impl Iterator<Item = Name>, heap: blaze_own::Alloc<'static>) {
-        let kept = self.grains_entered.get_or_insert_with(|| Vec::new_in(heap));
-        kept.extend(names.filter(|name| matches!(name.kind, Kind::CrateScope | Kind::ImplBucket)));
-        kept.sort_unstable();
-        kept.dedup();
+        let grains = self.grains_entered.get_or_insert_with(|| Vec::new_in(heap));
+        let outlines = self.outlines_entered.get_or_insert_with(|| Vec::new_in(heap));
+        for name in names {
+            match name.kind {
+                Kind::CrateScope | Kind::ImplBucket => grains.push(name),
+                Kind::FileItems => outlines.push(name),
+                _ => {}
+            }
+        }
+        grains.sort_unstable();
+        grains.dedup();
+        outlines.sort_unstable();
+        outlines.dedup();
+    }
+
+    /// Whether the last request's members record was loaded and is available to stand members from.
+    pub(crate) fn has_members_record(&self) -> bool {
+        self.members_last.and_then(|(record, _)| record).is_some()
+    }
+
+    /// The `FileItems` tasks entered in earlier phases of this request, sorted.
+    pub(crate) fn outlines_entered(&self) -> &[Name] {
+        self.outlines_entered.as_deref().unwrap_or(&[])
+    }
+
+    /// Whether any `ImplBucket` task entered in earlier phases of this request.
+    pub(crate) fn entered_impl_bucket(&self) -> bool {
+        self.grains_entered.as_deref().unwrap_or(&[]).iter().any(|name| name.kind == Kind::ImplBucket)
     }
 
     /// The grains record this request put: the key the checkout's grains root names from the
@@ -2902,7 +4537,7 @@ impl<'f> BodiesStage<'f> {
     /// The plan's notes into the request's lines (engine_body_plan.rs `Outside::lines`): a file
     /// no unit holds, said once, with no engine row; kept from `last` where no body of the file
     /// was entered. Its scratch is `frame`'s.
-    pub(crate) fn plan_lines(&self, outlined: &[Outlined<'_>], unread: &[Name], last: Option<&crate::engine_lines::Last<'_, '_>>, lines: &mut crate::engine_lines::Lines<'_>, frame: &Frame) {
+    pub(crate) fn plan_lines<'a>(&self, outlined: &[Outlined<'_>], unread: &[Name], last: Option<&crate::engine_lines::Last<'a, '_>>, lines: &mut crate::engine_lines::Lines<'a>, frame: &Frame) {
         self.outside.lines(self.ran.iter().map(|one| one.file), outlined, unread, last, lines, frame);
         // The bodies a macro wrote that no task checks: named once a request, never silent.
         // Decided by this request's phase when it read the members' records; else the last
@@ -2954,6 +4589,36 @@ impl<'f> BodiesStage<'f> {
         // In the request's heap through its handle that crosses threads: the body workers insert
         // (a frame is one thread's, and the set's `insert` takes a `'static` allocator).
         let expansion_keys: SharedSet<Key, SharedAlloc<'static>> = SharedSet::new_in("engine bodies expansion text record keys", heap.shared());
+        let stopped_out = |stage: &mut BodiesStage<'f>, reach, snapshot_owner, expansion_keys| {
+            stage.reach = reach;
+            let procs = handles.names.and_then(|inputs| inputs.stage().names.as_ref()).and_then(|names| names.procs());
+            let names_keys = handles.names.map(|inputs| inputs.keys());
+            Ok(Prepared {
+                snapshot: snapshot_owner,
+                expansion_keys,
+                dep_files: DependencyFiles::new(heap),
+                found: None,
+                ones: &[],
+                outlined: handles.outlined,
+                root: handles.root,
+                fs: &handles.env.fs,
+                board: handles.board,
+                clock: handles.clock,
+                listings,
+                seeds: request_heads,
+                names_keys,
+                procs,
+                heap,
+                keep_scratch: planted_keep_scratch(),
+                has_unread_outlines: stage.unread.as_ref().is_some_and(|unread| !unread.is_empty()),
+                unread_digests: stage.unread_digests.as_ref().map(blaze_own::Share::share),
+                plants: planted_rows(),
+            })
+        };
+        if handles.board.stopping().is_some() {
+            let reach = self.reach.take();
+            return stopped_out(self, reach, snapshot_owner, expansion_keys);
+        }
         // 0. What this phase OWES: the files of the entered tasks' bodies (each task's
         // `planned.file`, the outline its `BodyCheck` part is in: `plan` above), by outline
         // index, sorted, each once. Only these files' entries are outlined and keyed by chain
@@ -2962,7 +4627,11 @@ impl<'f> BodiesStage<'f> {
         // A task whose file the request has no outline of is the setup's typed refusal (rule 3:
         // the ready setup reads back every owed file, engine_check.rs `checking`), never a body
         // dropped from what is owed.
-        for task in tasks.iter() {
+        for (idx, task) in tasks.iter().enumerate() {
+            if (idx & 255) == 0 && handles.board.stopping().is_some() {
+                let reach = self.reach.take();
+                return stopped_out(self, reach, snapshot_owner, expansion_keys);
+            }
             let at = handles.outlined.binary_search_by(|one| one.name.cmp(&task.planned.file)).map_err(|_| EngineCheckError::Unplaced { body: task.planned.name, what: "its file is none of the request's outlines (the ready setup reads back every owed file: engine_check.rs `checking`)" })?;
             owed.push(u32::try_from(at).unwrap_or(u32::MAX));
         }
@@ -2994,6 +4663,9 @@ impl<'f> BodiesStage<'f> {
             shared.sort_unstable_by_key(|row| row.name);
             shared.dedup_by_key(|row| row.name);
         }
+        if handles.board.stopping().is_some() {
+            return stopped_out(self, reach, snapshot_owner, expansion_keys);
+        }
         // 1. Each member's check scope and files, and each owed body's item key, on this thread.
         let plants = planted_rows();
         // The open seam (D168 (2), rule 78): by need, or whole under the oracle's plant. The
@@ -3004,16 +4676,16 @@ impl<'f> BodiesStage<'f> {
         let entered = Entered { tasks, rows: &rows, reach: reach.as_ref() };
         #[cfg(test)]
         let found = match (plants.open_whole, standing) {
-            (true, _) => self.groups::<Whole, EveryMember>(&cx, store, read, handles, view, plants, frame, snapshot, &expansion_keys, &owed, entered)?,
-            (false, false) => self.groups::<ByNeed, EveryMember>(&cx, store, read, handles, view, plants, frame, snapshot, &expansion_keys, &owed, entered)?,
-            (false, true) => self.groups::<ByNeed, StandingMembers>(&cx, store, read, handles, view, plants, frame, snapshot, &expansion_keys, &owed, entered)?,
+            (true, _) => self.groups::<Whole, EveryMember>(&cx, store, read, handles, view, plants, listings, frame, snapshot, &expansion_keys, &owed, entered)?,
+            (false, false) => self.groups::<ByNeed, EveryMember>(&cx, store, read, handles, view, plants, listings, frame, snapshot, &expansion_keys, &owed, entered)?,
+            (false, true) => self.groups::<ByNeed, StandingMembers>(&cx, store, read, handles, view, plants, listings, frame, snapshot, &expansion_keys, &owed, entered)?,
         };
         #[cfg(not(test))]
         let found = match standing {
-            false => self.groups::<ByNeed, EveryMember>(&cx, store, read, handles, view, plants, frame, snapshot, &expansion_keys, &owed, entered)?,
-            true => self.groups::<ByNeed, StandingMembers>(&cx, store, read, handles, view, plants, frame, snapshot, &expansion_keys, &owed, entered)?,
+            false => self.groups::<ByNeed, EveryMember>(&cx, store, read, handles, view, plants, listings, frame, snapshot, &expansion_keys, &owed, entered)?,
+            true => self.groups::<ByNeed, StandingMembers>(&cx, store, read, handles, view, plants, listings, frame, snapshot, &expansion_keys, &owed, entered)?,
         };
-        let (found, stopped) = match found {
+        let (mut found, stopped) = match found {
             Ok(found) => (Some(found), None),
             Err(why) => (None, Some(why)),
         };
@@ -3033,7 +4705,13 @@ impl<'f> BodiesStage<'f> {
         if let (Some(found), Some(reach)) = (found.as_ref(), reach.as_ref()) {
             by_rank.extend((0..reach.len()).map(|rank| reach.unit(rank).and_then(|one| found.holders.unit_named(one.unit))));
         }
-        for task in tasks.iter() {
+        if handles.board.stopping().is_some() {
+            return stopped_out(self, reach, snapshot_owner, expansion_keys);
+        }
+        for (idx, task) in tasks.iter().enumerate() {
+            if (idx & 255) == 0 && handles.board.stopping().is_some() {
+                return stopped_out(self, reach, snapshot_owner, expansion_keys);
+            }
             let name = task.planned.name;
             let file = handles.outlined.binary_search_by(|one| one.name.cmp(&task.planned.file)).map_or(u32::MAX, |at| u32::try_from(at).unwrap_or(u32::MAX));
             // Each refusal with the cells it is a function of (plan row A8): its failed row
@@ -3064,12 +4742,12 @@ impl<'f> BodiesStage<'f> {
                         (_, None) => Decision::Refused { why: NO_CLAIM, took: None },
                     };
                     let label_of = |took: Option<u32>| took.and_then(|at| found.took.get(at as usize)).map_or("", |one| one.label);
-                    let plan_cells = || crate::engine_body_plan::Holders::cells(unit_cells.as_deref().expect("a found plan has its unit cells"), &passed, &met, frame);
+                    let plan_cells = || crate::engine_body_plan::Holders::cells(unit_cells.as_deref().expect("a found plan has its unit cells"), decided, &passed, &met, frame);
                     let ordered = || -> &'f [CellId] {
                         let mut ids = plan_cells();
                         ids.sort_unstable();
                         ids.dedup();
-                        ids.leak()
+                        ids.into_bump_slice()
                     };
                     match decided {
                         Decision::Taken { took, .. } => {
@@ -3082,7 +4760,7 @@ impl<'f> BodiesStage<'f> {
                                     if file as usize >= handles.outlined.len() {
                                         return Err(EngineCheckError::Unplaced { body: name, what: "its file is none of the planner's outlines" }.into());
                                     }
-                                    let held = plan_cells().leak();
+                                    let held = plan_cells().into_bump_slice();
                                     ones.push(One { task: *task, items, group, file, label: one.label, place: one.place, held, part: None, costs: one.costs, asked: one.asked });
                                     continue;
                                 }
@@ -3166,25 +4844,38 @@ impl<'f> BodiesStage<'f> {
         self.reach = reach;
         // 3. Your code first is the next piece (engine.md 4); today: by member, file, name.
         ones.sort_unstable_by_key(|one| (one.group, one.file, one.task.planned.name));
-        let ones: &'f [One<'f>] = ones.leak();
+        let ones: &'f [One<'f>] = ones.into_bump_slice();
+        if let Some(found) = found.as_mut() {
+            for one in ones {
+                if let Some(group) = usize::try_from(one.group).ok().and_then(|idx| found.groups.get_mut(idx)) {
+                    group.bodies = group.bodies.saturating_add(u32::try_from(one.items.len()).unwrap_or(u32::MAX));
+                }
+            }
+        }
         // The memory status's slots sized once for every body to check: a slice has its
         // entry's path and label, so the entries cover the slices `run_phase` cuts.
         handles.board.bodies_mem.prepare(ones, handles.outlined, heap.shared())?;
         let procs = handles.names.and_then(|inputs| inputs.stage().names.as_ref()).and_then(|names| names.procs());
+        let names_keys = handles.names.map(|inputs| inputs.keys());
         Ok(Prepared {
             snapshot: snapshot_owner,
             expansion_keys,
+            dep_files: DependencyFiles::new(heap),
             found,
             ones,
             outlined: handles.outlined,
             root: handles.root,
+            fs: &handles.env.fs,
             board: handles.board,
             clock: handles.clock,
             listings,
             seeds: request_heads,
+            names_keys,
             procs,
             heap,
             keep_scratch: planted_keep_scratch(),
+            has_unread_outlines: self.unread.as_ref().is_some_and(|unread| !unread.is_empty()),
+            unread_digests: self.unread_digests.as_ref().map(blaze_own::Share::share),
             plants,
         })
     }
@@ -3205,6 +4896,7 @@ impl<'f> BodiesStage<'f> {
         frame: &'f Frame,
         request_heads: Option<&crate::engine_seeds::RequestTable<'_>>,
         listings: &crate::engine_heads::Listings,
+        paged_shelf: Option<&dyn blaze_ladder::front2::buckets::ShelfSource>,
         at_phase: SharedAlloc<'p>,
     ) -> Result<MadeFacts<'p>, CliError> {
         let cx = cx.span("engine: one bodies phase");
@@ -3212,6 +4904,9 @@ impl<'f> BodiesStage<'f> {
         let heap = handles.env.heap;
         // 0 to 2: the phase's setup, its plan-time rows in `buffer` ([`BodiesStage::prepare`]).
         let prepared = self.prepare(&cx, store, read, handles, tasks, &view, buffer, request_heads, listings, alloc, frame)?;
+        if handles.board.stopping().is_some() {
+            return Ok(MadeFacts { bytes: SVec::new_in(at_phase), index: SVec::new_in(at_phase) });
+        }
         // 3. The bodies to run, by member, file, name ([`Prepared::ones`]).
         let mut ones: Vec<One<'f>, Global> = Vec::new_in(Global);
         ones.extend_from_slice(prepared.ones);
@@ -3220,9 +4915,9 @@ impl<'f> BodiesStage<'f> {
         // it alone is a slice alone), each its own run ([`Part`]); the entry itself is kept whole
         // in `wholes` for the join, its slices in `parts`, `slice_of` naming each whole's slices.
         // Phase arena: dropped with the phase.
-        let mut wholes: SVec<'a, One<'f>> = SVec::new_in(alloc);
-        let mut parts: SVec<'a, One<'f>> = SVec::new_in(alloc);
-        let mut slice_of: SVec<'a, (usize, usize)> = SVec::new_in(alloc);
+        let mut wholes: SVec<'p, One<'f>> = SVec::new_in(at_phase);
+        let mut parts: SVec<'p, One<'f>> = SVec::new_in(at_phase);
+        let mut slice_of: SVec<'p, (usize, usize)> = SVec::new_in(at_phase);
         ones.retain(|one| {
             if one.items.len() <= 1 || predicted(one.costs, 0, one.items.len()) <= SLICE_BYTES {
                 return true;
@@ -3248,36 +4943,41 @@ impl<'f> BodiesStage<'f> {
             wholes.push(*one);
             false
         });
-        // The slices first, each alone; then the rest, a run ending at `RUN` entries or at
-        // `SLICE_BYTES` predicted, whichever comes first. They are started the most predicted
-        // first (below), so the longest work is begun first.
-        let mut runs: Vec<&[One<'f>], Global> = Vec::new_in(Global);
+        // Build dynamic LPT work-stealing items: macro-expansion slices first (each alone for
+        // `join_slices`), then individual items for every body >= `SINGLE_BODY_BYTES`, and tiny
+        // same-group batches (<= `TINY_BATCH_MAX` bodies and <= `TINY_BATCH_BYTES`) for trivial
+        // getters (or 1-body items on small incremental edits so every dirty body fans out).
+        let mut runs: SVec<'p, &[One<'f>]> = SVec::new_in(at_phase);
         for part in parts.iter() {
             runs.push(core::slice::from_ref(part));
         }
-        let mut from = 0;
-        while from < ones.len() {
-            let group = ones[from].group;
-            let mut to = from;
-            let mut cost = 0u64;
-            while to < ones.len() && ones[to].group == group && to - from < RUN {
-                let next = predicted(ones[to].costs, 0, ones[to].items.len());
-                if to > from && cost + next > SLICE_BYTES {
-                    break;
+        let workers = usize::try_from(handles.workers.get()).unwrap_or(1).max(1);
+        let tiny_batch_max = if ones.len() <= workers.saturating_mul(4) { 1 } else { TINY_BATCH_MAX };
+        let mut from = 0usize;
+        while let Some(first) = ones.get(from) {
+            let group = first.group;
+            let first_cost = predicted(first.costs, 0, first.items.len());
+            let mut to = from + 1;
+            if first_cost < SINGLE_BODY_BYTES && tiny_batch_max > 1 {
+                let mut cost = first_cost;
+                while let Some(next_one) = ones.get(to) {
+                    if next_one.group != group || to - from >= tiny_batch_max {
+                        break;
+                    }
+                    let next = predicted(next_one.costs, 0, next_one.items.len());
+                    if next >= SINGLE_BODY_BYTES || cost.saturating_add(next) > TINY_BATCH_BYTES {
+                        break;
+                    }
+                    cost = cost.saturating_add(next);
+                    to += 1;
                 }
-                cost += next;
-                to += 1;
             }
-            runs.push(&ones[from..to]);
+            if let Some(slice) = ones.get(from..to) {
+                runs.push(slice);
+            }
             from = to;
         }
         self.runs = u32::try_from(runs.len()).unwrap_or(u32::MAX);
-        // Each run's results in the phase's arena: its `Done`s, its bodies' rows and their
-        // findings ([`RunOut`]); merged below, never kept on the process heap.
-        let mut buffers: SVec<'a, (Buffer<'a>, SVec<'a, Ran<'f>>, RunOut<'a>)> = SVec::with_capacity_in(runs.len(), alloc);
-        for _ in 0..runs.len() {
-            buffers.push((Buffer::new_in(alloc), SVec::new_in(alloc), RunOut::new(alloc)));
-        }
         let Some(found) = prepared.found.as_ref() else {
             // Nothing to run: every task's result is in `buffer` above.
             self.ran.sort_unstable_by_key(|one| one.name);
@@ -3285,57 +4985,155 @@ impl<'f> BodiesStage<'f> {
         };
         // The same each phase (found from the same records): kept, not summed.
         self.uncovered = found.uncovered;
-        // Each run's counts of its seeded bodies, summed after the join.
-        let mut tallies: Vec<crate::engine_seeds::SeedTally, Global> = Vec::new_in(Global);
-        tallies.resize(runs.len(), crate::engine_seeds::SeedTally::default());
-        // Each run's thread stretch (start, end), for the stage's floor (engine_times.rs
+        // Each item's results in the phase's arena: its `Done`s (in `alloc` for engine merge),
+        // its bodies' rows and their findings ([`RunOut`]) in `at_phase`, dropped with the phase.
+        let mut buffers: SVec<'p, (Buffer<'a>, SVec<'p, Ran<'f>>, RunOut<'p>)> = SVec::with_capacity_in(runs.len(), at_phase);
+        // Each item's thread span (start, end), for the stage's floor (engine_times.rs
         // `Times::job`): what bounds the stage is how many ran at once, measured, not the workers.
-        let mut spans: SVec<'a, (u64, u64)> = SVec::with_capacity_in(runs.len(), alloc);
-        spans.resize(runs.len(), (0, 0));
-        // The phase's scope records opened by need, one for all its runs (each crate opened
-        // once whichever run asks it first); its counts read after the runs end.
+        let mut spans: SVec<'p, (u64, u64)> = SVec::with_capacity_in(runs.len(), at_phase);
+        // The phase's scope records opened by need, one for all its workers (each crate opened
+        // once whichever worker asks it first); its counts read after the workers end.
         let by_need = prepared.scope_records();
-        {
-            let shared = prepared.shared(found, self.reads_view(), &view, &by_need);
-            let scope = cx.scope();
-            scope.narrow_workers(handles.workers, Class::Foreground);
-            // Each run started the most predicted first (ties in plan order), so the longest work
-            // is begun first and the stage does not end on a long run started last.
-            let mut started = Vec::with_capacity_in(runs.len(), heap.alloc());
-            for (at, (((run, (out, ran, run_out)), tally), span)) in runs.iter().zip(buffers.iter_mut()).zip(tallies.iter_mut()).zip(spans.iter_mut()).enumerate() {
+        #[cfg(test)]
+        let plant_no_inline = PLANT_CHECK_ONLY_GUARD.get();
+        #[cfg(not(test))]
+        let plant_no_inline = false;
+        let run_inline = !plant_no_inline && should_run_inline(&runs, !wholes.is_empty());
+        if !run_inline {
+            prepared.pre_open_lang(&cx, &by_need, handles.workers)?;
+        }
+        if run_inline {
+            // Small-phase inline fast path (1–4 tiny runs, <= `INLINE_BYTES_MAX`): skips both
+            // `pre_open_lang` and work-stealing pool spawns and reuses one set of stretch/scratch
+            // frames on the caller thread.
+            let stage_reads = match paged_shelf {
+                Some(source) => self.reads_paged(source),
+                None => self.reads_view(),
+            };
+            let shared = prepared.shared(found, stage_reads, &view, &by_need);
+            let caps = WorkerFrameCaps::for_workers(1);
+            let mut scratch = Frame::with_reserve(BODY_SCRATCH, bstd::mem::Tag::Diagnostics).ok();
+            let mut freeze_scratch = blaze_ladder::front2::tables::head::FreezeScratch::new(FREEZE_SCRATCH, caps.freeze_scratch_keep, bstd::mem::Tag::Infer).ok();
+            let mut stretch = Frame::with_reserve(BODIES_FRAME, bstd::mem::Tag::Infer).ok();
+            let mut tally = crate::engine_seeds::SeedTally::default();
+            for &run in runs.iter() {
+                let mut out = Buffer::new_in(alloc);
+                let mut ran = SVec::new_in(at_phase);
+                let mut run_out = RunOut::new(at_phase);
+                let span = if shared.board.stopping().is_some() {
+                    shared.board.refused(Stage::Bodies, u64::try_from(run.len()).unwrap_or(u64::MAX));
+                    (0, 0)
+                } else {
+                    let start = crate::engine_times::ns(prepared.clock.now().since_start());
+                    match (scratch.as_mut(), freeze_scratch.as_mut(), stretch.as_mut()) {
+                        (Some(sc), Some(fs), Some(st)) => {
+                            run_bodies_with_frames(&cx, &shared, run, prepared.clock, sc, fs, st, caps, &mut out, &mut ran, &mut run_out, &mut tally, alloc, at_phase);
+                        }
+                        (None, _, _) => {
+                            let _ = refuse::<View<'_, 'a>>(run, "the scratch frame of its run's bodies could not be reserved (engine_bodies.rs `BODY_SCRATCH`)", None, &mut out, &mut ran, &mut run_out, alloc);
+                        }
+                        (_, None, _) => {
+                            let _ = refuse::<View<'_, 'a>>(run, "the dependency-head freeze scratch frame could not be reserved (engine_bodies.rs `FREEZE_SCRATCH`)", None, &mut out, &mut ran, &mut run_out, alloc);
+                        }
+                        (_, _, None) => {
+                            let _ = refuse::<View<'_, 'a>>(run, "the frame of its run's stretch could not be reserved (engine_bodies.rs `BODIES_FRAME`)", None, &mut out, &mut ran, &mut run_out, alloc);
+                        }
+                    }
+                    (start, crate::engine_times::ns(prepared.clock.now().since_start()))
+                };
+                if handles.board.stopping().is_some() {
+                    self.wall_ns = self.wall_ns.saturating_add(handles.clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)));
+                    return Ok(MadeFacts { bytes: SVec::new_in(at_phase), index: SVec::new_in(at_phase) });
+                }
+                buffers.push((out, ran, run_out));
+                spans.push(span);
+            }
+            self.seeds.add(&tally);
+        } else if !runs.is_empty() {
+            // Dynamic LPT work stealing: sort heavy items strictly largest-first (and bucket
+            // medium/small items into 512B tiers grouped by member + original file/item order for
+            // worker-local stretch and cache reuse), then pull dynamically from one 128B-padded
+            // atomic cursor across `min(workers, runs.len())` long-lived workers.
+            let mut dispatch: SVec<'p, usize> = SVec::with_capacity_in(runs.len(), at_phase);
+            dispatch.extend(0..runs.len());
+            dispatch.sort_unstable_by_key(|&at| {
+                let run = runs.get(at).copied().unwrap_or(&[]);
                 let cost: u64 = run.iter().map(|one| predicted(one.costs, 0, one.items.len())).sum();
-                started.push((core::cmp::Reverse(cost), at, run, out, ran, run_out, tally, span));
+                let tier = if cost >= LPT_EXACT_BYTES { cost } else { cost & !511 };
+                let group = run.first().map_or(0, |one| one.group);
+                (core::cmp::Reverse(tier), group, at)
+            });
+            let worker_count = workers.min(runs.len());
+            let cursor = CachePadded::new(AtomicUsize::new(0));
+            let mut worker_outs: SVec<'p, CachePadded<WorkerOut<'a, 'p, 'f>>> = SVec::with_capacity_in(worker_count, at_phase);
+            for _ in 0..worker_count {
+                worker_outs.push(CachePadded::new(WorkerOut::new(at_phase)));
             }
-            started.sort_unstable_by_key(|one| (one.0, one.1));
-            // One handle a run: as many as the project's bodies over `RUN`, so in the heap.
-            let mut running = Vec::new_in(heap.alloc());
-            for (_, _, run, out, ran, run_out, tally, span) in started.into_iter() {
-                let shared = &shared;
-                let clock = prepared.clock.clone();
-                running.push(scope.may_overlap("engine bodies run", BODIES_FRAME, move |cx: &Cx| {
-                    let began = crate::engine_times::ns(clock.now().since_start());
-                    run_bodies(cx, shared, run, &clock, out, ran, run_out, tally, alloc);
-                    *span = (began, crate::engine_times::ns(clock.now().since_start()));
-                    Ok::<(), Infallible>(())
-                }));
-            }
-            let mut failed = None;
-            for handle in running.into_iter() {
-                if let Err(error) = handle.join(&cx) {
-                    failed.get_or_insert(error);
+            {
+                let stage_reads = match paged_shelf {
+                    Some(source) => self.reads_paged(source),
+                    None => self.reads_view(),
+                };
+                let shared = prepared.shared(found, stage_reads, &view, &by_need);
+                let runs_slice = runs.as_slice();
+                let dispatch_slice = dispatch.as_slice();
+                let cursor_ref = &cursor;
+                let clock = prepared.clock;
+                let scope = cx.scope();
+                scope.narrow_workers(handles.workers, Class::Foreground);
+                let mut running = Vec::with_capacity_in(worker_count, heap.alloc());
+                for worker_out in worker_outs.iter_mut() {
+                    let shared = &shared;
+                    running.push(scope.may_overlap("engine bodies worker", BODIES_FRAME, move |cx: &Cx| {
+                        run_worker_stealing(cx, shared, runs_slice, dispatch_slice, cursor_ref, clock, worker_out, alloc, at_phase);
+                        Ok::<(), Infallible>(())
+                    }));
+                }
+                let mut failed = None;
+                for handle in running.into_iter() {
+                    if let Err(error) = handle.join(&cx) {
+                        failed.get_or_insert(error);
+                    }
+                }
+                scope.join(&cx).map_err(CliError::Pool)?;
+                if let Some(error) = failed {
+                    return Err(CliError::Pool(error));
                 }
             }
-            scope.join(&cx).map_err(CliError::Pool)?;
-            if let Some(error) = failed {
-                return Err(CliError::Pool(error));
+            // Stopped while the phase ran: account for any unpulled items in the queue and return
+            // without merging to stay well within `STOP_BOUND` (rule 18).
+            if handles.board.stopping().is_some() {
+                let pulled = cursor.load(Ordering::Acquire).min(dispatch.len());
+                if let Some(rest) = dispatch.get(pulled..) {
+                    let unpulled: u64 = rest.iter().map(|&at| runs.get(at).map_or(0, |r| u64::try_from(r.len()).unwrap_or(u64::MAX))).sum();
+                    if unpulled > 0 {
+                        handles.board.refused(Stage::Bodies, unpulled);
+                    }
+                }
+                self.wall_ns = self.wall_ns.saturating_add(handles.clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)));
+                return Ok(MadeFacts { bytes: SVec::new_in(at_phase), index: SVec::new_in(at_phase) });
+            }
+            let mut all_items: SVec<'p, ItemDone<'a, 'p, 'f>> = SVec::with_capacity_in(runs.len(), at_phase);
+            for worker_out in worker_outs.into_iter() {
+                let worker = worker_out.into_inner();
+                self.seeds.add(&worker.tally);
+                self.setup.add(worker.setup);
+                self.frames.fold(worker.frames);
+                all_items.extend(worker.items.into_iter());
+            }
+            // Rule 25: reassemble work items in exact original `0..runs.len()` order before merging.
+            all_items.sort_unstable_by_key(|item| item.at);
+            if all_items.len() != runs.len() {
+                return Err(CliError::Text { what: "the Bodies stage's work-stealing workers did not return every scheduled item (engine_bodies.rs `run_phase`)" });
+            }
+            for item in all_items.into_iter() {
+                buffers.push((item.out, item.ran, item.run_out));
+                spans.push(item.span);
             }
         }
         self.expansion_demands = prepared.snapshot.expansion_demands();
         self.expansion_keys = prepared.expansion_keys.len() as u64;
         self.add_by_need(by_need.counts());
-        for tally in tallies.iter() {
-            self.seeds.add(tally);
-        }
         for &(start, end) in spans.iter() {
             times.job(crate::engine_times::Step::BodiesRun, start, end);
         }
@@ -3351,8 +5149,8 @@ impl<'f> BodiesStage<'f> {
         // first body ([`BodiesStage::task_label`]); a joined row's time is not pushed again.
         let joined_runs = wholes.len();
         let mut slices_done = buffers.into_iter();
-        let mut buffers: SVec<'a, (Buffer<'a>, SVec<'a, Ran<'f>>, RunOut<'a>)> = SVec::with_capacity_in(runs.len() - parts.len() + wholes.len(), alloc);
-        let mut group: SVec<'a, (Buffer<'a>, SVec<'a, Ran<'f>>, RunOut<'a>)> = SVec::new_in(alloc);
+        let mut buffers: SVec<'p, (Buffer<'a>, SVec<'p, Ran<'f>>, RunOut<'p>)> = SVec::with_capacity_in(runs.len() - parts.len() + wholes.len(), at_phase);
+        let mut group: SVec<'p, (Buffer<'a>, SVec<'p, Ran<'f>>, RunOut<'p>)> = SVec::new_in(at_phase);
         for (whole, &(first, end)) in wholes.iter().zip(slice_of.iter()) {
             group.clear();
             group.extend(slices_done.by_ref().take(end - first));
@@ -3365,15 +5163,49 @@ impl<'f> BodiesStage<'f> {
                 let label = SliceLabel { name, entry: whole.label, from, to: from + part.items.len() as u32, whole: whole.items.len() as u32 };
                 self.slices.get_or_insert_with(|| Vec::new_in(frame)).push(label);
             }
-            buffers.push(join_slices(whole, &mut group, heap.alloc(), alloc)?);
+            buffers.push(join_slices(whole, &mut group, heap.alloc(), alloc, at_phase)?);
         }
         buffers.extend(slices_done);
-        let mut entry_runs: SVec<'a, &[One<'f>]> = SVec::with_capacity_in(buffers.len(), alloc);
+        let mut entry_runs: SVec<'p, &[One<'f>]> = SVec::with_capacity_in(buffers.len(), at_phase);
         entry_runs.extend(wholes.iter().map(core::slice::from_ref));
         entry_runs.extend(runs[parts.len()..].iter().copied());
+        self.persist_stretch_fronts(&cx, store, &found.groups, heap)?;
+        prepared.dep_files.persist(&cx, store, &mut self.member_rows, heap)?;
         let made = self.join_runs(&cx, store, buffer, times, &entry_runs, buffers, joined_runs, heap, frame, at_phase)?;
         self.wall_ns = self.wall_ns.saturating_add(handles.clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)));
         Ok(made)
+    }
+
+    /// Persists any newly built `BSF1` [`blaze_ladder::front2::tables::task::StretchFront`]
+    /// records from `groups` into `store`, pins every read or put `BSF1` key under
+    /// `self.member_rows` so GC keeps it alive across requests, and surfaces any corrupt `BSF1`
+    /// or snapshot-read error (rule 3).
+    fn persist_stretch_fronts<'r>(
+        &mut self,
+        cx: &Cx,
+        store: &mut dyn crate::store::Store<'r>,
+        groups: &[Group<'f, '_>],
+        heap: &'static blaze_own::Heap,
+    ) -> Result<(), CliError> {
+        let g = heap.alloc();
+        for group in groups.iter() {
+            let Some(state) = group.front.get() else { continue };
+            match state {
+                GroupFrontState::Ready { key, put, .. } => {
+                    if let Some((put_key, bytes)) = put.as_ref() {
+                        store.put(cx, *put_key, bytes.as_slice())?;
+                    }
+                    if let Some(kept_key) = *key {
+                        self.member_rows.get_or_insert_with(|| Vec::new_in(g)).push(kept_key);
+                    }
+                }
+                GroupFrontState::Error(what) => {
+                    return Err(CliError::Text { what: *what });
+                }
+                GroupFrontState::None => {}
+            }
+        }
+        Ok(())
     }
 
     /// THE BODIES' JOIN, one function both drivers call (rule 30): each run's results merged
@@ -3387,14 +5219,14 @@ impl<'f> BodiesStage<'f> {
     /// ([`BodiesStage::run_phase`]); the `Ready` driver after its drive over the runs its
     /// `BodyCheck` kind sank ([`Prepared::join_ready`]).
     #[expect(clippy::too_many_arguments, reason = "the join's edge: each argument one handle of it")]
-    fn join_runs<'a, 'r, 'p>(
+    fn join_runs<'a, 'b, 'r, 'p>(
         &mut self,
         cx: &Cx,
         store: &mut dyn crate::store::Store<'r>,
         buffer: &mut Buffer<'a>,
         times: &mut crate::engine_times::Times,
         runs: &[&[One<'f>]],
-        buffers: SVec<'a, (Buffer<'a>, SVec<'a, Ran<'f>>, RunOut<'a>)>,
+        buffers: SVec<'b, (Buffer<'a>, SVec<'b, Ran<'f>>, RunOut<'b>)>,
         joined_runs: usize,
         heap: &'static blaze_own::Heap,
         frame: &'f Frame,
@@ -3418,7 +5250,7 @@ impl<'f> BodiesStage<'f> {
         let mut covers: SVec<'p, [u8; 16]> = SVec::new_in(at_phase);
         // A run's typed records' keys by check, sorted: what each body's run facts name.
         let mut typed_keys: SVec<'p, (Name, Key)> = SVec::new_in(at_phase);
-        for (run_at, (mut out, mut ran, mut run_out)) in buffers.into_iter().enumerate() {
+        for (run_at, (mut out, mut ran, run_out)) in buffers.into_iter().enumerate() {
             buffer.done.append(&mut out.done);
             buffer.made.append(&mut out.made);
             buffer.owed.append(&mut out.owed);
@@ -3430,7 +5262,7 @@ impl<'f> BodiesStage<'f> {
             for (row, said, head_failed) in run_out.notes {
                 let said = said.map_task(|error| {
                     let text = bstd::mem::format_in!(frame, "{error}");
-                    &*blaze_own::Box::leak(text.into_boxed_str())
+                    &*text.into_bump_str()
                 });
                 ran[row].note = Some(frame.alloc(BodyNote { said, head_failed }));
             }
@@ -3446,16 +5278,23 @@ impl<'f> BodiesStage<'f> {
             // `blaze run` builds from it.
             self.untyped_clean = self.untyped_clean.saturating_add(run_out.untyped_clean);
             self.setup.add(run_out.setup);
-            self.census.absorb(&mut run_out.census);
+            if let Some((body, why)) = run_out.facts_error {
+                return Err(EngineCheckError::BodyFacts { body, why: crate::engine_body_facts::MakeError::Bytes(why) }.into());
+            }
+            let preencoded = run_out.facts_index.len() == ran.len();
             typed_keys.clear();
             for one in run_out.typed.iter() {
-                let key = crate::engine_body_record::typed_key(&one.bytes);
+                let key = one.key;
                 store.put(cx, key, &one.bytes)?;
                 self.typed_bytes = self.typed_bytes.saturating_add(one.bytes.len() as u64);
                 self.typed.get_or_insert_with(|| Vec::new_in(heap.alloc())).push(key);
-                typed_keys.push((one.check, key));
+                if !preencoded {
+                    typed_keys.push((one.check, key));
+                }
             }
-            typed_keys.sort_unstable_by_key(|one| one.0);
+            if !preencoded {
+                typed_keys.sort_unstable_by_key(|one| one.0);
+            }
             self.items += run_out.items;
             self.item_tasks += run_out.item_tasks;
             // One copy of the run's messages. Each row addresses its contiguous findings in
@@ -3473,32 +5312,65 @@ impl<'f> BodiesStage<'f> {
                 findings.push(BodyFinding { rule, at, message: &messages[from..end] });
                 from = end;
             }
-            // Each body of the run: its class from its note and its findings' rules, its covered
-            // keys from the run's `One` of that name (a body in a run ran unless it has a note),
-            // and each fn declared in a body its check reached (`RunOut::locals`, in run order).
-            for (at, one) in ran.iter().enumerate() {
-                // Its bodies as a program calls them ([`asked_keys`]: a method by its member
-                // key), not each library key's first 16 bytes.
-                let asked: &[blaze_typeck::ItemKey] = runs[run_at].iter().find(|task| task.task.planned.name == one.name).map_or(&[], |task| task.asked);
-                let rules = run_out.found.iter().filter(|found| found.0 == at).map(|found| found.1);
-                let rule = note_rule(one.said(), true);
-                let class = crate::engine_body_facts::class_of(rule.into_iter().chain(rules));
-                let from = run_out.locals.partition_point(|local| local.0 < at);
-                let to = run_out.locals.partition_point(|local| local.0 <= at);
-                covers.clear();
-                covers.extend(asked.iter().map(|key| key.0.to_be_bytes()));
-                // A fn declared in a body is always `Free` (front2 tables/task.rs `locals`): its
-                // checker key is its library key's first 16 bytes (keys.rs `Keys::local`).
-                for item in run_out.locals[from..to].iter().map(|local| &local.1) {
-                    covers.push(blaze_ladder::front2::keys::checker_of(*item).0.to_be_bytes());
+            if preencoded {
+                let base = made.bytes.len();
+                made.bytes.extend_from_slice(&run_out.facts_bytes);
+                made.index.reserve(run_out.facts_index.len());
+                for &(at, from, to) in run_out.facts_index.iter() {
+                    if let Some(one) = ran.get(at) {
+                        let start = base.saturating_add(usize::try_from(from).unwrap_or(0));
+                        let end = base.saturating_add(usize::try_from(to).unwrap_or(0));
+                        made.index.push((one.name, u32::try_from(start).unwrap_or(u32::MAX), u32::try_from(end).unwrap_or(u32::MAX)));
+                    }
                 }
-                covers.sort_unstable();
-                covers.dedup();
-                let typed = typed_keys.binary_search_by_key(&one.name, |typed| typed.0).ok().map(|at| typed_keys[at].1);
-                let from = made.bytes.len();
-                crate::engine_body_facts::write(class, &covers, typed, &mut made.bytes)
-                    .map_err(|why| EngineCheckError::BodyFacts { body: one.name, why: crate::engine_body_facts::MakeError::Bytes(why) })?;
-                made.index.push((one.name, from as u32, made.bytes.len() as u32));
+            } else {
+                // Fallback path for sliced entries (`join_slices`) and runs with refused rows:
+                // reuse any pre-encoded row verbatim, and encode any remaining row here.
+                for (at, one) in ran.iter().enumerate() {
+                    if let Ok(idx) = run_out.facts_index.binary_search_by_key(&at, |entry| entry.0)
+                        && let Some(&(_, f, t)) = run_out.facts_index.get(idx)
+                        && let (Ok(fs), Ok(ts)) = (usize::try_from(f), usize::try_from(t))
+                        && let Some(slice) = run_out.facts_bytes.get(fs..ts)
+                    {
+                        let from = made.bytes.len();
+                        made.bytes.extend_from_slice(slice);
+                        let end = made.bytes.len();
+                        made.index.push((one.name, u32::try_from(from).unwrap_or(u32::MAX), u32::try_from(end).unwrap_or(u32::MAX)));
+                        continue;
+                    }
+                    // Its bodies as a program calls them ([`asked_keys`]: a method by its member
+                    // key), not each library key's first 16 bytes. Each run appends `Ran` rows in
+                    // exact `runs[run_at]` index order (0..len), so `runs[run_at][at]` is O(1).
+                    let run_tasks = runs.get(run_at).copied().unwrap_or(&[]);
+                    let matched = run_tasks.get(at).filter(|task| task.task.planned.name == one.name);
+                    debug_assert!(
+                        matched.is_some() || run_tasks.iter().all(|task| task.task.planned.name != one.name),
+                        "join_runs expected ran[{at}] ({:?}) to match runs[{run_at}][{at}]",
+                        one.name,
+                    );
+                    let asked: &[blaze_typeck::ItemKey] = matched.map_or(&[], |task| task.asked);
+                    let found_from = run_out.found.partition_point(|found| found.0 < at);
+                    let found_to = run_out.found.partition_point(|found| found.0 <= at);
+                    let rules = run_out.found.get(found_from..found_to).unwrap_or(&[]).iter().map(|found| found.1);
+                    let rule = note_rule(one.said(), true);
+                    let class = crate::engine_body_facts::class_of(rule.into_iter().chain(rules));
+                    let from = run_out.locals.partition_point(|local| local.0 < at);
+                    let to = run_out.locals.partition_point(|local| local.0 <= at);
+                    covers.clear();
+                    covers.extend(asked.iter().map(|key| key.0.to_be_bytes()));
+                    // A fn declared in a body is always `Free` (front2 tables/task.rs `locals`): its
+                    // checker key is its library key's first 16 bytes (keys.rs `Keys::local`).
+                    for item in run_out.locals[from..to].iter().map(|local| &local.1) {
+                        covers.push(blaze_ladder::front2::keys::checker_of(*item).0.to_be_bytes());
+                    }
+                    covers.sort_unstable();
+                    covers.dedup();
+                    let typed = typed_keys.binary_search_by_key(&one.name, |typed| typed.0).ok().map(|at| typed_keys[at].1);
+                    let from = made.bytes.len();
+                    crate::engine_body_facts::write(class, &covers, typed, &mut made.bytes)
+                        .map_err(|why| EngineCheckError::BodyFacts { body: one.name, why: crate::engine_body_facts::MakeError::Bytes(why) })?;
+                    made.index.push((one.name, u32::try_from(from).unwrap_or(u32::MAX), u32::try_from(made.bytes.len()).unwrap_or(u32::MAX)));
+                }
             }
             self.ran.extend(ran.drain(..));
         }
@@ -3535,7 +5407,7 @@ impl<'f> BodiesStage<'f> {
     /// the files it reaches and does not hold, row key and uncovered bodies), unvisited: no names
     /// record asked, no environment made, no items record opened, no module tree walked. Every
     /// member visited ([`EveryMember`]) gives the same outputs; both write the record.
-    fn groups<'r, O: OpenWorld, S: SetupInputs>(&mut self, cx: &Cx, store: &mut dyn crate::store::Store<'r>, read: &mut EngineRecords<'r>, handles: &Handles<'_, '_, '_, '_>, view: &(impl CellDigests + ?Sized), _plants: RowPlants, frame: &'f Frame, snapshot: &StoreSnapshot, expansion_keys: &SharedSet<Key, SharedAlloc<'static>>, owed: &[u32], asked: Entered<'_>) -> Result<Result<Found<'f, 'r>, Stop<'f>>, CliError> {
+    fn groups<'r, O: OpenWorld, S: SetupInputs>(&mut self, cx: &Cx, store: &mut dyn crate::store::Store<'r>, read: &mut EngineRecords<'r>, handles: &Handles<'_, '_, '_, '_>, view: &(impl CellDigests + ?Sized), _plants: RowPlants, listings: &crate::engine_heads::Listings, frame: &'f Frame, snapshot: &StoreSnapshot, expansion_keys: &SharedSet<Key, SharedAlloc<'static>>, owed: &[u32], asked: Entered<'_>) -> Result<Result<Found<'f, 'r>, Stop<'f>>, CliError> {
         let Entered { tasks, rows, reach: plan_reach } = asked;
         let heap = handles.env.heap;
         let g = heap.alloc();
@@ -3563,13 +5435,14 @@ impl<'f> BodiesStage<'f> {
         // The setup's reader of scope crates made by need (`scope_by_need`): a member's row and
         // listing ask its own crate, opened already; one past it is opened here only if asked.
         // The runs read through the request's memo instead (`Prepared::scope_records`).
-        let setup_records = crate::front_load::ScopeRecords::new(snapshot, CrateGraph::len(&list), heap);
+        let setup_records = LazyScopeRecords::new(snapshot, CrateGraph::len(&list), Some(names.keys()), heap);
         let planted_unreadable = self.unreadable;
         // The trees are packs mapped from the shelf and the sources store (body_types.rs
-        // `open_trees`): a refusal there is of the machine's files, not of a cell (a pack missing
-        // or not the one the list's world read), so it reads nothing and is owed, entered again
-        // each request (rule 3: no invented read to make it stand).
-        let (packs, corrected) = match self.kept.trees(cx, handles.env, graph.out, &list, frame) {
+        // `Kept::lazy_trees`, shared across `Names`, `Heads`, and `Bodies`): a refusal there is
+        // of the machine's files, not of a cell (a pack missing or not the one the list's world
+        // read), so it reads nothing and is owed, entered again each request (rule 3: no invented
+        // read to make it stand).
+        let (packs, corrected) = match self.kept.lazy_trees(handles.env, graph.out, list) {
             Ok(trees) => trees,
             Err(why) => return Ok(Err((why, &[]))),
         };
@@ -3611,20 +5484,20 @@ impl<'f> BodiesStage<'f> {
         // record is made again below (D160), never read in part.
         use crate::engine_members_record as rec;
         let today = rec::Header { graph_out: graph.out, tool: handles.tool, made_at: self.members_last.map_or(0, |(_, serial)| serial) };
-        let stored_members = match (S::STANDING, self.members_last.and_then(|(record, _)| record)) {
-            (true, Some(key)) => store.get(cx, key)?.map(|held| held.bytes),
-            _ => None,
-        };
-        let stood_view = match stored_members.map(|bytes| rec::View::open(bytes, g)) {
-            Some(Ok(view)) => {
-                tally.members_recorded = u32::try_from(view.len()).unwrap_or(u32::MAX);
-                Some(view)
+        let stood_view = if S::STANDING {
+            match self.open_members(cx, store, g)? {
+                Some(Ok(view)) => {
+                    tally.members_recorded = u32::try_from(view.len()).unwrap_or(u32::MAX);
+                    Some(view)
+                }
+                Some(Err(_refused)) => {
+                    tally.members_record_refused = tally.members_record_refused.saturating_add(1);
+                    None
+                }
+                None => None,
             }
-            Some(Err(_refused)) => {
-                tally.members_record_refused = tally.members_record_refused.saturating_add(1);
-                None
-            }
-            None => None,
+        } else {
+            None
         };
         tally.parts.members_record_ns = lap(handles.clock, &mut mark);
         let mut moved: Vec<Name, blaze_own::Alloc<'static>> = Vec::new_in(g);
@@ -3638,9 +5511,11 @@ impl<'f> BodiesStage<'f> {
         let drop_standing_heads = self.standing_drops_heads;
         // The planted control of the members' row key (`CommitPlant::RowKeyUnitOnly`).
         let row_key_unit_only = self.row_key_unit_only;
-        // This request's record, made at its answer's serial, one member at a time in the crate
-        // list's order.
-        let mut members_out = rec::Writer::new(&rec::Header { made_at: today.made_at.saturating_add(1), ..today }, g);
+        // This request's record, content-stable (`CONTENT_STABLE_SERIAL`): unchanged body edits
+        // reuse the prior `BLZMEMB` key with zero bytes encoded, hashed, or put (rule 77).
+        let out_header = rec::Header { made_at: rec::CONTENT_STABLE_SERIAL, ..today };
+        let prior_members = self.members_last.and_then(|(k, _)| k).zip(stood_view.as_deref());
+        let mut members_out = MembersOut::new(out_header, prior_members, g);
         let mut groups: Vec<Group<'f, 'r>, Global> = Vec::new_in(Global);
         let mut took: Vec<Took<'f>, blaze_own::Alloc<'static>> = Vec::new_in(g);
         // The first list that could not grow: the stage's typed stop (rule 3).
@@ -3687,7 +5562,7 @@ impl<'f> BodiesStage<'f> {
         // each unit whose row is entered, and by no other. A visit then adds the member's claims
         // alone: its entry, row, head subjects and uncovered bodies are the record's, taken
         // already (`again`: its unit, made at its first turn).
-        let mut first_turn = (0..CrateGraph::len(&list)).filter(|at| list.member(*at));
+        let mut first_turn = (0..CrateGraph::len(&list)).filter(|at| list.member(*at) && handles.scoped.is_none_or(|s| s.allows(*at)));
         // The entered tasks' names, sorted: the only finds a decision reads (piece B, the
         // listing's walk by need). Each is a body's row at one unit: a unit's find of a body is
         // asked when the body's name AT THAT UNIT'S VIEW is entered (below, `own_view`).
@@ -3696,9 +5571,9 @@ impl<'f> BodiesStage<'f> {
         entered.sort_unstable();
         // The holders' views of the body at hand, scratch for `Reach::view_in`.
         let mut views: Vec<blaze_drive::view::ViewKey, blaze_own::Alloc<'static>> = Vec::new_in(g);
-        // Each outline's cfg cuts (engine_plan_cfg.rs `PlanCuts`), made at the first member
-        // visited and read by every walk and entry after it.
-        let mut plan_cuts: Option<crate::engine_plan_cfg::PlanCuts<'static>> = None;
+        // Each outline's cfg cuts (engine_plan_cfg.rs `PlanCuts`), computed lazily per file on
+        // first ask so unvisited files' outlines are never parsed or lexed.
+        let mut plan_cuts: Option<crate::engine_plan_cfg::PlanCuts<'_, '_, 'static>> = None;
         let mut below: Vec<(usize, u32), blaze_own::Alloc<'static>> = Vec::new_in(g);
         let mut below_at = 0usize;
         // The units visited at need, to check their claims once every member is done.
@@ -3715,13 +5590,30 @@ impl<'f> BodiesStage<'f> {
                 (_, crate::engine_member_rows::FileHead::Text(_) | crate::engine_member_rows::FileHead::NotOutlined) => None,
             }
         };
+        // Precomputed `(slot, outline_at)` pairs for the owed files, sorted by `slot`, so a
+        // member stood below its heads (`kept_below`) intersects its recorded held files with
+        // `owed` in O(held * log(owed)) without scanning `items.files()`.
+        let mut owed_slots: Vec<(Name, u32), blaze_own::Alloc<'static>> = Vec::with_capacity_in(owed.len(), g);
+        for &outline_at in owed.iter() {
+            if let Some(one) = usize::try_from(outline_at).ok().and_then(|at| handles.outlined.get(at)) {
+                owed_slots.push((one.name, outline_at));
+            }
+        }
+        owed_slots.sort_unstable_by_key(|&(slot, _)| slot);
+        let setup_dep_files = DependencyFiles::new(heap);
+        let has_unread_outlines = self.unread.as_ref().is_some_and(|u| !u.is_empty());
+        let unread_digests_arc = self.unread_digests.as_ref().map(blaze_own::Share::share);
+        let unread_digests = unread_digests_arc.as_deref().map(blaze_own::Vec::as_slice);
         loop {
+            if handles.board.stopping().is_some() {
+                return Ok(Err(("stopped by signal", &[])));
+            }
             let (member, again) = match first_turn.next() {
                 Some(member) => (member, None),
                 None => {
                     let Some(&(member, unit)) = below.get(below_at) else { break };
                     below_at += 1;
-                    let kept = stood_view.as_ref().and_then(|view| view.member(u32::try_from(member).unwrap_or(u32::MAX)));
+                    let kept = stood_view.as_deref().and_then(|view| view.member(u32::try_from(member).unwrap_or(u32::MAX)));
                     let rank = plan_reach.and_then(|reach| reach.rank_of(units[unit as usize].name));
                     let visit = deferral != Deferral::NeverVisited && kept.is_none_or(|kept| own_row_entered(kept, rows, rank));
                     if !visit {
@@ -3737,12 +5629,13 @@ impl<'f> BodiesStage<'f> {
             // This member's laps ([`SetupParts`]): stood, or each part of its visit.
             let mut member_mark = handles.clock.now();
             let own_name = blaze_drive::key::crate_scope_name(&list.key(member));
+            let unit_val = crate::engine_body_plan::Unit { name: own_name, prefix: list.key(member).prefix(), test: is_test(own_name) };
             let unit = match again {
                 Some(unit) => unit,
                 None => {
                     tally.members = tally.members.saturating_add(1);
                     let unit = u32::try_from(units.len()).unwrap_or(u32::MAX);
-                    units.push(crate::engine_body_plan::Unit { name: own_name, prefix: list.key(member).prefix(), test: is_test(own_name) });
+                    units.push(unit_val);
                     member_cells.push(CellId { of: own_name, cell: WHOLE });
                     unit
                 }
@@ -3759,77 +5652,147 @@ impl<'f> BodiesStage<'f> {
             // not asked: no file of it is owed) and its uncovered bodies; written again whole.
             let place = u32::try_from(member).unwrap_or(u32::MAX);
             // Stood whole, or below its heads (piece A: kept in `below`, counted at its turn).
-            let standing = match (again, stood_view.as_ref()) {
-                (None, Some(view)) => match stands(view, place, &today, &moved, &units[unit as usize], names) {
+            let standing = match (again, stood_view.as_deref()) {
+                (None, Some(view)) => match stands(view, place, &today, &moved, &unit_val, names) {
                     Some(kept) => Some((kept, false)),
-                    None => stands_below(view, place, &today, &moved, &units[unit as usize], names, &entries_now).map(|kept| (kept, true)),
+                    None => stands_below(view, place, &today, &moved, &unit_val, names, &entries_now).map(|kept| (kept, true)),
                 },
                 _ => None,
             };
             if let Some((kept, below_heads)) = standing {
-                if below_heads {
-                    below.push((member, unit));
-                } else {
-                    tally.members_stood = tally.members_stood.saturating_add(1);
-                }
-                members.push(kept.names);
-                if !drop_standing_heads {
-                    heads.extend(kept.held.iter().map(|held| held.subject(kept.unit.prefix)));
-                }
-                member_files.extend(kept.not_held.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::NotHeld, reads: own_cells }));
-                tally.files = tally.files.saturating_add(u32::try_from(kept.held.len()).unwrap_or(u32::MAX));
-                self.member_rows.get_or_insert_with(|| Vec::new_in(g)).push(kept.row);
-                uncovered = uncovered.saturating_add(kept.uncovered);
-                for label in kept.named.iter() {
-                    if uncovered_named.len() < MOST_UNCOVERED_NAMED {
-                        uncovered_named.push(crate::engine_head_notes::leak(g, format_args!("{label}")));
+                match &kept.state {
+                    rec::MemberState::Held(held) => {
+                        if below_heads {
+                            below.push((member, unit));
+                        } else {
+                            tally.members_stood = tally.members_stood.saturating_add(1);
+                        }
+                        members.push(held.names);
+                        if !drop_standing_heads {
+                            heads.extend(held.held.iter().map(|h| h.subject_lazy(kept.unit.prefix)));
+                        }
+                        member_files.extend(kept.not_held.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::NotHeld, reads: own_cells }));
+                        tally.files = tally.files.saturating_add(u32::try_from(held.held.len()).unwrap_or(u32::MAX));
+                        self.member_rows.get_or_insert_with(|| Vec::new_in(g)).push(held.row);
+                        uncovered = uncovered.saturating_add(held.uncovered);
+                        for label in held.named.iter() {
+                            if uncovered_named.len() < MOST_UNCOVERED_NAMED {
+                                uncovered_named.push(crate::engine_head_notes::leak(g, format_args!("{label}")));
+                            }
+                        }
+                        members_out.stood(kept);
+                        tally.parts.stood_ns = tally.parts.stood_ns.saturating_add(lap(handles.clock, &mut member_mark));
+                        continue;
+                    }
+                    rec::MemberState::CutScope(cut) => {
+                        tally.members_stood = tally.members_stood.saturating_add(1);
+                        members.push(cut.names);
+                        if !drop_standing_heads {
+                            heads.extend(cut.held.iter().map(|h| h.subject_lazy(kept.unit.prefix)));
+                        }
+                        member_files.extend(kept.not_held.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::NotHeld, reads: own_cells }));
+                        tally.files = tally.files.saturating_add(u32::try_from(cut.held.len()).unwrap_or(u32::MAX));
+                        members_out.stood(kept);
+                        tally.parts.stood_ns = tally.parts.stood_ns.saturating_add(lap(handles.clock, &mut member_mark));
+                        continue;
+                    }
+                    rec::MemberState::Refused(why) => {
+                        if let Some(words) = why.words() {
+                            tally.members_stood = tally.members_stood.saturating_add(1);
+                            member_files.extend(kept.not_held.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::Refused(words), reads: own_cells }));
+                            members_out.stood(kept);
+                            tally.parts.stood_ns = tally.parts.stood_ns.saturating_add(lap(handles.clock, &mut member_mark));
+                            continue;
+                        }
                     }
                 }
-                members_out.member(kept);
-                tally.parts.stood_ns = tally.parts.stood_ns.saturating_add(lap(handles.clock, &mut member_mark));
-                continue;
             }
-            // The member's files: what its module tree reaches from its root under what plan
-            // time knows of its `test` (engine_body_plan.rs `reached_under`), the walk the
-            // planner took (the `Owners` fact `check` reads, blaze-drive owners.rs): each is
-            // this member's, checked or refused by name, never in "no crate holds" (rule 3). The
-            // atom is the plan's (engine_plan_cfg.rs `test_atom`), not the script run's answer
-            // this stage has: the walk must be the plan's reach (below).
-            let cuts = plan_cuts.get_or_insert_with(|| crate::engine_plan_cfg::PlanCuts::of(handles.outlined, g));
             // Its found files beside its root (engine_body_plan.rs `FoundEdge`), as the plan's walk took them.
             let found = plan_reach.map_or(&[][..], |plan| plan.found_of(own_name));
-            let reach = crate::engine_body_plan::reached_under(handles.outlined, cuts, crate::engine_body_plan::root_file(&list, member), crate::engine_plan_cfg::test_atom(&list, member), found, g).map_err(EngineCheckError::Unoutlined)?;
-            // The plan named this unit's rows from its reach (engine_body_plan.rs `Reach`): the
-            // walk today must be that reach, or a row would be planned for a file it does not
-            // reach, or none for one it does (the ready plan's reach is the last members
-            // record's: a `mod` the edit moved is this stop, named, rule 3).
-            if let Some(file) = plan_reach.and_then(|plan| plan.disagrees(own_name, &reach)) {
-                return Err(EngineCheckError::ReadyHost {
-                    task: file,
-                    what: "a member's module tree reaches this file, or no longer reaches it, unlike the reach the plan named its body rows from (a `mod` moved since the reach was read: engine_body_plan.rs `Reach`)",
+            // When a member stood below its heads on turn 1 (`again.is_some()`), `stands_below`
+            // already proved its unit, tool, `CrateScope` record, and every moved file's
+            // `entries_of` (including `surface`, every `mod`, and every `#[cfg]`) match the
+            // members record. Unless `row_key_unit_only` is planted or `found` carries an edge
+            // outside the record, verify each MOVED/OWED recorded slot is outlined (unchanged
+            // files were already proven by the members record and `moved`, avoiding fetching 500
+            // unchanged outlines from CAS on a 1-body edit while still refusing missing visited
+            // trees on head/`mod` edits where `stands_below` is `None`) and reuse the record's
+            // reach, held file map, and `row_key`.
+            let kept_below = match (again.is_some() && !row_key_unit_only, stood_view.as_deref().and_then(|view| view.member(place))) {
+                (true, Some(kept)) => match &kept.state {
+                    rec::MemberState::Held(held)
+                        if found.iter().all(|edge| held.held.iter().any(|h| h.slot == edge.file) || kept.not_held.iter().any(|slot| *slot == edge.file)) =>
+                    {
+                        Some((held, kept.not_held.as_slice()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            let reach = if let Some((held, not_held)) = kept_below {
+                let root = crate::engine_body_plan::root_file(&list, member);
+                for h in held.held.iter() {
+                    if moved.binary_search(&h.slot).is_ok()
+                        && handles.outlined.binary_search_by(|one| one.name.cmp(&h.slot)).is_err()
+                    {
+                        return Err(EngineCheckError::Unoutlined(crate::engine_body_plan::Unoutlined { file: h.slot, root }).into());
+                    }
                 }
-                .into());
-            }
+                for &slot in not_held.iter() {
+                    if moved.binary_search(&slot).is_ok()
+                        && handles.outlined.binary_search_by(|one| one.name.cmp(&slot)).is_err()
+                    {
+                        return Err(EngineCheckError::Unoutlined(crate::engine_body_plan::Unoutlined { file: slot, root }).into());
+                    }
+                }
+                Vec::new_in(g)
+            } else {
+                // The member's files: what its module tree reaches from its root under what plan
+                // time knows of its `test` (engine_body_plan.rs `reached_under`), the walk the
+                // planner took (the `Owners` fact `check` reads, blaze-drive owners.rs): each is
+                // this member's, checked or refused by name, never in "no crate holds" (rule 3). The
+                // atom is the plan's (engine_plan_cfg.rs `test_atom`), not the script run's answer
+                // this stage has: the walk must be the plan's reach (below).
+                let cuts = plan_cuts.get_or_insert_with(|| crate::engine_plan_cfg::PlanCuts::of(handles.outlined, g));
+                let reach = crate::engine_body_plan::reached_under(handles.outlined, cuts, crate::engine_body_plan::root_file(&list, member), crate::engine_plan_cfg::test_atom(&list, member), found, g).map_err(EngineCheckError::Unoutlined)?;
+                // The plan named this unit's rows from its reach (engine_body_plan.rs `Reach`): the
+                // walk today must be that reach, or a row would be planned for a file it does not
+                // reach, or none for one it does (the ready plan's reach is the last members
+                // record's: a `mod` the edit moved is this stop, named, rule 3).
+                if let Some(file) = plan_reach.and_then(|plan| plan.disagrees(own_name, &reach)) {
+                    return Err(EngineCheckError::ReadyHost {
+                        task: file,
+                        what: "a member's module tree reaches this file, or no longer reaches it, unlike the reach the plan named its body rows from (a `mod` moved since the reach was read: engine_body_plan.rs `Reach`)",
+                    }
+                    .into());
+                }
+                reach
+            };
             // What the members record keeps of a visit: each held file's head parts and each
             // reached file it does not hold, in the order the claims are made.
             let mut held_kept: Vec<rec::Held<'_>, blaze_own::Alloc<'static>> = Vec::new_in(g);
             let mut not_held_kept: Vec<Name, blaze_own::Alloc<'static>> = Vec::new_in(g);
-            let mut refuse_all = |why: &'static str, reads: &'f [CellId]| member_files.extend(reach.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::Refused(why), reads }));
+            let mut refuse_all = |kept_below: Option<(&rec::HeldMember<'_>, &[Name])>, files: &[Name], why: &'static str, reads: &'f [CellId]| {
+                if let Some((held, not_held)) = kept_below {
+                    member_files.extend(held.held.iter().map(|h| FileClaim { file: h.slot, unit, is: FileIs::Refused(why), reads }));
+                    member_files.extend(not_held.iter().map(|&file| FileClaim { file, unit, is: FileIs::Refused(why), reads }));
+                } else {
+                    member_files.extend(files.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::Refused(why), reads }));
+                }
+            };
             let Some(own) = input_at(member) else {
                 // Its crate's own names failed (a build script, its resolution): that failure
                 // is the crate's `CrateScope` row, reported there once; its bodies say so. Read
                 // as it is today: no task defines the crate's names cell (ABSENT), or its task
                 // failed and defines none; the task that comes, or its fix, moves it.
-                refuse_all(
-                    if names.failed(own_name) {
-                        "its crate has no names record this command: its `CrateScope` task failed, and that failure is reported at it"
-                    } else {
-                        "its crate has no `Names` task this command (engine_names.rs `plan`)"
-                    },
-                    own_cells,
-                );
+                let why = if names.failed(own_name) { rec::RefusedWhy::ScopeFailed } else { rec::RefusedWhy::NoNamesTask };
+                refuse_all(kept_below, &reach, why.words().unwrap_or("its crate has no `Names` task this command (engine_names.rs `plan`)"), own_cells);
+                if again.is_none() {
+                    members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(why), not_held: reach });
+                }
                 continue;
             };
+            listings.record_scope_key(list.key(member), own.at);
             // A member visited at need was pushed at its first turn (piece A).
             if again.is_none() {
                 members.push(own.name);
@@ -3849,7 +5812,10 @@ impl<'f> BodiesStage<'f> {
                     Ok(records) => records,
                     Err(error) => {
                         let cause = ScopeRefusal::Records { krate, at: member, error };
-                        refuse_all(crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        refuse_all(kept_below, &reach, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        if again.is_none() {
+                            members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(rec::RefusedWhy::Unstood), not_held: reach });
+                        }
                         continue;
                     }
                 }
@@ -3861,7 +5827,10 @@ impl<'f> BodiesStage<'f> {
                         own_records
                     }
                     Err(cause) => {
-                        refuse_all(crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        refuse_all(kept_below, &reach, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        if again.is_none() {
+                            members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(rec::RefusedWhy::Unstood), not_held: reach });
+                        }
                         continue;
                     }
                 }
@@ -3878,81 +5847,118 @@ impl<'f> BodiesStage<'f> {
             // A scope refused at need takes back the member's head subjects (as the oracle arm
             // refuses before the first).
             let heads_at = heads.len();
-            // The member's files: its items record's file rows, matched to the planner's outlines.
-            let Ok(items) = ItemsRecord::open(own_records.items, g) else {
-                // The items record is the crate's names task's: a function of its cell.
-                refuse_all("its crate's items record does not open (blaze-scope items_record.rs `ItemsRecord::open`)", own_cells);
-                continue;
-            };
+            // The member's files: its items record's file rows, matched to the planner's outlines
+            // (already verified when `own_records` was loaded, rule 74).
+            let items = ItemsRecord::from_verified(own_records.items_proof, g);
             // Each member's text length of the impls and traits a macro wrote, made the first
             // time a body is asked that no item row holds ([`text_bytes`]).
             let mut member_lens: Option<Vec<(ItemKey, u32), blaze_own::Alloc<'static>>> = None;
             let mut files: Vec<(u32, u32), Global> = Vec::new_in(Global);
             // Each file row's head, by index: what the member's listing row is keyed by besides
             // its names record (engine_member_rows.rs `row_key`).
-            let mut file_heads: Vec<crate::engine_member_rows::FileHead, blaze_own::Alloc<'static>> = Vec::with_capacity_in(items.files(), g);
-            for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
-                let head = 'head: {
-                    let Ok(Some(row)) = items.file_surface(file) else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
-                    let Some(path) = row.path.in_package(list.shown_from(member), g) else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
-                    let Some(path) = path.strip_prefix("/0/") else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
-                    // The outline this unit reaches, of the file's outlines (one a name it is
-                    // planned by: a `mod x;` slot and a `#[path]` to `x/mod.rs` are two).
-                    let Some(at) = crate::engine_body_plan::outline_at_path(handles.outlined, path.as_bytes(), &reach) else {
-                        // A file the request has an outline of but did not read back (the ready
-                        // setup's, [`BodiesStage::unread_outlines`]): the phase path would match
-                        // it, so a `NotOutlined` head here would key the member's row apart from
-                        // the phase path's. The setup's typed refusal, never that row (rule 3).
-                        if S::STANDING
-                            && let Some(unread) = self.unread.as_ref()
-                            && let Some(file) = slot_names(path, g).into_iter().flatten().find(|name| unread.binary_search(name).is_ok())
-                        {
-                            let root = Name::file(list.root(member).strip_prefix("/0/").unwrap_or(list.root(member)).as_bytes());
-                            return Err(EngineCheckError::Unoutlined(crate::engine_body_plan::Unoutlined { file, root }).into());
-                        }
-                        break 'head crate::engine_member_rows::FileHead::NotOutlined
-                    };
-                    files.push((file, u32::try_from(at).unwrap_or(u32::MAX)));
-                    // A member visited at need (piece A) gave its head subjects at its first
-                    // turn, from the record: equal to these (its files' listing facts are).
-                    if again.is_none() {
-                        heads.push(crate::engine_heads::Subject::new(list.key(member).prefix(), file, &handles.outlined[at]));
-                    }
-                    crate::engine_member_rows::FileHead::of(&handles.outlined[at])
-                };
-                file_heads.push(head);
-            }
+            let mut file_heads: Vec<crate::engine_member_rows::FileHead, blaze_own::Alloc<'static>> = Vec::new_in(g);
             // The member's files this phase owes: the only ones outlined and keyed below.
             let mut owed_files: Vec<(u32, u32), blaze_own::Alloc<'static>> = Vec::new_in(g);
-            owed_files.extend(files.iter().copied().filter(|(_, outline)| owed.binary_search(outline).is_ok()));
             // THE MEMBER'S LISTING ROW (engine_member_rows.rs, D149 piece I1): what the rest of
             // its whole listing was for (the bodies a macro wrote, of blocks, the uncovered
             // note), keyed by its unit, its names record, its files' texts and the tool: all
             // known from its own names record, so its stored row is read before its scope is
             // asked for. Its snapshot's refusal is raised below, only where the row is asked of.
-            let row_key = if row_key_unit_only {
-                // The planted control: no names record's `out`, no file's head.
-                crate::engine_member_rows::row_key(&crate::engine_member_rows::RowKey { unit: own_name, names: Input { out: blaze_drive::key::ABSENT, ..own }, files: &[], tool: handles.tool })
+            let row_key = if let Some((held, _)) = kept_below {
+                for h in held.held.iter() {
+                    if let Ok(idx) = owed_slots.binary_search_by_key(&h.slot, |&(slot, _)| slot)
+                        && let Some(&(_, outline_at)) = owed_slots.get(idx)
+                    {
+                        owed_files.push((h.file, outline_at));
+                    }
+                }
+                held.row
             } else {
-                crate::engine_member_rows::row_key(&crate::engine_member_rows::RowKey { unit: own_name, names: own, files: &file_heads, tool: handles.tool })
+                file_heads.reserve(items.files());
+                for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
+                    if (file & 15) == 0 && handles.board.stopping().is_some() {
+                        return Ok(Err(("stopped by signal", &[])));
+                    }
+                    let head = 'head: {
+                        let Ok(Some(row)) = items.file_surface(file) else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
+                        let Some(path) = row.path.in_package(list.shown_from(member), g) else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
+                        let Some(path) = path.strip_prefix("/0/") else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
+                        // The outline this unit reaches, of the file's outlines (one a name it is
+                        // planned by: a `mod x;` slot and a `#[path]` to `x/mod.rs` are two).
+                        let Some(at) = crate::engine_body_plan::outline_at_path(handles.outlined, path.as_bytes(), &reach) else {
+                            // A file the request has an outline of but did not read back (the ready
+                            // setup's, [`BodiesStage::unread_outlines`]): the phase path would match
+                            // it, so a `NotOutlined` head here would key the member's row apart from
+                            // the phase path's. The setup's typed refusal, never that row (rule 3).
+                            if S::STANDING
+                                && let Some(unread) = self.unread.as_ref()
+                                && let Some(file) = slot_names(path, g).into_iter().flatten().find(|name| unread.binary_search(name).is_ok())
+                            {
+                                let root = Name::file(list.root(member).strip_prefix("/0/").unwrap_or(list.root(member)).as_bytes());
+                                return Err(EngineCheckError::Unoutlined(crate::engine_body_plan::Unoutlined { file, root }).into());
+                            }
+                            break 'head crate::engine_member_rows::FileHead::NotOutlined
+                        };
+                        files.push((file, u32::try_from(at).unwrap_or(u32::MAX)));
+                        // A member visited at need (piece A) gave its head subjects at its first
+                        // turn, from the record: equal to these (its files' listing facts are).
+                        if again.is_none()
+                            && let Some(one) = handles.outlined.get(at)
+                        {
+                            heads.push(crate::engine_heads::Subject::new(list.key(member).prefix(), file, one));
+                        }
+                        match handles.outlined.get(at) {
+                            Some(one) => crate::engine_member_rows::FileHead::of(one),
+                            None => crate::engine_member_rows::FileHead::NotOutlined,
+                        }
+                    };
+                    file_heads.push(head);
+                }
+                owed_files.extend(files.iter().copied().filter(|(_, outline)| owed.binary_search(outline).is_ok()));
+                if row_key_unit_only {
+                    // The planted control: no names record's `out`, no file's head.
+                    crate::engine_member_rows::row_key(&crate::engine_member_rows::RowKey { unit: own_name, names: Input { out: blaze_drive::key::ABSENT, ..own }, files: &[], tool: handles.tool })
+                } else {
+                    crate::engine_member_rows::row_key(&crate::engine_member_rows::RowKey { unit: own_name, names: own, files: &file_heads, tool: handles.tool })
+                }
             };
             let probed = snapshot.get(row_key).map(|got| got.map(|bytes| crate::engine_member_rows::open(bytes, g)));
             tally.parts.files_ns = tally.parts.files_ns.saturating_add(lap(handles.clock, &mut member_mark));
+            // Standing member on the ready driver with no `CrateScope` entered this request and no
+            // planted unreadable crate: its scope stood whole in the members record, so defer both
+            // dependency `names.input_of` (stored page reads) and `present` checks to first ask.
+            // On all paths (both `ready` and `phases`) when no unreadable crate is planted, defer
+            // upfront `front_load::present` CAS lookups to `LazyScopeRecords::open` on first ask
+            // while still checking `names.input_of` (in-memory on `phases`) so failed `CrateScope`
+            // dependencies still cut the scope immediately.
+            let stood_in_record = again.is_some() || stood_view.as_deref().and_then(|view| view.member(place)).is_some_and(|m| matches!(m.state, rec::MemberState::Held(_)));
+            let defer_scope_inputs = stood_in_record
+                && names.stood_on().is_some()
+                && names.stage().results.is_empty()
+                && self.grains_entered.as_deref().unwrap_or(&[]).iter().all(|name| name.kind != Kind::CrateScope)
+                && planted_unreadable.is_none();
+            let defer_present = planted_unreadable.is_none();
             // D168 (2) (c): the member's check scope, at need ([`OpenWorld`]): its bodies are
             // owed, or its row must be made (not stored, or its bytes do not open), or a crate of
             // its scope has no names input (the refusal `scope_of` words). Else nothing of its
             // scope is opened: no body of it runs, and its row is the stored one.
-            let needs_scope = !O::BY_NEED || !owed_files.is_empty() || !matches!(probed, Ok(Some(Ok(_)))) || !scope_inputs_whole(names, &list, member, &own_records, g);
+            let needs_scope = !O::BY_NEED
+                || !owed_files.is_empty()
+                || !matches!(probed, Ok(Some(Ok(_))))
+                || (!defer_scope_inputs && !scope_inputs_whole(names, &list, member, &own_records, g));
             tally.scopes_needed = tally.scopes_needed.saturating_add(u32::from(needs_scope));
             if needs_scope && whole_scope.is_none() {
                 // Piece C (a): made by need, the member's own record the one opened; every other
-                // scope crate's opened at a body's first question of it (`ScopeRecords`).
-                match scope_by_need(names, &list, member, own_records, snapshot, planted_unreadable, heap)? {
+                // scope crate's opened at a body's first question of it (`LazyScopeRecords`).
+                match scope_by_need(names, &list, member, own_records, snapshot, planted_unreadable, (defer_scope_inputs, defer_present), heap)? {
                     Ok(made) => whole_scope = Some(made),
                     Err(cause) => {
                         // As the oracle arm refuses it: before any claim or head subject of it.
                         heads.truncate(heads_at);
-                        refuse_all(crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        refuse_all(kept_below, &reach, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        if again.is_none() {
+                            members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(rec::RefusedWhy::Unstood), not_held: reach });
+                        }
                         continue;
                     }
                 }
@@ -3962,9 +5968,13 @@ impl<'f> BodiesStage<'f> {
             // The scope's cut, the cells a refusal of it reads, and the member's group: of an
             // opened scope alone. Not opened: no file of it is owed, its row stands, and every
             // crate of its scope has an input (`scope_of` would cut none at an input).
-            let (whole, cut_words, scope_cells, group) = match whole_scope {
+            let (whole, cut_words, cut_missing, scope_cells, group) = match whole_scope {
                 Some((mut scope, unopened, whole)) => {
                     let cut_words = scope.cut_cause(&list).map(|cause| crate::engine_head_notes::leak(heap.alloc(), format_args!("its member's {cause}")));
+                    let cut_missing = match scope.cut {
+                        Some((at, CutWhy::NoNamesRecord { failed })) => Some((blaze_drive::key::crate_scope_name(&list.key(at)), failed)),
+                        _ => None,
+                    };
                     // The cells a cut scope's refusal reads: the graph's, each scope crate's that
                     // had records and the first that had none (the one whose task comes or is fixed).
                     let mut cut_reads: Vec<Name, Global> = Vec::new_in(Global);
@@ -3984,14 +5994,25 @@ impl<'f> BodiesStage<'f> {
                     scope.scope.dedup();
                     // Made by need, the member is its one opened crate (`scope_by_need`); a scope
                     // cut before the member has no group to check (the member is refused below).
+                    if let Some(ref rest) = unopened {
+                        for one in rest.iter() {
+                            listings.record_scope_key(one.key, one.input.at);
+                        }
+                    } else {
+                        for one in scope.crates.iter() {
+                            if let Some(inp) = input_at(one.world_at) {
+                                listings.record_scope_key(one.records.key, inp.at);
+                            }
+                        }
+                    }
                     let crates = match (unopened, scope.crates.first().copied()) {
                         (None, _) => Some(GroupCrates::Opened(scope.crates)),
                         (Some(rest), Some(own)) => Some(GroupCrates::ByNeed { own, rest }),
                         (Some(_), None) => None,
                     };
-                    (whole, cut_words, scope_cells, crates.map(|crates| Group { list, own: own.name, crates, env, script, lang: scope.lang, scope: scope.scope }))
+                    (whole, cut_words, cut_missing, scope_cells, crates.map(|crates| Group { list, own: own.name, tool: handles.tool, crates, env, script, lang: scope.lang, scope: scope.scope, front: bstd::sync::Once::new("bodies group front"), bodies: 0, goals: bstd::sync::Once::new("bodies group goals"), own_module_cache: bstd::sync::PublishOnce::new() }))
                 }
-                None => (true, None, own_cells, None),
+                None => (true, None, None, own_cells, None),
             };
             // A file the planner's cfg-blind walk reaches that the items record lists at no path
             // of it: this unit's cfg cut its `mod` (engine_body_plan.rs). Not this unit's file,
@@ -4002,11 +6023,11 @@ impl<'f> BodiesStage<'f> {
                 member_files.push(FileClaim { file: *file, unit, is: FileIs::NotHeld, reads: own_cells });
                 not_held_kept.push(*file);
             }
-            held_kept.extend(files.iter().map(|&(file, at)| {
-                let one = &handles.outlined[at as usize];
-                rec::Held { file, slot: one.name, path: one.path.as_slice(), entries: crate::engine_listing_record::entries_of(one) }
-            }));
             if again.is_none() {
+                held_kept.extend(files.iter().filter_map(|&(file, at)| {
+                    let one = usize::try_from(at).ok().and_then(|idx| handles.outlined.get(idx))?;
+                    Some(rec::Held { file, slot: one.name, path: one.path.as_slice(), entries: crate::engine_listing_record::entries_of(one) })
+                }));
                 tally.files = tally.files.saturating_add(u32::try_from(files.len()).unwrap_or(u32::MAX));
             }
             tally.files_owed =tally.files_owed.saturating_add(u32::try_from(owed_files.len()).unwrap_or(u32::MAX));
@@ -4058,10 +6079,24 @@ impl<'f> BodiesStage<'f> {
             // row and the listing ask the member's own crate, opened already; a crate past it
             // is opened only if they ask it.
             let opened = match (open_records, group.as_ref()) {
-                (true, Some(group)) => {
-                    let record_files = (packs, Some(handles.outlined));
-                    Some(crate::run_names::names_records_over(cx, handles.root, group.crates.scope(&setup_records), record_files, corrected, procs, std::vec::Vec::new_in(Global), env_in(group.env, frame).ok().flatten(), Some(snapshot), Some(expansion_keys), frame, g))
-                }
+                (true, Some(group)) => Some(open_stretch_records(
+                    cx,
+                    handles.root,
+                    group.scope(&setup_records, heap),
+                    &list,
+                    (packs, &handles.env.fs).into(),
+                    handles.outlined,
+                    has_unread_outlines,
+                    unread_digests,
+                    &setup_dep_files,
+                    corrected,
+                    procs,
+                    env_in(group.env, frame).ok().flatten(),
+                    snapshot,
+                    expansion_keys,
+                    frame,
+                    g,
+                )),
                 _ => None,
             };
             if opened.is_some() {
@@ -4069,9 +6104,7 @@ impl<'f> BodiesStage<'f> {
             }
             let (records, refused) = match (refused, opened) {
                 (Some(why), _) => (None, Some(why)),
-                (None, Some(Ok(opened))) => (Some(opened.records), None),
-                // The scope crates' records, each its names task's: a function of their cells.
-                (None, Some(Err(_))) => (None, Some(("its member's items record does not open for its edition (run_names.rs `names_records`)", scope_cells))),
+                (None, Some(opened)) => (Some(opened.records), None),
                 // Not opened: no file of it is owed, and its row stands.
                 (None, None) => (None, None),
             };
@@ -4091,7 +6124,7 @@ impl<'f> BodiesStage<'f> {
                     // missed an input (engine_member_rows.rs THE KEY, rule 21).
                     #[cfg(test)]
                     if let Some(records) = records {
-                        let made = crate::engine_member_rows::make(records, expansions.as_ref(), g);
+                        let made = crate::engine_member_rows::make(records, expansions.as_ref(), frame, g);
                         let (mut fresh, mut read): (Vec<u8, blaze_own::Alloc<'static>>, Vec<u8, blaze_own::Alloc<'static>>) = (Vec::new_in(g), Vec::new_in(g));
                         crate::engine_member_rows::encode(&made, &mut fresh);
                         crate::engine_member_rows::encode(&row, &mut read);
@@ -4102,11 +6135,14 @@ impl<'f> BodiesStage<'f> {
                     Some(row)
                 }
                 (stored, Some(records)) => {
+                    if handles.board.stopping().is_some() {
+                        return Ok(Err(("stopped by signal", &[])));
+                    }
                     let damaged = matches!(stored, Some(Err(_)));
-                    let made = crate::engine_member_rows::make(records, expansions.as_ref(), g);
+                    let made = crate::engine_member_rows::make(records, expansions.as_ref(), frame, g);
                     let mut bytes: Vec<u8, blaze_own::Alloc<'static>> = Vec::new_in(g);
                     crate::engine_member_rows::encode(&made, &mut bytes);
-                    let bytes: &'static [u8] = bytes.leak();
+                    let bytes: &'static [u8] = bytes.leak_static();
                     if damaged {
                         // Other bytes stand under its key: the store refuses a second form (rule
                         // 21), so the row is made each command and counted, never put over.
@@ -4134,23 +6170,50 @@ impl<'f> BodiesStage<'f> {
             // (`kept`: so its scope and environment stood) and every file row of which an outline
             // matched (a row no outline matched is a file that may appear: never stood on). A
             // member visited at need (piece A) was written at its first turn, from the record.
+            let all_outlined = !file_heads.iter().any(|head| matches!(head, crate::engine_member_rows::FileHead::NotOutlined));
             if kept
                 && again.is_none()
                 && let Some(row) = row.as_ref()
-                && !file_heads.iter().any(|head| matches!(head, crate::engine_member_rows::FileHead::NotOutlined))
+                && all_outlined
             {
                 let mut named: Vec<&str, blaze_own::Alloc<'static>> = Vec::with_capacity_in(row.named.len(), g);
                 named.extend(row.named.iter().copied());
                 members_out.member(&rec::Member {
                     at: place,
-                    unit: units[unit as usize],
-                    names: own.name,
-                    names_out: own.out,
-                    row: row_key,
-                    uncovered: row.uncovered,
-                    named,
-                    held: held_kept,
+                    unit: unit_val,
+                    state: rec::MemberState::Held(rec::HeldMember {
+                        names: own.name,
+                        names_out: own.out,
+                        row: row_key,
+                        uncovered: row.uncovered,
+                        named,
+                        held: held_kept,
+                    }),
                     not_held: not_held_kept,
+                });
+            } else if !whole
+                && again.is_none()
+                && all_outlined
+                && let Some((missing, missing_failed)) = cut_missing
+            {
+                members_out.member(&rec::Member {
+                    at: place,
+                    unit: unit_val,
+                    state: rec::MemberState::CutScope(rec::CutScopeMember {
+                        names: own.name,
+                        names_out: own.out,
+                        missing,
+                        missing_failed,
+                        held: held_kept,
+                    }),
+                    not_held: not_held_kept,
+                });
+            } else if again.is_none() {
+                members_out.member(&rec::Member {
+                    at: place,
+                    unit: unit_val,
+                    state: rec::MemberState::Refused(rec::RefusedWhy::Unstood),
+                    not_held: reach,
                 });
             }
             // The bodies a macro wrote that no entry covers: neither at a file entry nor in a
@@ -4169,6 +6232,9 @@ impl<'f> BodiesStage<'f> {
                     }
                 }
             }
+            if handles.board.stopping().is_some() {
+                return Ok(Err(("stopped by signal", &[])));
+            }
             let mut list_mark = handles.clock.now();
             let index = records.zip(row).map(|(records, row)| {
                 // The listed bodies of the member's OWED files alone (front2 project_records.rs
@@ -4177,10 +6243,11 @@ impl<'f> BodiesStage<'f> {
                 // below, in the walk's one outline of the file).
                 let mut owed_in: Vec<u32, blaze_own::Alloc<'static>> = Vec::with_capacity_in(owed_files.len(), g);
                 owed_in.extend(owed_files.iter().map(|(file, _)| *file));
-                let listed = list_files_with(records, Listing::FnsAndInitializers, &owed_in, g);
-                let mut mine: blaze_own::AVec<'_, blaze_ladder::front2::project_records::Listed<'_>> = blaze_own::AVec::new_in(g);
-                mine.extend(listed.iter().copied().filter(|l| l.entry.is_some_and(|(f, _)| owed_in.contains(&f))));
-                mine.sort_unstable_by_key(|l| l.entry.map(|(f, _)| f));
+                if owed_in.len() > 1 {
+                    owed_in.sort_unstable();
+                    owed_in.dedup();
+                }
+                let mine = list_owed_files(records, &items, &owed_in, g);
                 // The unit's cfg, as the names library lowered the crate (body_types.rs
                 // `Checker::holds`): what tells an entry a `cfg` left out from one the records
                 // lost ([`absent_entry`]).
@@ -4194,6 +6261,9 @@ impl<'f> BodiesStage<'f> {
             // Only the owed files: a file no entered task is in is asked of by no decision
             // (`Holders::decide` reads the claims of the decided task's file alone).
             for &(file, outline_at) in owed_files.iter() {
+                if handles.board.stopping().is_some() {
+                    return Ok(Err(("stopped by signal", &[])));
+                }
                 let file_name = handles.outlined[outline_at as usize].name;
                 let root_file = handles.outlined[outline_at as usize].path.as_slice() == root_path.as_bytes();
                 let Some((records, mine, row, cfg)) = index.as_ref() else {
@@ -4203,6 +6273,7 @@ impl<'f> BodiesStage<'f> {
                     continue;
                 };
                 let records = *records;
+                let block_locals = &row.block_locals;
                 // The bodies a macro wrote whose walk ends at an entry of this file, and the
                 // member's bodies of blocks, from its listing row (engine_member_rows.rs).
                 let mut written: Vec<&crate::engine_member_rows::Written<'_>, blaze_own::Alloc<'static>> = Vec::new_in(g);
@@ -4228,180 +6299,372 @@ impl<'f> BodiesStage<'f> {
                     None => None,
                 };
                 let (chains_ns, entries_keyed) = (&mut tally.parts.listing_chains_ns, &mut tally.entries_keyed);
-                let read = records.with_outline(file, g, &mut |text, outline| {
-                    // PIECE B: the run keyed by chain in this one outline of the file (front2
-                    // project_records.rs `index_outlined_by_chain`, `index_by_chain`'s rows and
-                    // refusals with no second outline made).
-                    let mut chain_mark = handles.clock.now();
-                    let chains = index_outlined_by_chain(file, run, text, outline, &blaze_file_items::item_chain, g);
-                    *chains_ns = chains_ns.saturating_add(lap(handles.clock, &mut chain_mark));
-                    *entries_keyed = entries_keyed.saturating_add(chains.as_ref().map_or(0, |by| by.rows().len() as u64));
-                    let chains = &chains;
-                    for (entry, item) in outline.items().iter().enumerate() {
-                        let body = work::checked_body(outline, item).is_some();
-                        if !body && !work::expansion_entry(outline, item, text) {
-                            continue;
-                        }
-                        let name = work::body_name(file_name, outline, item, text);
-                        let own_view = match own_rank {
-                            Some((plan, rank)) => {
-                                let cut = file_cuts.map_or(crate::engine_plan_cfg::Cut::HOLDS, |cuts| cuts.of(item.range.start));
-                                match plan.view_in::<Production, _>(file_name, cut, rank, &mut views) {
-                                    Some(view) => view,
-                                    None => continue,
+                let mut push_entry = |entry: u32,
+                                      item: &blaze_surface::Item,
+                                      body: bool,
+                                      name: Name,
+                                      chain: ContentId,
+                                      text: &str,
+                                      own_key: Result<Option<ItemKey>, &'static str>,
+                                      max_steps: usize,
+                                      parent_item: &dyn Fn(blaze_surface::ItemIndex) -> Option<blaze_surface::Item>,
+                                      item_len: &dyn Fn(blaze_surface::ItemIndex) -> u32,
+                                      eval_attrs: &dyn Fn(&blaze_surface::Item, blaze_own::Alloc<'static>) -> Option<(u32, bool)>| {
+                    // The bodies an expansion at this entry wrote: the entry's task checks
+                    // each (one task an entry, planned from text; covered.rs).
+                    let top = (file, blaze_surface::ItemIndex(entry));
+                    let by = written.iter().find(|w| w.top == top).map(|w| w.by);
+                    // One a body: in the request's heap with its list, never the fixed frame.
+                    let shown = crate::item_name::shown_name(item, text);
+                    let label = match (shown.is_empty(), by) {
+                        (false, _) => bstd::mem::format_in!(g, "{shown}"),
+                        (true, Some(by)) => bstd::mem::format_in!(g, "{{the expansion of `{by}!`}}"),
+                        (true, None) => bstd::mem::format_in!(g, "{{a macro call}}"),
+                    };
+                    let label: &'f str = blaze_own::Box::leak_static(label.into_boxed_str());
+                    // The entry's bodies, each with where its findings are printed: the
+                    // entry's own (`None`: from the item's start), or each body an expansion
+                    // at it wrote, by its label as `check` names it (covered.rs
+                    // `written_label`); then each body of a block's module whose owner is one
+                    // of them (covered.rs `in_blocks`), by its label. Each body is in one
+                    // entry's list alone: an entry's own key is listed at its file entry, a
+                    // written body's `top` is one entry, a block's body has one owner, and
+                    // the three are apart (a listed body with an entry is no macro's, and a
+                    // walk that ends in a file is no block's): so checked once (rule 77).
+                    let mut keys: Vec<ItemKey, _> = Vec::new_in(g);
+                    let mut labels: Vec<Option<Unplaced<'static>>, _> = Vec::new_in(g);
+                    // D167 (a): each key's predicted cost, made from the rows once the
+                    // keys are found (below).
+                    let mut costs: Vec<u32, _> = Vec::new_in(g);
+                    // COVERAGE (body_types/covered.rs, the reference): every body of the entry
+                    // is in its task's list, or the entry is refused by name; an entry is left
+                    // to no unit (`ENTRY_ABSENT`) only when its `cfg` is false for this unit.
+                    let own = match own_key {
+                        Err(why) => Err(why),
+                        Ok(own_body_key) => 'own: {
+                            // 1. The entry's own body, listed at its chain.
+                            if let Some(key) = own_body_key {
+                                keys.push(key);
+                                labels.push(None);
+                            }
+                            // 2. Each body an expansion at the entry wrote: an expansion
+                            // entry's, and an attribute's at a body entry (its output kept or
+                            // replaced the item: D122, the entry's task checks them).
+                            for w in written.iter().filter(|w| w.top == top) {
+                                match w.key {
+                                    Some(key) => {
+                                        keys.push(key);
+                                        let shown = bstd::mem::format_in!(g, "{}", w.label);
+                                        let shown: &'static str = blaze_own::Box::leak_static(shown.into_boxed_str());
+                                        labels.push(Some(Unplaced { label: shown, words: crate::body_types::covered::WRITTEN_UNPLACED }));
+                                    }
+                                    None => break 'own Err("a member a macro wrote has no key of its own in its crate's records"),
                                 }
                             }
-                            None => blaze_drive::view::UnitView::Base,
-                        };
-                        // PIECE B, BY NEED: only an entered row is decided (`prepare` asks
-                        // `Holders::decide` of each of `tasks` alone, and a decision reads its own
-                        // unit's find of its own body alone), so an entry whose row at this unit
-                        // no entered task names is found by no one: its keys, label and cost are
-                        // not made. The find keeps the body's base name (a claim is by body).
-                        if entered.binary_search(&at_view(name, own_view)).is_err() {
-                            continue;
-                        }
-                        // The bodies an expansion at this entry wrote: the entry's task checks
-                        // each (one task an entry, planned from text; covered.rs).
-                        let top = (file, blaze_surface::ItemIndex(u32::try_from(entry).unwrap_or(u32::MAX)));
-                        let by = written.iter().find(|w| w.top == top).map(|w| w.by);
-                        // One a body: in the request's heap with its list, never the fixed frame.
-                        let shown = crate::item_name::shown_name(item, text);
-                        let label = match (shown.is_empty(), by) {
-                            (false, _) => bstd::mem::format_in!(g, "{shown}"),
-                            (true, Some(by)) => bstd::mem::format_in!(g, "{{the expansion of `{by}!`}}"),
-                            (true, None) => bstd::mem::format_in!(g, "{{a macro call}}"),
-                        };
-                        let label: &'f str = core::str::from_utf8(label.into_bytes().leak()).unwrap_or("");
-                        // The entry's bodies, each with where its findings are printed: the
-                        // entry's own (`None`: from the item's start), or each body an expansion
-                        // at it wrote, by its label as `check` names it (covered.rs
-                        // `written_label`); then each body of a block's module whose owner is one
-                        // of them (covered.rs `in_blocks`), by its label. Each body is in one
-                        // entry's list alone: an entry's own key is listed at its file entry, a
-                        // written body's `top` is one entry, a block's body has one owner, and
-                        // the three are apart (a listed body with an entry is no macro's, and a
-                        // walk that ends in a file is no block's): so checked once (rule 77).
-                        let mut keys: Vec<ItemKey, _> = Vec::new_in(g);
-                        let mut labels: Vec<Option<Unplaced<'f>>, _> = Vec::new_in(g);
-                        // D167 (a): each key's predicted cost, made from the rows once the
-                        // keys are found (below).
-                        let mut costs: Vec<u32, _> = Vec::new_in(g);
-                        // COVERAGE (body_types/covered.rs, the reference): every body of the entry
-                        // is in its task's list, or the entry is refused by name; an entry is left
-                        // to no unit (`ENTRY_ABSENT`) only when its `cfg` is false for this unit.
-                        let own = match chains {
-                            Err(_) => Err("its file's bodies could not be indexed by their outline entries (front2 project_records.rs `index_outlined_by_chain`)"),
-                            Ok(chains) => 'own: {
-                                // 1. The entry's own body, listed at its chain.
-                                let listed = if body { chains.get(file, blaze_file_items::item_chain(outline, item, text)) } else { None };
-                                if let Some(listed) = listed {
-                                    match crate::body_types::covered::body_key(records, listed) {
-                                        Some(key) => {
-                                            keys.push(key);
-                                            labels.push(None);
-                                        }
-                                        None => break 'own Err("a member the records list has no key of its own"),
+                            // 3. A body entry the records list no body at, and no macro wrote
+                            // one at: the root's replaced `fn main`, a `cfg` that is false
+                            // (not this unit's), or a refusal naming why (never silent).
+                            // An entry written inside an item that an attribute macro took
+                            // (`#[async_trait] impl Signer for S { fn address(&self) .. }`):
+                            // the Reference, "Procedural Macros", "Attribute macros": the
+                            // attribute's output REPLACES the item, so the member's text is
+                            // no body of the crate. What the crate holds there is the
+                            // output, whose bodies an expansion at that ancestor wrote and
+                            // whose entry's task checks them (step 2 at the ancestor). Only
+                            // an ancestor some expansion wrote a body at counts: one whose
+                            // expansion is not in the records stays refused below.
+                            let taken_above = body && keys.is_empty() && {
+                                let mut up = item.parent;
+                                let mut steps = 0usize;
+                                let mut taken = false;
+                                while let Some(p) = up {
+                                    if written.iter().any(|w| w.top == (file, p)) {
+                                        taken = true;
+                                        break;
                                     }
+                                    steps += 1;
+                                    // Bounded by the outline's length (rule 18).
+                                    if steps > max_steps {
+                                        break;
+                                    }
+                                    up = parent_item(p).and_then(|e| e.parent);
                                 }
-                                // 2. Each body an expansion at the entry wrote: an expansion
-                                // entry's, and an attribute's at a body entry (its output kept or
-                                // replaced the item: D122, the entry's task checks them).
-                                for w in written.iter().filter(|w| w.top == top) {
-                                    match w.key {
-                                        Some(key) => {
-                                            keys.push(key);
-                                            let shown = bstd::mem::format_in!(g, "{}", w.label);
-                                            let shown: &'f str = core::str::from_utf8(shown.into_bytes().leak()).unwrap_or("");
-                                            labels.push(Some(Unplaced { label: shown, words: crate::body_types::covered::WRITTEN_UNPLACED }));
-                                        }
-                                        None => break 'own Err("a member a macro wrote has no key of its own in its crate's records"),
+                                taken
+                            };
+                            if body && keys.is_empty() && !taken_above {
+                                match absent_entry_with(records, item, text, root_file, max_steps, parent_item, eval_attrs, g) {
+                                    Ok(key) => {
+                                        keys.push(key);
+                                        labels.push(Some(Unplaced { label: REPLACED_MAIN, words: crate::body_types::covered::WRITTEN_UNPLACED }));
                                     }
+                                    Err(why) => break 'own Err(why),
                                 }
-                                // 3. A body entry the records list no body at, and no macro wrote
-                                // one at: the root's replaced `fn main`, a `cfg` that is false
-                                // (not this unit's), or a refusal naming why (never silent).
-                                // An entry written inside an item that an attribute macro took
-                                // (`#[async_trait] impl Signer for S { fn address(&self) .. }`):
-                                // the Reference, "Procedural Macros", "Attribute macros": the
-                                // attribute's output REPLACES the item, so the member's text is
-                                // no body of the crate. What the crate holds there is the
-                                // output, whose bodies an expansion at that ancestor wrote and
-                                // whose entry's task checks them (step 2 at the ancestor). Only
-                                // an ancestor some expansion wrote a body at counts: one whose
-                                // expansion is not in the records stays refused below.
-                                let taken_above = body && keys.is_empty() && {
-                                    let all = outline.items();
-                                    let mut up = item.parent;
-                                    let mut steps = 0usize;
-                                    let mut taken = false;
-                                    while let Some(p) = up {
-                                        if written.iter().any(|w| w.top == (file, p)) {
-                                            taken = true;
-                                            break;
-                                        }
-                                        steps += 1;
-                                        // Bounded by the outline's length (rule 18).
-                                        if steps > all.len() {
-                                            break;
-                                        }
-                                        up = all.get(p.0 as usize).and_then(|e| e.parent);
-                                    }
-                                    taken
-                                };
-                                if body && keys.is_empty() && !taken_above {
-                                    match absent_entry(records, outline, item, text, root_file, cfg.as_ref(), g) {
-                                        Ok(key) => {
-                                            keys.push(key);
-                                            labels.push(Some(Unplaced { label: REPLACED_MAIN, words: crate::body_types::covered::WRITTEN_UNPLACED }));
-                                        }
-                                        Err(why) => break 'own Err(why),
-                                    }
-                                }
-                                Ok(())
                             }
-                        };
-                        let found = match (own, blocks) {
-                            (Err(why), _) => Err(why),
-                            // Its blocks' bodies could not be told apart: refused by name, never
-                            // checked without them (rule 3).
-                            (Ok(()), Err(why)) if !keys.is_empty() => Err(why.words()),
-                            (Ok(()), _) => {
-                                if let Ok(blocks) = blocks {
-                                    let owners = keys.len();
-                                    for at_owner in 0..owners {
-                                        let owner = keys[at_owner];
-                                        let from = blocks.partition_point(|b| b.owner < owner);
-                                        for b in blocks[from..].iter().take_while(|b| b.owner == owner) {
-                                            let shown = bstd::mem::format_in!(g, "{}", BlockLabel { entry: label, name: b.name });
-                                            let shown: &'f str = core::str::from_utf8(shown.into_bytes().leak()).unwrap_or("");
-                                            keys.push(b.key);
-                                            labels.push(Some(Unplaced { label: shown, words: crate::body_types::covered::BLOCK_UNPLACED }));
-                                        }
+                            Ok(())
+                        }
+                    };
+                    let found = match (own, blocks) {
+                        (Err(why), _) => Err(why),
+                        // Its blocks' bodies could not be told apart: refused by name, never
+                        // checked without them (rule 3).
+                        (Ok(()), Err(why)) if !keys.is_empty() => Err(why.words()),
+                        (Ok(()), _) => {
+                            if let Ok(blocks) = blocks {
+                                let owners = keys.len();
+                                for at_owner in 0..owners {
+                                    let owner = keys[at_owner];
+                                    let from = blocks.partition_point(|b| b.owner < owner);
+                                    for b in blocks[from..].iter().take_while(|b| b.owner == owner) {
+                                        let shown = bstd::mem::format_in!(g, "{}", BlockLabel { entry: label, name: b.name });
+                                        let shown: &'static str = blaze_own::Box::leak_static(shown.into_boxed_str());
+                                        keys.push(b.key);
+                                        labels.push(Some(Unplaced { label: shown, words: crate::body_types::covered::BLOCK_UNPLACED }));
                                     }
                                 }
-                                // The entry's own body is the outline's item; every other key
-                                // is read from the items record's rows, no text read.
-                                for (k, key) in keys.iter().enumerate() {
-                                    let own_body = k == 0 && labels.first().is_some_and(Option::is_none);
-                                    costs.push(if own_body { item.range.len().max(MIN_BODY_BYTES) } else { text_bytes(&items, &mut member_lens, outline, file, *key, g) });
-                                }
-                                Ok((at, &*keys.leak()))
                             }
-                        };
-                        let place = Place { chain: work::item_chain(outline, item, text), file, item: item.range, written: &*labels.leak() };
-                        let costs: &'f [u32] = costs.leak();
-                        // Each key as a program calls it, over the records it was found in.
-                        let mut called: Vec<blaze_typeck::ItemKey, _> = Vec::new_in(g);
-                        if let Ok((_, keys)) = found {
-                            asked_keys(records, keys, &mut called);
+                            // The entry's own body is the outline's item; every other key
+                            // is read from the items record's rows, no text read.
+                            for (k, key) in keys.iter().enumerate() {
+                                let own_body = k == 0 && labels.first().is_some_and(Option::is_none);
+                                costs.push(if own_body { item.range.len().max(MIN_BODY_BYTES) } else { text_bytes(&items, &mut member_lens, item_len, file, *key, g) });
+                            }
+                            Ok((at, &*keys.leak_static()))
                         }
-                        let called: &'f [blaze_typeck::ItemKey] = called.leak();
-                        if grown.is_ok() {
-                            grown = EngineCheckError::push(&mut took, Took { name, label, item: found, place, unit, costs, asked: called }, "the bodies found in their crates' records (engine_bodies.rs `groups`)");
+                    };
+                    let place = Place { chain: work::item_chain_word(chain), file, item: item.range, written: &*labels.leak_static() };
+                    let costs: &'f [u32] = costs.leak_static();
+                    // Each key as a program calls it, over the records it was found in.
+                    let mut called: Vec<blaze_typeck::ItemKey, _> = Vec::new_in(g);
+                    if let Ok((_, keys)) = found {
+                        asked_keys(records, keys, &mut called);
+                        if !block_locals.is_empty() {
+                            let krate = items.key();
+                            let mut queue: Vec<ItemKey, _> = Vec::with_capacity_in(keys.len(), g);
+                            queue.extend_from_slice(keys);
+                            let mut head = 0usize;
+                            let limit = block_locals.len().saturating_add(keys.len());
+                            while head < queue.len() && head < limit {
+                                let owner = queue[head];
+                                head += 1;
+                                let block = crate::body_types::covered::block_key(krate, owner);
+                                let from = block_locals.partition_point(|(exp, _)| *exp < block);
+                                for &(_, alias) in block_locals[from..].iter().take_while(|(exp, _)| *exp == block) {
+                                    let asked_alias = blaze_ladder::front2::keys::asked_key(records, alias);
+                                    if called.scan_for(&asked_alias).is_none() {
+                                        called.push(asked_alias);
+                                    }
+                                    // Also include nested locals derived from this block-module
+                                    // alias (e.g. `hosted` inside `bstd_hosted_start`, when
+                                    // `program.rs` enters `bstd_hosted_start` by its
+                                    // block-module library key instead of its `INNER` key).
+                                    if let Some(alias_text) = NamesSource::text_of(records, alias)
+                                        && let Some(atoms) = NamesSource::cfg_atoms(records, 0)
+                                        && let Ok(walk) = blaze_ladder::front2::nested_exports::walk_every(
+                                            blaze_ladder::front2::nested_exports::Top {
+                                                text: alias_text.text,
+                                                name: NamesSource::name_of(records, alias).unwrap_or("_"),
+                                                library: Some((krate, alias)),
+                                            },
+                                            None,
+                                            blaze_ladder::front2::nested_exports::Reading {
+                                                edition: items.edition(),
+                                                atoms,
+                                                alloc: g,
+                                            },
+                                        )
+                                    {
+                                        for local in walk.locals.iter() {
+                                            if let Ok(local_key) = local.key {
+                                                let asked_local = blaze_ladder::front2::keys::checker_of(local_key);
+                                                if called.scan_for(&asked_local).is_none() {
+                                                    called.push(asked_local);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if queue.scan_for(&alias).is_none() {
+                                        queue.push(alias);
+                                    }
+                                }
+                            }
                         }
                     }
-                });
+                    let called: &'f [blaze_typeck::ItemKey] = called.leak_static();
+                    if grown.is_ok() {
+                        grown = EngineCheckError::push(&mut took, Took { name, label, item: found, place, unit, costs, asked: called }, "the bodies found in their crates' records (engine_bodies.rs `groups`)");
+                    }
+                };
+                let file_outline = usize::try_from(outline_at).ok().and_then(|idx| handles.outlined.get(idx));
+                let read = match (records.file_now(0, file), NamesSource::edition_of(records, 0)) {
+                    (Some(text), Some(edition)) => {
+                        let reused_view = file_outline
+                            .filter(|one| one.edition == edition.byte())
+                            .and_then(|one| one.made.as_ref().ok())
+                            .and_then(|record| {
+                                let payload = record.payload_bytes().ok()?;
+                                let view = blaze_surface::FileItemsView::read(payload).ok()?;
+                                Some((record, view))
+                            });
+                        if let Some((outline_record, view)) = reused_view {
+                            // Reuse the planner's `FileItemsView` directly (zero re-lex/re-parse),
+                            // and resolve only the entered bodies via `outline_record.parts` so
+                            // unentered items in huge files pay zero `body_name`/`item_chain` hashing.
+                            let mut bases: Vec<Name, blaze_own::Alloc<'static>> = Vec::new_in(g);
+                            match own_rank {
+                                Some((_, rank)) => {
+                                    bases.extend(rows.iter().filter(|r| r.file == file_name && r.rank == rank).map(|r| r.base));
+                                }
+                                None => {
+                                    bases.extend(tasks.iter().filter(|t| t.planned.file == file_name).map(|t| t.planned.name));
+                                }
+                            }
+                            bases.sort_unstable();
+                            bases.dedup();
+                            let mut matched: Vec<(u32, blaze_surface::Item, bool, Name, ContentId), blaze_own::Alloc<'static>> = Vec::with_capacity_in(bases.len(), g);
+                            for &base in bases.iter() {
+                                let Ok(part_at) = outline_record.parts.binary_search_by_key(&base, |part| part.name) else {
+                                    continue;
+                                };
+                                let Some(part) = outline_record.parts.get(part_at) else { continue };
+                                if !matches!(part.locate, Locate::Source(_)) {
+                                    continue;
+                                }
+                                let place = part.place;
+                                let mut lo = 0usize;
+                                let mut hi = view.len();
+                                while lo < hi {
+                                    let mid = lo + (hi - lo) / 2;
+                                    let mid_idx = blaze_surface::ItemIndex(u32::try_from(mid).unwrap_or(u32::MAX));
+                                    let start = view.item(mid_idx).map_or(u32::MAX, |e| e.item.range.start);
+                                    if start < place {
+                                        lo = mid + 1;
+                                    } else {
+                                        hi = mid;
+                                    }
+                                }
+                                for entry in lo..view.len() {
+                                    let entry_u32 = u32::try_from(entry).unwrap_or(u32::MAX);
+                                    let idx = blaze_surface::ItemIndex(entry_u32);
+                                    let Some(found_item) = view.item(idx) else { break };
+                                    if found_item.item.range.start != place {
+                                        break;
+                                    }
+                                    let item = found_item.item;
+                                    let body = work::checked_body_view(view, &item).is_some();
+                                    if !body && !work::expansion_entry_view(view, &item, text) {
+                                        continue;
+                                    }
+                                    let chain = crate::signature::stored_chain(view, idx);
+                                    let name = work::body_name_from_chain(file_name, chain);
+                                    if name != base {
+                                        continue;
+                                    }
+                                    let own_view = match own_rank {
+                                        Some((plan, rank)) => {
+                                            let cut = file_cuts.map_or(crate::engine_plan_cfg::Cut::HOLDS, |cuts| cuts.of(item.range.start));
+                                            match plan.view_in::<Production, _>(file_name, cut, rank, &mut views) {
+                                                Some(v) => v,
+                                                None => break,
+                                            }
+                                        }
+                                        None => blaze_drive::view::UnitView::Base,
+                                    };
+                                    if entered.binary_search(&at_view(name, own_view)).is_ok() {
+                                        matched.push((entry_u32, item, body, name, chain));
+                                    }
+                                    break;
+                                }
+                            }
+                            matched.sort_unstable_by_key(|row| row.0);
+                            matched.dedup_by_key(|row| row.0);
+                            let mut wanted_entries: Vec<u32, blaze_own::Alloc<'static>> = Vec::with_capacity_in(matched.len(), g);
+                            wanted_entries.extend(matched.iter().filter(|row| row.2).map(|row| row.0));
+                            let mut chain_mark = handles.clock.now();
+                            let chains = index_view_by_chain(file, run, view, Some(&wanted_entries), &crate::signature::stored_chain, g);
+                            *chains_ns = chains_ns.saturating_add(lap(handles.clock, &mut chain_mark));
+                            *entries_keyed = entries_keyed.saturating_add(chains.as_ref().map_or(0, |by| u64::try_from(by.rows().len()).unwrap_or(u64::MAX)));
+                            let parent_item = |p: blaze_surface::ItemIndex| view.item(p).map(|e| e.item);
+                            let item_len = |idx: blaze_surface::ItemIndex| view.item(idx).map_or(0, |e| e.item.range.len());
+                            let cfg_ref = cfg.as_ref();
+                            let eval_attrs = |entry_item: &blaze_surface::Item, alloc: blaze_own::Alloc<'static>| {
+                                let cfg = cfg_ref?;
+                                let mut attrs = blaze_scope::task::Attrs::new_in(alloc);
+                                let mut stack = blaze_own::AVec::new_in(alloc);
+                                for attr in view.attrs(entry_item) {
+                                    if attr.kind == blaze_surface::AttrKind::Doc {
+                                        continue;
+                                    }
+                                    cfg.attr(&mut attrs, blaze_scope::task::strip_attr(entry_item.text(text, attr.range)), &mut stack);
+                                }
+                                Some((attrs.cfg_unread, attrs.cfg_ok))
+                            };
+                            for &(entry_u32, ref item, body, name, chain) in matched.iter() {
+                                let own_key = match &chains {
+                                    Err(_) => Err("its file's bodies could not be indexed by their outline entries (front2 project_records.rs `index_outlined_by_chain`)"),
+                                    Ok(by) => match if body { by.get(file, chain) } else { None } {
+                                        None => Ok(None),
+                                        Some(listed) => match crate::body_types::covered::body_key(records, listed) {
+                                            Some(key) => Ok(Some(key)),
+                                            None => Err("a member the records list has no key of its own"),
+                                        },
+                                    },
+                                };
+                                push_entry(entry_u32, item, body, name, chain, text, own_key, view.len(), &parent_item, &item_len, &eval_attrs);
+                            }
+                            true
+                        } else {
+                            // Cross-edition shared file (rare): file was planned under a different
+                            // edition than crate 0's, so outline in crate 0's edition.
+                            records.with_outline(file, g, &mut |text, outline| {
+                                let mut chain_mark = handles.clock.now();
+                                let chains = index_outlined_by_chain(file, run, text, outline, &blaze_file_items::item_chain, g);
+                                *chains_ns = chains_ns.saturating_add(lap(handles.clock, &mut chain_mark));
+                                *entries_keyed = entries_keyed.saturating_add(chains.as_ref().map_or(0, |by| u64::try_from(by.rows().len()).unwrap_or(u64::MAX)));
+                                let parent_item = |p: blaze_surface::ItemIndex| usize::try_from(p.0).ok().and_then(|i| outline.items().get(i)).copied();
+                                let item_len = |idx: blaze_surface::ItemIndex| usize::try_from(idx.0).ok().and_then(|i| outline.items().get(i)).map_or(0, |e| e.range.len());
+                                let cfg_ref = cfg.as_ref();
+                                let eval_attrs = |entry_item: &blaze_surface::Item, alloc: blaze_own::Alloc<'static>| {
+                                    let cfg = cfg_ref?;
+                                    let attrs = blaze_scope::task::item_attrs(cfg, outline, entry_item, text, alloc);
+                                    Some((attrs.cfg_unread, attrs.cfg_ok))
+                                };
+                                for (entry, item) in outline.items().iter().enumerate() {
+                                    let body = work::checked_body(outline, item).is_some();
+                                    if !body && !work::expansion_entry(outline, item, text) {
+                                        continue;
+                                    }
+                                    let chain = blaze_file_items::item_chain(outline, item, text);
+                                    let name = work::body_name_from_chain(file_name, chain);
+                                    let own_view = match own_rank {
+                                        Some((plan, rank)) => {
+                                            let cut = file_cuts.map_or(crate::engine_plan_cfg::Cut::HOLDS, |cuts| cuts.of(item.range.start));
+                                            match plan.view_in::<Production, _>(file_name, cut, rank, &mut views) {
+                                                Some(v) => v,
+                                                None => continue,
+                                            }
+                                        }
+                                        None => blaze_drive::view::UnitView::Base,
+                                    };
+                                    if entered.binary_search(&at_view(name, own_view)).is_err() {
+                                        continue;
+                                    }
+                                    let own_key = match &chains {
+                                        Err(_) => Err("its file's bodies could not be indexed by their outline entries (front2 project_records.rs `index_outlined_by_chain`)"),
+                                        Ok(by) => match if body { by.get(file, chain) } else { None } {
+                                            None => Ok(None),
+                                            Some(listed) => match crate::body_types::covered::body_key(records, listed) {
+                                                Some(key) => Ok(Some(key)),
+                                                None => Err("a member the records list has no key of its own"),
+                                            },
+                                        },
+                                    };
+                                    push_entry(u32::try_from(entry).unwrap_or(u32::MAX), item, body, name, chain, text, own_key, outline.items().len(), &parent_item, &item_len, &eval_attrs);
+                                }
+                            })
+                        }
+                    }
+                    _ => false,
+                };
                 core::mem::replace(&mut grown, Ok(()))?;
                 if !read && let Some(last) = member_files.last_mut() {
                     // The file's text as it is now, through its crate's records (front2
@@ -4450,10 +6713,9 @@ impl<'f> BodiesStage<'f> {
         // This request's members record, under the key of its bytes; the driver names it under
         // the checkout's members root at the commit (engine_check.rs).
         let mut put_mark = handles.clock.now();
-        let members_bytes = members_out.finish();
-        let members_key = blaze_drive::key::content_key(&members_bytes);
-        store.put(cx, members_key, &members_bytes)?;
+        let (members_key, _) = members_out.finish_and_put(cx, store)?;
         self.members_key = Some(members_key);
+        setup_dep_files.persist(cx, store, &mut self.member_rows, heap)?;
         tally.parts.put_ns = lap(handles.clock, &mut put_mark);
         self.uncovered_note = (uncovered > 0).then(|| crate::engine_head_notes::leak(g, format_args!("{}", Uncovered { count: uncovered, named: &uncovered_named })));
         self.groups_found = true;
@@ -4515,6 +6777,134 @@ impl<'f> BodiesStage<'f> {
             lines.note(name, crate::engine_lines::Class::Head, crate::engine_head_notes::seed_words(first.head, first.why, frame).as_bytes());
         }
         Ok(())
+    }
+
+    /// Computes today's `VIEW` header for a standing `BodyCheck` row with findings so a standing
+    /// finding carried from a whole-workspace answer into a scoped check (or across a target
+    /// addition/removal) never keeps a stale `VIEW` unit list.
+    ///
+    /// Returns `Ok(None)` when `file` is not in `outlined` (e.g. an unread outline on the `Ready`
+    /// path, where no unit was added or removed so the stored `VIEW` header is already exact) or
+    /// when `self.reach` is absent; returns `Ok(Some(None))` when today's reach has `< 2` holders
+    /// (strip any stale `VIEW`); returns `Ok(Some(Some((base, at, units))))` when `>= 2` holders.
+    #[expect(clippy::type_complexity, reason = "optional refresh result for standing body VIEW header")]
+    pub(crate) fn standing_view<'s, 'r>(
+        &'s self,
+        name: Name,
+        outlined: &[Outlined<'_>],
+        file: Name,
+        frame: &'r Frame,
+    ) -> Result<Option<Option<(Name, u32, Vec<crate::engine_lines::ViewUnit<'s>, &'r Frame>)>>, EngineCheckError> {
+        let Some(reach) = self.reach.as_ref() else { return Ok(None) };
+        if reach.ranks(file).len() < 2 {
+            return Ok(Some(None));
+        }
+        let mut cache_slot = self.standing_views.borrow_mut();
+        let entry = if let Some(cache) = cache_slot.as_mut() {
+            let tag = (outlined.as_ptr().addr(), outlined.len());
+            if cache.outlined_tag != tag {
+                cache.files.clear();
+                cache.outlined_tag = tag;
+            }
+            if !cache.files.contains_key(&file) {
+                let state = match outlined.binary_search_by(|one| one.name.cmp(&file)).ok().and_then(|at| outlined.get(at)) {
+                    None => StandingFileState::Missing,
+                    Some(one) => match &one.made {
+                        Err(_) => StandingFileState::NoMultiHolder,
+                        Ok(record) => {
+                            let erased = blaze_own::Erased::new(frame);
+                            let cuts = crate::engine_plan_cfg::file_cuts(one, erased.handle());
+                            let mut views: Vec<ViewKey, &'r Frame> = Vec::new_in(frame);
+                            let mut ranks: Vec<u32, &'r Frame> = Vec::new_in(frame);
+                            let mut map: blaze_hash::Map<Name, StandingFileEntry, blaze_hash::BuildKeyHasher, blaze_own::Alloc<'static>> =
+                                blaze_hash::Map::new(blaze_hash::MapOpts {
+                                    hasher: blaze_hash::BuildKeyHasher::default(),
+                                    alloc: cache.alloc,
+                                    capacity: None,
+                                });
+                            for part in record.parts.iter().filter(|part| matches!((part.name.kind, part.locate), (Kind::BodyCheck, Locate::Source(_)))) {
+                                let cut = crate::engine_plan_cfg::part_cut(cuts.as_ref(), part);
+                                ranks.clear();
+                                ranks.extend(reach.body_ranks(file, cut));
+                                if ranks.len() < 2 {
+                                    continue;
+                                }
+                                reach.views_into(file, cut, &mut views);
+                                for i in 0..ranks.len() {
+                                    let view_name = at_view(part.name, Production::view_of(&views, i));
+                                    map.entry(view_name).or_insert(StandingFileEntry {
+                                        base: part.name,
+                                        row_at: u32::try_from(i).unwrap_or(u32::MAX),
+                                        cut,
+                                    });
+                                }
+                            }
+                            if map.is_empty() { StandingFileState::NoMultiHolder } else { StandingFileState::Multi(map) }
+                        }
+                    },
+                };
+                cache.files.insert(file, state);
+            }
+            match cache.files.get(&file) {
+                Some(StandingFileState::Missing) => return Ok(None),
+                Some(StandingFileState::NoMultiHolder) | None => return Ok(Some(None)),
+                Some(StandingFileState::Multi(map)) => match map.get(&name).copied() {
+                    Some(found) => found,
+                    None => return Ok(Some(None)),
+                },
+            }
+        } else {
+            let Ok(file_at) = outlined.binary_search_by(|one| one.name.cmp(&file)) else {
+                return Ok(None);
+            };
+            let Some(one) = outlined.get(file_at) else {
+                return Ok(None);
+            };
+            let Ok(record) = &one.made else {
+                return Ok(Some(None));
+            };
+            let erased = blaze_own::Erased::new(frame);
+            let cuts = crate::engine_plan_cfg::file_cuts(one, erased.handle());
+            let mut views: Vec<ViewKey, &'r Frame> = Vec::new_in(frame);
+            let mut ranks: Vec<u32, &'r Frame> = Vec::new_in(frame);
+            let mut found = None;
+            for part in record.parts.iter().filter(|part| matches!((part.name.kind, part.locate), (Kind::BodyCheck, Locate::Source(_)))) {
+                let cut = crate::engine_plan_cfg::part_cut(cuts.as_ref(), part);
+                ranks.clear();
+                ranks.extend(reach.body_ranks(file, cut));
+                reach.views_into(file, cut, &mut views);
+                for (i, _rank) in ranks.iter().enumerate() {
+                    if at_view(part.name, Production::view_of(&views, i)) == name {
+                        if ranks.len() < 2 {
+                            return Ok(Some(None));
+                        }
+                        found = Some(StandingFileEntry {
+                            base: part.name,
+                            row_at: u32::try_from(i).unwrap_or(u32::MAX),
+                            cut,
+                        });
+                        break;
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            let Some(found) = found else { return Ok(Some(None)) };
+            found
+        };
+        drop(cache_slot);
+        let mut units: Vec<crate::engine_lines::ViewUnit<'s>, &'r Frame> = Vec::new_in(frame);
+        for r in reach.body_ranks(file, entry.cut) {
+            units.push(reach.label(r).ok_or(EngineCheckError::Unplaced {
+                body: name,
+                what: "a unit that holds a row of the body has no label in the plan's reach (engine_body_plan.rs `Reach::label`)",
+            })?);
+        }
+        if units.len() < 2 {
+            return Ok(Some(None));
+        }
+        Ok(Some(Some((entry.base, entry.row_at, units))))
     }
 
     /// Body `name`'s item as written, when it ran.
@@ -4756,12 +7146,13 @@ impl<'f> BodiesStage<'f> {
         let frames = self.frames;
         let _ = writeln!(
             into,
-            "bodies: frames committed: a run's scratch at most {} bytes (floor {} used, {:.2}x; kept {SCRATCH_KEEP} between bodies, trimmed {} times); a stretch's frame at most {} bytes at its end (given back with it)",
+            "bodies: frames committed: a run's scratch at most {} bytes (floor {} used, {:.2}x; kept {SCRATCH_KEEP} between bodies, trimmed {} times); a stretch's frame at most {} bytes at its end (given back with it); a stretch's heads frame at most {} bytes",
             frames.scratch_committed_most,
             self.scratch_most,
             frames.scratch_committed_most as f64 / self.scratch_most.max(1) as f64,
             frames.scratch_trims,
-            frames.stretch_committed_most
+            frames.stretch_committed_most,
+            frames.heads_committed_most
         );
         // What the plan left to no unit (engine_body_plan.rs): entries, and files, counted; and
         // the rows entered by view (D191): a row is called checked only when its own check ran
@@ -4879,8 +7270,6 @@ impl<'f> BodiesStage<'f> {
         if let Some(line) = self.grains_line {
             let _ = writeln!(into, "{line}");
         }
-        // The call census (feature `call-census`): its whole report and the summary block.
-        self.census.write(into);
         let s = self.setup;
         let [first, second, third] = s.largest();
         let _ = writeln!(
@@ -4978,7 +7367,8 @@ struct Shared<'s, 'a, 'f, 'r, R: ?Sized + CellDigests> {
     /// `Listings`, lane OW1): every stretch's `Owners` places its reads in them.
     listings: &'s crate::engine_heads::Listings,
     root: &'s Dir<ReadWrite>,
-    packs: &'s [blaze_fetch::PackView<'static>],
+    fs: &'s bstd::fs::Fs,
+    packs: &'s crate::body_types::SyncLazyTrees<'f>,
     corrected: &'s [(u32, &'static str, &'static str)],
     procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
     groups: &'s [Group<'f, 'r>],
@@ -5006,17 +7396,20 @@ struct Shared<'s, 'a, 'f, 'r, R: ?Sized + CellDigests> {
     /// PLANTED BUG when true, tests only ([`PLANT_KEEP_SCRATCH`]): a body's scratch is not
     /// reset when it ends.
     keep_scratch: bool,
+    /// True when the ready setup left standing dependency outlines unread (`BodiesStage::unread`),
+    /// so `run_stretch` passes `None` for outlines and lets `StoreLoad::file_items` outline any
+    /// dependency file actually queried on demand (`CurrentFile::from_text`).
+    has_unread_outlines: bool,
+    unread_digests: Option<&'s [(blaze_own::String<SharedAlloc<'static>>, ContentId)]>,
     /// PLANTED BUGS, tests only ([`RowPlants`]): the old row's capacity, or the coarse step off.
     plants: RowPlants,
     /// The request's scope records opened by need ([`BodyRunner::by_need`]).
     by_need: &'s dyn crate::front_load::OpenByNeed,
+    /// Outlined dependency files cached once per phase across stretches.
+    dep_files: &'s DependencyFiles,
 }
 
 impl<R: ?Sized + CellDigests> Shared<'_, '_, '_, '_, R> {
-    fn record_memory(&self, one: &One<'_>, mem: &BodyMem) {
-        self.board.bodies_mem.add(mem, one.task.planned.name, one.path(self.outlined), one.label);
-    }
-
     fn missing_data(&self, label: &str, path: &str, id: CellId) -> Option<&'static str> {
         (self.reads.row_failed(id.of) != Some(false)).then(|| {
             leak(self.heap.alloc(), format_args!("body `{label}` read `{path}` without an available FileItems record"))
@@ -5183,64 +7576,509 @@ fn seed_cause<'n>(
 /// other half (tempo, g124650: three 32-body runs used up the whole 1 GiB in one frame).
 const STRETCH_FULL: usize = BODIES_FRAME / 2;
 
-/// One run: its bodies checked in stretches, each over a frame of its own that ends with it
-/// ([`STRETCH_FULL`]), so no run uses up a frame however many bodies it holds.
-#[expect(clippy::too_many_arguments, reason = "a run's edge: each argument one handle of it")]
-fn run_bodies<'a, 'f, R: ?Sized + CellDigests>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_, R>, run: &[One<'f>], clock: &Clock, out: &mut Buffer<'a>, ran: &mut SVec<'a, Ran<'f>>, run_out: &mut RunOut<'a>, tally: &mut crate::engine_seeds::SeedTally, alloc: SharedAlloc<'a>) {
+/// One completed work item from a work-stealing Bodies worker, tagged with its original index
+/// `at` in `0..runs.len()` so the coordinator reassembles results in deterministic order (rule 25).
+struct ItemDone<'a, 'b, 'f> {
+    at: usize,
+    out: Buffer<'a>,
+    ran: SVec<'b, Ran<'f>>,
+    run_out: RunOut<'b>,
+    span: (u64, u64),
+}
+
+impl<'a, 'b, 'f> ItemDone<'a, 'b, 'f> {
+    fn new(at: usize, len: usize, clock: &Clock, alloc: SharedAlloc<'a>, at_phase: SharedAlloc<'b>) -> Self {
+        // Filing a refusal must work even when the allocation for the successful row failed.
+        // Each body consumes at most one slot in each of these four lists.
+        let mut out = Buffer::new_in(alloc);
+        out.done.reserve_exact(len);
+        out.owed.reserve_exact(len);
+        let ran = SVec::with_capacity_in(len, at_phase);
+        let mut run_out = RunOut::new(at_phase);
+        run_out.notes.reserve_exact(len);
+        let began = crate::engine_times::ns(clock.now().since_start());
+        ItemDone { at, out, ran, run_out, span: (began, began) }
+    }
+}
+
+/// Work carried across a stretch boundary by a stealing worker when either a stolen item belongs
+/// to a different member group or a multi-body item was interrupted mid-batch by `STRETCH_FULL`
+/// or an unwind.
+enum Pending<'a, 'b, 'f> {
+    Whole(usize),
+    Partial { item: ItemDone<'a, 'b, 'f>, offset: usize },
+}
+
+/// Per-worker results accumulated without locks across a multi-item Bodies phase, wrapped in
+/// [`CachePadded`] at its owner to eliminate false sharing across cores (rule 86).
+struct WorkerOut<'a, 'b, 'f> {
+    items: SVec<'b, ItemDone<'a, 'b, 'f>>,
+    tally: crate::engine_seeds::SeedTally,
+    setup: StretchSetup,
+    frames: FramesHeld,
+}
+
+impl<'a, 'b, 'f> WorkerOut<'a, 'b, 'f> {
+    fn new(at_phase: SharedAlloc<'b>) -> Self {
+        WorkerOut {
+            items: SVec::new_in(at_phase),
+            tally: crate::engine_seeds::SeedTally::default(),
+            setup: StretchSetup::default(),
+            frames: FramesHeld::default(),
+        }
+    }
+}
+
+/// Feeds bodies into [`run_stretch_with`]: either a fixed slice ([`run_bodies`], used by the
+/// single-item fast path and the `Ready` driver) or a dynamic LPT work-stealing worker that keeps
+/// its stretch alive across consecutive stolen items of the same member group.
+enum StretchDriver<'d, 'a, 'b, 'f> {
+    Fixed {
+        run: &'d [One<'f>],
+        at: usize,
+        out: &'d mut Buffer<'a>,
+        ran: &'d mut SVec<'b, Ran<'f>>,
+        run_out: &'d mut RunOut<'b>,
+    },
+    Stealing {
+        group: u32,
+        runs: &'d [&'d [One<'f>]],
+        dispatch: &'d [usize],
+        cursor: &'d CachePadded<AtomicUsize>,
+        current: Option<(ItemDone<'a, 'b, 'f>, usize)>,
+        worker_items: &'d mut SVec<'b, ItemDone<'a, 'b, 'f>>,
+        worker_setup: &'d mut StretchSetup,
+        pending: Option<Pending<'a, 'b, 'f>>,
+    },
+}
+
+impl<'d, 'a, 'b, 'f> StretchDriver<'d, 'a, 'b, 'f> {
+    fn group_id(&self) -> Option<u32> {
+        match self {
+            StretchDriver::Fixed { run, .. } => run.first().map(|one| one.group),
+            StretchDriver::Stealing { group, .. } => Some(*group),
+        }
+    }
+
+    /// Whether this stretch can check 2 or more body items and therefore benefits from reserving
+    /// [`HEADS_STRETCH_FRAME`] (`StretchStore`) to reuse frozen heads across bodies. A 1-body
+    /// incremental edit (`items <= 1`) skips the 512 MiB `mmap`/`munmap` completely.
+    fn wants_stretch_store(&self, group_bodies: u32) -> bool {
+        match self {
+            StretchDriver::Fixed { run, at, .. } => {
+                let mut count = 0usize;
+                for one in run.get(*at..).unwrap_or(&[]) {
+                    count = count.saturating_add(one.items.len());
+                    if count >= 2 {
+                        return true;
+                    }
+                }
+                false
+            }
+            StretchDriver::Stealing { runs, current, .. } => {
+                if group_bodies >= 2 {
+                    return true;
+                }
+                let Some((item, offset)) = current.as_ref() else { return false };
+                let Some(run) = runs.get(item.at) else { return false };
+                let mut count = 0usize;
+                for one in run.get(*offset..).unwrap_or(&[]) {
+                    count = count.saturating_add(one.items.len());
+                    if count >= 2 {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    fn refuse_current<'s, R: ?Sized + CellDigests>(
+        &mut self,
+        why: &'static str,
+        scope: Option<(&Shared<'s, 'a, 'f, '_, R>, &Group<'_, '_>)>,
+        local_mem: &mut LocalBodyMem<'s, 'f>,
+        clock: &Clock,
+        alloc: SharedAlloc<'a>,
+    ) -> usize {
+        let scoped = scope.map(|(shared, group)| (shared, group, local_mem));
+        match self {
+            StretchDriver::Fixed { run, at, out, ran, run_out } => {
+                let took = refuse::<R>(run, why, scoped, out, ran, run_out, alloc);
+                *at = took;
+                took
+            }
+            StretchDriver::Stealing { runs, current, worker_items, .. } => {
+                if let Some((mut item, offset)) = current.take() {
+                    if let Some(rest) = runs.get(item.at).and_then(|r| r.get(offset..)) {
+                        let _ = refuse::<R>(rest, why, scoped, &mut item.out, &mut item.ran, &mut item.run_out, alloc);
+                    }
+                    item.span.1 = crate::engine_times::ns(clock.now().since_start());
+                    worker_items.push(item);
+                }
+                0
+            }
+        }
+    }
+
+    fn record_setup(&mut self, setup: StretchSetup) {
+        match self {
+            StretchDriver::Fixed { run_out, .. } => run_out.setup.add(setup),
+            StretchDriver::Stealing { worker_setup, .. } => worker_setup.add(setup),
+        }
+    }
+
+    fn next_body<R: ?Sized + CellDigests>(
+        &mut self,
+        taken: usize,
+        frame_used: usize,
+        shared: &Shared<'_, 'a, '_, '_, R>,
+        clock: &Clock,
+        alloc: SharedAlloc<'a>,
+        at_phase: SharedAlloc<'b>,
+    ) -> Option<(&'d One<'f>, &mut Buffer<'a>, &mut SVec<'b, Ran<'f>>, &mut RunOut<'b>)> {
+        match self {
+            StretchDriver::Fixed { run, at, out, ran, run_out } => {
+                if *at >= run.len() {
+                    return None;
+                }
+                if taken > 0 && frame_used > STRETCH_FULL {
+                    return None;
+                }
+                // The workers' scheduling point (engine_status.rs): stopped, the stretch ends, and
+                // `run_bodies` refuses the rest.
+                if taken > 0 && shared.board.stopping().is_some() {
+                    return None;
+                }
+                let one = run.get(*at)?;
+                *at += 1;
+                Some((one, out, ran, run_out))
+            }
+            StretchDriver::Stealing { group, runs, dispatch, cursor, current, worker_items, pending, .. } => {
+                loop {
+                    let needs_next = match current.as_ref() {
+                        None => true,
+                        Some((item, offset)) => *offset >= runs.get(item.at).map_or(0, |r| r.len()),
+                    };
+                    if needs_next {
+                        if let Some((mut item, _)) = current.take() {
+                            item.span.1 = crate::engine_times::ns(clock.now().since_start());
+                            worker_items.push(item);
+                        }
+                        if taken > 0 && frame_used > STRETCH_FULL {
+                            return None;
+                        }
+                        if shared.board.stopping().is_some() {
+                            return None;
+                        }
+                        let slot = cursor.fetch_add(1, Ordering::Relaxed);
+                        let &next_at = dispatch.get(slot)?;
+                        let next_run = *runs.get(next_at)?;
+                        if next_run.first().map(|o| o.group) != Some(*group) {
+                            *pending = Some(Pending::Whole(next_at));
+                            return None;
+                        }
+                        *current = Some((ItemDone::new(next_at, next_run.len(), clock, alloc, at_phase), 0));
+                        continue;
+                    }
+                    if taken > 0 && frame_used > STRETCH_FULL {
+                        if let Some((item, offset)) = current.take() {
+                            *pending = Some(if offset == 0 { Pending::Whole(item.at) } else { Pending::Partial { item, offset } });
+                        }
+                        return None;
+                    }
+                    if shared.board.stopping().is_some() {
+                        if let Some((item, offset)) = current.take() {
+                            let rem = runs.get(item.at).map_or(0, |r| r.len().saturating_sub(offset));
+                            shared.board.refused(Stage::Bodies, u64::try_from(rem).unwrap_or(u64::MAX));
+                        }
+                        return None;
+                    }
+                    break;
+                }
+                let (item, offset) = current.as_mut()?;
+                let one = runs.get(item.at).copied().and_then(|r| r.get(*offset))?;
+                *offset += 1;
+                Some((one, &mut item.out, &mut item.ran, &mut item.run_out))
+            }
+        }
+    }
+
+    fn after_body(&mut self, stopped: bool, clock: &Clock) -> bool {
+        if !stopped {
+            return false;
+        }
+        if let StretchDriver::Stealing { runs, current, worker_items, pending, .. } = self
+            && let Some((mut item, offset)) = current.take()
+        {
+            let len = runs.get(item.at).map_or(0, |r| r.len());
+            if offset < len {
+                *pending = Some(Pending::Partial { item, offset });
+            } else {
+                item.span.1 = crate::engine_times::ns(clock.now().since_start());
+                worker_items.push(item);
+            }
+        }
+        true
+    }
+}
+
+/// Long-lived Bodies worker: reserves one [`BODY_SCRATCH`] frame for the phase, steals LPT items
+/// dynamically from `cursor`, and keeps its current member's [`BODIES_FRAME`] stretch alive across
+/// consecutive stolen items of the same member group (opening a fresh stretch only when the group
+/// changes, `frame.used() > STRETCH_FULL`, or an unwind poisons the stretch).
+#[expect(clippy::too_many_arguments, reason = "a stealing worker's edge: each argument one handle of it")]
+fn run_worker_stealing<'s, 'a, 'b, 'f, R: ?Sized + CellDigests>(
+    cx: &Cx,
+    shared: &Shared<'s, 'a, 'f, '_, R>,
+    runs: &[&[One<'f>]],
+    dispatch: &[usize],
+    cursor: &CachePadded<AtomicUsize>,
+    clock: &Clock,
+    worker: &mut WorkerOut<'a, 'b, 'f>,
+    alloc: SharedAlloc<'a>,
+    at_phase: SharedAlloc<'b>,
+) {
     #[cfg(test)]
     crate::engine_check::stack_probe::at("run_bodies");
+    let caps = WorkerFrameCaps::for_workers(usize::try_from(cx.workers()).unwrap_or(1).max(1));
+    let Ok(mut scratch) = Frame::with_reserve(BODY_SCRATCH, bstd::mem::Tag::Diagnostics) else {
+        loop {
+            if shared.board.stopping().is_some() {
+                return;
+            }
+            let slot = cursor.fetch_add(1, Ordering::Relaxed);
+            let Some(&at) = dispatch.get(slot) else { return };
+            let Some(run) = runs.get(at).copied() else { continue };
+            let mut item = ItemDone::new(at, run.len(), clock, alloc, at_phase);
+            let _ = refuse::<R>(run, "the scratch frame of its run's bodies could not be reserved (engine_bodies.rs `BODY_SCRATCH`)", None, &mut item.out, &mut item.ran, &mut item.run_out, alloc);
+            item.span.1 = crate::engine_times::ns(clock.now().since_start());
+            worker.items.push(item);
+        }
+    };
+    let Ok(mut freeze_scratch) = blaze_ladder::front2::tables::head::FreezeScratch::new(FREEZE_SCRATCH, caps.freeze_scratch_keep, bstd::mem::Tag::Infer) else {
+        loop {
+            if shared.board.stopping().is_some() {
+                return;
+            }
+            let slot = cursor.fetch_add(1, Ordering::Relaxed);
+            let Some(&at) = dispatch.get(slot) else { return };
+            let Some(run) = runs.get(at).copied() else { continue };
+            let mut item = ItemDone::new(at, run.len(), clock, alloc, at_phase);
+            let _ = refuse::<R>(run, "the dependency-head freeze scratch frame could not be reserved (engine_bodies.rs `FREEZE_SCRATCH`)", None, &mut item.out, &mut item.ran, &mut item.run_out, alloc);
+            item.span.1 = crate::engine_times::ns(clock.now().since_start());
+            worker.items.push(item);
+        }
+    };
+    let Ok(mut stretch) = Frame::with_reserve(BODIES_FRAME, bstd::mem::Tag::Infer) else {
+        loop {
+            if shared.board.stopping().is_some() {
+                return;
+            }
+            let slot = cursor.fetch_add(1, Ordering::Relaxed);
+            let Some(&at) = dispatch.get(slot) else { return };
+            let Some(run) = runs.get(at).copied() else { continue };
+            let mut item = ItemDone::new(at, run.len(), clock, alloc, at_phase);
+            let _ = refuse::<R>(run, "the frame of its run's stretch could not be reserved (engine_bodies.rs `BODIES_FRAME`)", None, &mut item.out, &mut item.ran, &mut item.run_out, alloc);
+            item.span.1 = crate::engine_times::ns(clock.now().since_start());
+            worker.items.push(item);
+        }
+    };
+    let mut body_mem = MergeBodyMem::new(&shared.board.bodies_mem);
+    let mut pending: Option<Pending<'a, 'b, 'f>> = None;
+    loop {
+        let next = match pending.take() {
+            Some(item) => {
+                if shared.board.stopping().is_some() {
+                    let rem = match item {
+                        Pending::Whole(at) => runs.get(at).map_or(0, |r| r.len()),
+                        Pending::Partial { item, offset } => runs.get(item.at).map_or(0, |r| r.len().saturating_sub(offset)),
+                    };
+                    if rem > 0 {
+                        shared.board.refused(Stage::Bodies, u64::try_from(rem).unwrap_or(u64::MAX));
+                    }
+                    break;
+                }
+                item
+            }
+            None => {
+                if shared.board.stopping().is_some() {
+                    break;
+                }
+                let slot = cursor.fetch_add(1, Ordering::Relaxed);
+                let Some(&at) = dispatch.get(slot) else { break };
+                Pending::Whole(at)
+            }
+        };
+        let (item, offset) = match next {
+            Pending::Whole(at) => {
+                let Some(run) = runs.get(at).copied() else { continue };
+                (ItemDone::new(at, run.len(), clock, alloc, at_phase), 0)
+            }
+            Pending::Partial { item, offset } => (item, offset),
+        };
+        let Some(run) = runs.get(item.at).copied() else { continue };
+        let Some(first) = run.first() else {
+            let mut item = item;
+            item.span.1 = crate::engine_times::ns(clock.now().since_start());
+            worker.items.push(item);
+            continue;
+        };
+        stretch.reset();
+        if stretch.committed() > caps.stretch_keep {
+            stretch.trim(caps.stretch_keep);
+        }
+        let mut driver = StretchDriver::Stealing {
+            group: first.group,
+            runs,
+            dispatch,
+            cursor,
+            current: Some((item, offset)),
+            worker_items: &mut worker.items,
+            worker_setup: &mut worker.setup,
+            pending: None,
+        };
+        let _ = freeze_scratch.with_resettable_alloc(|freeze_alloc, freeze_reset| {
+            let stretch: &Frame = &stretch;
+            run_stretch_with(cx, shared, &mut driver, stretch, &mut scratch, freeze_alloc, freeze_reset, clock, &mut worker.tally, &mut body_mem.local, alloc, at_phase)
+        });
+        worker.frames.stretch_committed_most = worker.frames.stretch_committed_most.max(u64::try_from(stretch.committed()).unwrap_or(u64::MAX));
+        if let StretchDriver::Stealing { pending: carry, .. } = driver {
+            pending = carry;
+        }
+    }
+    worker.frames.scratch_committed_most = worker.frames.scratch_committed_most.max(u64::try_from(scratch.committed()).unwrap_or(u64::MAX));
+}
+
+/// Pure predicate for [`should_run_inline`]: true when `run_count == 1`, or when `1..=INLINE_RUNS_MAX`
+/// unsliced runs total at most `INLINE_BYTES_MAX` predicted bytes.
+const fn should_run_inline_costs(run_count: usize, total_cost: u64, has_wholes: bool) -> bool {
+    if run_count == 0 {
+        return false;
+    }
+    if run_count == 1 {
+        return true;
+    }
+    !has_wholes && run_count <= INLINE_RUNS_MAX && total_cost <= INLINE_BYTES_MAX
+}
+
+/// Whether a Bodies phase's scheduled runs are small enough to execute inline on the caller
+/// thread (reusing one stretch + scratch frame pair and skipping both `pre_open_lang` and
+/// work-stealing pool spawns).
+fn should_run_inline(runs: &[&[One<'_>]], has_wholes: bool) -> bool {
+    let total_cost: u64 = runs
+        .iter()
+        .map(|run| run.iter().map(|one| predicted(one.costs, 0, one.items.len())).sum::<u64>())
+        .sum();
+    should_run_inline_costs(runs.len(), total_cost, has_wholes)
+}
+
+/// One run over caller-owned reusable `scratch`, `freeze_scratch`, and `stretch` frames: its
+/// bodies checked in stretches, each over a frame reset between stretches ([`STRETCH_FULL`]), so
+/// small inline multi-run phases reuse one set of frames instead of allocating per run.
+#[expect(clippy::too_many_arguments, reason = "a run's edge: each argument one handle of it")]
+fn run_bodies_with_frames<'s, 'a, 'b, 'f, R: ?Sized + CellDigests>(
+    cx: &Cx,
+    shared: &Shared<'s, 'a, 'f, '_, R>,
+    run: &[One<'f>],
+    clock: &Clock,
+    scratch: &mut Frame,
+    freeze_scratch: &mut blaze_ladder::front2::tables::head::FreezeScratch,
+    stretch: &mut Frame,
+    caps: WorkerFrameCaps,
+    out: &mut Buffer<'a>,
+    ran: &mut SVec<'b, Ran<'f>>,
+    run_out: &mut RunOut<'b>,
+    tally: &mut crate::engine_seeds::SeedTally,
+    alloc: SharedAlloc<'a>,
+    at_phase: SharedAlloc<'b>,
+) {
+    #[cfg(test)]
+    crate::engine_check::stack_probe::at("run_bodies");
+    let mut body_mem = MergeBodyMem::new(&shared.board.bodies_mem);
     // Filing a refusal must work even when the allocation for the successful row failed.
     // Each body consumes at most one slot in each of these four lists.
     out.done.reserve_exact(run.len());
     out.owed.reserve_exact(run.len());
     ran.reserve_exact(run.len());
     run_out.notes.reserve_exact(run.len());
+    let mut at = 0;
+    while let Some(rest) = run.get(at..) {
+        if rest.is_empty() {
+            break;
+        }
+        // Stopped (engine_status.rs): the bodies not begun are refused, each named, and the
+        // driver stops before the merge.
+        if shared.board.stopping().is_some() {
+            shared.board.refused(Stage::Bodies, u64::try_from(rest.len()).unwrap_or(u64::MAX));
+            refuse::<R>(rest, "not checked: the command was stopped by a signal before this body began (engine_status.rs)", None, out, ran, run_out, alloc);
+            return;
+        }
+        stretch.reset();
+        if stretch.committed() > caps.stretch_keep {
+            stretch.trim(caps.stretch_keep);
+        }
+        let mut driver = StretchDriver::Fixed { run: rest, at: 0, out, ran, run_out };
+        let took = freeze_scratch.with_resettable_alloc(|freeze_alloc, freeze_reset| {
+            let stretch: &Frame = &*stretch;
+            run_stretch_with(cx, shared, &mut driver, stretch, scratch, freeze_alloc, freeze_reset, clock, tally, &mut body_mem.local, alloc, at_phase)
+        });
+        run_out.frames.stretch_committed_most = run_out.frames.stretch_committed_most.max(u64::try_from(stretch.committed()).unwrap_or(u64::MAX));
+        at += took.max(1);
+    }
+    run_out.frames.scratch_committed_most = run_out.frames.scratch_committed_most.max(u64::try_from(scratch.committed()).unwrap_or(u64::MAX));
+}
+
+/// One run: its bodies checked in stretches, each over a frame of its own that ends with it
+/// ([`STRETCH_FULL`]), so no run uses up a frame however many bodies it holds.
+#[expect(clippy::too_many_arguments, reason = "a run's edge: each argument one handle of it")]
+fn run_bodies<'s, 'a, 'b, 'f, R: ?Sized + CellDigests>(cx: &Cx, shared: &Shared<'s, 'a, 'f, '_, R>, run: &[One<'f>], clock: &Clock, out: &mut Buffer<'a>, ran: &mut SVec<'b, Ran<'f>>, run_out: &mut RunOut<'b>, tally: &mut crate::engine_seeds::SeedTally, alloc: SharedAlloc<'a>, at_phase: SharedAlloc<'b>) {
     // The bodies' scratch: one reservation a run, reset as each body ends (rule 11).
     // (Its own tag, as the stretch's below: the status's `memory by tag` line names each.)
+    let caps = WorkerFrameCaps::for_workers(usize::try_from(cx.workers()).unwrap_or(1).max(1));
     let Ok(mut scratch) = Frame::with_reserve(BODY_SCRATCH, bstd::mem::Tag::Diagnostics) else {
         refuse::<R>(run, "the scratch frame of its run's bodies could not be reserved (engine_bodies.rs `BODY_SCRATCH`)", None, out, ran, run_out, alloc);
         return;
     };
-    let mut at = 0;
-    while at < run.len() {
-        let rest = &run[at..];
-        // Stopped (engine_status.rs): the bodies not begun are refused, each named, and the
-        // driver stops before the merge.
-        if shared.board.stopping().is_some() {
-            shared.board.refused(Stage::Bodies, rest.len() as u64);
-            refuse::<R>(rest, "not checked: the command was stopped by a signal before this body began (engine_status.rs)", None, out, ran, run_out, alloc);
-            return;
-        }
-        let took = match Frame::with_reserve(BODIES_FRAME, bstd::mem::Tag::Infer) {
-            Ok(stretch) => {
-                let took = run_stretch(cx, shared, rest, &stretch, &mut scratch, clock, out, ran, run_out, tally, alloc);
-                // Its records' pages go as the stretch ends, not the run (the frame's drop: what
-                // its thread's shelf has no room for goes back, blaze-mem frame.rs `give_span`).
-                run_out.frames.stretch_committed_most = run_out.frames.stretch_committed_most.max(stretch.committed() as u64);
-                took
-            }
-            Err(_) => refuse::<R>(rest, "the frame of its run's stretch could not be reserved (engine_bodies.rs `BODIES_FRAME`)", None, out, ran, run_out, alloc),
-        };
-        at += took.max(1);
-    }
+    let Ok(mut freeze_scratch) = blaze_ladder::front2::tables::head::FreezeScratch::new(FREEZE_SCRATCH, caps.freeze_scratch_keep, bstd::mem::Tag::Infer) else {
+        refuse::<R>(run, "the dependency-head freeze scratch frame could not be reserved (engine_bodies.rs `FREEZE_SCRATCH`)", None, out, ran, run_out, alloc);
+        return;
+    };
+    let Ok(mut stretch) = Frame::with_reserve(BODIES_FRAME, bstd::mem::Tag::Infer) else {
+        refuse::<R>(run, "the frame of its run's stretch could not be reserved (engine_bodies.rs `BODIES_FRAME`)", None, out, ran, run_out, alloc);
+        return;
+    };
+    run_bodies_with_frames(cx, shared, run, clock, &mut scratch, &mut freeze_scratch, &mut stretch, caps, out, ran, run_out, tally, alloc, at_phase);
 }
 
 /// Every body of `rest` refused for one reason, each named (rule 3): how many it took (all).
-fn refuse<'a, 'f, R: ?Sized + CellDigests>(rest: &[One<'f>], why: &'static str, scope: Option<(&Shared<'_, 'a, '_, '_, R>, &Group<'_, '_>)>, out: &mut Buffer<'a>, ran: &mut SVec<'a, Ran<'f>>, run_out: &mut RunOut<'a>, alloc: SharedAlloc<'a>) -> usize {
-    for one in rest {
-        if let Some((shared, group)) = scope {
+fn refuse<'s, 'a, 'b, 'f, R: ?Sized + CellDigests>(
+    rest: &[One<'f>],
+    why: &'static str,
+    scope: Option<(&Shared<'s, 'a, 'f, '_, R>, &Group<'_, '_>, &mut LocalBodyMem<'s, 'f>)>,
+    out: &mut Buffer<'a>,
+    ran: &mut SVec<'b, Ran<'f>>,
+    run_out: &mut RunOut<'b>,
+    alloc: SharedAlloc<'a>,
+) -> usize {
+    if let Some((shared, group, local_mem)) = scope {
+        for one in rest {
             let done = shared.refused_scope(one, group, core::iter::empty(), alloc);
-            let mut mem = BodyMem { scope: group.crates.len() as u64, ..BodyMem::default() };
+            let mut mem = BodyMem { scope: u64::try_from(group.crates.len()).unwrap_or(u64::MAX), ..BodyMem::default() };
             mem.count_scope(&done);
             mem.count_done(&done);
-            shared.record_memory(one, &mem);
+            local_mem.record(&mem, one.task.planned.name, one.path(shared.outlined), one.label);
             out.push(done, Stands::ByReads);
-        } else {
+            run_out.notes.push((ran.len(), Said::Refused(why), None));
+            ran.push(Ran::without_check(one.task.planned.name, one.label, one.file));
+        }
+    } else {
+        for one in rest {
             let (done, stands) = Outcome::owed(&one.task, alloc);
             out.push(done, stands);
+            run_out.notes.push((ran.len(), Said::Refused(why), None));
+            ran.push(Ran::without_check(one.task.planned.name, one.label, one.file));
         }
-        run_out.notes.push((ran.len(), Said::Refused(why), None));
-        ran.push(Ran::without_check(one.task.planned.name, one.label, one.file));
     }
     rest.len()
 }
@@ -5256,15 +8094,16 @@ fn refuse<'a, 'f, R: ?Sized + CellDigests>(rest: &[One<'f>], why: &'static str, 
 /// entry's are). The first slice that was not checked (a refusal, a panic, a frame used up)
 /// decides as the first body that stopped decides an entry: its result and note, the reads of
 /// the slices before it beside its own, none of their findings.
-fn join_slices<'a, 'f>(
+fn join_slices<'a, 'b, 'f>(
     entry: &One<'f>,
-    slices: &mut SVec<'a, (Buffer<'a>, SVec<'a, Ran<'f>>, RunOut<'a>)>,
+    slices: &mut SVec<'b, (Buffer<'a>, SVec<'b, Ran<'f>>, RunOut<'b>)>,
     g: blaze_own::Alloc<'static>,
     alloc: SharedAlloc<'a>,
-) -> Result<(Buffer<'a>, SVec<'a, Ran<'f>>, RunOut<'a>), EngineCheckError> {
+    at_phase: SharedAlloc<'b>,
+) -> Result<(Buffer<'a>, SVec<'b, Ran<'f>>, RunOut<'b>), EngineCheckError> {
     let name = entry.task.planned.name;
     let mut buffer = Buffer::new_in(alloc);
-    let mut joined = RunOut::new(alloc);
+    let mut joined = RunOut::new(at_phase);
     let mut reads: SVec<'a, (CellId, ContentId)> = SVec::new_in(alloc);
     let (mut ns, mut bytes, mut stretch) = (0u64, 0u64, InStretch::No);
     let mut stopped = None;
@@ -5286,7 +8125,6 @@ fn join_slices<'a, 'f>(
         joined.typed.append(&mut run_out.typed);
         joined.untyped_clean = joined.untyped_clean.saturating_add(run_out.untyped_clean);
         joined.setup.add(run_out.setup);
-        joined.census.absorb(&mut run_out.census);
         // Its data files followed as its reads are joined: each slice's up to a stopped one.
         joined.data_files.append(&mut run_out.data_files);
         buffer.made.append(&mut out.made);
@@ -5303,12 +8141,11 @@ fn join_slices<'a, 'f>(
             joined.typed.append(&mut run_out.typed);
             joined.untyped_clean = joined.untyped_clean.saturating_add(run_out.untyped_clean);
             joined.setup.add(run_out.setup);
-            joined.census.absorb(&mut run_out.census);
         }
     }
     reads.sort_unstable_by_key(|read| read.0);
     reads.dedup_by_key(|read| read.0);
-    let mut ran: SVec<'a, Ran<'f>> = SVec::with_capacity_in(1, alloc);
+    let mut ran: SVec<'b, Ran<'f>> = SVec::with_capacity_in(1, at_phase);
     ran.push(Ran { name, label: entry.label, ns, bytes, chain: entry.place.chain, note: None, found: FindingRange::default(), file: entry.file, stretch });
     if let Some(at) = stopped {
         let (out, _, run_out) = &mut slices[at];
@@ -5371,7 +8208,7 @@ fn join_slices<'a, 'f>(
     if noted {
         let words = leak(g, format_args!("{joined_why}"));
         let said = match types_short {
-            true => Said::Unchecked { why: words, calls: if calls.is_empty() { &[] } else { calls.leak() } },
+            true => Said::Unchecked { why: words, calls: if calls.is_empty() { &[] } else { calls.leak_static() } },
             false => Said::BorrowsUnchecked(words),
         };
         joined.notes.push((0, said, None));
@@ -5380,7 +8217,7 @@ fn join_slices<'a, 'f>(
     }
     joined.item_tasks = 1;
     // Rule 25: one entry's findings in one order, whatever its slices' were.
-    let mut found: SVec<'a, (FoundAt, u16, &[u8])> = SVec::new_in(alloc);
+    let mut found: SVec<'b, (FoundAt, u16, &[u8])> = SVec::new_in(at_phase);
     for (_, _, run_out) in slices.iter() {
         let mut from = 0;
         for &(_, rule, at, end) in run_out.found.iter() {
@@ -5397,27 +8234,178 @@ fn join_slices<'a, 'f>(
     Ok((buffer, ran, joined))
 }
 
-/// One stretch of a run: its member's records opened once into `frame`, each body checked over
-/// one view until the frame is past [`STRETCH_FULL`]. How many bodies it took (at least one).
+#[derive(Debug)]
+struct LangIndexRefused(&'static str);
+
+impl core::fmt::Display for LangIndexRefused {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+/// Per-stretch lazy wrapper over `BodySeed`: serves all already-frozen member and dependency heads
+/// (`Known::Bytes`) and member refusals (`Known::Refused`) directly in O(1) without constructing
+/// `lang_index`, `Pointers`, `HeadConsts`, or `SeededHeads`. Only on a cold dependency head miss
+/// (`Known::Freeze`) does it lazily build the freezer once per stretch into `frame`.
+struct LazyBodySeed<'k, 'r, 'm, 'n, 't> {
+    names: &'n blaze_ladder::front2::source::Records<'n>,
+    heads: &'k crate::engine_seeds::StretchHeads<'k, 'k, 'n>,
+    tables: Tables<'t, 'n>,
+    evaluated: &'n Recorder<'n>,
+    lang_crates: &'t [usize],
+    frame: &'n Frame,
+    fb: blaze_own::Bump<'n>,
+    fa: blaze_own::Alloc<'n>,
+    g: blaze_own::Alloc<'static>,
+    freeze_alloc: blaze_own::Alloc<'static>,
+    freeze_reset: &'r blaze_ladder::front2::tables::head::FreezeReset<'r, 'm>,
+    freeze_exhausted: &'k core::cell::Cell<Option<(usize, usize)>>,
+    freeze_depth: core::cell::Cell<u32>,
+    body_locals: blaze_ladder::front2::tables::seeds::BodyLocals,
+    import_cache: &'k blaze_ladder::front2::tables::head::FrozenImportCache<'n>,
+    front: Option<&'n blaze_ladder::front2::tables::task::StretchFront>,
+    index_reads: core::cell::Cell<u64>,
+    lang_refused: core::cell::Cell<Option<&'static str>>,
+    inner: core::cell::OnceCell<Result<&'n crate::engine_seeds::BodySeed<'k, 'n, 'n, &'n blaze_ladder::front2::source::Records<'n>, crate::engine_seeds::StretchHeads<'k, 'k, 'n>>, LangIndexRefused>>,
+}
+
+impl<'k, 'r, 'm, 'n, 't> LazyBodySeed<'k, 'r, 'm, 'n, 't> {
+    fn index_reads(&self) -> u64 {
+        self.index_reads.get()
+    }
+
+    fn lang_refused(&self) -> Option<&'static str> {
+        self.lang_refused.get()
+    }
+
+    fn with_failure<R>(&self, cell: Want, inspect: impl FnOnce(CellFailure<'_>) -> R) -> Option<R> {
+        self.inner.get()?.as_ref().ok()?.with_failure(cell, inspect)
+    }
+
+    #[inline(never)]
+    fn build_lang_index(&self) -> Result<&'n blaze_ladder::front2::index::Index<'n>, LangIndexRefused> {
+        match crate::engine_head_consts::lang_index(self.tables, self.evaluated, self.lang_crates) {
+            Ok(index) => Ok(self.frame.alloc(index)),
+            Err(twice) => {
+                let words = crate::engine_head_notes::leak(self.g, format_args!("its scope's constants have no lang index: {twice} (front2 index.rs `LangTwice`)"));
+                self.lang_refused.set(Some(words));
+                Err(LangIndexRefused(words))
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn build_head_consts(&self, index: &'n blaze_ladder::front2::index::Index<'n>) -> &'n mut (dyn ConstValues<'n> + 'n) {
+        self.frame.alloc(crate::engine_head_consts::HeadConsts::new(self.tables.reading_into(self.evaluated), index, self.fb))
+    }
+
+    #[inline(never)]
+    fn build_body_seed(
+        &self,
+        index: &'n blaze_ladder::front2::index::Index<'n>,
+        consts: Option<&'n mut (dyn ConstValues<'n> + 'n)>,
+        pointers: Option<blaze_ladder::front2::receiver::Pointers>,
+    ) -> &'n crate::engine_seeds::BodySeed<'k, 'n, 'n, &'n blaze_ladder::front2::source::Records<'n>, crate::engine_seeds::StretchHeads<'k, 'k, 'n>> {
+        let sized = index.lang("sized");
+        // The program's receiver pointer types, as the Heads stage's freezes are made with
+        // (engine_heads.rs `heads_of`): without them this freezer would write other bytes
+        // under a dependency head's key (rule 21; lane H9).
+        let pointers = pointers.unwrap_or_else(|| blaze_ladder::front2::receiver::Pointers::find(index, blaze_ladder::resolve::Paths { names: self.tables }));
+        let freezer = SeededHeads::new(SeededHeadsOpts { names: self.names, sized, pointers, frame: self.frame, scratch: self.freeze_alloc, alloc: self.fa, consts, known: Some(self.heads), owners: None });
+        self.frame.alloc(crate::engine_seeds::BodySeed::new(RequestSeedOpts { names: self.names, heads: self.heads, freezer, body_locals: self.body_locals }))
+    }
+
+    #[inline(never)]
+    fn build_freezer(&self) -> Result<&'n crate::engine_seeds::BodySeed<'k, 'n, 'n, &'n blaze_ladder::front2::source::Records<'n>, crate::engine_seeds::StretchHeads<'k, 'k, 'n>>, LangIndexRefused> {
+        let (index, pointers) = if let Some(sf) = self.front {
+            for &read in sf.reads() {
+                blaze_ladder::front2::tables::recorder::ReadSink::read(self.evaluated, read);
+            }
+            self.index_reads.set(self.evaluated.tally().offered);
+            (&*self.frame.alloc(sf.borrow_index()), Some(sf.pointers()))
+        } else {
+            let index = self.build_lang_index()?;
+            self.index_reads.set(self.evaluated.tally().offered);
+            (index, None)
+        };
+        let consts = Some(self.build_head_consts(index));
+        Ok(self.build_body_seed(index, consts, pointers))
+    }
+}
+
+impl<'n> HeadSeed<'n> for LazyBodySeed<'_, '_, '_, 'n, '_> {
+    fn seed(&self, store: &blaze_ladder::front2::heads::Store<'n>, keys: &blaze_ladder::front2::keys::Keys, need: Want, scratch: blaze_own::Alloc<'static>) -> Result<blaze_ladder::front2::heads::Seeded, SeedError> {
+        if self.body_locals == blaze_ladder::front2::tables::seeds::BodyLocals::Lowered
+            && blaze_ladder::front2::tables::seeds::of_the_body(store, need)
+        {
+            return Ok(blaze_ladder::front2::heads::Seeded::Lower);
+        }
+        let cell = blaze_ladder::front2::tables::head::cell_of(self.names, need).map_err(SeedError::Freeze)?;
+        match self.heads.known_frozen(cell).map_err(SeedError::Freeze)? {
+            crate::engine_seeds::KnownFrozen::Head(frozen) => {
+                blaze_ladder::front2::tables::head::file_frozen_cached(self.names, cell, frozen, store, keys, self.import_cache, scratch)
+                    .map_err(SeedError::Freeze)?;
+                return Ok(blaze_ladder::front2::heads::Seeded::Filed);
+            }
+            crate::engine_seeds::KnownFrozen::Refused(why) => {
+                return Err(SeedError::of_freeze(FreezeError::NotTheirs { want: cell, why }));
+            }
+            crate::engine_seeds::KnownFrozen::Freeze => {}
+        }
+        let inner = self.inner.get_or_init(|| self.build_freezer());
+        match inner {
+            Ok(body_seed) => {
+                struct FreezeResetGuard<'a, 'k, 'm> {
+                    depth: &'a core::cell::Cell<u32>,
+                    reset: &'k blaze_ladder::front2::tables::head::FreezeReset<'k, 'm>,
+                    exhausted: &'k core::cell::Cell<Option<(usize, usize)>>,
+                }
+                impl Drop for FreezeResetGuard<'_, '_, '_> {
+                    fn drop(&mut self) {
+                        let next = self.depth.get().saturating_sub(1);
+                        self.depth.set(next);
+                        if next == 0
+                            && let Some(ex) = self.reset.reset_and_trim()
+                        {
+                            self.exhausted.set(Some(ex));
+                        }
+                    }
+                }
+                self.freeze_depth.set(self.freeze_depth.get().saturating_add(1));
+                let _reset = FreezeResetGuard { depth: &self.freeze_depth, reset: self.freeze_reset, exhausted: self.freeze_exhausted };
+                body_seed.seed(store, keys, need, scratch)
+            }
+            Err(refused) => Err(SeedError::of_freeze(FreezeError::NotTheirs {
+                want: cell,
+                why: NotTheirs::Failed { said: refused.0 },
+            })),
+        }
+    }
+}
+
+/// One stretch of bodies: its member's records opened once into `frame`, each body supplied by
+/// `driver` checked over one view until `driver` stops (group change, [`STRETCH_FULL`], stop
+/// signal, or unwind). Returns how many bodies it checked (or refused for a fixed slice).
 #[expect(clippy::too_many_arguments, reason = "a stretch's edge: each argument one handle of it")]
-fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
+fn run_stretch_with<'d, 's, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
     cx: &Cx,
-    shared: &Shared<'_, 'a, '_, '_, R>,
-    run: &[One<'f>],
+    shared: &Shared<'s, 'a, 'f, '_, R>,
+    driver: &mut StretchDriver<'d, 'a, 'b, 'f>,
     frame: &Frame,
     scratch: &mut Frame,
+    freeze_alloc: blaze_own::Alloc<'static>,
+    freeze_reset: &'r blaze_ladder::front2::tables::head::FreezeReset<'r, 'm>,
     clock: &Clock,
-    out: &mut Buffer<'a>,
-    ran: &mut SVec<'a, Ran<'f>>,
-    run_out: &mut RunOut<'a>,
     tally: &mut crate::engine_seeds::SeedTally,
+    local_mem: &mut LocalBodyMem<'s, 'f>,
     alloc: SharedAlloc<'a>,
+    at_phase: SharedAlloc<'b>,
 ) -> usize {
     #[cfg(test)]
     crate::engine_check::stack_probe::at("run_stretch");
-    let Some(first) = run.first() else { return 0 };
-    let Some(group) = shared.groups.get(first.group as usize) else {
-        return refuse::<R>(run, "a body's member group is gone", None, out, ran, run_out, alloc);
+    let Some(group_id) = driver.group_id() else { return 0 };
+    let Some(group) = usize::try_from(group_id).ok().and_then(|idx| shared.groups.get(idx)) else {
+        return driver.refuse_current::<R>("a body's member group is gone", None, local_mem, clock, alloc);
     };
     // The setup's marks (D168 (2) (e)): what the stretch does before its first body begins.
     let set_began = clock.now();
@@ -5427,7 +8415,8 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
     // impl table's notes, the evaluator's sink and the constants' lists were placed in the frame
     // but grew on the process heap (`g`), never freed until the request ended: the Bodies
     // stage's growth on a 700-crate workspace (engine_bodies.rs memory table, lane BD1).
-    let fa = frame.alloc(blaze_own::Erased::new(frame)).handle();
+    let fb = frame.alloc(blaze_own::Erased::new(frame)).bump();
+    let fa = fb.alloc();
     // The impls from the request's shelf: each impl question reads its crate's bucket cell
     // (front2 tables/task.rs `cell_id`), which the Heads stage defined. Held in the stretch's
     // frame, so it lives as long as the records it is read beside (`Tables` takes both for one
@@ -5441,17 +8430,31 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
     let scope = Some((shared, group));
     let env = match env_in(group.env, frame) {
         Ok(env) => env,
-        Err(error) => return refuse(run, leak(g, format_args!("its member's environment did not copy into the run: {error:?} (blaze-scope crate_env.rs `EnvLent::copy_in`)")), scope, out, ran, run_out, alloc),
+        Err(error) => return driver.refuse_current(leak(g, format_args!("its member's environment did not copy into the run: {error:?} (blaze-scope crate_env.rs `EnvLent::copy_in`)")), scope, local_mem, clock, alloc),
     };
-    let files = (shared.packs, Some(shared.outlined));
     // Its scope crates past the member opened by need, at their first question, through the
     // request's memo (`shared.by_need`, piece C (a)); the oracle arm's all opened at the setup.
-    let Ok(opened) = crate::run_names::names_records_over(cx, shared.root, group.crates.scope(shared.by_need), files, shared.corrected, shared.procs, std::vec::Vec::new_in(Global), env, Some(shared.snapshot), Some(shared.expansion_keys), frame, g) else {
-        return refuse(run, "its member's records could not be opened in the run", scope, out, ran, run_out, alloc);
-    };
+    let opened = open_stretch_records(
+        cx,
+        shared.root,
+        group.scope(shared.by_need, shared.heap),
+        &group.list,
+        (shared.packs, shared.fs).into(),
+        shared.outlined,
+        shared.has_unread_outlines,
+        shared.unread_digests,
+        shared.dep_files,
+        shared.corrected,
+        shared.procs,
+        env,
+        shared.snapshot,
+        shared.expansion_keys,
+        frame,
+        g,
+    );
     let set_records = clock.now();
-    let unused = Recorder::new(RecorderOpts { alloc: g });
-    let tables = Tables::new(TablesOpts { records: opened.records, impls: Some(impls), lang_crates: &group.lang, reads: &unused });
+    let unused: &Recorder<'_> = frame.alloc(Recorder::new(RecorderOpts { alloc: fa }));
+    let tables = Tables::new(TablesOpts { records: opened.records, impls: Some(impls), lang_crates: &group.lang, reads: unused });
     // A stack owner drops the memo when this stretch ends. Its caller's heap reclaims old
     // buffers as it grows; a bump frame would retain every superseded capacity.
     let mut ids = ReadIds::new(tables, g);
@@ -5465,58 +8468,123 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
     // `StretchHeads`), on the stack so its `Owners` is dropped with the stretch.
     let stretch_heads = shared.seeds.map(|table| crate::engine_seeds::StretchHeads::new(table, shared.heads_failed, opened.records, shared.heads, group.crates.scope(shared.by_need), shared.listings, g));
     let set_heads = clock.now();
-    // The seed freezer's constant evaluator: the head tasks' own (engine_head_consts.rs), its
-    // lang index built once a stretch, and dependency const-fn head facts consumed by the
-    // body's on-demand body/value evaluator. Its reads stay in the stretch memo, so each
-    // body's read list takes the placed prefix ([`EvalReads`]).
-    // Two crates declaring one lang item refuse the stretch by name, as they fail a head task.
-    let evaluated: &Recorder<'_> = frame.alloc(Recorder::new(RecorderOpts { alloc: fa }));
-    let index: Option<&blaze_ladder::front2::index::Index<'_>> = match shared.seeds {
-        Some(_) => match crate::engine_head_consts::lang_index(tables, evaluated, &group.lang) {
-            Ok(index) => Some(&*frame.alloc(index)),
-            Err(twice) => return refuse(run, crate::engine_head_notes::leak(g, format_args!("its scope's constants have no lang index: {twice} (front2 index.rs `LangTwice`)")), scope, out, ran, run_out, alloc),
-        },
-        None => None,
-    };
-    // The reads of building the index alone: a body takes the evaluator's reads only once it
-    // evaluated a constant (as a head task takes them when its evaluator was asked).
-    let index_reads = evaluated.tally().offered;
-    let mut eval = EvalReads { placed: 0, ids: Vec::new_in(fa) };
-    let seed: Option<&crate::engine_seeds::BodySeed<'_, '_, '_, _, _>> = match &stretch_heads {
-        Some(table) => {
-            let mut sized = None;
-            for at in group.lang.iter() {
-                NamesSource::each_lang(opened.records, *at, &mut |name, key| {
-                    if name == "sized" {
-                        sized = Some(key);
-                    }
-                });
+    // Group-scoped lang IndexIn and receiver Pointers persisted as a content-addressed `BSF1`
+    // CAS record: look up from the committed snapshot first (skipping lang-crate scanning and
+    // pointer resolution on warm and post-reboot incremental edits), or build once per member
+    // group (in `shared.heap.shared()`, zero Global allocs, zero stretch-frame growth) and queue
+    // the encoded `BSF1` bytes for coordinator `store.put`.
+    let front_state = group.front.get_or_make(cx, |_| {
+        let front_key = stretch_front_key(group, shared.reads);
+        if let Some(key) = front_key {
+            match shared.snapshot.get(key) {
+                Ok(Some(bytes)) => {
+                    return Ok::<_, core::convert::Infallible>(match blaze_ladder::front2::tables::task::StretchFront::decode(bytes, shared.heap.shared()) {
+                        Ok(front) => GroupFrontState::Ready { front, key: Some(key), put: None },
+                        Err(err) => GroupFrontState::Error(leak(
+                            g,
+                            format_args!("stored StretchFront BSF1 record {key} refused: {err} (engine_bodies.rs)"),
+                        )),
+                    });
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    return Ok::<_, core::convert::Infallible>(GroupFrontState::Error(leak(
+                        g,
+                        format_args!("reading StretchFront BSF1 record {key} from store snapshot failed: {err:?} (engine_bodies.rs)"),
+                    )));
+                }
             }
-            let consts = index.map(|index| frame.alloc(crate::engine_head_consts::HeadConsts::new(tables.reading_into(evaluated), index, fa)) as &mut (dyn ConstValues<'_> + '_));
-            // The program's receiver pointer types, as the Heads stage's freezes are made with
-            // (engine_heads.rs `heads_of`): without them this freezer would write other bytes
-            // under a dependency head's key (rule 21; lane H9).
-            let Some(index) = index else { return refuse(run, "its scope has no lang index for its receiver pointer types (engine_bodies.rs `run_stretch`)", scope, out, ran, run_out, alloc) };
-            let pointers = blaze_ladder::front2::receiver::Pointers::find(index, blaze_ladder::resolve::Paths { names: tables });
-            let freezer = SeededHeads::new(SeededHeadsOpts { names: opened.records, sized, pointers, frame, scratch: g, alloc: fa, consts, known: Some(table), owners: None });
-            Some(frame.alloc(crate::engine_seeds::BodySeed::new(RequestSeedOpts { names: opened.records, heads: table, freezer, body_locals: table.body_locals() })))
         }
-        None => None,
+        match blaze_ladder::front2::tables::task::StretchFront::new(tables, fa, shared.heap.shared()) {
+            Ok(front) => {
+                if let Some(key) = front_key
+                    && stretch_front_reads_in_lang_crates(group, &front)
+                {
+                    let mut encoded = blaze_own::Vec::new_in(shared.heap.shared());
+                    match front.encode(&mut encoded) {
+                        Ok(()) => Ok(GroupFrontState::Ready { front, key: Some(key), put: Some((key, encoded)) }),
+                        Err(err) => Ok(GroupFrontState::Error(leak(
+                            g,
+                            format_args!("encoding StretchFront BSF1 record {key} failed: {err} (engine_bodies.rs)"),
+                        ))),
+                    }
+                } else {
+                    Ok(GroupFrontState::Ready { front, key: None, put: None })
+                }
+            }
+            Err(_) => Ok(GroupFrontState::None),
+        }
+    });
+    let front_ref = match front_state {
+        Ok(GroupFrontState::Ready { front, .. }) => Some(front),
+        Ok(GroupFrontState::None) => None,
+        Ok(GroupFrontState::Error(why)) => {
+            return driver.refuse_current::<R>(*why, scope, local_mem, clock, alloc);
+        }
+        Err(_) => None,
     };
+    // The seed freezer's constant evaluator and lang index are built lazily on the first cold
+    // dependency head miss (`LazyBodySeed`): warm edits (0 heads frozen) pay 0 us here.
+    let evaluated: &Recorder<'_> = frame.alloc(Recorder::new(RecorderOpts { alloc: fa }));
+    let mut eval = EvalReads { placed: 0, ids: Vec::new_in(fa) };
+    // Held on the stretch's stack in `g` so it leaves 0 bytes in `frame` and drops cleanly with the stretch.
+    let import_cache = blaze_ladder::front2::tables::head::FrozenImportCache::new(g);
+    let binding_keys = blaze_ladder::front2::tables::recorder::SharedBindingKeys::new(g);
+    let freeze_exhausted: core::cell::Cell<Option<(usize, usize)>> = core::cell::Cell::new(None);
+    let seed: Option<&LazyBodySeed<'_, '_, '_, '_, '_>> = stretch_heads.as_ref().map(|table| {
+        &*frame.alloc(LazyBodySeed {
+            names: opened.records,
+            heads: table,
+            tables,
+            evaluated,
+            lang_crates: &group.lang,
+            frame,
+            fb,
+            fa,
+            g,
+            freeze_alloc,
+            freeze_reset,
+            freeze_exhausted: &freeze_exhausted,
+            freeze_depth: core::cell::Cell::new(0),
+            body_locals: table.body_locals(),
+            import_cache: &import_cache,
+            front: front_ref,
+            index_reads: core::cell::Cell::new(0),
+            lang_refused: core::cell::Cell::new(None),
+            inner: core::cell::OnceCell::new(),
+        })
+    });
     // Each body's rounds (front2 tables/cost.rs `Spent::rounds`): one when its heads are all
     // seeded (runtime.md point 3).
     let cost: &Cost<'_> = frame.alloc(Cost::new(&NO_GAUGE));
-    // The call census (D190 step 2), one cell per stretch, filled by each body on this worker:
-    // only in a build with the feature.
-    let census: Option<&blaze_ladder::front2::call_census::CensusCell> =
-        cfg!(feature = "call-census").then(|| &*frame.alloc(blaze_ladder::front2::call_census::CensusCell::new(shared.heap.shared())));
-    let body_frame = BodyFrame { frame, alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::First, heads: seed.map(|s| s as &dyn HeadSeed<'_>), sources: Some(opened.sources), goals: None, census };
+    // One stretch-scoped macro preparation table shared across every body in the stretch so
+    // `ProjectWorld::over_prepared` allocates 0 bytes in `frame` per body and macros are prepared
+    // once per stretch rather than leaked per body.
+    let prepared: &blaze_scope::prepares::Prepares<'_> = blaze_scope::prepares::Prepares::new_in(fb);
+    // Per-group shared trait goals table (rule 70: dropped when `Bodies` ends; never shared
+    // across member groups; uses `ReplayMode::SameScope` so verified reads memoize per body;
+    // skipped when this group has < 2 scheduled bodies so 1-body edits pay 0).
+    let goals_ref: Option<&dyn blaze_ladder::front2::tables::goals::GoalShare> = if group.bodies >= 2 {
+        match group.goals.get_or_make(cx, |_| {
+            let opts = blaze_ladder::front2::tables::goals::GoalTableOpts {
+                share: blaze_ladder::front2::tables::goals::share_opts_same_scope(),
+                most: blaze_ladder::front2::tables::goals::MOST_GOALS,
+            };
+            Ok::<_, core::convert::Infallible>(blaze_ladder::front2::tables::goals::GoalTable::new_in(opts, shared.heap.shared()))
+        }) {
+            Ok(table) => Some(table as &dyn blaze_ladder::front2::tables::goals::GoalShare),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let body_frame = BodyFrame { frame, alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::First, heads: seed.map(|s| s as &dyn HeadSeed<'_>), sources: Some(opened.sources), goals: goals_ref, prepared: Some(prepared), front: front_ref };
     // Each crate's listing from the request's table (engine_heads.rs `Listings`): made once a
     // request, not once a stretch that places a read in it.
     let set_lang = clock.now();
     let mut owners = crate::engine_heads::Owners::new(shared.heads, group.crates.scope(shared.by_need), shared.listings, g);
     let set_done = clock.now();
-    run_out.setup.add(StretchSetup {
+    driver.record_setup(StretchSetup {
         stretches: 1,
         ns: ns_between(set_began, set_done),
         records_ns: ns_between(set_began, set_records),
@@ -5524,26 +8592,40 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
         lang_ns: ns_between(set_heads, set_lang),
         owners_ns: ns_between(set_lang, set_done),
     });
+    let caps = WorkerFrameCaps::for_workers(usize::try_from(cx.workers()).unwrap_or(1).max(1));
+    let mut stretch_store = if body_frame.heads.is_some() && driver.wants_stretch_store(group.bodies) {
+        match StretchStore::new(StretchStoreOpts {
+            reserve: HEADS_STRETCH_FRAME,
+            cap: caps.heads_stretch_cap,
+            keep: caps.heads_stretch_keep,
+            alloc: g,
+        }) {
+            Ok(store) => Some(store),
+            Err(_) => {
+                return driver.refuse_current::<R>(
+                    "the heads frame of its run's stretch could not be reserved (engine_bodies.rs `HEADS_STRETCH_FRAME`)",
+                    scope,
+                    local_mem,
+                    clock,
+                    alloc,
+                );
+            }
+        }
+    } else {
+        None
+    };
     let mut taken = 0usize;
-    for one in run {
-        if taken > 0 && frame.used() > STRETCH_FULL {
-            break;
-        }
-        // The workers' scheduling point (engine_status.rs): stopped, the stretch ends, and
-        // `run_bodies` refuses the rest.
-        if taken > 0 && shared.board.stopping().is_some() {
-            break;
-        }
+    while let Some((one, out, ran, run_out)) = driver.next_body(taken, frame.used(), shared, clock, alloc, at_phase) {
         taken += 1;
         // The body's scratch starts empty (rule 11): the last body's findings and words were
         // copied out as it ended. Kept only under the plant (the answers must not change).
-        run_out.frames.scratch_committed_most = run_out.frames.scratch_committed_most.max(scratch.committed() as u64);
+        run_out.frames.scratch_committed_most = run_out.frames.scratch_committed_most.max(u64::try_from(scratch.committed()).unwrap_or(u64::MAX));
         if !shared.keep_scratch {
             scratch.reset();
-            // A reset keeps every block the last body grew it to: past `SCRATCH_KEEP` they go
+            // A reset keeps every block the last body grew it to: past `caps.scratch_keep` they go
             // back now, so a large body's high-water is not held through the run's rest.
-            if scratch.committed() > SCRATCH_KEEP {
-                scratch.trim(SCRATCH_KEEP);
+            if scratch.committed() > caps.scratch_keep {
+                scratch.trim(caps.scratch_keep);
                 run_out.frames.scratch_trims += 1;
             }
         }
@@ -5574,11 +8656,16 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
         let at_start = frame.used();
         let _body = cx.span("engine: one body");
         let began = clock.now();
-        let running = shared.board.show(Stage::Bodies, crate::engine_status::Label::of(one.label), at_start as u64, shared.board.now(clock));
+        let running = shared.board.show_lazy(
+            Stage::Bodies,
+            || crate::engine_status::Label::of(one.label),
+            u64::try_from(at_start).unwrap_or(u64::MAX),
+            shared.board.now(clock),
+        );
         let name = one.task.planned.name;
         let (made_before, hits_before) = ids.counts();
         let mut body_tally = crate::engine_seeds::SeedTally::default();
-        let mut recording = Some(Recorder::new(RecorderOpts { alloc: w }));
+        let mut recording = Some(Recorder::with_shared_bindings(RecorderOpts { alloc: w }, &binding_keys));
         // Keep the include log until publication: a frame can fill after the last include
         // and before the row's reads have been copied out.
         let data_at = opened.sources.0.data.borrow().len();
@@ -5587,13 +8674,21 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
         let left_at = opened.sources.0.left.borrow().len();
         // A refused large allocation need not increase the peak, and an ordinary panic can
         // happen arbitrarily close to the limit. Read the typed refusal at its source.
-        let frame_limit = |what: &'static str| {
+        let frame_limit = |what: &'static str, heads: Option<&StretchStore<'_>>| {
             let scratch_full = sc.take_exhaustion();
+            let heads_full = heads.and_then(StretchStore::take_exhaustion);
+            let freeze_full = freeze_exhausted.take();
             // A shared stretch has space left by its preceding bodies. No source cell
             // certifies that capacity. Only the body's private reservation starts empty.
             match frame.take_exhaustion() {
                 Some(used) => Some((used, frame.reserved(), what, Stands::OwedNextRequest)),
-                None => scratch_full.map(|used| (used, sc.reserved(), what, Stands::ByReads)),
+                None => match heads_full {
+                    Some((used, reserved)) => Some((used, reserved, what, Stands::OwedNextRequest)),
+                    None => match freeze_full {
+                        Some((used, reserved)) => Some((used, reserved, what, Stands::OwedNextRequest)),
+                        None => scratch_full.map(|used| (used, sc.reserved(), what, Stands::ByReads)),
+                    },
+                },
             }
         };
         let gather = || {
@@ -5643,11 +8738,11 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                 let result = {
                     let keyer = BodyReadKeyer {
                         grains: shared.grains,
-                        fine_buckets: shared.scope_reads.tables_at_cells() || shared.plants.fine_buckets,
+                        fine_buckets: shared.plants.fine_buckets,
                         ids: core::cell::RefCell::new(&mut ids),
                     };
                     let active = recording.as_mut().expect("the entry owns its recorder");
-                    let mut check = || check_body_item(tables, &asked, &body_frame, w, active, Some(&keyer), &mut encoding);
+                    let mut check = || check_body_item(tables, &asked, &body_frame, w, active, Some(&keyer), &mut encoding, stretch_store.as_mut());
                     #[cfg(test)]
                     let checked = if shared.plants.check_only_guard {
                         match work::unwinding(check) {
@@ -5677,7 +8772,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                     let keys = blaze_ladder::front2::keys::Keys::new();
                     let error = blaze_ladder::front2::tables::head::fact_cell(opened.records, &keys, key).expect_err("no head for the data digest");
                     let shown = blaze_ladder::front2::item_shown::FactDefinition::of(opened.records, key, None, w);
-                    let active = recording.insert(Recorder::new(RecorderOpts { alloc: w }));
+                    let active = recording.insert(Recorder::with_shared_bindings(RecorderOpts { alloc: w }, &binding_keys));
                     for &key in &body.reads {
                         active.read(key);
                     }
@@ -5779,7 +8874,29 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                                 written
                             };
                             match found_of(line, written, item_text, sc) {
-                                Ok(Some(one_found)) => found.push(one_found),
+                                Ok(Some(one_found)) => {
+                                    // A macro-written free item in a block (e.g. `const` from a
+                                    // macro inside a fn body) is checked both via `each_from`
+                                    // (`host::ITEM`) and via `in_blocks` (`{a block of host}::ITEM`
+                                    // so its block-module library key and nested statics enter
+                                    // `covers`). Report each finding once (rule 77).
+                                    let dup_block = written.is_some_and(|u| {
+                                        u.words == crate::body_types::covered::BLOCK_UNPLACED
+                                            && u.label.rsplit("::").next().is_some_and(|name| {
+                                                let tag = bstd::mem::format_in!(sc, "::{name}`, ");
+                                                found.iter().any(|prev| {
+                                                    prev.rule == one_found.rule
+                                                        && prev.at == one_found.at
+                                                        && core::str::from_utf8(prev.message).is_ok_and(|msg| {
+                                                            msg.ends_with(line.words.as_str()) && msg.contains(tag.as_str())
+                                                        })
+                                                })
+                                            })
+                                    });
+                                    if !dup_block {
+                                        found.push(one_found);
+                                    }
+                                }
                                 Ok(None) => {}
                                 // Never quietly dropped (rule 3): the body is then not checked whole.
                                 Err(cause) => {
@@ -5821,7 +8938,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                         if let Some(what) = recording.as_ref().and_then(Recorder::allocating) {
                             mem.allocating = what;
                         }
-                        if let Some(limit) = frame_limit(mem.allocating) {
+                        if let Some(limit) = frame_limit(mem.allocating, stretch_store.as_ref()) {
                             // A fallible write can return TaskError instead of unwinding.
                             return Err(limit);
                         }
@@ -5897,7 +9014,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                         if mem.fault == Some(BodyFault::DropDataLeaf) {
                             continue;
                         }
-                        run_out.data_files.push((blaze_own::String::from_str_in(path, alloc), read.seen));
+                        run_out.data_files.push((blaze_own::String::from_str_in(path, at_phase), read.seen));
                     }
                     DataCell::Unnamed => data_unnamed = true,
                 }
@@ -5909,6 +9026,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
             let package = group.crates.world_at(0).map(|at| group.list.shown_from(at));
             for &(from, at, shape, call, path) in &opened.sources.0.left.borrow()[left_at..] {
                 found.push(left_found((from, at, shape, call, path), package, one.place.item, item_text, sc));
+                findings = findings.saturating_add(1);
             }
             // A scope crate opened by need whose record did not open (front_load.rs
             // `StoreLoad::refused`): the records answered this body, and every later one of the
@@ -5921,16 +9039,22 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                 scope_required = true;
                 seed_refused = false;
             }
+            if let Some(words) = seed.and_then(|s| s.lang_refused()) && !matches!(said, Some(Said::Panicked)) {
+                said = Some(Said::Refused(words));
+                scope_required = true;
+                seed_refused = false;
+            }
             // A checked verdict and a refusal at a seed both depend on the evaluator. Its
             // prepared definitions persist across this stretch, so each row takes its prefix.
             mem.allocating = "the constant evaluator's cell ID list";
+            let index_reads = seed.map_or(0, |s| s.index_reads());
             let placed = if !scope_required {
                 eval.update(evaluated, index_reads, &mut ids, opened.records, shared.heads)
                     .map_err(|error| error.words(&group.crates.opened(shared.by_need, g), g))
             } else {
                 Ok(())
             };
-            mem.offered += evaluated.tally().offered - offered_before + if taken == 1 { index_reads } else { 0 };
+            mem.offered += evaluated.tally().offered - offered_before;
             let mut head_failed = None;
             if seed_refused {
                 // Refused at a seed; never checked by lowering instead (rule 3). A head that cannot
@@ -5984,10 +9108,26 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                     }
                     other => other,
                 };
-                if let Some(want) = head {
-                    // Keep the failed head's own cell.  Widening a failed head to its record
-                    // would make an unrelated edit in the same file re-enter this body.
-                    data_reads.push(head_cell_id(want));
+                match head {
+                    Some(want) => {
+                        // Place the failed head's cell to its owning `Signature` task (same rule
+                        // as `widen`, rule 21): `head_cell_id(want)` is unplaced (keyed by item,
+                        // not task name), and `data_reads` bypasses `widen_as`, so leaving it
+                        // unplaced recorded a phantom cell that was forever `ABSENT` and never
+                        // woke the body when the head was repaired. Widening a placed member head
+                        // to its file would wake unrelated edits; keep its exact head cell.
+                        let raw = head_cell_id(want);
+                        match owners.place(opened.records, &raw, g) {
+                            Some(crate::engine_heads::HeadAt::Cell { cell, .. }) => data_reads.push(cell),
+                            Some(
+                                crate::engine_heads::HeadAt::Dependency(of)
+                                | crate::engine_heads::HeadAt::OfTheBody(of)
+                                | crate::engine_heads::HeadAt::Unlisted { scope: of, .. },
+                            ) => data_reads.push(CellId { of, cell: WHOLE }),
+                            None => scope_required = true,
+                        }
+                    }
+                    None => scope_required = true,
                 }
             }
             if let Err(words) = placed {
@@ -6024,7 +9164,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                     }
                     _ => (done, stands),
                 };
-                let note = Some((said.map_task(|error| blaze_own::Box::new_in(error, alloc)), head_failed));
+                let note = Some((said.map_task(|error| blaze_own::Box::new_in(error, at_phase)), head_failed));
                 // Its locals keep the entry's class: a call of one is refused naming it, not
                 // as a fn the table holds nothing for.
                 // Not checked whole: no typed record of it is put.
@@ -6087,7 +9227,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                     } else {
                         let mut kept = Vec::with_capacity_in(calls.len(), g);
                         kept.extend_from_slice(&calls);
-                        kept.leak()
+                        kept.leak_static()
                     };
                     Said::Unchecked { why: words, calls }
                 } else {
@@ -6124,12 +9264,12 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
         body_tally.reads.covered = mem.asks.covered;
         body_tally.reads.by_kind = mem.asks.by_kind;
         let outcome = match outcome {
-            Ok(Ok(body)) => match frame_limit(mem.allocating) {
+            Ok(Ok(body)) => match frame_limit(mem.allocating, stretch_store.as_ref()) {
                 None => Ok(body),
                 limit => Err(limit),
             },
             Ok(Err(limit)) => Err(Some(limit)),
-            Err(work::Panicked) => Err(frame_limit(mem.allocating)),
+            Err(work::Panicked) => Err(frame_limit(mem.allocating, stretch_store.as_ref())),
         };
         let stopped = outcome.is_err();
         let result = match outcome {
@@ -6156,7 +9296,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                                 let read = data_read(shared.reads, path, bytes);
                                 match read.cell {
                                     DataCell::Planned => {}
-                                    DataCell::Followed => run_out.data_files.push((blaze_own::String::from_str_in(path, alloc), read.seen)),
+                                    DataCell::Followed => run_out.data_files.push((blaze_own::String::from_str_in(path, at_phase), read.seen)),
                                     DataCell::Unnamed => {
                                         if matches!(said, Said::FrameUsedUp { .. }) && let Some(words) = shared.missing_data(one.label, path, read.id) {
                                             said = Said::Refused(words);
@@ -6186,6 +9326,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
         opened.sources.0.data.borrow_mut().truncate(data_at);
         opened.sources.0.left.borrow_mut().truncate(left_at);
         let index = ran.len();
+        let entry_rule = note_rule(result.note.as_ref().map(|(said, _)| said), true);
         if let Some((said, head_failed)) = result.note {
             run_out.notes.push((index, said, head_failed));
         } else if result.checked && result.done.findings == 0 {
@@ -6200,15 +9341,57 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
             run_out.messages.extend_from_slice(finding.message);
             run_out.found.push((index, finding.rule, finding.at, run_out.messages.len()));
         }
-        run_out.locals.extend(result.locals.iter().map(|key| (index, *key)));
+        let mut entry_typed: Option<Key> = None;
         if result.checked {
             run_out.untyped_clean = run_out.untyped_clean.saturating_add(result.untyped_clean);
             run_out.typed.reserve(result.typed.len());
             for &(check, bytes) in result.typed.iter() {
-                let mut kept = SVec::with_capacity_in(bytes.len(), alloc);
-                kept.extend_from_slice(bytes);
-                run_out.typed.push(TypedPut { check, bytes: kept });
+                let (key, kept) = match crate::engine_body_record::prepare_typed_in(bytes, at_phase) {
+                    Ok((key, crate::store::record_codec::Encoded::Compressed(kept))) => (key, kept),
+                    Ok((key, crate::store::record_codec::Encoded::Raw(raw))) => {
+                        let mut kept = SVec::with_capacity_in(raw.len(), at_phase);
+                        kept.extend_from_slice(raw);
+                        (key, kept)
+                    }
+                    Err(_) => {
+                        let key = crate::engine_body_record::typed_key(bytes);
+                        let mut kept = SVec::with_capacity_in(bytes.len(), at_phase);
+                        kept.extend_from_slice(bytes);
+                        (key, kept)
+                    }
+                };
+                if check == name {
+                    entry_typed = Some(key);
+                }
+                run_out.typed.push(TypedPut { check, key, bytes: kept });
             }
+        }
+        let mut encoded_facts = false;
+        if one.part.is_none() && run_out.facts_error.is_none() {
+            let class = crate::engine_body_facts::class_of(entry_rule.into_iter().chain(result.found.iter().map(|finding| finding.rule)));
+            let mut covers: SVec<'_, [u8; 16]> = SVec::with_capacity_in(one.asked.len().saturating_add(result.locals.len()), at_phase);
+            covers.extend(one.asked.iter().map(|key| key.0.to_be_bytes()));
+            for item in result.locals.iter() {
+                covers.push(blaze_ladder::front2::keys::checker_of(*item).0.to_be_bytes());
+            }
+            covers.sort_unstable();
+            covers.dedup();
+            let from = run_out.facts_bytes.len();
+            match crate::engine_body_facts::write(class, &covers, entry_typed, &mut run_out.facts_bytes) {
+                Ok(()) => {
+                    let end = run_out.facts_bytes.len();
+                    if let (Ok(from), Ok(end)) = (u32::try_from(from), u32::try_from(end)) {
+                        run_out.facts_index.push((index, from, end));
+                        encoded_facts = true;
+                    }
+                }
+                Err(why) => {
+                    run_out.facts_error = Some((name, why));
+                }
+            }
+        }
+        if !encoded_facts {
+            run_out.locals.extend(result.locals.iter().map(|key| (index, *key)));
         }
         let (made_now, hits_now) = ids.counts();
         mem.ids_made = made_now - made_before;
@@ -6216,22 +9399,22 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
         mem.scratch = mem.scratch.max(sc.used() as u64);
         mem.count_done(&result.done);
         run_out.scratch_most = run_out.scratch_most.max(mem.scratch);
+        if let Some(ss) = stretch_store.as_ref() {
+            run_out.frames.heads_committed_most = run_out.frames.heads_committed_most.max(u64::try_from(ss.committed()).unwrap_or(u64::MAX));
+        }
         let ns = clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
         let bytes = frame.used().saturating_sub(at_start) as u64;
         ran.push(Ran { name, label: one.label, ns, bytes, chain: one.place.chain, note: None, found: FindingRange::default(), file: one.file, stretch });
         out.push(result.done, result.stands);
-        shared.record_memory(one, &mem);
+        local_mem.record(&mem, one.task.planned.name, one.path(shared.outlined), one.label);
         running.end(shared.board.now(clock));
-        if stopped {
+        if driver.after_body(stopped, clock) {
             break;
         }
     }
     // The stretch's records opened each expansion's origin column once (front2 source.rs
     // `Records::text_marks`): how many, for the stage's line.
     tally.origins_opened = tally.origins_opened.saturating_add(opened.records.opened().origins);
-    if let Some(census) = census {
-        run_out.census.add_cell(census, shared.heap.shared());
-    }
     taken
 }
 
@@ -6277,7 +9460,7 @@ fn found_of<'s>(line: &Line<'_>, written: Option<Unplaced<'_>>, item: Option<(&s
         }
     };
     message.extend_from_slice(line.words.as_str().as_bytes());
-    Ok(Some(BodyFinding { rule, at, message: &*message.leak() }))
+    Ok(Some(BodyFinding { rule, at, message: &*message.into_bump_slice() }))
 }
 
 // The code of a body's diagnostic that says its text does not parse (front2 project.rs
@@ -6302,7 +9485,7 @@ fn syntax_found<'s>(line: &Line<'_>, written: Option<Unplaced<'_>>, item: Option
     let error = outline.errors().iter().find(|error| error.range.start >= line.start).ok_or(SYNTAX_UNFOUND)?;
     let range = error.range.start as usize..error.range.end as usize;
     let at = FoundAt::Tokens(blaze_file_items::token_place(text, edition, range).map_err(|_| NOT_TOKENS)?);
-    let message = Vec::from_slice_in(outline.message(error).as_bytes(), scratch).leak();
+    let message = scratch.alloc_slice_copy(outline.message(error).as_bytes());
     Ok(BodyFinding { rule: work::SYNTAX, at, message: &*message })
 }
 
@@ -6343,7 +9526,7 @@ fn left_found<'s>(
         _ => None,
     };
     let at = placed.map_or(FoundAt::Start, FoundAt::Tokens);
-    BodyFinding { rule: crate::names::include_outside::INCLUDE_OUTSIDE_PACKAGE, at, message: &*message.leak() }
+    BodyFinding { rule: crate::names::include_outside::INCLUDE_OUTSIDE_PACKAGE, at, message: &*message.into_bump_slice() }
 }
 
 /// Why a body's syntax error has no place: its text is a macro's expansion.
@@ -6394,36 +9577,38 @@ const ROOT_MAIN_UNPLACED: &str = "this is the root's `fn main`, which D104's lau
 /// file's top-level `fn main` (D104: the launcher `fn main() -> Exit { fn main(..) <the written
 /// body> .. }`; its local `main`, the body the user wrote, is checked by the task's work list,
 /// front2 tables/task.rs); else a refusal naming why. Never a silent absence (rule 3).
-fn absent_entry<'n>(
+#[expect(clippy::too_many_arguments, reason = "absent-entry cfg/main check shared by FileItemsView and Outline paths")]
+fn absent_entry_with<'n>(
     records: &'n blaze_ladder::front2::source::Records<'n>,
-    outline: &blaze_file_items::Outline<'_>,
     item: &blaze_surface::Item,
     text: &str,
     root_file: bool,
-    cfg: Option<&blaze_scope::task::Cfg<'_, '_>>,
+    max_steps: usize,
+    parent_item: impl Fn(blaze_surface::ItemIndex) -> Option<blaze_surface::Item>,
+    eval_attrs: impl Fn(&blaze_surface::Item, blaze_own::Alloc<'static>) -> Option<(u32, bool)>,
     g: blaze_own::Alloc<'static>,
 ) -> Result<ItemKey, &'static str> {
     if planted_silent_absent() {
         return Err(crate::engine_body_plan::ENTRY_ABSENT);
     }
-    let Some(cfg) = cfg else { return Err(CFG_ATOMS_UNREAD) };
     // Up the parents, bounded by the outline's length (rule 18).
-    let all = outline.items();
-    let mut at = Some(item);
+    let mut at = Some(*item);
     let mut steps = 0usize;
     while let Some(entry) = at {
-        let attrs = blaze_scope::task::item_attrs(cfg, outline, entry, text, g);
-        if attrs.cfg_unread > 0 {
+        let Some((cfg_unread, cfg_ok)) = eval_attrs(&entry, g) else {
+            return Err(CFG_ATOMS_UNREAD);
+        };
+        if cfg_unread > 0 {
             return Err(CFG_UNREAD);
         }
-        if !attrs.cfg_ok {
+        if !cfg_ok {
             return Err(crate::engine_body_plan::ENTRY_ABSENT);
         }
         steps += 1;
-        if steps > all.len() {
+        if steps > max_steps {
             return Err(CFG_UNREAD);
         }
-        at = entry.parent.and_then(|p| all.get(p.0 as usize));
+        at = entry.parent.and_then(&parent_item);
     }
     let root_main_entry = root_file && item.parent.is_none() && matches!(item.kind(), blaze_surface::ItemKind::Function) && crate::item_name::shown_name(item, text) == "main";
     if !root_main_entry {
@@ -6445,9 +9630,9 @@ fn absent_entry<'n>(
 /// called here, crate_env.rs `EnvLent`), as body_types.rs does for its workers.
 fn env_in<'l: 'n, 'n>(lent: Option<EnvLent<'_, 'l>>, frame: &'n Frame) -> Result<Option<&'n blaze_scope::crate_env::CrateEnv<'n>>, blaze_build_script::outputs::RecordError> {
     let Some(lent) = lent else { return Ok(None) };
-    let erased: &'n blaze_own::Erased<&'n Frame> = blaze_own::Box::leak(blaze_own::Box::new_in(blaze_own::Erased::new(frame), frame));
-    let env = lent.copy_in(erased.handle())?;
-    Ok(Some(&*blaze_own::Box::leak(blaze_own::Box::new_in(env, frame))))
+    let erased: &'n blaze_own::Erased<&'n Frame> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(blaze_own::Erased::new(frame), frame));
+    let env = lent.copy_in(erased.bump())?;
+    Ok(Some(&*blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(env, frame))))
 }
 
 /// The stretch's evaluator appends distinct keys. Place just the new suffix, retaining at most
@@ -6645,7 +9830,17 @@ fn data_read<R: ?Sized + CellDigests>(reads: &R, path: &str, bytes: Option<&[u8]
     let file = CellId { of: Name::file(path.as_bytes()), cell: WHOLE };
     let planned = || bytes.map_or_else(crate::data_include::absent_out, crate::data_include::data_out);
     if reads.row_failed(file.of) == Some(false) {
-        return DataRead { id: file, seen: planned(), cell: DataCell::Planned };
+        let seen = planned();
+        // Only bind to the `FileItems` task when its `WHOLE` cell IS a `data_include` digest
+        // (pure `DATA_FILE`) or its `DATA` cell holds the raw bytes digest (a Rust source file
+        // also read via `include_str!` / `include_bytes!`); otherwise fall through to its `Given` cell.
+        if reads.cell(&file) == seen {
+            return DataRead { id: file, seen, cell: DataCell::Planned };
+        }
+        let data = CellId { of: file.of, cell: crate::engine_tasks::DATA };
+        if reads.cell(&data) == seen {
+            return DataRead { id: data, seen, cell: DataCell::Planned };
+        }
     }
     match crate::engine_script_reads::file_read(path, bytes) {
         Some((given, answer)) => DataRead { id: CellId { of: given, cell: WHOLE }, seen: answer, cell: DataCell::Followed },
@@ -6691,4 +9886,325 @@ fn add_work(into: &mut WorkBytes, more: &WorkBytes) {
     into.said += more.said;
     into.verdict = into.verdict.max(more.verdict);
     into.goal_hits += more.goal_hits;
+}
+
+#[cfg(test)]
+mod worker_frame_caps_tests {
+    use super::*;
+
+    #[test]
+    fn worker_frame_caps_scale_inversely_for_128_cores_and_preserve_mac_caps() {
+        for w in [0usize, 1, 8, 12, 18] {
+            let caps = WorkerFrameCaps::for_workers(w);
+            assert_eq!(caps.scratch_keep, SCRATCH_KEEP);
+            assert_eq!(caps.stretch_keep, STRETCH_KEEP);
+            assert_eq!(caps.heads_stretch_cap, HEADS_STRETCH_CAP);
+            assert_eq!(caps.heads_stretch_keep, HEADS_STRETCH_KEEP);
+            assert_eq!(caps.freeze_scratch_keep, FREEZE_SCRATCH_KEEP);
+        }
+        let c64 = WorkerFrameCaps::for_workers(64);
+        assert!(c64.scratch_keep < SCRATCH_KEEP && c64.scratch_keep >= SCRATCH_KEEP_MIN);
+        assert!(c64.heads_stretch_cap < HEADS_STRETCH_CAP && c64.heads_stretch_cap >= HEADS_STRETCH_CAP_MIN);
+
+        let c128 = WorkerFrameCaps::for_workers(128);
+        assert!(c128.scratch_keep <= c64.scratch_keep && c128.scratch_keep >= SCRATCH_KEEP_MIN);
+        assert!(c128.stretch_keep <= c64.stretch_keep && c128.stretch_keep >= STRETCH_KEEP_MIN);
+        assert!(c128.heads_stretch_cap <= c64.heads_stretch_cap && c128.heads_stretch_cap >= HEADS_STRETCH_CAP_MIN);
+        assert!(c128.heads_stretch_keep <= c64.heads_stretch_keep && c128.heads_stretch_keep >= HEADS_STRETCH_KEEP_MIN);
+        assert!(c128.freeze_scratch_keep <= c64.freeze_scratch_keep && c128.freeze_scratch_keep >= FREEZE_SCRATCH_KEEP_MIN);
+        // Aggregate idle keep across 128 workers stays well under 1 GiB (vs 4.6 GiB unscaled).
+        let idle_total_128 = 128usize
+            .saturating_mul(c128.scratch_keep + c128.stretch_keep + c128.heads_stretch_keep + c128.freeze_scratch_keep);
+        assert!(idle_total_128 <= 700 << 20, "128-core aggregate idle keep should stay <= 700 MiB, got {idle_total_128}");
+    }
+
+    #[test]
+    fn lang_crate_name_filter_keeps_sysroot_and_panic_crates_and_skips_pure_toolchain_deps() {
+        for keep in ["core", "alloc", "std", "bstd", "blaze_std", "panic_unwind", "panic_abort"] {
+            assert!(is_lang_crate_name(keep), "`{keep}` must be kept as a lang/incoherent crate");
+        }
+        for skip in [
+            "libc",
+            "gimli",
+            "object",
+            "addr2line",
+            "hashbrown",
+            "miniz_oxide",
+            "adler2",
+            "memchr",
+            "rustc_demangle",
+            "cfg_if",
+            "unwind",
+            "std_detect",
+            "rustc_std_workspace_core",
+            "rustc_std_workspace_alloc",
+            "rustc_std_workspace_std",
+            "compiler_builtins",
+            "test",
+            "proc_macro",
+        ] {
+            assert!(!is_lang_crate_name(skip), "pure toolchain dep `{skip}` must not be opened eagerly by `name_lang_crates`");
+        }
+    }
+
+    #[test]
+    fn small_phase_inline_fast_path_boundaries() {
+        assert!(!should_run_inline_costs(0, 0, false), "empty phase does not run inline");
+        assert!(should_run_inline_costs(1, 100 << 10, false), "single run always runs inline");
+        assert!(should_run_inline_costs(2, 512, false), "2 tiny bodies (lib+test edit) run inline");
+        assert!(should_run_inline_costs(INLINE_RUNS_MAX, INLINE_BYTES_MAX, false), "exact cap runs inline");
+        assert!(!should_run_inline_costs(INLINE_RUNS_MAX + 1, 512, false), "past INLINE_RUNS_MAX fans out to pool");
+        assert!(!should_run_inline_costs(2, INLINE_BYTES_MAX + 1, false), "past INLINE_BYTES_MAX fans out to pool");
+        assert!(!should_run_inline_costs(2, 512, true), "sliced macro expansions fan out to pool");
+    }
+
+    #[test]
+    fn dependency_files_persists_to_cas_and_reuses_zero_copy_on_next_phase() {
+        use crate::store::{CommandStore, Facts, Home, Store};
+        use bstd::io::{Io, Limits, SimWorld};
+
+        let io = Io::simulated(SimWorld::new(73, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root context");
+        let err = io.need_err().expect("stderr");
+        let home = Home::of(&cx, &io.need_fs().expect("files"), Some("/h")).expect("test home");
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let lent = home.open_store(&blaze_cas::plain::Settings::default(), Facts { boot: Some(1), nonce: 73 }, alloc).expect("store");
+        let mut store = CommandStore::new(&cx, &lent, false, 0, None, io.need_clock().expect("clock"), &err, alloc).expect("command store");
+        let empty_snap = store.commit_for_body_reads().expect("empty committed snapshot");
+
+        let text = "pub fn wrapping_demo(x: u64) -> u64 { x.wrapping_add(1) }\n";
+        let ed = blaze_surface::Edition::E2021;
+        let frame = Frame::new(bstd::mem::Tag::Other).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+
+        // Phase 1 (cold CAS miss): outlines once into compact `small` slab (never allocates 4096-slot `large`).
+        let cold_deps = DependencyFiles::new(heap);
+        let cold_file = cold_deps
+            .get_or_outline(&empty_snap, 1, 0, text, None, ed, DepFilePin::Toolchain, bump)
+            .expect("cold get_or_outline");
+        assert!(cold_deps.small.get().is_some(), "cold miss populates compact small slab");
+        assert!(cold_deps.large.get().is_none(), "single file must not spill to 4096-slot slab");
+
+        let mut member_rows: Option<Vec<Key, blaze_own::Alloc<'static>>> = None;
+        cold_deps.persist(&cx, &mut store, &mut member_rows, heap).expect("persist cold dep file");
+        assert!(member_rows.is_none(), "toolchain dep file pins via keep_with_toolchain, not member_rows");
+        let warm_snap = store.commit_for_body_reads().expect("warm committed snapshot");
+
+        // Phase 2 (warm CAS hit): borrows zero-copy from `warm_snap` (`CachedDepData::Snapshot`), never allocates `large`.
+        let warm_deps = DependencyFiles::new(heap);
+        let warm_file = warm_deps
+            .get_or_outline(&warm_snap, 1, 0, text, None, ed, DepFilePin::Toolchain, bump)
+            .expect("warm get_or_outline");
+        assert_eq!(warm_file.surface, cold_file.surface, "warm CAS hit surface matches cold");
+        assert_eq!(warm_file.view.file(), cold_file.view.file(), "warm CAS hit file digest matches cold");
+        assert_eq!(warm_file.view.len(), cold_file.view.len(), "warm CAS hit item count matches cold");
+        assert!(warm_deps.large.get().is_none(), "warm CAS hit must not allocate 4096-slot slab");
+        let snapshot_entries = warm_deps
+            .small
+            .get()
+            .expect("compact slab populated")
+            .iter()
+            .filter_map(|slot| slot.get())
+            .filter(|entry| matches!(entry.data, CachedDepData::Snapshot))
+            .count();
+        assert_eq!(snapshot_entries, 1, "warm CAS hit caches zero-copy Snapshot entry without copying bytes");
+
+        // Second lookup in Phase 2 hits `warm_deps.small` directly without re-outlining.
+        let repeat_file = warm_deps
+            .get_or_outline(&warm_snap, 1, 0, text, None, ed, DepFilePin::Toolchain, bump)
+            .expect("repeat warm get_or_outline");
+        assert_eq!(repeat_file.surface, cold_file.surface);
+        assert_eq!(repeat_file.view.len(), cold_file.view.len());
+
+        // Non-toolchain pack file pins into `member_rows` on persist.
+        let dep_text = "pub const DEP_VAL: u32 = 42;\n";
+        let _ = warm_deps
+            .get_or_outline(&warm_snap, 2, 0, dep_text, None, ed, DepFilePin::MemberRow, bump)
+            .expect("non-toolchain dep file");
+        warm_deps.persist(&cx, &mut store, &mut member_rows, heap).expect("persist warm dep files");
+        assert_eq!(member_rows.as_ref().map_or(0, Vec::len), 1, "non-toolchain pack file pins into member_rows");
+    }
+
+    #[test]
+    fn members_out_reuses_content_stable_key_with_zero_puts_and_caches_open_once() {
+        use crate::engine_members_record as rec;
+        use crate::store::{CommandStore, Facts, Home};
+        use bstd::io::{Io, Limits, SimWorld};
+
+        let io = Io::simulated(SimWorld::new(89, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root context");
+        let err = io.need_err().expect("stderr");
+        let home = Home::of(&cx, &io.need_fs().expect("files"), Some("/h")).expect("test home");
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let lent = home.open_store(&blaze_cas::plain::Settings::default(), Facts { boot: Some(1), nonce: 89 }, alloc).expect("store");
+        let mut store = CommandStore::new(&cx, &lent, false, 0, None, io.need_clock().expect("clock"), &err, alloc).expect("command store");
+
+        let header = rec::Header {
+            graph_out: ContentId([7; 32]),
+            tool: blaze_drive::Tool(ContentId([8; 32])),
+            made_at: rec::CONTENT_STABLE_SERIAL,
+        };
+        let make_member = |at: u32, test: bool, row_byte: u8| {
+            let mut held = Vec::new_in(alloc);
+            held.push(rec::Held {
+                file: 0,
+                slot: Name::file(b"src/lib.rs"),
+                path: b"src/lib.rs",
+                entries: ContentId([row_byte; 32]),
+            });
+            rec::Member {
+                at,
+                unit: crate::engine_body_plan::Unit {
+                    name: Name::new(Kind::CrateScope, ContentId([u8::try_from(at + 1).expect("small"); 32])),
+                    prefix: [u8::try_from(at + 1).expect("small"); 8],
+                    test,
+                },
+                state: rec::MemberState::Held(rec::HeldMember {
+                    names: Name::new(Kind::CrateScope, ContentId([u8::try_from(at + 1).expect("small"); 32])),
+                    names_out: ContentId([row_byte.wrapping_add(1); 32]),
+                    row: Key(ContentId([row_byte; 32])),
+                    uncovered: 0,
+                    named: Vec::new_in(alloc),
+                    held,
+                }),
+                not_held: Vec::new_in(alloc),
+            }
+        };
+
+        // Initial write puts content-stable BLZMEMB.
+        let m0 = make_member(0, false, 11);
+        let m1 = make_member(1, true, 22);
+        let mut out1 = MembersOut::new(header, None, alloc);
+        out1.member(&m0);
+        out1.member(&m1);
+        let (k1, did_put1) = out1.finish_and_put(&cx, &mut store).expect("initial put");
+        assert!(did_put1, "initial write must put BLZMEMB");
+
+        // BodiesStage::open_members caches the decoded View across plan_reach / ready_reads / groups.
+        let mut stage = BodiesStage::new(crate::engine_scope_reads::ScopeReadsAs::Cells);
+        stage.members_from(Some(k1), 42);
+        let v1 = stage.open_members(&cx, &mut store, alloc).expect("first open").expect("present").expect("valid");
+        let v2 = stage.open_members(&cx, &mut store, alloc).expect("second open").expect("present").expect("valid");
+        assert!(core::ptr::eq(&*v1, &*v2), "open_members must reuse the single cached Rc<View>");
+        assert_eq!(v1.len(), 2);
+        assert_eq!(v1.header.made_at, rec::CONTENT_STABLE_SERIAL);
+
+        // Unchanged body edit: both members stand -> 0 bytes encoded, 0 bytes hashed, 0 store.put.
+        let mut out2 = MembersOut::new(header, Some((k1, &v1)), alloc);
+        out2.stood(v1.member(0).expect("member 0"));
+        out2.stood(v1.member(1).expect("member 1"));
+        let (k2, did_put2) = out2.finish_and_put(&cx, &mut store).expect("reused finish");
+        assert_eq!(k2, k1, "unchanged members reuse exact prior key");
+        assert!(!did_put2, "unchanged members must perform 0 BLZMEMB puts");
+
+        // Control 1: member 0 stands, member 1 changes -> flushes member 0 and puts new key.
+        let m1_changed = make_member(1, true, 99);
+        let mut out3 = MembersOut::new(header, Some((k1, &v1)), alloc);
+        out3.stood(v1.member(0).expect("member 0"));
+        out3.member(&m1_changed);
+        let (k3, did_put3) = out3.finish_and_put(&cx, &mut store).expect("changed put");
+        assert!(did_put3 && k3 != k1, "changed member must put a fresh BLZMEMB");
+        stage.members_from(Some(k3), 43);
+        let v3 = stage.open_members(&cx, &mut store, alloc).expect("open k3").expect("present").expect("valid");
+        assert_eq!(v3.len(), 2);
+        assert!(v3.member(0).is_some() && v3.member(1).is_some());
+
+        // Control 2: narrowed scope (only 1 of 2 prior members stood) -> puts new 1-member record.
+        let mut out4 = MembersOut::new(header, Some((k1, &v1)), alloc);
+        out4.stood(v1.member(0).expect("member 0"));
+        let (k4, did_put4) = out4.finish_and_put(&cx, &mut store).expect("narrowed put");
+        assert!(did_put4 && k4 != k1, "narrowed member set must not reuse 2-member key");
+        stage.members_from(Some(k4), 44);
+        let v4 = stage.open_members(&cx, &mut store, alloc).expect("open k4").expect("present").expect("valid");
+        assert_eq!(v4.len(), 1);
+    }
+
+    #[test]
+    fn local_body_mem_merges_deterministically_across_orders_ties_and_empty_workers() {
+        let make_name = |byte: u8| Name::new(Kind::BodyCheck, ContentId([byte; 32]));
+        let make_mem = |recorded: u64, scratch: u64, row: u64| BodyMem {
+            row,
+            row_floor: row,
+            recorded,
+            distinct: recorded,
+            placed_all: true,
+            body_offers: recorded.saturating_mul(2),
+            before: recorded,
+            after: recorded,
+            scratch,
+            ..BodyMem::default()
+        };
+
+        // Worker 0: empty (must be a clean no-op).
+        let w0 = LocalBodyMem::default();
+
+        // Worker 1: 4 bodies (evicts its own 4th body, includes a tie on `recorded = 500`
+        // and slice 1 of duplicate name `make_name(2)`).
+        let mut w1 = LocalBodyMem::default();
+        w1.record(&make_mem(100, 1000, 128), make_name(9), b"src/low.rs", "low");
+        w1.record(&make_mem(500, 4000, 256), make_name(5), b"src/tie_hi.rs", "tie_hi");
+        w1.record(&make_mem(500, 2000, 256), make_name(3), b"src/tie_lo.rs", "tie_lo");
+        w1.record(&make_mem(800, 3000, 512), make_name(2), b"src/dup.rs", "dup_item");
+
+        // Worker 2: higher `recorded = 900`, tied `recorded = 500` with smallest `Name(1)`,
+        // and slice 2 of duplicate name `make_name(2)` with same `recorded = 800` but larger `scratch = 7000`.
+        let mut w2 = LocalBodyMem::default();
+        w2.record(&make_mem(900, 6000, 1024), make_name(8), b"src/top.rs", "top_item");
+        w2.record(&make_mem(500, 1500, 256), make_name(1), b"src/tie_smallest.rs", "tie_smallest");
+        w2.record(&make_mem(800, 7000, 512), make_name(2), b"src/dup.rs", "dup_item");
+
+        // Worker 3: smaller bodies that should not enter top-3, plus an even higher recorded count
+        // for an existing duplicate name? No, keep separate to check sum/max aggregation.
+        let mut w3 = LocalBodyMem::default();
+        w3.record(&make_mem(50, 500, 64), make_name(10), b"src/tiny.rs", "tiny");
+
+        let heap = blaze_own::testing::heap();
+        let run_order = |order: [&LocalBodyMem<'_, '_>; 4]| -> blaze_own::FixedString<2048> {
+            let live = BodyMemLive::new();
+            live.prepare_with_caps(64, 64, heap.shared()).expect("prepare largest slots");
+            for local in order {
+                live.merge(local);
+            }
+            assert_eq!(live.bodies(), 8, "all bodies counted across non-empty workers");
+            let mut out = blaze_own::FixedString::<2048>::new();
+            live.line(&mut out).expect("line fits");
+            out
+        };
+
+        let fwd = run_order([&w0, &w1, &w2, &w3]);
+        let rev = run_order([&w3, &w2, &w1, &w0]);
+        let rot = run_order([&w2, &w0, &w3, &w1]);
+
+        assert_eq!(fwd.as_str(), rev.as_str(), "merge must be order-independent (fwd vs rev)");
+        assert_eq!(fwd.as_str(), rot.as_str(), "merge must be order-independent (fwd vs rot)");
+
+        let line = fwd.as_str();
+        assert!(line.contains("bodies memory: 8 bodies"), "{line}");
+        assert!(line.contains("· #1 `src/top.rs` item `top_item`: 900 reads recorded"), "{line}");
+        assert!(
+            line.contains("· #2 `src/dup.rs` item `dup_item`: 800 reads recorded, 800 distinct ids, 7000 scratch bytes"),
+            "duplicate Name must appear once with deterministic max-scratch winner:\n{line}"
+        );
+        assert!(
+            line.contains("· #3 `src/tie_smallest.rs` item `tie_smallest`: 500 reads recorded"),
+            "equal recorded counts must tie-break by smallest stable Name:\n{line}"
+        );
+        assert_eq!(line.matches("dup_item").count(), 1, "duplicate Name never listed twice:\n{line}");
+
+        // Control: MergeBodyMem RAII guard flushes once on drop.
+        let guard_live = BodyMemLive::new();
+        guard_live.prepare_with_caps(32, 32, heap.shared()).expect("prepare");
+        {
+            let mut guard = MergeBodyMem::new(&guard_live);
+            guard.local.record(&make_mem(42, 128, 64), make_name(4), b"src/g.rs", "guarded");
+            assert_eq!(guard_live.bodies(), 0, "not flushed until worker exits");
+        }
+        assert_eq!(guard_live.bodies(), 1, "flushed once on guard drop");
+        let mut gline = blaze_own::FixedString::<1024>::new();
+        guard_live.line(&mut gline).expect("fits");
+        assert!(gline.as_str().contains("· #1 `src/g.rs` item `guarded`: 42 reads recorded"), "{}", gline.as_str());
+    }
 }

@@ -124,11 +124,13 @@ fn module(line: &[u8]) -> Vec<u8> {
 }
 
 /// The module record of `app 0.1.0` with no features in `home`'s module store.
-fn put_module(home: &Path) {
+fn put_module(home: &Path, app_dir: &Path) {
     let record = home.join(".blaze/v2/build-script/modules/app-0.1.0-test");
     std::fs::create_dir_all(&record).unwrap_or_else(|error| panic!("making {}: {error}", record.display()));
-    // A wasm module names the process shim it was built with; the host runs only its own.
-    let identity = format!("name app\nversion 0.1.0\nfeatures \n{}\n", blaze_proc_macro::script_unit::shim_line());
+    // A wasm module names the process shim it was built with and (for path packages) its
+    // `files <sha256>` digest (rule 21); the host runs only its own.
+    let files = blaze_proc_macro::script_unit::script_files_digest(app_dir, "build.rs").expect("script files digest");
+    let identity = format!("name app\nversion 0.1.0\nfeatures \nfiles {files}\n{}\n", blaze_proc_macro::script_unit::shim_line());
     std::fs::write(record.join("identity"), identity).expect("the module's identity");
     let bytes = module(LINE);
     // The record's digest (script_modules.rs reads it as the lookup's out): the module's SHA-256.
@@ -200,7 +202,7 @@ fn a_scripts_cfg_reaches_a_cfg_item() {
     let base = fresh_home("build_scripts_cfg", true);
     let (home, at) = (base.join("home"), base.join("ws"));
     workspace(&at);
-    put_module(&home);
+    put_module(&home, &at.join("app"));
     let (_, said) = check(&at, &home);
     assert!(!said.contains("the build script of app"), "the script did not run:\n{said}");
     // The status is not read: while the borrow check's findings stay notes, every check ends
@@ -212,18 +214,20 @@ fn a_scripts_cfg_reaches_a_cfg_item() {
     println!("cfg reached");
 }
 
-/// With no module of `app`'s script in the store, the run fails: one finding naming the script
-/// and its package, and the unit that reads it named as not checked (rule 20: the rest goes on).
-/// Prints "failed by name".
+/// When `app`'s build script fails to compile to `wasm64`, the check fails: one finding naming
+/// the script and its package, and the unit that reads it named as not checked (rule 20: the rest
+/// goes on). Prints "failed by name".
 #[test]
 fn a_failed_script_is_a_finding_naming_it_and_its_unit() {
     let base = fresh_home("build_scripts_failed", true);
     let (home, at) = (base.join("home"), base.join("ws"));
     workspace(&at);
+    // Make build.rs fail to compile so MacroModule fails cleanly with a typed diagnostic.
+    std::fs::write(at.join("app/build.rs"), "fn main() { let _: u32 = \"not_a_u32\"; }\n").expect("writing broken build.rs");
     let (ok, said) = check(&at, &home);
     assert!(!ok, "a check whose build script failed exited 0:\n{said}");
     assert!(said.contains("the build script of app 0.1.0"), "the failed script is not named:\n{said}");
-    assert!(said.contains("no build-script module of app 0.1.0"), "the script's own failure is not said:\n{said}");
+    assert!(said.contains("wasm64 self-compilation failed"), "the script's own failure is not said:\n{said}");
     // Ruling D115 (6), one shape for every cause (blaze-cli not_checked.rs).
     assert!(
         // Since d115-6 (piece 2c) the cause is the module's lookup, named by its script.
@@ -266,7 +270,7 @@ fn engine_check_runs_the_script_and_lists_what_check_lists() {
     let base = fresh_home("build_scripts_engine", true);
     let (home, at) = (base.join("home"), base.join("ws"));
     workspace(&at);
-    put_module(&home);
+    put_module(&home, &at.join("app"));
     let (_, said) = check(&at, &home);
     // Not the status: every check ends "incomplete: NOT checked: borrows" for now.
     assert!(said.contains("0 errors: blaze check") && !said.contains("not checked because"), "check of the fixture failed:\n{said}");
@@ -289,23 +293,46 @@ fn engine_check_runs_the_script_and_lists_what_check_lists() {
     println!("engine scripts: {phases:?}");
 }
 
-/// With no module of the script in the store, `engine-check` fails as `check` does: the lookup's
-/// own words name the script's package, and its crate is not resolved. Prints "engine failed by
-/// name".
+/// With no prebuilt module in the store, `engine-check` self-compiles `build.rs` to `wasm64`,
+/// runs it in Wasmtime `memory64`, and checks `#[cfg(from_script)]` with zero errors.
+/// And when `build.rs` fails to compile, the lookup's failure names the script's package and its
+/// crate waits on it.
 #[test]
 fn engine_check_names_a_missing_script_module() {
+    // 1. Positive self-compilation path from an empty module store.
+    let base_ok = fresh_home("build_scripts_engine_self_compile", true);
+    let (home_ok, at_ok) = (base_ok.join("home"), base_ok.join("ws"));
+    workspace(&at_ok);
+    let (_, said_ok) = run(&at_ok, &home_ok, "engine-check");
+    assert!(
+        said_ok.contains("0 errors: blaze check") && !said_ok.lines().any(|line| line.contains("`made`")),
+        "self-compiled build.rs did not reach #[cfg(from_script)]:\n{said_ok}"
+    );
+    let published = home_ok.join(".blaze/v2/build-script/modules");
+    assert!(
+        std::fs::read_dir(&published)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .any(|e| e.path().join("module.wasm").is_file()),
+        "expected self-compiled wasm64 build-script module in {}",
+        published.display()
+    );
+
+    // 2. Failure path: a broken build.rs fails MacroModule by name and holds `app` not checked.
     let base = fresh_home("build_scripts_engine_failed", true);
     let (home, at) = (base.join("home"), base.join("ws"));
     workspace(&at);
+    std::fs::write(at.join("app/build.rs"), "fn main() { let _: u32 = \"not_a_u32\"; }\n").expect("writing broken build.rs");
     let (ok, said) = run(&at, &home, "engine-check");
     assert!(!ok, "an engine-check whose build script failed exited 0:\n{said}");
-    assert!(said.contains("no build-script module of app 0.1.0"), "the lookup's own failure is not said:\n{said}");
+    assert!(said.contains("the build script of app 0.1.0"), "the lookup's own failure is not said:\n{said}");
     assert!(said.contains("not run: each waits on a task that failed"), "the run and its crate did not wait on the lookup:\n{said}");
     let phases = engine_phases(&at);
     for (stage, wave, planned, entered) in phases.iter() {
         assert_eq!(planned, entered, "{stage} {wave}: tasks planned and entered:\n{phases:?}");
     }
-    println!("engine failed by name");
+    println!("engine self-compile and failed by name");
 }
 
 /// `check` (the engine, the one command path since the old checker went, 2026-11-19) must give
@@ -377,7 +404,12 @@ dependencies = [\"cc\"]
         let store = home.join(".blaze/v2");
         let module = store.join("build-script/modules/sha3-asm-jobs");
         std::fs::create_dir_all(&module).unwrap();
-        std::fs::write(module.join("identity"), "name sha3-asm\nversion 0.1.0\nfeatures \ntarget aarch64-apple-darwin\n").unwrap();
+        let files = blaze_proc_macro::script_unit::script_files_digest(&ws, "build.rs").expect("sha3-asm files digest");
+        std::fs::write(
+            module.join("identity"),
+            format!("name sha3-asm\nversion 0.1.0\nfeatures \nfiles {files}\ntarget aarch64-apple-darwin\n"),
+        )
+        .unwrap();
         let program = module.join("script.bin");
         std::fs::write(&program, PROBE).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();

@@ -68,13 +68,14 @@
 //! Owed: debug rows of kept slots (a `VarRec` names a slot; a kept local needs "the state
 //! plus an offset"), so the outputs drop them.
 
-use std::alloc::Allocator;
-use std::fmt;
+use alloc::vec::Vec;
+use alloc::alloc::Allocator;
+use core::{convert::Infallible, fmt};
 
 use crate::{
     Block, Func, Op, Ty, Value, View,
     func::{BlockKind, Ext, NONE, ParamKind, ParamRec, SigRec, SlotId},
-    op::{Field, Layout, Word, walk},
+    op::{Field, Layout, RewriteSink, Word, rewrite_fields, walk},
     ty::Form,
     verify::{VerifyError, verify},
 };
@@ -309,7 +310,7 @@ impl fmt::Display for CoroutineError {
     }
 }
 
-impl std::error::Error for CoroutineError {}
+impl core::error::Error for CoroutineError {}
 
 /// Splits the coroutine body `view` into its `poll`, its state's `drop` and the state's
 /// layout, every buffer in `alloc`.
@@ -349,24 +350,27 @@ fn split_inner<A: Allocator + Clone>(
     region: Option<(Region, &[SlotName])>,
     alloc: A,
 ) -> Result<Split<A>, CoroutineError> {
-    verify(view).map_err(CoroutineError::Verify)?;
-    let body = read(view, shape, panics, &alloc)?;
-    let live = overlap::addressed(&body, &alloc);
-    let lir_kept = kept_slots(&body, &live, plant, &alloc);
+    crate::verify::verify_in(view, &alloc).map_err(CoroutineError::Verify)?;
+    let scratch = &alloc;
+    let body = read(view, shape, panics, &scratch)?;
+    let live = overlap::addressed(&body, &scratch);
+    let lir_kept = kept_slots(&body, &live, plant, &scratch);
     // In a laid state the names decide what is kept, and an unnamed slot the pass would keep
     // that code after a suspension reaches is refused (coroutine_region.rs `kept_by_name`).
-    let (kept, at) = match region {
+    let (kept, at, conflicts) = match region {
         Some((r, names)) => {
-            let (kept, at) = region::kept_by_name(&body, &lir_kept, r, names, &alloc)?;
-            (kept, Some((r, at)))
+            let (kept, at, conflicts) = region::kept_by_name(&body, &live, &lir_kept, r, names, plant, &scratch)?;
+            (kept, Some((r, at)), conflicts)
         }
-        None => (lir_kept, None),
+        None => {
+            let conflicts = overlap::conflicts(&body, &live, &lir_kept, plant, &scratch);
+            (lir_kept, None, conflicts)
+        }
     };
-    let conflicts = overlap::conflicts(&body, &live, &kept, plant, &alloc);
-    let crossing = crossing_values(&body, &alloc);
-    let plan = plan(&body, &kept, &conflicts, &crossing, at.as_ref().map(|(r, at)| (*r, &at[..])), &alloc)?;
-    let poll = emit(&body, &plan, Which::Poll, plant, &alloc)?;
-    let drop = emit(&body, &plan, Which::Drop, plant, &alloc)?;
+    let crossing = crossing_values(&body, &scratch);
+    let plan = plan(&body, &kept, &conflicts, &crossing, at.as_ref().map(|(r, at)| (*r, &at[..])), &scratch, alloc.clone())?;
+    let poll = emit(&body, &plan, Which::Poll, plant, &scratch, alloc.clone())?;
+    let drop = emit(&body, &plan, Which::Drop, plant, &scratch, alloc.clone())?;
     Ok(Split { poll, drop, layout: plan.layout })
 }
 
@@ -399,14 +403,12 @@ struct Body<'a, A: Allocator> {
     suspends: Vec<SuspendAt, A>,
     /// Where `poll` goes on a finished state.
     panics: Panics,
-    /// The landing blocks of the body's `invoke`s, rising: the cleanup paths' entries.
-    landings: Vec<u32, A>,
     /// Per block: the `invoke` whose normal block it is, [`NONE`] for another.
     invoked: Vec<u32, A>,
 }
 
-fn filled<T: Clone, A: Allocator + Clone>(len: usize, item: T, alloc: &A) -> Vec<T, A> {
-    let mut all = Vec::with_capacity_in(len, alloc.clone());
+fn filled<T: Clone, A: Allocator + Copy>(len: usize, item: T, alloc: &A) -> Vec<T, A> {
+    let mut all = Vec::with_capacity_in(len, *alloc);
     all.resize(len, item);
     all
 }
@@ -471,9 +473,9 @@ fn each_value(view: &View<'_>, at: usize, mut f: impl FnMut(u32)) {
 }
 
 /// The blocks reached from `roots`, with or without suspends' cancel edges.
-fn reach<A: Allocator + Clone>(view: &View<'_>, roots: &[u32], cancel_edges: bool, alloc: &A) -> Vec<bool, A> {
+fn reach<A: Allocator + Copy>(view: &View<'_>, roots: &[u32], cancel_edges: bool, alloc: &A) -> Vec<bool, A> {
     let mut seen = filled(view.blocks(), false, alloc);
-    let mut work = Vec::new_in(alloc.clone());
+    let mut work = Vec::new_in(*alloc);
     for &root in roots {
         if !seen[root as usize] {
             seen[root as usize] = true;
@@ -491,7 +493,7 @@ fn reach<A: Allocator + Clone>(view: &View<'_>, roots: &[u32], cancel_edges: boo
     seen
 }
 
-fn read<'a, A: Allocator + Clone>(
+fn read<'a, A: Allocator + Copy>(
     view: View<'a>,
     shape: Shape,
     panics: Panics,
@@ -528,7 +530,7 @@ fn read<'a, A: Allocator + Clone>(
     // `poll` holds what the entry and the finished-state blocks reach.
     let (roots, n) = unwind::poll_roots(panics);
     let in_poll = reach(&view, &roots[..n], false, alloc);
-    let mut suspends = Vec::new_in(alloc.clone());
+    let mut suspends = Vec::new_in(*alloc);
     for b in 0..blocks {
         if !in_poll[b] {
             continue;
@@ -552,7 +554,7 @@ fn read<'a, A: Allocator + Clone>(
     if let Some(pair) = suspends.windows(2).find(|pair| pair[0].point == pair[1].point) {
         return Err(CoroutineError::PointTwice { point: pair[1].point, inst: pair[1].inst });
     }
-    let mut roots = Vec::with_capacity_in(suspends.len() + 1, alloc.clone());
+    let mut roots = Vec::with_capacity_in(suspends.len() + 1, *alloc);
     roots.push(shape.unresumed.0);
     roots.extend(suspends.iter().map(|it| it.cancel));
     let in_drop = reach(&view, &roots, true, alloc);
@@ -566,13 +568,13 @@ fn read<'a, A: Allocator + Clone>(
             _ => {}
         }
     }
-    Ok(Body { view, shape, entry_params, block_of, in_poll, in_drop, suspends, panics, landings, invoked })
+    Ok(Body { view, shape, entry_params, block_of, in_poll, in_drop, suspends, panics, invoked })
 }
 
 /// Per slot, whether the state keeps it: whether at some suspend its address may have been
 /// taken and its storage not ended (the module's first rule; `live` is that analysis,
 /// coroutine_overlap.rs `addressed`).
-fn kept_slots<A: Allocator + Clone>(
+fn kept_slots<A: Allocator + Copy>(
     body: &Body<'_, A>,
     live: &overlap::Addressed<A>,
     plant: Plant,
@@ -597,7 +599,7 @@ fn kept_slots<A: Allocator + Clone>(
 /// Per value, whether it is live into the resume or the cancel block of some suspend. Each
 /// value is walked back from the blocks that use it to the block that makes it; the blocks
 /// passed are those it is live into.
-fn crossing_values<A: Allocator + Clone>(body: &Body<'_, A>, alloc: &A) -> Vec<bool, A> {
+fn crossing_values<A: Allocator + Copy>(body: &Body<'_, A>, alloc: &A) -> Vec<bool, A> {
     let view = &body.view;
     let blocks = view.blocks();
     let held = |b: usize| body.in_poll[b] || body.in_drop[b];
@@ -606,11 +608,13 @@ fn crossing_values<A: Allocator + Clone>(body: &Body<'_, A>, alloc: &A) -> Vec<b
         after[suspend.resume as usize] = true;
         after[suspend.cancel as usize] = true;
     }
-    // A cleanup path's entry is counted as a cancel block is (ASYNC.md P5): a value live into
-    // it is kept, and loaded there from the state.
-    for &landing in body.landings.iter() {
-        after[landing as usize] = true;
-    }
+    // A cleanup path's entry is NOT a resume/cancel boundary of its own: a landing block is
+    // entered only from an `invoke`'s unwind edge (which `preds` already carries). If that
+    // `invoke` lies after some suspend without passing through `made_in`, the backward walk
+    // through `preds` reaches that suspend's `resume` or `cancel` block (both in `after`) and
+    // marks the value crossing; if the `invoke` lies on the same side of every suspend as
+    // `made_in` (or the body has no suspends), `made_in` still strictly dominates the landing
+    // block in `poll`, so the value does not cross a suspension.
     // Predecessors, in CSR.
     let mut starts = filled(blocks + 1, 0u32, alloc);
     for b in (0..blocks).filter(|&b| held(b)) {
@@ -630,7 +634,7 @@ fn crossing_values<A: Allocator + Clone>(body: &Body<'_, A>, alloc: &A) -> Vec<b
     }
     // Each use of a value in another block than the one that makes it, once per block. An
     // entry parameter is each poll's own and is never kept.
-    let mut uses: Vec<(u32, u32), A> = Vec::new_in(alloc.clone());
+    let mut uses: Vec<(u32, u32), A> = Vec::new_in(*alloc);
     for b in (0..blocks).filter(|&b| held(b)) {
         for at in view.block(Block(b as u32)) {
             each_value(view, at, |value| {
@@ -645,7 +649,7 @@ fn crossing_values<A: Allocator + Clone>(body: &Body<'_, A>, alloc: &A) -> Vec<b
     let mut crossing = filled(view.len(), false, alloc);
     // Per block, the last value whose walk passed it.
     let mut passed = filled(blocks, NONE, alloc);
-    let mut work = Vec::new_in(alloc.clone());
+    let mut work = Vec::new_in(*alloc);
     let mut i = 0;
     while i < uses.len() {
         let value = uses[i].0;
@@ -681,13 +685,13 @@ const DIRECT: u32 = NONE;
 const REMADE: u32 = NONE - 1;
 
 /// Where everything lives.
-struct Plan<A: Allocator> {
+struct Plan<S: Allocator, A: Allocator> {
     /// Per slot of the body: its offset in the state, [`NONE`] for a slot that stays.
-    slot_offset: Vec<u32, A>,
+    slot_offset: Vec<u32, S>,
     /// Per slot of the body: its row in the outputs' `slots`, [`NONE`] for a kept one.
-    slot_row: Vec<u32, A>,
+    slot_row: Vec<u32, S>,
     /// Per value of the body: [`DIRECT`], [`REMADE`], or its field's offset.
-    home: Vec<u32, A>,
+    home: Vec<u32, S>,
     layout: StateLayout<A>,
 }
 
@@ -711,21 +715,134 @@ fn align_up(at: u64, align: u8) -> u64 {
     (at + mask) & !mask
 }
 
-fn plan<A: Allocator + Clone>(
-    body: &Body<'_, A>,
+/// Maximum DAG depth and expanded node count for rematerializing a pure/address SSA value across a
+/// suspend.
+const MAX_REMAT_DEPTH: u8 = 16;
+const MAX_REMAT_NODES: usize = 64;
+
+/// Whether SSA value `value` can be rematerialized at its uses across a suspend with zero state
+/// bytes: any constant, symbol address, kept slot's address, `state_param`, or pure non-trapping
+/// DAG over them (bounded to `depth` levels and [`MAX_REMAT_NODES`] expanded nodes).
+fn can_remat(view: &View<'_>, state_param: u32, kept: &[bool], value: usize, depth: u8) -> bool {
+    let Ok(state_ix) = usize::try_from(state_param) else { return false };
+    let mut stack = [(0usize, 0u8); MAX_REMAT_NODES];
+    let Some(first) = stack.get_mut(0) else { return false };
+    *first = (value, depth);
+    let mut len = 1usize;
+    let mut visited = 0usize;
+    while len > 0 {
+        len -= 1;
+        let Some(&(cur, rem)) = stack.get(len) else { return false };
+        if cur == state_ix {
+            continue;
+        }
+        visited += 1;
+        if rem == 0 || visited > MAX_REMAT_NODES {
+            return false;
+        }
+        match view.op(cur) {
+            Op::SlotAddr => {
+                let is_kept = view
+                    .data
+                    .get(cur)
+                    .copied()
+                    .and_then(|d| usize::try_from(d).ok())
+                    .and_then(|s| kept.get(s).copied())
+                    .unwrap_or(false);
+                if !is_kept {
+                    return false;
+                }
+            }
+            Op::Iconst
+            | Op::IconstWide
+            | Op::Fconst
+            | Op::FconstWide
+            | Op::Vconst
+            | Op::Null
+            | Op::Uninit
+            | Op::FuncAddr
+            | Op::DataAddr => {}
+            Op::PtrAdd
+            | Op::PtrAddr
+            | Op::Expose
+            | Op::FromExposed
+            | Op::PtrWithAddr
+            | Op::Zext
+            | Op::Sext
+            | Op::Trunc
+            | Op::Bitcast
+            | Op::Fpext
+            | Op::Fptrunc
+            | Op::UitoFp
+            | Op::SitoFp
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Neg
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Not
+            | Op::Shl
+            | Op::Lshr
+            | Op::Ashr
+            | Op::Rotl
+            | Op::Rotr
+            | Op::Umin
+            | Op::Umax
+            | Op::Smin
+            | Op::Smax
+            | Op::UaddSat
+            | Op::SaddSat
+            | Op::UsubSat
+            | Op::SsubSat
+            | Op::Clz
+            | Op::Ctz
+            | Op::Popcnt
+            | Op::Bswap
+            | Op::Bitrev
+            | Op::Icmp
+            | Op::Fcmp
+            | Op::Select => {
+                let mut ok = true;
+                each_value(view, cur, |op_v| {
+                    let Ok(op_ix) = usize::try_from(op_v) else {
+                        ok = false;
+                        return;
+                    };
+                    if let Some(dst) = stack.get_mut(len) {
+                        *dst = (op_ix, rem - 1);
+                        len += 1;
+                    } else {
+                        ok = false;
+                    }
+                });
+                if !ok {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn plan<S: Allocator + Copy, A: Allocator>(
+    body: &Body<'_, S>,
     kept: &[bool],
     conflicts: &[u64],
     crossing: &[bool],
     region: Option<(Region, &[u32])>,
-    alloc: &A,
-) -> Result<Plan<A>, CoroutineError> {
+    alloc: &S,
+    out_alloc: A,
+) -> Result<Plan<S, A>, CoroutineError> {
     let view = &body.view;
     let ptr_bits = view.head.ptr_bits;
     let mut slot_offset = filled(kept.len(), NONE, alloc);
     let mut slot_row = filled(kept.len(), NONE, alloc);
     let mut home = filled(view.len(), DIRECT, alloc);
-    let mut fields = Vec::new_in(alloc.clone());
-    let mut sizes = Vec::new_in(alloc.clone());
+    let mut fields = Vec::new_in(out_alloc);
+    let mut sizes = Vec::new_in(*alloc);
     let mut rows = 0u32;
     for (slot, &keep) in kept.iter().enumerate() {
         let rec = view.slots[slot];
@@ -768,12 +885,7 @@ fn plan<A: Allocator + Clone>(
         }
     }
     for (value, _) in crossing.iter().enumerate().filter(|it| *it.1) {
-        let remade = match view.op(value) {
-            Op::SlotAddr => kept[view.data[value] as usize],
-            Op::Iconst | Op::Null | Op::FuncAddr | Op::DataAddr => true,
-            _ => false,
-        };
-        if remade {
+        if can_remat(view, body.shape.state_param, kept, value, MAX_REMAT_DEPTH) {
             home[value] = REMADE;
             continue;
         }
@@ -851,32 +963,32 @@ fn plan<A: Allocator + Clone>(
 }
 
 /// One output being made.
-struct Emit<'p, 'a, A: Allocator + Clone> {
-    body: &'p Body<'a, A>,
-    plan: &'p Plan<A>,
+struct Emit<'p, 'a, S: Allocator + Copy, A: Allocator> {
+    body: &'p Body<'a, S>,
+    plan: &'p Plan<S, A>,
     which: Which,
     plant: Plant,
     func: Func<A>,
     /// Per value of the body: its value here, [`NONE`] if nothing here makes it.
-    map: Vec<u32, A>,
+    map: Vec<u32, S>,
     /// Per block of the body: its block here, [`NONE`] if this output has it not.
-    block_map: Vec<u32, A>,
+    block_map: Vec<u32, S>,
     /// The state pointer here.
     state: u32,
     /// The body's block being copied.
     current: u32,
     /// Per value of the body: what stands for it in the block `fetched_in` names (a load
     /// from the state, or the value made again).
-    fetched: Vec<u32, A>,
-    fetched_in: Vec<u32, A>,
+    fetched: Vec<u32, S>,
+    fetched_in: Vec<u32, S>,
     /// The places that hold a value of the body, to be its value here once every block is
     /// copied (a use may come before its value in layout order): an index of `data` if the
     /// flag is set, else of `extra`.
-    fixups: Vec<(u32, bool), A>,
+    fixups: Vec<(u32, bool), S>,
     ptr_int: Ty,
 }
 
-impl<A: Allocator + Clone> Emit<'_, '_, A> {
+impl<S: Allocator + Copy, A: Allocator> Emit<'_, '_, S, A> {
     fn begin(&mut self, kind: BlockKind) {
         self.func.block_starts.push(self.func.ops.len() as u32);
         self.func.block_kinds.push(kind as u8);
@@ -925,6 +1037,77 @@ impl<A: Allocator + Clone> Emit<'_, '_, A> {
         self.push(Op::Store, Ty::NONE, &[tag, state, offset], loc);
     }
 
+    /// Rematerializes a `can_remat` SSA value (and any of its non-local operands) into the
+    /// current block, caching each remade value once per block in `self.fetched`.
+    fn fetch_remade(&mut self, root: u32, loc: u32) {
+        let mut stack = [(0u32, false); 2 * MAX_REMAT_NODES];
+        let mut len = 0usize;
+        if let Some(first) = stack.get_mut(0) {
+            *first = (root, false);
+            len = 1;
+        }
+        let view = self.body.view;
+        while len > 0 {
+            len -= 1;
+            let Some(&(value, ready)) = stack.get(len) else { break };
+            if value == self.body.shape.state_param {
+                continue;
+            }
+            let Ok(at) = usize::try_from(value) else { continue };
+            if self.body.block_of.get(at).copied() == Some(self.current)
+                || self.fetched_in.get(at).copied() == Some(self.current)
+            {
+                continue;
+            }
+            if matches!(view.op(at), Op::SlotAddr) {
+                let off = view
+                    .data
+                    .get(at)
+                    .copied()
+                    .and_then(|d| usize::try_from(d).ok())
+                    .and_then(|s| self.plan.slot_offset.get(s).copied());
+                let Some(off) = off else { continue };
+                let new = self.state_ptr(off, loc);
+                if let Some(dst) = self.fetched.get_mut(at) {
+                    *dst = new;
+                }
+                if let Some(dst) = self.fetched_in.get_mut(at) {
+                    *dst = self.current;
+                }
+                continue;
+            }
+            if ready {
+                let new = self.copy(at);
+                if let Some(dst) = self.fetched.get_mut(at) {
+                    *dst = new;
+                }
+                if let Some(dst) = self.fetched_in.get_mut(at) {
+                    *dst = self.current;
+                }
+            } else {
+                if let Some(dst) = stack.get_mut(len) {
+                    *dst = (value, true);
+                    len += 1;
+                }
+                each_value(&view, at, |op_v| {
+                    if op_v == self.body.shape.state_param {
+                        return;
+                    }
+                    let Ok(op_at) = usize::try_from(op_v) else { return };
+                    if self.body.block_of.get(op_at).copied() == Some(self.current)
+                        || self.fetched_in.get(op_at).copied() == Some(self.current)
+                    {
+                        return;
+                    }
+                    if let Some(dst) = stack.get_mut(len) {
+                        *dst = (op_v, false);
+                        len += 1;
+                    }
+                });
+            }
+        }
+    }
+
     /// Makes the body's `value` usable in the current block: nothing for a value used as it
     /// is made, else a load from its field or the value made again, once per block.
     fn fetch(&mut self, value: u32, loc: u32) {
@@ -936,16 +1119,14 @@ impl<A: Allocator + Clone> Emit<'_, '_, A> {
         if home == DIRECT || self.body.block_of[at] == self.current || self.fetched_in[at] == self.current {
             return;
         }
+        if home == REMADE {
+            self.fetch_remade(value, loc);
+            return;
+        }
         let view = self.body.view;
         let ty = Ty(view.tys[at]);
         let state = self.state;
-        let new = if home == REMADE {
-            match view.op(at) {
-                Op::SlotAddr => self.state_ptr(self.plan.slot_offset[view.data[at] as usize], loc),
-                // `iconst`, `null`, `func_addr`, `data_addr`: one word, or none.
-                op => self.push(op, ty, &[view.data[at]], loc),
-            }
-        } else if cfg!(test) && self.plant == Plant::NoReloadOnCancel && self.which == Which::Drop {
+        let new = if cfg!(test) && self.plant == Plant::NoReloadOnCancel && self.which == Which::Drop {
             // Planted (test builds only): a cancel path's value is not loaded.
             self.push(Op::Uninit, ty, &[], loc)
         } else if ty == Ty::I1 {
@@ -973,110 +1154,11 @@ impl<A: Allocator + Clone> Emit<'_, '_, A> {
         self.push(Op::Store, Ty::NONE, &[stored, state, home], loc);
     }
 
-    /// Appends, to `extra`, the word that stands for the body's `value` in the current block.
-    fn put_value(&mut self, value: u32) {
-        if self.fetched_in[value as usize] == self.current {
-            self.func.extra.push(self.fetched[value as usize]);
-        } else {
-            self.fixups.push((self.func.extra.len() as u32, false));
-            self.func.extra.push(value);
-        }
-    }
-
-    fn put_block(&mut self, block: u32) {
-        let to = self.block_map[block as usize];
-        debug_assert!(to != NONE, "an edge of a held block leads to a held block");
-        self.func.extra.push(to);
-    }
-
-    /// Appends the target at `words[at..]`; where its words end.
-    fn put_target(&mut self, words: &[u32], mut at: usize) -> usize {
-        self.put_block(words[at]);
-        let n = words[at + 1] as usize;
-        self.func.extra.push(n as u32);
-        at += 2;
-        for _ in 0..n {
-            self.put_value(words[at]);
-            at += 1;
-        }
-        at
-    }
-
     /// Appends the operands `fields` at `words` to `extra`, each value, block and slot as
     /// this output names it. The mirror of [`walk`], on a verified function.
     fn rewrite(&mut self, words: &[u32], fields: &[Field], ty: Ty) {
         let tys = self.body.view.tys;
-        let mut at = 0;
-        let mut scrutinee = None;
-        for &field in fields {
-            match field {
-                Field::Value => {
-                    scrutinee = Some(words[at]);
-                    self.put_value(words[at]);
-                    at += 1;
-                }
-                Field::Block => {
-                    self.put_block(words[at]);
-                    at += 1;
-                }
-                Field::Slot => {
-                    self.func.extra.push(self.plan.slot_row[words[at] as usize]);
-                    at += 1;
-                }
-                Field::Imm
-                | Field::Offset
-                | Field::IntCond
-                | Field::FloatCond
-                | Field::Rmw
-                | Field::Ref
-                | Field::Sig
-                | Field::Intrinsic
-                | Field::Asm => {
-                    self.func.extra.push(words[at]);
-                    at += 1;
-                }
-                Field::Target => at = self.put_target(words, at),
-                Field::Values => {
-                    let n = words[at] as usize;
-                    self.func.extra.push(n as u32);
-                    at += 1;
-                    for _ in 0..n {
-                        self.put_value(words[at]);
-                        at += 1;
-                    }
-                }
-                Field::Blocks => {
-                    let n = words[at] as usize;
-                    self.func.extra.push(n as u32);
-                    at += 1;
-                    for _ in 0..n {
-                        self.put_block(words[at]);
-                        at += 1;
-                    }
-                }
-                Field::Mask => {
-                    let n = words[at] as usize;
-                    self.func.extra.extend_from_slice(&words[at..at + 1 + n]);
-                    at += 1 + n;
-                }
-                Field::Const => {
-                    let n = ty.const_words() as usize;
-                    self.func.extra.extend_from_slice(&words[at..at + n]);
-                    at += n;
-                }
-                Field::Cases => {
-                    let width = scrutinee.map_or(0, |it: u32| Ty(tys[it as usize]).const_words()) as usize;
-                    let n = words[at] as usize;
-                    self.func.extra.push(n as u32);
-                    at += 1;
-                    for _ in 0..n {
-                        self.func.extra.extend_from_slice(&words[at..at + width]);
-                        at += width;
-                        at = self.put_target(words, at);
-                    }
-                }
-            }
-        }
+        let Ok(()) = rewrite_fields(words, fields, ty, tys, self);
     }
 
     /// Copies the body's instruction `at`, its operands as this output names them.
@@ -1171,18 +1253,52 @@ impl<A: Allocator + Clone> Emit<'_, '_, A> {
     }
 }
 
+impl<S: Allocator + Copy, A: Allocator> RewriteSink for Emit<'_, '_, S, A> {
+    type Error = Infallible;
+
+    /// Appends, to `extra`, the word that stands for the body's `value` in the current block.
+    fn put_value(&mut self, value: u32) {
+        if self.fetched_in[value as usize] == self.current {
+            self.func.extra.push(self.fetched[value as usize]);
+        } else {
+            self.fixups.push((self.func.extra.len() as u32, false));
+            self.func.extra.push(value);
+        }
+    }
+
+    fn put_block(&mut self, block: u32) {
+        let to = self.block_map[block as usize];
+        debug_assert!(to != NONE, "an edge of a held block leads to a held block");
+        self.func.extra.push(to);
+    }
+
+    fn put_slot(&mut self, slot: u32) -> Result<(), Infallible> {
+        self.func.extra.push(self.plan.slot_row[slot as usize]);
+        Ok(())
+    }
+
+    fn push_word(&mut self, word: u32) {
+        self.func.extra.push(word);
+    }
+
+    fn push_words(&mut self, words: &[u32]) {
+        self.func.extra.extend_from_slice(words);
+    }
+}
+
 /// Makes `which` of the two functions.
-fn emit<A: Allocator + Clone>(
-    body: &Body<'_, A>,
-    plan: &Plan<A>,
+fn emit<S: Allocator + Copy, A: Allocator + Clone>(
+    body: &Body<'_, S>,
+    plan: &Plan<S, A>,
     which: Which,
     plant: Plant,
-    alloc: &A,
+    alloc: &S,
+    out_alloc: A,
 ) -> Result<Func<A>, CoroutineError> {
     let view = body.view;
     let blocks = view.blocks();
     // The body's tables; the instructions and blocks are made below.
-    let mut func = view.to_func_in(alloc.clone());
+    let mut func = view.to_func_in(out_alloc);
     func.ops.clear();
     func.flags.clear();
     func.tys.clear();
@@ -1251,7 +1367,7 @@ fn emit<A: Allocator + Clone>(
         current: NONE,
         fetched: filled(view.len(), NONE, alloc),
         fetched_in: filled(view.len(), NONE, alloc),
-        fixups: Vec::new_in(alloc.clone()),
+        fixups: Vec::new_in(*alloc),
         ptr_int,
     };
     // The head: the parameters, the tag, the switch.
@@ -1269,8 +1385,8 @@ fn emit<A: Allocator + Clone>(
     let (tag_ty, tag_offset, state) = (plan.layout.tag_ty, plan.layout.tag_offset, e.state);
     let tag = e.push(Op::Load, tag_ty, &[state, tag_offset], 0);
     // The switch's words: the scrutinee, the default target, the cases by rising tag.
-    let mut words = Vec::new_in(alloc.clone());
-    let case = |words: &mut Vec<u32, A>, tag: u32, to: u32| words.extend_from_slice(&[tag, to, 0]);
+    let mut words = Vec::new_in(*alloc);
+    let case = |words: &mut Vec<u32, S>, tag: u32, to: u32| words.extend_from_slice(&[tag, to, 0]);
     match which {
         Which::Poll => {
             // A finished state goes to its block of `Panics` when the builder passed one; it
@@ -1312,10 +1428,10 @@ fn emit<A: Allocator + Clone>(
         let params = view.params(Block(b as u32));
         // The entry's parameters are the head's.
         if b != 0 {
-            for at in params.clone() {
+            for at in params.start..params.end {
                 e.map[at] = e.raw(Op::Param, view.flags[at], Ty(view.tys[at]), 0, view.attrs[at], view.locs[at]);
             }
-            for at in params.clone() {
+            for at in params.start..params.end {
                 e.spill(at);
             }
         }
@@ -1357,7 +1473,7 @@ fn emit<A: Allocator + Clone>(
     }
     // As the builder does: the output is checked in debug builds.
     if cfg!(debug_assertions) {
-        verify(func.view()).map_err(|error| CoroutineError::Output(which, error))?;
+        crate::verify::verify_in(func.view(), func.allocator()).map_err(|error| CoroutineError::Output(which, error))?;
     }
     Ok(func)
 }

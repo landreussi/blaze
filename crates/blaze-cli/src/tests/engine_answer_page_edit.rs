@@ -30,7 +30,8 @@ fn file(group: u32) -> Name {
 fn editing_one_of_fifty_thousand_rows_reads_only_its_file_and_row_pages() {
     let io = Io::simulated(SimWorld::new(31, Limits::USUAL));
     let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
-    let home = crate::store::Home::of(&cx, &io.need_fs().expect("filesystem"), Some("/h")).expect("home");
+    let fs = io.need_fs().expect("filesystem");
+    let home = crate::store::Home::of(&cx, &fs, Some("/h")).expect("home");
     let heap = blaze_own::testing::heap();
     let alloc = heap.shared();
     let frame = cx.frame();
@@ -39,7 +40,7 @@ fn editing_one_of_fifty_thousand_rows_reads_only_its_file_and_row_pages() {
     let err = io.need_err().expect("stderr");
     let lent = home.open_store(&Settings::default(), crate::store::Facts { boot: Some(1), nonce: 31 }, heap.alloc()).expect("store");
     let mut store = CommandStore::new(&cx, &lent, false, 0, None, clock.clone(), &err, erased.handle()).expect("command store");
-    let journal = crate::journal_sweep::take(&cx, home.dir(), home.dir(), &clock, crate::journal_sweep::Stored::NONE, frame).expect("journal");
+    let journal = crate::journal_sweep::take(&cx, &fs, home.dir(), home.dir(), &clock, crate::journal_sweep::Stored::NONE, frame).expect("journal");
     let lines = crate::engine_lines::Lines::new_in(alloc).record();
     let leaves = Rows::new_in(frame);
     let tools = Tools([Tool(ContentId([3; 32])); blaze_drive::key::KINDS]);
@@ -51,8 +52,8 @@ fn editing_one_of_fifty_thousand_rows_reads_only_its_file_and_row_pages() {
     store.put(&cx, old_payload, b"before").expect("old task payload");
     let mut cold = Kept::new_in(alloc);
     cold.answer.serial = first;
-    let page_of = blaze_drive::answers::page_of;
-    let edited_file = (0..ROWS).map(|n| file(ROWS + n)).find(|f| page_of(*f, 1) != page_of(task(0), 1)).expect("file and row on distinct pages");
+    let page_of = blaze_engine::pages::content_page_of;
+    let edited_file = (0..ROWS).map(|n| file(ROWS + n)).find(|f| page_of(*f, 2) != page_of(task(0), 2)).expect("file and row on distinct pages");
     let observed = CellId { of: task(ROWS - 2), cell: crate::engine_tasks::WHOLE };
     for i in 0..ROWS {
         let name = task(i);
@@ -62,7 +63,7 @@ fn editing_one_of_fifty_thousand_rows_reads_only_its_file_and_row_pages() {
         let phase = if i == ROWS - 1 {
             reads.push((observed, blaze_drive::key::ABSENT));
             by_cell.push(0);
-            cold.answer.readers.entry(observed).or_insert_with(|| blaze_own::BTreeSet::new_in(alloc)).insert(name);
+            cold.answer.readers.insert(observed, name);
             Phase::new(Stage::Units, 1)
         } else {
             phase
@@ -80,10 +81,10 @@ fn editing_one_of_fifty_thousand_rows_reads_only_its_file_and_row_pages() {
         names.sort_unstable();
     }
     let saved = save_edit(&cx, &mut store, &lent, "answer", toolchain, &tools, &cold, Printed::default(), (lines.0, &lines.1),
-        None, &leaves, &journal, alloc, frame, &[], None).expect("save all rows");
+        None, &leaves, &journal, alloc, frame, &[], (None, core::num::NonZeroU32::MIN), crate::engine_answer::SaveBase::Keep).expect("save all rows");
     assert_eq!(saved.rekeyed.whole, Some(WhyWhole::NoLast), "a first commit keys every page");
     assert!(saved.new_pages > 1, "the answer spans multiple pages");
-    store.commit_puts().expect("commit original answer");
+    lent.commit().expect("commit original answer");
     drop(cold);
 
     let pointer = load_pointer(&cx, &mut store, "answer").expect("store reads").expect("pointer").expect("valid pointer");
@@ -117,19 +118,43 @@ fn editing_one_of_fifty_thousand_rows_reads_only_its_file_and_row_pages() {
     payloads.insert(plan.name, after);
     let changed = Kept::after(BTreeMap::new_in(alloc), finished.answer, &finished.causes, payloads);
     let saved = save_edit(&cx, &mut store, &lent, "answer", toolchain, &tools, &changed, Printed::default(), (lines.0, &lines.1),
-        Some(&stored), &leaves, &journal, alloc, frame, &[], Some(pointer.root)).expect("publish edit");
+        Some(&stored), &leaves, &journal, alloc, frame, &[], (Some(pointer.root), core::num::NonZeroU32::MIN), crate::engine_answer::SaveBase::Keep).expect("publish edit");
     assert_eq!(stored.pages_read(), 2, "planning, merging and publication read the file plan and the changed row");
     assert!((1..=2).contains(&saved.new_pages), "only the edited row and file plan can require a new page");
-    store.commit_puts().expect("commit edited answer");
+    lent.commit().expect("commit edited answer");
 
     let pointer = load_pointer(&cx, &mut store, "answer").expect("store reads").expect("updated pointer").expect("valid pointer");
     let next = open_root(&cx, &mut store, pointer.root, alloc).expect("store reads").expect("updated directory");
+    let load_pages = |dir: &pages::Root<'_>, st: &mut CommandStore<'_, '_, _>| -> std::vec::Vec<Key> {
+        if !dir.is_radix() {
+            return dir.pages.iter().copied().collect();
+        }
+        let mut out = std::vec::Vec::with_capacity(dir.page_count());
+        for (shard_idx, &shard_key) in dir.page_shards.iter().enumerate() {
+            if shard_key == Key::default() {
+                out.extend(core::iter::repeat_n(Key::default(), pages::RADIX_LEAF_PAGES));
+            } else {
+                let bytes = st.get(&cx, shard_key).expect("read shard").expect("shard exists");
+                let shard = pages::decode_radix_shard(
+                    pages::Sealed::hashed(shard_key, &bytes.bytes).expect("sealed shard"),
+                    u32::try_from(shard_idx).expect("shard index"),
+                    dir.bits,
+                    alloc,
+                )
+                .expect("valid shard");
+                out.extend(shard.keys.iter().copied());
+            }
+        }
+        out
+    };
+    let old_pages = load_pages(&directory, &mut store);
+    let next_pages = load_pages(&next, &mut store);
     let edited_page = page_of(plan.name, next.bits) as usize;
     let file_page = page_of(edited_file, next.bits) as usize;
     assert_eq!(next.bits, directory.bits);
     assert_ne!(edited_page, file_page);
-    assert_ne!(next.pages[edited_page], directory.pages[edited_page]);
-    for (index, (&old, &new)) in directory.pages.iter().zip(&next.pages).enumerate() {
+    assert_ne!(next_pages[edited_page], old_pages[edited_page]);
+    for (index, (&old, &new)) in old_pages.iter().zip(&next_pages).enumerate() {
         if index != edited_page && index != file_page {
             assert_eq!(old, new, "reuse the page reference at {index}");
         }
@@ -140,16 +165,44 @@ fn editing_one_of_fifty_thousand_rows_reads_only_its_file_and_row_pages() {
     // control the store's proof must equal, row for row.
     let verified = Stored::new(&next, &reopened, &pointer.headers, pages::Check::Hashed, alloc);
     let other = (2..MEMBERS).map(task).find(|name| ![edited_page, file_page].contains(&(page_of(*name, next.bits) as usize))).expect("unchanged member on another page");
-    let reach = store.named("answer.reach").expect("read published reach root").expect("published reach root");
+    let mut carried: std::vec::Vec<[u8; 32]> = std::vec::Vec::new();
+    if !next.is_radix() {
+        let reach = store.named("answer.reach").expect("read published reach root").expect("published reach root");
+        carried.extend(reach.chunks_exact(32).map(|bytes| <[u8; 32]>::try_from(bytes).expect("a whole key")));
+    } else {
+        let num_shards = next.page_count().div_ceil(REACH_SHARD_PAGES);
+        for shard in 0..num_shards {
+            let shard_name = std::format!("answer.reach.{shard:02x}");
+            if let Some(reach) = store.named(&shard_name).expect("read published reach shard") {
+                carried.extend(reach.chunks_exact(32).map(|bytes| <[u8; 32]>::try_from(bytes).expect("a whole key")));
+            }
+        }
+        if let Some(delta) = store.named("answer.reach.delta").expect("read published reach delta") {
+            carried.extend(delta.chunks_exact(32).map(|bytes| <[u8; 32]>::try_from(bytes).expect("a whole key")));
+        }
+        carried.sort_unstable();
+        carried.dedup();
+    }
     // THE RE-KEY COUNT: the edit keyed into the reach root exactly the pages whose key moved,
-    // and the root it carried equals the one made from every page (the oracle: a carried index
-    // lost or kept stale would differ).
-    let moved = directory.pages.iter().zip(&next.pages).filter(|(old, new)| old != new).count();
+    // and the root it carried equals the one made from every page (or, for sharded radix delta,
+    // covers every live page plus at most the replaced old pages awaiting fold).
+    let moved = old_pages.iter().zip(&next_pages).filter(|(old, new)| old != new).count();
     assert_eq!(saved.rekeyed, Rekeyed { pages: u32::try_from(moved).expect("a page count"), whole: None }, "only the {moved} moved page(s) re-keyed");
-    let mut whole: std::vec::Vec<[u8; 32]> = next.pages.iter().filter(|key| **key != Key::default()).map(|key| blaze_cas::plain::beside_key(blaze_cas::Key(key.0)).0.0).collect();
+    let mut whole: std::vec::Vec<[u8; 32]> = next_pages.iter().filter(|key| **key != Key::default()).map(|key| blaze_cas::plain::beside_key(blaze_cas::Key(key.0)).0.0).collect();
     whole.sort_unstable();
-    let carried: std::vec::Vec<[u8; 32]> = reach.chunks_exact(32).map(|bytes| bytes.try_into().expect("a whole key")).collect();
-    assert_eq!(carried, whole, "the carried reach root is the whole one");
+    if !next.is_radix() {
+        assert_eq!(carried, whole, "the carried reach root is the whole one");
+    } else {
+        let mut expected = whole.clone();
+        for (&old, &new) in old_pages.iter().zip(&next_pages) {
+            if old != new && old != Key::default() {
+                expected.push(blaze_cas::plain::beside_key(blaze_cas::Key(old.0)).0.0);
+            }
+        }
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(carried, expected, "sharded reach + delta covers all live pages plus replaced base entries");
+    }
     for (name, payload, source, entered, cause) in [
         (plan.name, after, plan.source, Gen(first.0 + 1), Cause::KeyMoved),
         (task(1), old_payload, old_source, first, Cause::New),
@@ -160,9 +213,9 @@ fn editing_one_of_fifty_thousand_rows_reads_only_its_file_and_row_pages() {
         assert_eq!((row.key, row.source, row.out, row.serial), (tools.key(name, &source), source, payload.0, entered));
         assert_eq!(page.cause(name), Some((entered, cause)));
         assert_eq!(page.record(name), Some(payload));
-        let key = next.pages[page_of(name, next.bits) as usize];
+        let key = next_pages[page_of(name, next.bits) as usize];
         let beside = blaze_cas::plain::beside_key(blaze_cas::Key(key.0));
-        assert!(reach.chunks_exact(32).any(|bytes| bytes == &beside.0.0), "the new root keeps this page's reach index");
+        assert!(carried.iter().any(|bytes| bytes == &beside.0.0), "the new root keeps this page's reach index");
         let held = lent.get(&beside).expect("read reach index").expect("page reach index");
         for keep in [key, payload] {
             assert!(held.bytes.chunks_exact(32).any(|bytes| bytes == &keep.0.0), "cleanup must retain the live page and each standing payload");

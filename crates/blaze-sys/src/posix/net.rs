@@ -253,6 +253,18 @@ pub struct linger {
     pub l_linger: c_int,
 }
 
+/// `struct ip_mreq` (netinet/in.h): `IP_ADD_MEMBERSHIP`'s value — an IPv4 multicast group and
+/// the local interface address to join it on.
+/// replaces libc::ip_mreq
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[repr(C)]
+pub struct ip_mreq {
+    /// IPv4 multicast group address, network byte order.
+    pub imr_multiaddr: in_addr,
+    /// Local interface IPv4 address (`INADDR_ANY` = 0 for default), network byte order.
+    pub imr_interface: in_addr,
+}
+
 // ---------------------------------------------------------------------------------------------
 // Messages and control messages.
 // ---------------------------------------------------------------------------------------------
@@ -518,6 +530,7 @@ mod sol {
     pub const SO_REUSEADDR: c_int = 2;
     pub const SO_TYPE: c_int = 3;
     pub const SO_ERROR: c_int = 4;
+    pub const SO_BROADCAST: c_int = 6;
     pub const SO_SNDBUF: c_int = 7;
     pub const SO_RCVBUF: c_int = 8;
     pub const SO_KEEPALIVE: c_int = 9;
@@ -532,6 +545,7 @@ mod sol {
     pub const SO_ACCEPTCONN: c_int = 0x0002;
     pub const SO_REUSEADDR: c_int = 0x0004;
     pub const SO_KEEPALIVE: c_int = 0x0008;
+    pub const SO_BROADCAST: c_int = 0x0020;
     pub const SO_LINGER: c_int = 0x0080;
     pub const SO_REUSEPORT: c_int = 0x0200;
     pub const SO_SNDBUF: c_int = 0x1001;
@@ -554,6 +568,9 @@ pub const SO_TYPE: c_int = sol::SO_TYPE;
 /// `SO_ERROR`: the pending error, cleared by the read ([`pending_error`]).
 /// replaces libc::SO_ERROR
 pub const SO_ERROR: c_int = sol::SO_ERROR;
+/// `SO_BROADCAST`: permit sending broadcast datagrams on a datagram socket.
+/// replaces libc::SO_BROADCAST
+pub const SO_BROADCAST: c_int = sol::SO_BROADCAST;
 /// `SO_SNDBUF`.
 /// replaces libc::SO_SNDBUF
 pub const SO_SNDBUF: c_int = sol::SO_SNDBUF;
@@ -677,6 +694,30 @@ pub const IP_RECVTOS: c_int = 27;
 /// replaces libc::IP_DONTFRAG
 #[cfg(target_os = "macos")]
 pub const IP_DONTFRAG: c_int = 28;
+/// `IP_MULTICAST_TTL` (netinet/in.h): hop limit for outgoing IPv4 multicast datagrams.
+/// replaces libc::IP_MULTICAST_TTL
+#[cfg(target_os = "linux")]
+pub const IP_MULTICAST_TTL: c_int = 33;
+/// `IP_MULTICAST_TTL` (netinet/in.h): hop limit for outgoing IPv4 multicast datagrams.
+/// replaces libc::IP_MULTICAST_TTL
+#[cfg(target_os = "macos")]
+pub const IP_MULTICAST_TTL: c_int = 10;
+/// `IP_MULTICAST_LOOP` (netinet/in.h): whether outgoing IPv4 multicast datagrams loop back to local sockets.
+/// replaces libc::IP_MULTICAST_LOOP
+#[cfg(target_os = "linux")]
+pub const IP_MULTICAST_LOOP: c_int = 34;
+/// `IP_MULTICAST_LOOP` (netinet/in.h): whether outgoing IPv4 multicast datagrams loop back to local sockets.
+/// replaces libc::IP_MULTICAST_LOOP
+#[cfg(target_os = "macos")]
+pub const IP_MULTICAST_LOOP: c_int = 11;
+/// `IP_ADD_MEMBERSHIP` (netinet/in.h): join an IPv4 multicast group ([`ip_mreq`]).
+/// replaces libc::IP_ADD_MEMBERSHIP
+#[cfg(target_os = "linux")]
+pub const IP_ADD_MEMBERSHIP: c_int = 35;
+/// `IP_ADD_MEMBERSHIP` (netinet/in.h): join an IPv4 multicast group ([`ip_mreq`]).
+/// replaces libc::IP_ADD_MEMBERSHIP
+#[cfg(target_os = "macos")]
+pub const IP_ADD_MEMBERSHIP: c_int = 12;
 
 /// `IP_PMTUDISC_DONT` (bits/in.h, Linux).
 /// replaces libc::IP_PMTUDISC_DONT
@@ -1198,6 +1239,116 @@ pub fn connect(socket: Fd, at: &sockaddr_storage, len: socklen_t) -> Result<(), 
     }
 }
 
+/// Encodes `path` into a `sockaddr_un` stored in `sockaddr_storage`. Refuses empty paths, NUL
+/// bytes inside `path`, or paths that do not fit `sockaddr_un::sun_path`.
+#[blaze::noalloc]
+#[blaze::nopanic]
+fn unix_sockaddr(path: &[u8]) -> Result<(sockaddr_storage, socklen_t), Errno> {
+    if path.is_empty() {
+        return Err(Errno::Inval);
+    }
+    let mut un = sockaddr_un::ZERO;
+    if path.len() >= un.sun_path.len() {
+        return Err(Errno::NameTooLong);
+    }
+    let mut i = 0usize;
+    while let Some(&byte) = path.get(i) {
+        if byte == 0 {
+            return Err(Errno::Inval);
+        }
+        if let Some(slot) = un.sun_path.get_mut(i) {
+            *slot = c_char::from_ne_bytes([byte]);
+        }
+        i = i.wrapping_add(1);
+    }
+    un.sun_family = AF_UNIX as sa_family_t;
+    let addr_len = core::mem::offset_of!(sockaddr_un, sun_path).wrapping_add(path.len()).wrapping_add(1);
+    #[cfg(target_os = "macos")]
+    {
+        un.sun_len = match u8::try_from(addr_len) {
+            Ok(len) => len,
+            Err(_) => return Err(Errno::NameTooLong),
+        };
+    }
+    let mut storage = sockaddr_storage::ZERO;
+    // SAFETY: `sockaddr_storage` is strictly larger and at least as aligned as `sockaddr_un`,
+    // and both are plain-old-data C structs.
+    unsafe {
+        ptr::copy_nonoverlapping(ptr::from_ref(&un).cast::<u8>(), ptr::from_mut(&mut storage).cast::<u8>(), size_of::<sockaddr_un>());
+    }
+    let socklen = match socklen_t::try_from(addr_len) {
+        Ok(len) => len,
+        Err(_) => return Err(Errno::NameTooLong),
+    };
+    Ok((storage, socklen))
+}
+
+/// Opens an `AF_UNIX` `SOCK_STREAM` socket with `FD_CLOEXEC` and connects it to `path`.
+///
+/// Refuses empty paths, NUL bytes inside `path`, or paths that do not fit `sockaddr_un::sun_path`
+/// with [`Errno::Inval`] / [`Errno::NameTooLong`] before any syscall. The returned [`super::io::OwnedFd`]
+/// closes automatically on drop.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn connect_unix(path: &[u8]) -> Result<super::io::OwnedFd, Errno> {
+    let (storage, socklen) = unix_sockaddr(path)?;
+    #[cfg(target_os = "linux")]
+    let raw = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)?;
+    #[cfg(target_os = "macos")]
+    let raw = socket(AF_UNIX, SOCK_STREAM, 0)?;
+    // SAFETY: `socket` just returned a newly owned open file descriptor.
+    let owned = unsafe { super::io::OwnedFd::from_raw(raw.raw()) };
+    #[cfg(target_os = "macos")]
+    super::io::set_close_on_exec(owned.fd(), true)?;
+    connect(owned.fd(), &storage, socklen)?;
+    Ok(owned)
+}
+
+/// Opens a non-blocking, close-on-exec `AF_UNIX` `SOCK_STREAM` listener bound to `path`.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn listen_unix(path: &[u8], backlog: c_int) -> Result<super::io::OwnedFd, Errno> {
+    let (storage, socklen) = unix_sockaddr(path)?;
+    #[cfg(target_os = "linux")]
+    let raw = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)?;
+    #[cfg(target_os = "macos")]
+    let raw = socket(AF_UNIX, SOCK_STREAM, 0)?;
+    // SAFETY: `socket` just returned a newly owned open file descriptor.
+    let owned = unsafe { super::io::OwnedFd::from_raw(raw.raw()) };
+    #[cfg(target_os = "macos")]
+    {
+        super::io::set_close_on_exec(owned.fd(), true)?;
+        super::io::set_nonblocking(owned.fd(), true)?;
+    }
+    bind(owned.fd(), &storage, socklen)?;
+    listen(owned.fd(), backlog)?;
+    Ok(owned)
+}
+
+/// Accepts one connection from a non-blocking `AF_UNIX` listener, returning a non-blocking,
+/// close-on-exec [`super::io::OwnedFd`]. Returns [`Errno::Again`] when no connection is queued.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn accept_unix(listener: Fd) -> Result<super::io::OwnedFd, Errno> {
+    #[cfg(target_os = "linux")]
+    {
+        use crate::linux::SockFlags;
+        let owned = crate::linux::accept4(listener, SockFlags::NONBLOCK.with(SockFlags::CLOSE_ON_EXEC))?;
+        // SAFETY: `owned` is a freshly accepted open file descriptor.
+        Ok(unsafe { super::io::OwnedFd::from_raw(owned.into_raw()) })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: passing null peer-address pointers tells `accept` not to fill a peer sockaddr.
+        let fd = said(unsafe { c::accept(listener.raw(), ptr::null_mut(), ptr::null_mut()) })?;
+        // SAFETY: `accept` just returned a newly owned open file descriptor.
+        let owned = unsafe { super::io::OwnedFd::from_raw(fd) };
+        super::io::set_close_on_exec(owned.fd(), true)?;
+        super::io::set_nonblocking(owned.fd(), true)?;
+        Ok(owned)
+    }
+}
+
 /// `listen`: the socket takes connections, up to `backlog` waiting ([`SOMAXCONN`] at most).
 /// [`Errno::Inval`] for a negative backlog.
 /// replaces libc::listen
@@ -1479,6 +1630,18 @@ pub fn peer_ids(socket: Fd) -> Result<(super::types::uid_t, super::types::gid_t)
     Ok((uid, gid))
 }
 
+/// Returns `Ok(true)` if the connected Unix domain socket's peer has the same effective UID as
+/// this process (`SO_PEERCRED` on Linux, `getpeereid` on macOS).
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn peer_is_self_uid(socket: Fd) -> Result<bool, Errno> {
+    let me = super::thread::geteuid();
+    #[cfg(target_os = "linux")]
+    return peer_cred(socket).map(|cred| cred.uid == me);
+    #[cfg(target_os = "macos")]
+    return peer_ids(socket).map(|(uid, _)| uid == me);
+}
+
 /// `getsockopt(SOL_LOCAL, LOCAL_PEERTOKEN)` (macOS): a connected Unix socket's peer's audit
 /// token (`audit_token_t`, eight `u32`s), as it was when it connected.
 /// replaces libc::getsockopt (LOCAL_PEERTOKEN)
@@ -1621,6 +1784,7 @@ mod tests {
         same_layout!(in_pktinfo: ipi_ifindex, ipi_spec_dst, ipi_addr);
         same_layout!(in6_pktinfo: ipi6_addr, ipi6_ifindex);
         same_layout!(linger: l_onoff, l_linger);
+        same_layout!(ip_mreq: imr_multiaddr, imr_interface);
         same_layout!(msghdr: msg_name, msg_namelen, msg_iov, msg_iovlen, msg_control, msg_controllen, msg_flags);
         same_layout!(cmsghdr: cmsg_len, cmsg_level, cmsg_type);
         #[cfg(target_os = "linux")]
@@ -1641,11 +1805,12 @@ mod tests {
     fn constants_are_libc_s() {
         same_value!(
             AF_UNIX, AF_INET, AF_INET6, SOCK_STREAM, SOCK_DGRAM, SOMAXCONN, SHUT_RDWR, IPPROTO_IP,
-            IPPROTO_TCP, IPPROTO_IPV6, SOL_SOCKET, SO_REUSEADDR, SO_TYPE, SO_ERROR, SO_SNDBUF,
-            SO_RCVBUF, SO_KEEPALIVE, SO_LINGER, SO_REUSEPORT, SO_ACCEPTCONN, TCP_NODELAY,
-            TCP_KEEPINTVL, TCP_KEEPCNT, TCP_FASTOPEN, IP_TOS, IP_PKTINFO, IP_RECVTOS, IPV6_TCLASS,
-            IPV6_RECVTCLASS, IPV6_PKTINFO, IPV6_RECVPKTINFO, IPV6_DONTFRAG, MSG_TRUNC, MSG_NOSIGNAL,
-            MSG_CTRUNC, SCM_RIGHTS, SO_RCVTIMEO, SO_SNDTIMEO,
+            IPPROTO_TCP, IPPROTO_IPV6, SOL_SOCKET, SO_REUSEADDR, SO_TYPE, SO_ERROR, SO_BROADCAST,
+            SO_SNDBUF, SO_RCVBUF, SO_KEEPALIVE, SO_LINGER, SO_REUSEPORT, SO_ACCEPTCONN,
+            TCP_NODELAY, TCP_KEEPINTVL, TCP_KEEPCNT, TCP_FASTOPEN, IP_TOS, IP_PKTINFO, IP_RECVTOS,
+            IP_MULTICAST_TTL, IP_MULTICAST_LOOP, IP_ADD_MEMBERSHIP, IPV6_TCLASS, IPV6_RECVTCLASS,
+            IPV6_PKTINFO, IPV6_RECVPKTINFO, IPV6_DONTFRAG, MSG_TRUNC, MSG_NOSIGNAL, MSG_CTRUNC,
+            SCM_RIGHTS, SO_RCVTIMEO, SO_SNDTIMEO,
         );
         // Lane D2's rows.
         same_value!(IPV6_V6ONLY);

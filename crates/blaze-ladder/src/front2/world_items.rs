@@ -47,6 +47,16 @@ pub enum Fill {
     /// by name before it unifies self types: `impl Uint<{ <U1792>::LIMBS / 2 }> { fn concat }`
     /// is no candidate of `LIMBS`, so evaluating its header's constant never needs its own header.
     Inherent(Shape, Name),
+    /// A callee whose return signature contains `_` (`-> _`, `-> Option<_>`, `-> Result<T, _>`)
+    /// and whose body must be checked first to infer its concrete return type.
+    InferredOutput(ItemKey),
+    /// A `where const { COND }` condition (`cond`, ground-args digest) whose truth value must
+    /// be evaluated at the ground arguments queued in `Store::where_const_pending`.
+    ConstHolds(ItemKey, u64),
+    /// An opaque type (including a TAIT alias's `#[define_opaque(..)]` opaque) whose defining
+    /// body must be checked and filed into `Store::hidden` before a `Reveal::All` question can
+    /// read its hidden type.
+    DefineOpaque(ItemKey),
 }
 
 /// A question this front end cannot answer yet, by the item it is about.
@@ -131,6 +141,11 @@ pub enum Gap {
     /// An import through the one ask (`AsksMet::Once`, front2 asks.rs) was refused: the need
     /// and why.
     Ask(super::asks::AskRefused),
+    /// Mutual recursion cycle while inferring a return-type `_` placeholder (`-> _`, `Result<T, _>`):
+    /// add an explicit return/error type to break the cycle.
+    InferredOutputCycle { owner: ItemKey, callee: ItemKey },
+    /// A callee's inferred return/error type `_` could not be resolved from its body.
+    InferredOutputFailed { item: ItemKey, why: &'static str },
 }
 
 impl core::fmt::Display for Gap {
@@ -190,6 +205,14 @@ impl core::fmt::Display for Gap {
                 write!(f, "whether the member {name:?} of inherent impl {impl_:?} is unstable under a feature this crate does not turn on (rustc's `eval_stability`): {why}")
             }
             Gap::Ask(refused) => write!(f, "{refused}"),
+            Gap::InferredOutputCycle { owner, callee } => write!(
+                f,
+                "cycle (E0391) inferring return/error type `_` between {owner:?} and {callee:?}; add an explicit return or error type to break the cycle"
+            ),
+            Gap::InferredOutputFailed { item, why } => write!(
+                f,
+                "could not infer return/error type `_` for {item:?}: {why}"
+            ),
         }
     }
 }
@@ -302,7 +325,7 @@ pub(super) fn ctor_world<'n, S: NamesSource<'n>, T>(
     };
     let Some(module) = keys.library_in(names, at) else { return Err(refused) };
     let spell = Spelling::fixed();
-    let blocks = super::block_traits::BlockTraits::module(store.tys.alloc());
+    let blocks = super::block_traits::BlockTraits::module(store.work_alloc());
     let self_ = SelfTy::None;
     let world = BodyWorld {
         names,
@@ -385,7 +408,7 @@ impl<'w, 'n, S: NamesSource<'n>> BodyWorld<'w, 'n, S> {
         }
         if let Some(seeds) = self.store.seeds {
             let _cost = super::tables::cost::Cost::enter_want(self.store.cost, w);
-            let filed = seeds.seed(self.store, self.keys, w, self.store.tys.alloc());
+            let filed = seeds.seed(self.store, self.keys, w, self.store.work_alloc());
             if matches!(filed, Ok(Seeded::Filed)) && self.store.made(w) {
                 self.store.imported.set(self.store.imported.get() + 1);
                 return Err(Missing);
@@ -421,7 +444,7 @@ impl<'w, 'n, S: NamesSource<'n>> BodyWorld<'w, 'n, S> {
         let made = match fill {
             Fill::Impls(trait_, shape, seen) => trait_question(self.names, &mut heads, b, trait_, shape, seen, BuildOrder::AsAsked),
             Fill::Inherent(shape, name) => inherent_question(self.names, &mut heads, b, shape, name, BuildOrder::AsAsked),
-            Fill::Store(_) => return self.fill(fill),
+            Fill::Store(_) | Fill::InferredOutput(_) | Fill::ConstHolds(..) | Fill::DefineOpaque(_) => return self.fill(fill),
         };
         // Under the one ask, an import its question met refused is the question's gap.
         if let Some(refused) = self.store.asks.take_refused() {
@@ -637,6 +660,12 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
 impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     fn fn_sig_once(&self, item: ItemKey) -> Fetch<Option<FnSig<'_>>> {
         if let Some(f) = self.store.fns.get(&item) {
+            if item != self.owner && self.store.has_unresolved_inferred_output(item) {
+                if self.store.inferring_output_stack.scan_for(&item).is_some() {
+                    return self.gap(Gap::InferredOutputCycle { owner: self.owner, callee: item });
+                }
+                return self.fill(Fill::InferredOutput(item));
+            }
             return Ok(Some(FnSig {
                 parent_count: f.parent,
                 own_count: f.own,
@@ -646,7 +675,7 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
                 c_variadic: f.c_variadic,
                 legacy_const_generics: &f.legacy_const_generics,
                 inputs: &f.inputs,
-                output: f.output,
+                output: self.store.fn_output(item).unwrap_or(f.output),
                 types: self.types(),
             }));
         }
@@ -704,11 +733,15 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
         // The default of a provided trait fn's `impl Trait` (super::rpitit `Twin`): its
         // source's bounds with itself as `Self`, filed with its trait's rows.
         if let Some(twin) = self.store.rpitit_defaults.get(&item) {
-            return Ok(Predicates { clauses: &twin.clauses, types: self.types() });
+            return Ok(Predicates { clauses: &twin.clauses, types: self.types(), regions: None });
         }
         match self.store.preds.get(&item) {
             Some(p) if !p.conds.is_empty() => self.gap(Gap::WhereConst(item)),
-            Some(p) => Ok(Predicates { clauses: &p.clauses, types: self.types() }),
+            Some(p) => Ok(Predicates {
+                clauses: &p.clauses,
+                types: self.types(),
+                regions: self.store.regions.made(item).map(|r| r as &dyn tc::region_facts::HeadRegionRead),
+            }),
             // A trait's associated type whose bounds were refused (`Store::trait_members`
             // files the refusal under the type's own key): the gap names it and why.
             None if self.store.fn_gaps.contains_key(&item) => {
@@ -752,13 +785,16 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     /// `#[allow_internal_unstable(..)]` at the call (rustc's `span.allows_unstable`) and a
     /// module's own `#[unstable]` over an unmarked impl.
     fn member_unstable_once(&self, container: ItemKey, name: Name) -> Fetch<bool> {
-        let Some(i) = self.store.impls.get(&container) else {
+        let Some((i, provisional)) = self.store.impl_or_provisional(container) else {
             return match self.detail(container) {
                 Some(ItemDetail::Impl) => self.want(container),
                 // No inherent impl: the question was asked of no member, nothing marks it.
                 _ => Ok(false),
             };
         };
+        if provisional {
+            self.store.note_provisional_read(container);
+        }
         let Some((_, u)) = i.unstable.iter().find(|(n, _)| *n == name) else { return Ok(false) };
         let gap = |why: &'static str| self.gap(Gap::MemberStability { impl_: container, name, why });
         let home = self.keys.library_in(self.names, container).and_then(|k| self.names.crate_of(k));
@@ -784,37 +820,55 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     }
 
     fn member_visible_once(&self, container: ItemKey, name: Name) -> Fetch<bool> {
-        let Some(i) = self.store.impls.get(&container) else {
+        use super::heads::MemberVis;
+        let gap = |why: &'static str| self.gap(Gap::MemberVisibility { impl_: container, name, why });
+        let (vis, home, is_adt) = if let Some((i, provisional)) = self.store.impl_or_provisional(container) {
+            if provisional {
+                self.store.note_provisional_read(container);
+            }
+            let Some(at) = i.fns.iter().position(|(n, _)| *n == name) else { return Ok(true) };
+            let Some(&vis) = i.fn_vis.get(at) else {
+                return gap("its impl's head holds no visibility for it");
+            };
+            if vis == MemberVis::Public {
+                return Ok(true);
+            }
+            let Some(frame) = self.store.member_frame(container) else {
+                return gap("its impl's head holds no members' frame (the impl's module)");
+            };
+            (vis, frame.module, false)
+        } else if let Some(adt) = self.store.adts.get(&container) {
+            let Some(at) = adt.fields.iter().position(|f| f.name == name) else { return Ok(true) };
+            let Some(&vis) = adt.field_vis.get(at) else { return Ok(true) };
+            if vis == MemberVis::Public {
+                return Ok(true);
+            }
+            let Some(lib) = self.keys.library_in(self.names, container) else { return Ok(true) };
+            let Some(home) = self.names.home_of(lib) else { return Ok(true) };
+            (vis, home, true)
+        } else {
             return match self.detail(container) {
-                Some(ItemDetail::Impl) => self.want(container),
-                // No inherent impl: the question was asked of no member, nothing hides it.
+                Some(ItemDetail::Impl | ItemDetail::Struct | ItemDetail::Union) => self.want(container),
+                // Neither an inherent impl nor a struct/union: nothing hides the member.
                 _ => Ok(true),
             };
         };
-        let Some(at) = i.fns.iter().position(|(n, _)| *n == name) else { return Ok(true) };
-        let Some(&vis) = i.fn_vis.get(at) else {
-            return self.gap(Gap::MemberVisibility { impl_: container, name, why: "its impl's head holds no visibility for it" });
-        };
-        use super::heads::MemberVis;
-        let gap = |why: &'static str| self.gap(Gap::MemberVisibility { impl_: container, name, why });
-        if vis == MemberVis::Public {
-            return Ok(true);
-        }
-        let Some(frame) = self.store.member_frame(container) else { return gap("its impl's head holds no members' frame (the impl's module)") };
-        let home = frame.module;
         let (Some(home_crate), Some(body_crate)) = (self.names.crate_of(home), self.names.crate_of(self.module)) else {
-            return gap("the names hold no crate for the impl's module or the body's");
+            return if is_adt { Ok(true) } else { gap("the names hold no crate for the impl's module or the body's") };
         };
         // `pub(crate)`, `pub(super)`, `pub(in ..)` and private never reach past the crate.
         if home_crate != body_crate {
             return Ok(false);
+        }
+        if home == self.module {
+            return Ok(true);
         }
         let up = match vis {
             MemberVis::Public | MemberVis::Crate => return Ok(true),
             MemberVis::SelfMod => 0,
             MemberVis::Super => 1,
             MemberVis::Up { up } => up,
-            // The ancestor `depth` modules below the root: the impl's module's own depth, less
+            // The ancestor `depth` modules below the root: the item's module's own depth, less
             // `depth`, steps up (the path names an ancestor: heads.rs `MemberVis::InCrate`).
             MemberVis::InCrate { depth } => {
                 let mut deepest = None;
@@ -822,29 +876,47 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
                     match self.names.written_module(home, n) {
                         Ok(_) => deepest = Some(n),
                         Err(e) if matches!(e.why, blaze_scope::names::Why::SuperPastRoot) => break,
-                        Err(_) => return gap("the impl's module chain is not held"),
+                        Err(_) => return if is_adt { Ok(true) } else { gap("the impl's module chain is not held") },
                     }
                 }
-                let Some(at_root) = deepest else { return gap("the impl's module chain is not held") };
+                let Some(at_root) = deepest else {
+                    return if is_adt { Ok(true) } else { gap("the impl's module chain is not held") };
+                };
                 match at_root.checked_sub(depth) {
                     Some(up) => up,
-                    None => return gap("its `pub(in crate::..)` path is deeper than the impl's module: no ancestor (rustc E0742)"),
+                    None => {
+                        return if is_adt {
+                            Ok(true)
+                        } else {
+                            gap("its `pub(in crate::..)` path is deeper than the impl's module: no ancestor (rustc E0742)")
+                        };
+                    }
                 }
             }
-            MemberVis::InPath => return gap("it is `pub(in path)` in a form other than `crate::..` or `super::..`, and the body is in the impl's crate"),
+            MemberVis::InPath => {
+                return if is_adt {
+                    Ok(true)
+                } else {
+                    gap("it is `pub(in path)` in a form other than `crate::..` or `super::..`, and the body is in the impl's crate")
+                };
+            }
         };
         let Ok(scope) = self.names.written_module(home, up) else {
-            return gap("the impl's module chain is not held (or `pub(super)` at the crate's root)");
+            return if is_adt {
+                Ok(true)
+            } else {
+                gap("the impl's module chain is not held (or `pub(super)` at the crate's root)")
+            };
         };
         for n in 0..=u8::MAX {
             match self.names.written_module(self.module, n) {
                 Ok(m) if m == scope => return Ok(true),
                 Ok(_) => {}
                 Err(e) if matches!(e.why, blaze_scope::names::Why::SuperPastRoot) => return Ok(false),
-                Err(_) => return gap("the body's module chain is not held"),
+                Err(_) => return if is_adt { Ok(true) } else { gap("the body's module chain is not held") },
             }
         }
-        gap("the body's module is deeper than 256 modules (rule 18)")
+        if is_adt { Ok(true) } else { gap("the body's module is deeper than 256 modules (rule 18)") }
     }
 
     fn adt_once(&self, item: ItemKey) -> Fetch<Option<tc::Adt<'_>>> {
@@ -886,15 +958,23 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     }
 
     fn impl_header_once(&self, item: ItemKey) -> Fetch<Option<ImplHeader<'_>>> {
-        if let Some(i) = self.store.impls.get(&item) {
+        if let Some((i, provisional)) = self.store.impl_or_provisional(item) {
+            if provisional {
+                self.store.note_provisional_read(item);
+            }
             // An impl of a trait with a fn returning `impl Trait`: that type's value
-            // here is a synthetic associated type's row (super::rpitit).
-            let assoc_types = match i.trait_ {
-                Some(trait_) => match self.rpitit_rows(trait_)? {
-                    Some(rows) => self.rpitit_retry(item, || super::rpitit::impl_assoc(self.store, item, i, rows))?,
+            // here is a synthetic associated type's row (super::rpitit). Skip rpitit
+            // caching while provisional so incomplete assoc types are never cached.
+            let assoc_types = if provisional {
+                &i.assoc[..]
+            } else {
+                match i.trait_ {
+                    Some(trait_) => match self.rpitit_rows(trait_)? {
+                        Some(rows) => self.rpitit_retry(item, || super::rpitit::impl_assoc(self.store, item, i, rows))?,
+                        None => &i.assoc[..],
+                    },
                     None => &i.assoc[..],
-                },
-                None => &i.assoc[..],
+                }
             };
             return Ok(Some(ImplHeader {
                 generics: i.generics,
@@ -904,6 +984,7 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
                 assoc_types,
                 types: self.types(),
                 polarity: i.polarity,
+                regions: self.store.regions.made(item).map(|r| r as &dyn tc::region_facts::HeadRegionRead),
             }));
         }
         match self.detail(item) {
@@ -923,7 +1004,10 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     }
 
     fn assoc_item_once(&self, container: ItemKey, name: Name) -> Fetch<Option<AssocItem>> {
-        if let Some(i) = self.store.impls.get(&container) {
+        if let Some((i, provisional)) = self.store.impl_or_provisional(container) {
+            if provisional {
+                self.store.note_provisional_read(container);
+            }
             // The fn's `self` from its text (`ImplHead::fn_self`): naming a member makes no
             // signature; `fn_sig` asks for it (`Want::MemberFn`) when the fn is used.
             if let Some(at) = i.fns.iter().position(|(n, _)| *n == name) {
@@ -979,7 +1063,12 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
 
     fn lang_item_once(&self, item: LangItem) -> Fetch<Option<ItemKey>> {
         match super::langs::find(self.index, self.resolver(), item) {
-            Ok(found) => Ok(found.map(checker_of)),
+            Ok(found) => {
+                if let Some(lib) = found {
+                    let _ = self.keys.item(lib);
+                }
+                Ok(found.map(checker_of))
+            }
             Err(why) => self.gap(Gap::Lang(item, why)),
         }
     }
@@ -987,6 +1076,7 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     fn lang_path_once(&self, item: LangItem) -> Fetch<Option<Def>> {
         let Some(name) = lang_name(item) else { return self.gap(Gap::Lang(item, "no `#[lang]` name is known for it")) };
         let Some(lib) = self.index.lang(name) else { return self.gap(Gap::Lang(item, "no item of the program's crates is `#[lang]` under its name")) };
+        let _ = self.keys.item(lib);
         match self.resolver().detail(lib) {
             Some(ItemDetail::Fn { .. }) => Ok(Some(Def::Fn(checker_of(lib)))),
             Some(ItemDetail::Struct) => Ok(Some(Def::Adt(checker_of(lib)))),
@@ -1008,7 +1098,11 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
                             }
                         }
                         Some(ItemDetail::Impl) => {
-                            let Some(i) = self.store.impls.get(&checker_of(owner)) else { return self.store_want(Want::Impl(owner)) };
+                            let ck = checker_of(owner);
+                            let Some((i, provisional)) = self.store.impl_or_provisional(ck) else { return self.store_want(Want::Impl(owner)) };
+                            if provisional {
+                                self.store.note_provisional_read(ck);
+                            }
                             match i.fns.iter().find(|(n, _)| *n == name) {
                                 Some(&(_, f)) => Ok(Some(Def::Fn(f))),
                                 None => self.gap(Gap::Lang(item, "the impl holds no fn of its `#[lang]` name")),
@@ -1058,6 +1152,9 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
             super::opaque_auto::HiddenAnswer::Known(h) => Ok(Some(h)),
             super::opaque_auto::HiddenAnswer::Opaque => Ok(None),
             super::opaque_auto::HiddenAnswer::NoneGiven => {
+                if matches!(self.reveal, super::opaque_auto::Reveal::All) {
+                    return self.fill(Fill::DefineOpaque(filed));
+                }
                 if super::tait::of_alias(ordinal) {
                     return self.gap(Gap::Hidden(super::opaque_auto::HiddenFail::AliasOpaque { opaque: item, alias: owner }));
                 }
@@ -1110,15 +1207,23 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     /// asked for as an ADT (rung x0-drop-11-zst-temporary: "a fn (asked for as an ADT)").
     fn attrs_once(&self, item: ItemKey) -> Fetch<TypeAttrs> {
         if let Some(a) = self.store.adts.get(&item) {
-            // `#[blaze::args]` (rule 83): the options-struct mark, from the made head or its record.
+            // `#[blaze::args]` (rule 83), `#[blaze::capability]`, and `#![blaze::sans_io]` marks.
             let args = if a.args { TypeAttrs::ARGS } else { 0 };
+            let capability = if a.capability { TypeAttrs::CAPABILITY } else { 0 };
+            let sans_io = if a.sans_io { TypeAttrs::SANS_IO } else { 0 };
+            let base = args | capability | sans_io;
             // `repr(packed)` in any form (`packed(N)`, `C, packed`): the layout's own fact
             // (`ReprAttrs::packed`), answered for the capture analysis (TypeAttrs::PACKED).
             let packed = if a.repr.packed.is_some() { TypeAttrs::PACKED } else { 0 };
+            let auto_copy = if a.kind == tc::AdtKind::Struct && self.store.is_auto_copy_pub(self.names, self.keys, item) {
+                TypeAttrs::AUTO_COPY_PUB
+            } else {
+                0
+            };
             return Ok(match a.kind {
-                tc::AdtKind::Enum => TypeAttrs(args).with_discr(super::heads::discr_ty(a.repr)),
-                tc::AdtKind::Struct if a.repr.simd => TypeAttrs(TypeAttrs::SIMD | args | packed),
-                _ => TypeAttrs(args | packed),
+                tc::AdtKind::Enum => TypeAttrs(base).with_discr(super::heads::discr_ty(a.repr)),
+                tc::AdtKind::Struct if a.repr.simd => TypeAttrs(TypeAttrs::SIMD | base | packed | auto_copy),
+                _ => TypeAttrs(base | packed | auto_copy),
             });
         }
         if let Some(f) = self.store.fns.get(&item) {
@@ -1162,7 +1267,20 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
         Ok(Some(TraitDef {
             generics: t.generics,
             flags: t.flags,
-            lang: self.index.lang_name_of(lib).and_then(trait_lang),
+            lang: self.index.lang_name_of(lib).and_then(trait_lang).or_else(|| {
+                if t.generics != 2 {
+                    return None;
+                }
+                let from_key = match self.store.from_trait.get() {
+                    Some(cached) => cached,
+                    None => {
+                        let found = super::langs::find(self.index, self.resolver(), LangItem::From).ok().flatten();
+                        self.store.from_trait.set(Some(found));
+                        found
+                    }
+                };
+                (from_key == Some(lib)).then_some(LangItem::From)
+            }),
             supertraits: &extra.supertraits,
             // With a synthetic associated type per `impl Trait` at a place of a fn's return type
             // (super::rpitit), after the written ones.
@@ -1191,14 +1309,37 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     }
 
     fn const_holds_once(&self, cond: ItemKey, args: &[PTy], types: PTys<'_>) -> Fetch<tc::ConstHolds> {
-        self.gap(Gap::BodyRecord(tc::Question::ConstHolds(cond, tc::ground_args_digest(args, types))))
+        let digest = tc::ground_args_digest(args, types);
+        if let Some(&ans) = self.store.where_const_answers.get(&(cond, digest)) {
+            return Ok(ans);
+        }
+        if self.store.maps.evaluating.get() > 0 {
+            return self.gap(Gap::BodyRecord(tc::Question::ConstHolds(cond, digest)));
+        }
+        let alloc = self.store.work_alloc();
+        let mut req_tys = blaze_typeck::PortableTys::new_in(alloc);
+        let Ok(list) = super::const_at::copy_ground(types, args, &mut req_tys, alloc) else {
+            return self.gap(Gap::BodyRecord(tc::Question::ConstHolds(cond, digest)));
+        };
+        let Ok(slice) = req_tys.view().list(list) else {
+            return self.gap(Gap::BodyRecord(tc::Question::ConstHolds(cond, digest)));
+        };
+        let mut copied = blaze_own::Vec::with_capacity_in(slice.len(), alloc);
+        copied.extend_from_slice(slice);
+        {
+            let mut pending = self.store.where_const_pending.borrow_mut();
+            if !pending.iter().any(|p| p.cond == cond && p.digest == digest) {
+                pending.push(super::heads::PendingConstHolds { cond, digest, tys: req_tys, args: copied });
+            }
+        }
+        self.fill(Fill::ConstHolds(cond, digest))
     }
 
     /// The item's const generic parameters as its head made them (`Maps::const_params`: a
     /// fn's with its container's first), by what the item is
     /// ([`super::by_origin::const_params_of`]): a head not made is wanted, never answered "no
     /// const parameters"; a kind with none to give is refused by name.
-    fn const_params_once(&self, item: ItemKey) -> Fetch<tc::ConstParams<'_>> {
+    pub(super) fn const_params_once(&self, item: ItemKey) -> Fetch<tc::ConstParams<'_>> {
         match super::by_origin::const_params_of(self.names, self.keys, self.store, item) {
             Ok(params) => Ok(tc::ConstParams { params, types: self.types() }),
             Err(u) => self.unmade(u),

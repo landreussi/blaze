@@ -192,8 +192,11 @@ pub(crate) enum Class {
     /// prints a `BORROWS_NOT_CHECKED` note (print.rs `finding`): one by one under `--each`, or
     /// always once the borrow check is trusted (`BORROWS_ARE_ERRORS`); counted always.
     Borrows = 5,
-    // 6 was `Under`, a body not checked under a shared cause: a noted finding of a
-    // `Kind::Grouped` rule now (module docs, D164), grouped by blaze_report::query.
+    /// A file no unit of its crate holds under its cfg (engine_body_plan.rs `Outside::lines`):
+    /// kept in the lines record and counted in the profile; silent by default so normal cfg-gated
+    /// modules do not spam `blaze check`/`blaze run`, and printed under `--verbose` / `-v` or
+    /// `--each`.
+    Outside = 6,
 }
 
 impl Class {
@@ -205,6 +208,7 @@ impl Class {
             3 => Some(Class::Head),
             4 => Some(Class::Told),
             5 => Some(Class::Borrows),
+            6 => Some(Class::Outside),
             _ => None,
         }
     }
@@ -223,9 +227,35 @@ impl fmt::Display for LinesError {
     }
 }
 
+/// One task's block of entries inside [`Lines`]: either borrowed straight from the previous
+/// request's mapped lines record (zero allocation and zero copy for standing rows) or owned in
+/// the request's arena when made or appended to this request.
+struct Block<'a> {
+    borrowed: &'a [u8],
+    owned: SVec<'a, u8>,
+}
+
+impl<'a> Block<'a> {
+    fn as_slice(&self) -> &[u8] {
+        if self.owned.is_empty() { self.borrowed } else { self.owned.as_slice() }
+    }
+
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    fn owned_mut(&mut self) -> &mut SVec<'a, u8> {
+        if !self.borrowed.is_empty() {
+            self.owned.extend_from_slice(self.borrowed);
+            self.borrowed = &[];
+        }
+        &mut self.owned
+    }
+}
+
 /// The blocks of one request, being made: each task's entries by name.
 pub(crate) struct Lines<'a> {
-    blocks: SMap<'a, Name, SVec<'a, u8>>,
+    blocks: SMap<'a, Name, Block<'a>>,
     alloc: SharedAlloc<'a>,
 }
 
@@ -244,7 +274,7 @@ impl<'a> Lines<'a> {
 
     fn block(&mut self, name: Name) -> &mut SVec<'a, u8> {
         let alloc = self.alloc;
-        self.blocks.entry(name).or_insert_with(|| SVec::new_in(alloc))
+        self.blocks.entry(name).or_insert_with(|| Block { borrowed: &[], owned: SVec::new_in(alloc) }).owned_mut()
     }
 
     /// A finding of `name`'s record: `path` for an outline's (placed at the file's start).
@@ -364,9 +394,16 @@ impl<'a> Lines<'a> {
         }
     }
 
-    /// A standing row's block, as the last record holds it.
-    pub(crate) fn keep(&mut self, name: Name, entries: &[u8]) {
-        self.block(name).extend_from_slice(entries);
+    /// A standing row's block, as the last record holds it (borrowed in place when `name` has no
+    /// entries yet: zero allocation and zero copy).
+    pub(crate) fn keep(&mut self, name: Name, entries: &'a [u8]) {
+        let alloc = self.alloc;
+        match self.blocks.get_mut(&name) {
+            Some(slot) => slot.owned_mut().extend_from_slice(entries),
+            None => {
+                self.blocks.insert(name, Block { borrowed: entries, owned: SVec::new_in(alloc) });
+            }
+        }
     }
 
     /// Of a standing row's block as the last record holds it, the entries that are a
@@ -375,15 +412,67 @@ impl<'a> Lines<'a> {
     /// `lines_of`: a target its features skip): the phase path makes it again from its walk,
     /// the ready path carries it from the last record, and the block's other entries stand with
     /// its row. Nothing is added for `name` when no entry is kept.
-    pub(crate) fn keep_split(&mut self, name: Name, entries: &[u8], told: bool) -> Result<usize, LinesError> {
+    pub(crate) fn keep_split(&mut self, name: Name, entries: &'a [u8], told: bool) -> Result<usize, LinesError> {
         let mut reader = Reader { bytes: entries, at: 0 };
         let mut kept = 0usize;
+        let mut total = 0usize;
+        while reader.at < entries.len() {
+            let is_told = matches!(entry(&mut reader)?, Entry::Note { class: Class::Told, .. });
+            total += 1;
+            if is_told == told {
+                kept += 1;
+            }
+        }
+        if kept == 0 {
+            return Ok(0);
+        }
+        if kept == total {
+            self.keep(name, entries);
+            return Ok(kept);
+        }
+        let mut reader = Reader { bytes: entries, at: 0 };
         while reader.at < entries.len() {
             let from = reader.at;
             let is_told = matches!(entry(&mut reader)?, Entry::Note { class: Class::Told, .. });
-            if is_told == told {
-                self.block(name).extend_from_slice(&entries[from..reader.at]);
+            if is_told == told
+                && let Some(slice) = entries.get(from..reader.at)
+            {
+                self.block(name).extend_from_slice(slice);
+            }
+        }
+        Ok(kept)
+    }
+
+    /// Of a standing row's block as the last record holds it, keep only entries whose finding
+    /// rule equals `rule` (`matching == true`) or every other entry (`matching == false`), in
+    /// order. Used to keep manifest task findings separate from tail-computed `UNUSED_DEPENDENCY`
+    /// warnings across incremental runs.
+    pub(crate) fn keep_split_rule(&mut self, name: Name, entries: &'a [u8], rule: u16, matching: bool) -> Result<usize, LinesError> {
+        let mut reader = Reader { bytes: entries, at: 0 };
+        let mut kept = 0usize;
+        let mut total = 0usize;
+        while reader.at < entries.len() {
+            let is_rule = matches!(entry(&mut reader)?, Entry::Finding { rule: r, .. } if r == rule);
+            total += 1;
+            if is_rule == matching {
                 kept += 1;
+            }
+        }
+        if kept == 0 {
+            return Ok(0);
+        }
+        if kept == total {
+            self.keep(name, entries);
+            return Ok(kept);
+        }
+        let mut reader = Reader { bytes: entries, at: 0 };
+        while reader.at < entries.len() {
+            let from = reader.at;
+            let is_rule = matches!(entry(&mut reader)?, Entry::Finding { rule: r, .. } if r == rule);
+            if is_rule == matching
+                && let Some(slice) = entries.get(from..reader.at)
+            {
+                self.block(name).extend_from_slice(slice);
             }
         }
         Ok(kept)
@@ -405,7 +494,9 @@ impl<'a> Lines<'a> {
     }
 
     fn encode(&self, placement: Option<ContentId>) -> (Key, SVec<'a, u8>) {
-        let mut out = SVec::new_in(self.alloc);
+        let header_bytes = if placement.is_some() { 36 } else { 4 };
+        let cap = header_bytes + 4 + self.blocks.values().map(|block| 1 + 32 + 4 + block.len()).sum::<usize>();
+        let mut out = SVec::with_capacity_in(cap, self.alloc);
         match placement {
             Some(id) => {
                 out.extend_from_slice(LINES_PLACED_MAGIC);
@@ -415,12 +506,46 @@ impl<'a> Lines<'a> {
         }
         word(&mut out, u32::try_from(self.blocks.len()).unwrap_or(u32::MAX));
         for (name, block) in self.blocks.iter() {
+            let bytes = block.as_slice();
             out.push(name.kind as u8);
             out.extend_from_slice(&name.subject.0);
-            word(&mut out, len_of(block));
-            out.extend_from_slice(block);
+            word(&mut out, len_of(bytes));
+            out.extend_from_slice(bytes);
+        }
+        // Selectively compress large (>= 4 KiB) `BEFB`/`BEFC` lines records into a `BZR1` fast-Zstd
+        // envelope when compressed output is strictly < 85% of raw size; small/incompressible
+        // records stay raw with zero framing overhead (rule 25: deterministic).
+        if let Ok(crate::store::record_codec::Encoded::Compressed(compressed)) =
+            crate::store::record_codec::encode_selective_in(out.as_slice(), self.alloc)
+        {
+            return (Key(ContentId::of(LINES_DOMAIN, &compressed)), compressed);
         }
         (Key(ContentId::of(LINES_DOMAIN, &out)), out)
+    }
+
+    /// Whether `self`'s blocks match the serialized `blocks u32 | per block` tail of a stored
+    /// lines record byte-for-byte, without allocating or hashing.
+    fn blocks_equal_encoded(&self, encoded_blocks: &[u8]) -> bool {
+        let mut reader = Reader { bytes: encoded_blocks, at: 0 };
+        let Ok(count) = reader.u32("the block count") else { return false };
+        if usize::try_from(count).ok() != Some(self.blocks.len()) {
+            return false;
+        }
+        for (name, block) in self.blocks.iter() {
+            let Ok(kind) = reader.byte("a block's kind") else { return false };
+            if Kind::from_u8(kind) != Some(name.kind) {
+                return false;
+            }
+            let Ok(subject) = reader.take(32, "a block's subject") else { return false };
+            if subject != name.subject.0 {
+                return false;
+            }
+            let Ok(stored) = reader.sized("a block's entries") else { return false };
+            if stored != block.as_slice() {
+                return false;
+            }
+        }
+        reader.at == encoded_blocks.len()
     }
 }
 
@@ -472,12 +597,13 @@ impl<'m> Last<'m, '_> {
     }
 }
 
-/// Whether `block` holds a [`Class::Told`] note (engine_check.rs `ready_setup`: a target its
-/// features skip has its note in the last record, which the ready path carries).
+/// Whether `block` holds a [`Class::Told`] or [`Class::Outside`] plan note (engine_check.rs
+/// `ready_setup` and `has_outside_notes`: a target its features skip or a cfg-excluded file has
+/// its note in the last record, which the ready path carries).
 pub(crate) fn has_told(block: &[u8]) -> Result<bool, LinesError> {
     let mut reader = Reader { bytes: block, at: 0 };
     while reader.at < block.len() {
-        if let Entry::Note { class: Class::Told, .. } = entry(&mut reader)? {
+        if let Entry::Note { class: Class::Told | Class::Outside, .. } = entry(&mut reader)? {
             return Ok(true);
         }
     }
@@ -656,8 +782,38 @@ fn entry<'m>(reader: &mut Reader<'m>) -> Result<Entry<'m>, LinesError> {
     }
 }
 
-/// The record `bytes`, every block and entry checked.
-pub(crate) fn decode<'m, 'a>(bytes: &'m [u8], alloc: SharedAlloc<'a>) -> Result<Last<'m, 'a>, LinesError> {
+/// The record `bytes` (raw `BEFB`/`BEFC` zero-copy, or `BZR1`-compressed decompressed into
+/// `frame`), every block and entry checked.
+pub(crate) fn decode_in_frame<'b, 'a>(bytes: &'b [u8], frame: &'b Frame, alloc: SharedAlloc<'a>) -> Result<Last<'b, 'a>, LinesError> {
+    let raw: &'b [u8] = match crate::store::record_codec::decode_if_envelope_in(
+        bytes,
+        crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
+        frame,
+    ) {
+        Ok(crate::store::record_codec::Decoded::Borrowed(raw)) => raw,
+        Ok(crate::store::record_codec::Decoded::Owned(decompressed)) => decompressed.into_bump_slice(),
+        Err(_) => return Err(LinesError { at: 0, what: "the BZR1 compressed lines envelope is damaged or refused" }),
+    };
+    decode_raw(raw, alloc)
+}
+
+/// The record `bytes` (raw `BEFB`/`BEFC` zero-copy, or `BZR1`-compressed), every block and entry
+/// checked. Prefer [`decode_in_frame`] on hot command paths so decompressed buffers are reclaimed
+/// with the command's frame.
+pub(crate) fn decode<'m>(bytes: &'m [u8], alloc: SharedAlloc<'static>) -> Result<Last<'m, 'static>, LinesError> {
+    let raw: &'m [u8] = match crate::store::record_codec::decode_if_envelope_in(
+        bytes,
+        crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
+        alloc,
+    ) {
+        Ok(crate::store::record_codec::Decoded::Borrowed(raw)) => raw,
+        Ok(crate::store::record_codec::Decoded::Owned(decompressed)) => decompressed.leak_static(),
+        Err(_) => return Err(LinesError { at: 0, what: "the BZR1 compressed lines envelope is damaged or refused" }),
+    };
+    decode_raw(raw, alloc)
+}
+
+fn decode_raw<'m, 'a>(bytes: &'m [u8], alloc: SharedAlloc<'a>) -> Result<Last<'m, 'a>, LinesError> {
     let mut reader = Reader { bytes, at: 0 };
     let placement = match reader.take(4, "the form")? {
         form if form == LINES_PLACED_MAGIC => Some(reader.digest("the placement facts")?),
@@ -1126,6 +1282,11 @@ fn print_with<'f, 'b, O: print::RenderOutput, F: Files<'f, O>, VF: ViewFold>(
                         // Printed grouped by reason (engine_head_notes.rs `print_grouped`).
                         Class::Head => tally.heads += 1,
                         Class::Told => print::note(cx, words, shown, frame, out)?,
+                        Class::Outside => {
+                            if shown.verbose || shown.each {
+                                print::note(cx, words, shown, frame, out)?;
+                            }
+                        }
                         // As the old path's `BORROWS_NOT_CHECKED` (print.rs `finding`): counted;
                         // drawn under `--each`, or always once borrows are errors.
                         Class::Borrows => {
@@ -1166,7 +1327,7 @@ fn print_with<'f, 'b, O: print::RenderOutput, F: Files<'f, O>, VF: ViewFold>(
                 // file as it is now (print.rs `Place::Own`), so a child that grew moves no key.
                 Entry::PlacedOwn { rule, start, end, path, chain, edition, words } => (rule, start, end, words, Some(work::held_str(path, frame)), print::Place::Own(chain, edition), words),
             };
-            let kept: &'f [u8] = Vec::from_slice_in(words, frame).leak();
+            let kept: &'f [u8] = frame.alloc_slice_copy(words);
             let at = prints.len();
             let at_item = match place {
                 print::Place::Chain(chain, _) => (1, chain),
@@ -1928,7 +2089,7 @@ fn texts_of<'f>(rows: &crate::sweep::Rows<'_>, frame: &'f Frame) -> Result<Texts
             continue;
         }
         let physical = crate::sweep::real_path(slot, row.flags, frame);
-        let path = core::str::from_utf8(physical.leak()).map_err(|_| CliError::Text { what: "a sweep row's path is not UTF-8" })?;
+        let path = core::str::from_utf8(physical.into_bump_slice()).map_err(|_| CliError::Text { what: "a sweep row's path is not UTF-8" })?;
         match texts.get(path).copied() {
             None => {
                 texts.insert(path, Some(row.id));
@@ -1941,6 +2102,95 @@ fn texts_of<'f>(rows: &crate::sweep::Rows<'_>, frame: &'f Frame) -> Result<Texts
         }
     }
     Ok(texts)
+}
+
+/// Extracts the source file path from the next entry in `reader`, skipping `NOTE`, `NOTED`, and
+/// `VIEW` entries without `blaze_report::finding::decode` or UTF-8 validation overhead while still
+/// checking tags and byte bounds.
+fn next_entry_path<'m>(reader: &mut Reader<'m>) -> Result<Option<&'m str>, LinesError> {
+    let tag = reader.byte("an entry's tag")?;
+    match tag {
+        NOTE => {
+            let at = reader.at;
+            Class::of_byte(reader.byte("a note's class")?).ok_or(LinesError { at, what: "a note's class is none of the six" })?;
+            let _ = reader.sized("a note's words")?;
+            Ok(None)
+        }
+        NOTED => {
+            let _ = reader.sized("a noted finding")?;
+            Ok(None)
+        }
+        VIEW => {
+            let at_kind = reader.at;
+            Kind::from_u8(reader.byte("a view's base kind")?).ok_or(LinesError { at: at_kind, what: "a view's base kind is no task kind" })?;
+            let _ = reader.take(32, "a view's base subject")?;
+            let at_place = reader.at;
+            let at = reader.u32("a view's place")?;
+            let units = reader.u32("a view's unit count")?;
+            if units < 2 || at >= units {
+                return Err(LinesError { at: at_place, what: "a view's place is not below its unit count, or the count is under two" });
+            }
+            for _ in 0..units {
+                let at_flag = reader.at;
+                if reader.byte("a view's unit flag")? > 1 {
+                    return Err(LinesError { at: at_flag, what: "a view's unit flag is neither 0 nor 1" });
+                }
+                let _ = reader.sized("a view's unit name")?;
+            }
+            Ok(None)
+        }
+        _ => {
+            reader.at -= 1;
+            match entry(reader)? {
+                Entry::Finding { path: Some(path), .. } => core::str::from_utf8(path)
+                    .map(Some)
+                    .map_err(|_| LinesError { at: reader.at, what: "a finding's path is not UTF-8" }),
+                Entry::Finding { rule, path: None, words, .. } => {
+                    if crate::names::placed(rule) && words.contains(&0x1F) {
+                        match crate::names::place_pieces(words) {
+                            Ok((Some((path, _, _)), _)) => Ok(Some(path)),
+                            Ok((None, _)) => Ok(None),
+                            Err(_) => Err(LinesError { at: reader.at, what: "a finding's place pieces are malformed" }),
+                        }
+                    } else {
+                        Ok(None)
+                    }
+                }
+                Entry::Placed { path, .. } | Entry::PlacedTokens { path, .. } | Entry::PlacedOwn { path, .. } => Ok(Some(path)),
+                Entry::Note { .. } | Entry::Noted { .. } | Entry::View(_) => Ok(None),
+            }
+        }
+    }
+}
+
+/// Observes every file path referenced by finding entries in `lines` using its unambiguous sweep
+/// digest from `texts` (populated lazily on the first referenced path). Returns `Ok(false)`
+/// (forcing a fallthrough to full rendering) if any entry fails to parse or any referenced path
+/// lacks a single unambiguous sweep digest.
+fn observe_standing_paths<'f>(
+    lines: &Lines<'_>,
+    rows: &crate::sweep::Rows<'_>,
+    texts: &mut Option<Texts<'f>>,
+    sources: &Sources<'f>,
+    frame: &'f Frame,
+) -> Result<bool, CliError> {
+    for (_, block) in lines.blocks() {
+        let mut reader = Reader { bytes: block, at: 0 };
+        while reader.at < block.len() {
+            let Ok(path) = next_entry_path(&mut reader) else { return Ok(false) };
+            if let Some(path) = path {
+                let map = match texts {
+                    Some(map) => map,
+                    None => texts.insert(texts_of(rows, frame)?),
+                };
+                let Some(id) = map.get(path).copied().flatten() else {
+                    return Ok(false);
+                };
+                sources.observe_id(path, id)?;
+            }
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -2269,7 +2519,7 @@ impl<'m, 'f> ViewSlot<'m, 'f> {
         if let Some(tally) = self.certified(cx, lines, shown, frame, out)? {
             return Ok(Ok(tally));
         }
-        match crate::engine_answer::load_lines(cx, store, lines, alloc)? {
+        match crate::engine_answer::load_lines_in(cx, store, lines, frame, alloc)? {
             Ok(last) => Ok(Ok(self.new_view(cx, root, store, lines, &last, shown, alloc, frame, out)?)),
             Err(why) => Ok(Err(why)),
         }
@@ -2307,14 +2557,80 @@ impl<'m, 'f> ViewSlot<'m, 'f> {
             let (binding, bytes) = lines.record_for(sources.digest());
             return Ok((tally, (binding.key, bytes)));
         }
-        // Each file's text digest from this command's sweep, before the printer's own reads
-        // are added to the rows: a section of a file whose text stands is not read.
-        let texts = texts_of(rows, frame)?;
+        // Each file's text digest from this command's sweep, built lazily only if a finding path
+        // is observed (skipping the full sweep-row scan on standing replays with zero file paths).
+        let mut texts: Option<Texts<'f>> = None;
+        if let Some(replayed) = self.try_replay_standing(cx, store, lines, &mut texts, rows, shown, frame, out)? {
+            return Ok(replayed);
+        }
+        let texts = match texts {
+            Some(map) => map,
+            None => texts_of(rows, frame)?,
+        };
         let (tally, pending) = self.draw_with(cx, root, lines.blocks(), &sources, shown, lines.alloc, frame, Some(&texts))?;
         sources.cover(rows)?;
         let (binding, bytes) = lines.record_for(pending.placement);
         self.publish(cx, store, binding, pending, out)?;
         Ok((tally, (binding.key, bytes)))
+    }
+
+    /// Zero-rewrite fast path when every semantic block and every observed file's text digest
+    /// match the previous rendered view: skips re-rendering, re-encoding, re-hashing, and
+    /// re-putting both the `BEFC` lines record and the `BER3` view record, transferring the cached
+    /// stdout in one bulk write and returning empty bytes so `engine_answer::save` reuses the
+    /// already-stored `lines` key.
+    #[expect(clippy::too_many_arguments, reason = "render's fast path takes the same handles as render")]
+    fn try_replay_standing<'a, D: blaze_core::Driver, S: crate::store::Sharing>(
+        &self,
+        cx: &Cx,
+        store: &mut crate::store::CommandStore<'m, '_, D, S>,
+        lines: &Lines<'a>,
+        texts: &mut Option<Texts<'f>>,
+        rows: &mut crate::sweep::Rows<'_>,
+        shown: &mut print::Shown<'f>,
+        frame: &'f Frame,
+        out: &Out,
+    ) -> Result<Option<(Tally, (Key, SVec<'a, u8>))>, CliError> {
+        const RENEW_SENTINEL: blaze_toolchain::ToolchainId = blaze_toolchain::ToolchainId(*b"blaze-renew-no-toolchain-root\0\0\0");
+        if !key_reads_text() {
+            return Ok(None);
+        }
+        let presentation = shown.presentation(&self.tools);
+        let Some(old) = self.previous.filter(|old| !old.old_form && old.presentation == presentation) else {
+            return Ok(None);
+        };
+        let Some(held) = crate::store::Store::get(store, cx, old.lines)? else {
+            return Ok(None);
+        };
+        let Ok(decoded) = crate::store::record_codec::decode_if_envelope_in(
+            held.bytes,
+            crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
+            frame,
+        ) else {
+            return Ok(None);
+        };
+        let raw = decoded.as_slice();
+        if !raw.starts_with(LINES_PLACED_MAGIC) || raw.len() < 40 {
+            return Ok(None);
+        }
+        if !lines.blocks_equal_encoded(&raw[36..]) {
+            return Ok(None);
+        }
+        let mut old_placement = [0u8; 32];
+        old_placement.copy_from_slice(&raw[4..36]);
+        let fast_sources = Sources::new(frame);
+        if !observe_standing_paths(lines, rows, texts, &fast_sources, frame)? {
+            return Ok(None);
+        }
+        if fast_sources.digest() != ContentId(old_placement) {
+            return Ok(None);
+        }
+        fast_sources.cover(rows)?;
+        let tally = old.replay(shown, frame, |bytes| Ok(out.write_all(cx, bytes)?))?;
+        if !self.name.is_empty() {
+            store.renew(&[self.name.as_str()], RENEW_SENTINEL)?;
+        }
+        Ok(Some((tally, (old.lines, SVec::new_in(lines.alloc)))))
     }
 
     /// Prepare the current answer's immutable rendering. The fresh printer
@@ -2606,5 +2922,204 @@ mod section_tests {
         let before_under = Rendered::open(b"BER2 and whatever followed").expect("BER2 opens as older");
         assert!(before_under.old_form, "a BER2 view, a note a body under a refused call, is an older form");
         assert!(Rendered::open(b"BERX").is_err(), "an unknown form is refused by name");
+    }
+
+    /// Zero-rewrite fast path (`ViewSlot::try_replay_standing`): when findings, notes, and
+    /// observed files' text digests are unchanged on an edit, `ViewSlot::render` reuses the prior
+    /// `lines` key with 0 bytes returned and 0 CAS puts, producing byte-for-byte identical stdout;
+    /// moving a line in a file with a finding or adding/removing a finding or note invalidates the
+    /// fast path and emits the exact updated diagnostic.
+    #[test]
+    fn unchanged_findings_reuse_prior_lines_with_zero_puts_and_changes_invalidate() {
+        use crate::store::Store as _;
+        use blaze_cas::plain::Settings;
+        let io = Io::simulated(SimWorld::new(37, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
+        let fs = io.need_fs().expect("filesystem");
+        let root = fs.root();
+        let home = crate::store::Home::of(&cx, &fs, Some("/h")).expect("home");
+        let clock = io.need_clock().expect("clock");
+        let out = io.need_out().expect("stdout");
+        let err = io.need_err().expect("stderr");
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.shared();
+        let frame = cx.frame();
+        let erased = blaze_own::Erased::new(frame);
+        let lent = home.open_store(&Settings::default(), crate::store::Facts { boot: Some(1), nonce: 37 }, heap.alloc()).expect("store");
+        let mut store = crate::store::CommandStore::new(&cx, &lent, false, 0, None, clock.clone(), &err, erased.handle()).expect("command store");
+        let answer_name = "engine.zero_rewrite.test";
+
+        let make_rows = |files: &[(&str, &str)]| {
+            let mut rows = crate::sweep::Rows::new_in(frame);
+            for &(path, text) in files {
+                root.publish(&cx, &Path::new(path).unwrap(), Content::bytes(text.as_bytes()), Durable::No).unwrap();
+                rows.push(crate::sweep::LeafKind::Slot, 0, path, None, ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes()));
+            }
+            rows
+        };
+        let make_lines = |include_b: bool, note: Option<&[u8]>| {
+            let mut lines = Lines::new_in(alloc);
+            let (at_a, chain_a) = place_of(A_RS, "true", frame);
+            lines.placed_tokens(Name::new(Kind::BodyCheck, ContentId([1; 32])), crate::work::SYNTAX, at_a, b"a.rs", chain_a, EDITION, b"expected an expression");
+            if include_b {
+                let (at_b, chain_b) = place_of(B_RS, "'c'", frame);
+                lines.placed_tokens(Name::new(Kind::BodyCheck, ContentId([2; 32])), crate::work::SYNTAX, at_b, b"b.rs", chain_b, EDITION, b"expected an expression");
+            }
+            if let Some(words) = note {
+                lines.note(Name::file(b"a.rs"), Class::Unchecked, words);
+            }
+            lines
+        };
+
+        // 1. Cold render: publishes both lines and rendered view records.
+        let mut rows1 = make_rows(&[("a.rs", A_RS), ("b.rs", B_RS), ("clean.rs", "fn clean() {}\n")]);
+        let lines1 = make_lines(true, None);
+        let mut shown1 = print::Shown::new(Caps::LINES, View::Agent, "/ws", frame);
+        shown1.output_only = true;
+        let out_at1 = io.script(|h| h.out.len()).unwrap();
+        let slot1 = ViewSlot::load(&lent, answer_name, false, &shown1, &tools(), frame).unwrap();
+        let (tally1, (key1, bytes1)) = slot1.render(&cx, &root, &mut store, &lines1, &mut rows1, &mut shown1, frame, &out).unwrap();
+        let stdout1 = io.script(|h| h.out[out_at1..].to_vec()).unwrap();
+        assert!(!bytes1.is_empty(), "cold render encodes the BEFC lines record");
+        assert!(matches!(tally1.rendering, Rendering::Published { .. }), "cold render publishes a new view");
+        store.put(&cx, key1, &bytes1).unwrap();
+        store.pin("engine.zero_rewrite.test.lines", &[key1]).unwrap();
+        lent.commit().unwrap();
+
+        // 2. Edit a clean file (no findings in `clean.rs`, findings & observed files unchanged):
+        //    zero-rewrite fast path hits -> same lines key, empty bytes, 0 CAS puts, identical stdout!
+        let mut rows2 = make_rows(&[("a.rs", A_RS), ("b.rs", B_RS), ("clean.rs", "fn clean() { let _ = 1; }\n")]);
+        let lines2 = make_lines(true, None);
+        let mut shown2 = print::Shown::new(Caps::LINES, View::Agent, "/ws", frame);
+        shown2.output_only = true;
+        let copied_before = lent.put_tally().copied;
+        let out_at2 = io.script(|h| h.out.len()).unwrap();
+        let slot2 = ViewSlot::load(&lent, answer_name, false, &shown2, &tools(), frame).unwrap();
+        let (tally2, (key2, bytes2)) = slot2.render(&cx, &root, &mut store, &lines2, &mut rows2, &mut shown2, frame, &out).unwrap();
+        let stdout2 = io.script(|h| h.out[out_at2..].to_vec()).unwrap();
+        assert_eq!(key2, key1, "unchanged findings reuse the exact prior lines key");
+        assert!(bytes2.is_empty(), "zero-rewrite fast path returns 0 bytes to put");
+        assert_eq!(lent.put_tally().copied, copied_before, "zero-rewrite fast path copies 0 records into CAS");
+        assert_eq!(lent.uncommitted_bytes(), 0, "zero-rewrite fast path leaves 0 uncommitted bytes");
+        assert_eq!(stdout2, stdout1, "replayed stdout matches byte-for-byte");
+        assert!(matches!(tally2.rendering, Rendering::Replayed { .. }), "fast path reports Rendering::Replayed");
+        assert_eq!((tally2.listed, shown2.counts.errors), (tally1.listed, shown1.counts.errors));
+
+        // 3. Edit `a.rs` above its error (semantic blocks identical, placement digest moved):
+        //    must invalidate fast path and output the updated line number!
+        let mut rows3 = make_rows(&[("a.rs", A_RS_EDITED), ("b.rs", B_RS), ("clean.rs", "fn clean() { let _ = 1; }\n")]);
+        let lines3 = make_lines(true, None);
+        let mut shown3 = print::Shown::new(Caps::LINES, View::Agent, "/ws", frame);
+        shown3.output_only = true;
+        let out_at3 = io.script(|h| h.out.len()).unwrap();
+        let slot3 = ViewSlot::load(&lent, answer_name, false, &shown3, &tools(), frame).unwrap();
+        let (tally3, (key3, bytes3)) = slot3.render(&cx, &root, &mut store, &lines3, &mut rows3, &mut shown3, frame, &out).unwrap();
+        let stdout3 = io.script(|h| h.out[out_at3..].to_vec()).unwrap();
+        let text3 = core::str::from_utf8(&stdout3).unwrap();
+        assert_ne!(key3, key1, "moved line placement changes the BEFC lines key");
+        assert!(!bytes3.is_empty(), "invalidated placement re-encodes lines");
+        assert!(matches!(tally3.rendering, Rendering::Published { .. }), "moved placement publishes new view");
+        assert!(text3.contains(&line_col("a.rs", A_RS_EDITED, "true")), "outputs updated line number: {text3}");
+        assert!(!text3.contains(&line_col("a.rs", A_RS, "true")), "does not replay stale line number: {text3}");
+        store.put(&cx, key3, &bytes3).unwrap();
+        store.pin("engine.zero_rewrite.test.lines", &[key3]).unwrap();
+        lent.commit().unwrap();
+
+        // 4. Introducing a note invalidates the fast path and outputs the new note.
+        let mut rows4 = make_rows(&[("a.rs", A_RS_EDITED), ("b.rs", B_RS), ("clean.rs", "fn clean() { let _ = 1; }\n")]);
+        let lines4 = make_lines(true, Some(b"new unchecked note"));
+        let mut shown4 = print::Shown::new(Caps::LINES, View::Agent, "/ws", frame);
+        shown4.output_only = true;
+        let out_at4 = io.script(|h| h.out.len()).unwrap();
+        let slot4 = ViewSlot::load(&lent, answer_name, false, &shown4, &tools(), frame).unwrap();
+        let (tally4, (key4, bytes4)) = slot4.render(&cx, &root, &mut store, &lines4, &mut rows4, &mut shown4, frame, &out).unwrap();
+        let stdout4 = io.script(|h| h.out[out_at4..].to_vec()).unwrap();
+        let text4 = core::str::from_utf8(&stdout4).unwrap();
+        assert_ne!(key4, key3, "added note changes the lines key");
+        assert!(!bytes4.is_empty(), "added note re-encodes lines");
+        assert_eq!(tally4.unchecked, 1, "added note is counted");
+        assert!(text4.contains("new unchecked note"), "added note is printed: {text4}");
+        store.put(&cx, key4, &bytes4).unwrap();
+        store.pin("engine.zero_rewrite.test.lines", &[key4]).unwrap();
+        lent.commit().unwrap();
+
+        // 5. Removing a finding (`b.rs`) invalidates the fast path and drops `b.rs` from output.
+        let mut rows5 = make_rows(&[("a.rs", A_RS_EDITED), ("b.rs", B_RS), ("clean.rs", "fn clean() { let _ = 1; }\n")]);
+        let lines5 = make_lines(false, Some(b"new unchecked note"));
+        let mut shown5 = print::Shown::new(Caps::LINES, View::Agent, "/ws", frame);
+        shown5.output_only = true;
+        let out_at5 = io.script(|h| h.out.len()).unwrap();
+        let slot5 = ViewSlot::load(&lent, answer_name, false, &shown5, &tools(), frame).unwrap();
+        let (tally5, (key5, bytes5)) = slot5.render(&cx, &root, &mut store, &lines5, &mut rows5, &mut shown5, frame, &out).unwrap();
+        let stdout5 = io.script(|h| h.out[out_at5..].to_vec()).unwrap();
+        let text5 = core::str::from_utf8(&stdout5).unwrap();
+        assert_ne!(key5, key4, "removed finding changes the lines key");
+        assert!(!bytes5.is_empty(), "removed finding re-encodes lines");
+        assert_eq!(tally5.listed, 1, "only a.rs finding remains");
+        assert!(!text5.contains("b.rs"), "removed finding is no longer printed: {text5}");
+    }
+
+    /// Selective `BZR1` compression for `Lines` (`BEFB`/`BEFC`): small records (< 4 KiB) stay
+    /// raw zero-copy with `BEFB`/`BEFC` magic; large compressible records (>= 4 KiB) compress
+    /// deterministically into `BZR1`, round-trip block-for-block through both `decode_in_frame`
+    /// and `decode`, and refuse bit-flips and truncation with typed `LinesError`.
+    #[test]
+    fn lines_bzr1_selective_compression_round_trips_and_refuses_bit_flips() {
+        let frame = Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("test frame");
+        let alloc = blaze_own::testing::heap().shared();
+
+        // 1. Small record (< 4 KiB): stays raw BEFB/BEFC with zero envelope overhead.
+        let mut small = Lines::new_in(alloc);
+        let one = Name::new(Kind::BodyCheck, ContentId::of("bzr1 small", b"one"));
+        small.note(one, Class::Told, b"small body note");
+        let (small_key, small_bytes) = small.record();
+        assert!(!crate::store::record_codec::is_envelope(&small_bytes), "small Lines record stays raw");
+        assert!(small_bytes.starts_with(LINES_MAGIC), "small Lines record starts with BEFB");
+        assert_eq!(small.record().0, small_key, "small Lines key is deterministic");
+        let small_last = decode_in_frame(&small_bytes, &frame, alloc).expect("decode small in frame");
+        assert!(small_last.blocks().eq(small.blocks()));
+
+        // 2. Large compressible record (>= 4 KiB): compresses into BZR1 for both BEFB and BEFC.
+        let mut big = Lines::new_in(alloc);
+        for i in 0u32..160 {
+            let name = Name::new(Kind::BodyCheck, ContentId::of("bzr1 big", &i.to_le_bytes()));
+            big.note(name, Class::Unchecked, b"body not checked: repeated diagnostic payload for zstd compression verification");
+        }
+        let (key_befb, bytes_befb) = big.record();
+        let (key_befb2, bytes_befb2) = big.record();
+        assert_eq!((key_befb, bytes_befb.as_slice()), (key_befb2, bytes_befb2.as_slice()), "BZR1 BEFB encoding is deterministic");
+        assert!(crate::store::record_codec::is_envelope(&bytes_befb), "large BEFB Lines record must compress into BZR1");
+        // 160 unique 32-byte BLAKE3 digests = 5,120 incompressible bytes; the ~13 KiB diagnostic
+        // text compresses to ~300 bytes (~3.3x overall).
+        assert!(bytes_befb.len() < 6500, "expected strong compression on repetitive Lines record, got {} bytes", bytes_befb.len());
+
+        let decoded_frame = decode_in_frame(&bytes_befb, &frame, alloc).expect("decode_in_frame BZR1 BEFB");
+        assert!(decoded_frame.blocks().eq(big.blocks()), "decode_in_frame round-trips every block");
+        let decoded_static = decode(&bytes_befb, alloc).expect("decode BZR1 BEFB");
+        assert!(decoded_static.blocks().eq(big.blocks()), "decode round-trips every block");
+
+        let placement = ContentId([0x42; 32]);
+        let (placed, bytes_befc) = big.record_for(placement);
+        assert!(crate::store::record_codec::is_envelope(&bytes_befc), "large BEFC Lines record must compress into BZR1");
+        let decoded_befc = decode_in_frame(&bytes_befc, &frame, alloc).expect("decode_in_frame BZR1 BEFC");
+        assert_eq!(decoded_befc.placement, Some(placement), "BEFC placement digest survives BZR1 round-trip");
+        assert!(decoded_befc.blocks().eq(big.blocks()), "BEFC blocks survive BZR1 round-trip");
+        assert_eq!(big.record_for(placement).0.key, placed.key, "BZR1 BEFC key is deterministic");
+
+        // 3. Bit-flip corruption and truncation are refused loudly with typed LinesError.
+        for &flip_at in &[5usize, 6, 12, bytes_befb.len() / 2, bytes_befb.len() - 1] {
+            let mut corrupted = bytes_befb.as_slice().to_vec();
+            corrupted[flip_at] ^= 0x5A;
+            assert!(
+                decode_in_frame(&corrupted, &frame, alloc).is_err(),
+                "bit-flip at byte {flip_at} must be refused by decode_in_frame"
+            );
+            assert!(
+                decode(&corrupted, alloc).is_err(),
+                "bit-flip at byte {flip_at} must be refused by decode"
+            );
+        }
+        let truncated = &bytes_befb[..bytes_befb.len() - 4];
+        assert!(decode_in_frame(truncated, &frame, alloc).is_err(), "truncated BZR1 Lines record must be refused");
     }
 }

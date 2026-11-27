@@ -15,7 +15,9 @@
 //! type and every impl's binding alike, so they agree without asking for the item's key; the
 //! cache maps it back for `Facts::assoc` and for `TypeCtx::view`.
 
-use blaze_hash::HashMap;
+use core::cell::{Cell, RefCell};
+
+use blaze_hash::{FixedState, HashMap, Map, MapOpts};
 use blaze_own::{Alloc, Vec};
 use blaze_solve::facts::{
     AdtDef, AdtFlags, AssocDef, AssocKind, AssocTy, ConstHolds, Facts, Fetch, FnSigDef, ImplAssoc, ImplFlags, ImplHeader,
@@ -31,6 +33,8 @@ use crate::error::{CheckError, Malformed, Stop};
 use crate::hash::{ContentHash, StableHasher};
 use crate::ids::{FloatTy, IntTy, ItemKey, LangItem, Mutbl, Name, UintTy};
 use crate::portable::{PNode, PTy, PTys};
+use crate::region_facts::HeadRegionRead;
+use crate::regions::{Arity, MOST_REGION_STEPS, Region, region_arity};
 use crate::world::{AdtKind, PClause, Question, Reads, Shape, World};
 
 mod item_bounds;
@@ -54,11 +58,16 @@ struct Span {
 
 impl Span {
     fn of<T>(v: &[T], start: usize) -> Span {
-        Span { start: start as u32, len: (v.len() - start) as u32 }
+        Span {
+            start: u32::try_from(start).unwrap_or(u32::MAX),
+            len: u32::try_from(v.len().saturating_sub(start)).unwrap_or(u32::MAX),
+        }
     }
 
     fn get<T>(self, v: &[T]) -> &[T] {
-        &v[self.start as usize..(self.start + self.len) as usize]
+        let start = usize::try_from(self.start).unwrap_or(usize::MAX);
+        let end = usize::try_from(self.start.saturating_add(self.len)).unwrap_or(usize::MAX);
+        v.get(start..end).unwrap_or(&[])
     }
 }
 
@@ -68,7 +77,21 @@ struct Por {
     lists: Span,
 }
 
-#[derive(Clone, Copy)]
+/// Whether checker key `d` (first 16 bytes of `blaze_id::ItemKey`, big-endian) carries the
+/// `INNER` bit (`0x80` on byte 8), marking an item declared inside a body. Body-local entries
+/// are never persisted across bodies in a stretch-reused [`FactCache`].
+fn is_inner_def(d: u128) -> bool {
+    d.to_be_bytes()[8] & 0x80 != 0
+}
+
+fn shape_is_body_local(shape: SShape) -> bool {
+    match shape {
+        SShape::Closure(_) | SShape::Coroutine(_) => true,
+        SShape::Adt(d) | SShape::Foreign(d) | SShape::FnDef(d) | SShape::Dynamic(d) => is_inner_def(d.0),
+        _ => false,
+    }
+}
+
 struct TraitRow {
     flags: STraitFlags,
     generics: u32,
@@ -80,21 +103,26 @@ struct TraitRow {
     item_bounds: Span,
     por: Por,
     digest: u64,
+    reads: Span,
+    touched_gen: Cell<u32>,
+    reusable: bool,
 }
 
-#[derive(Clone, Copy)]
 struct ImplRow {
     generics: u32,
     polarity: ImplPolarity,
     trait_: SDef,
     args: SList,
     wheres: Span,
+    where_bounds: Span,
     assoc: Span,
     por: Por,
     digest: u64,
+    reads: Span,
+    touched_gen: Cell<u32>,
+    reusable: bool,
 }
 
-#[derive(Clone, Copy)]
 struct AdtRow {
     flags: AdtFlags,
     generics: u32,
@@ -105,9 +133,10 @@ struct AdtRow {
     wheres: Span,
     por: Por,
     digest: u64,
+    reads: Span,
+    touched_gen: Cell<u32>,
 }
 
-#[derive(Clone, Copy)]
 struct SigRow {
     generics: u32,
     /// `FnSigDef`'s flags: `UNSAFE` and `NOT_FN_ABI` from the fn's header.
@@ -115,6 +144,56 @@ struct SigRow {
     io: SList,
     por: Por,
     digest: u64,
+    reads: Span,
+    touched_gen: Cell<u32>,
+}
+
+struct AssocRow {
+    def: AssocDef,
+    reads: Span,
+    touched_gen: Cell<u32>,
+}
+
+struct ImplsRow {
+    span: Span,
+    digest: u64,
+    reads: Span,
+    touched_gen: Cell<u32>,
+}
+
+struct LangRow {
+    def: Option<SDef>,
+    reads: Span,
+    touched_gen: Cell<u32>,
+}
+
+/// Key inserted into a persistent [`FactCache`] table during one body round, paired with
+/// whether it is sound to retain across bodies on a clean commit.
+#[derive(Clone, Copy)]
+enum AddedKey {
+    Trait(u128),
+    Impls(u128, SShape),
+    Header(u128),
+    Adt(u128),
+    Sig(u128),
+    Assoc(u128),
+    Lang(Lang),
+}
+
+#[derive(Clone, Copy, Default)]
+struct RoundSnap {
+    nodes: usize,
+    lists: usize,
+    preds: usize,
+    where_bounds: usize,
+    assoc_tys: usize,
+    impl_assoc: usize,
+    fields: usize,
+    variants: usize,
+    impl_defs: usize,
+    impl_columns: usize,
+    cached_reads: usize,
+    erased: Option<STy>,
 }
 
 #[derive(Clone, Copy)]
@@ -168,26 +247,55 @@ pub struct FactCache<'a> {
     nodes: Vec<K, Alloc<'a>>,
     lists: Vec<STy, Alloc<'a>>,
     preds: Vec<Pred, Alloc<'a>>,
+    where_bounds: Vec<u32, Alloc<'a>>,
     assoc_tys: Vec<AssocTy, Alloc<'a>>,
     impl_assoc: Vec<ImplAssoc, Alloc<'a>>,
     fields: Vec<STy, Alloc<'a>>,
     variants: Vec<(u32, u32), Alloc<'a>>,
     impl_defs: Vec<SDef, Alloc<'a>>,
     traits: HashMap<u128, TraitRow, Alloc<'a>>,
-    impls: HashMap<(u128, SShape), (Span, u64), Alloc<'a>>,
+    impls: HashMap<(u128, SShape), ImplsRow, Alloc<'a>>,
     /// Each `impls` entry's fingerprint columns (blaze-solve prefilter.rs): their start in
     /// `impl_columns` and their stride; `WIDTH * stride` bytes.
     impl_cols: HashMap<(u128, SShape), (u32, u32), Alloc<'a>>,
     impl_columns: Vec<u8, Alloc<'a>>,
+    /// Header-only fingerprint columns for `instance::holding_owning` when a bucket has `> 16`
+    /// impls and was not already filled via `fill_one(SQ::Impls)` (reads headers only, never
+    /// predicates). Cleared per body round in `clear_ephemeral`.
+    header_cols: Map<(ItemKey, Shape), (Span, u32, u32), FixedState, Alloc<'a>>,
+    header_impl_defs: Vec<ItemKey, Alloc<'a>>,
+    header_columns: Vec<u8, Alloc<'a>>,
+    /// Scratch survivor indices for `prefilter::filter` (reused across calls).
+    survivor_scratch: Vec<u32, Alloc<'a>>,
     /// One bucket's fingerprints and columns while it is filled (reused).
     fp_scratch: Vec<Fingerprint, Alloc<'a>>,
     col_scratch: Vec<u8, Alloc<'a>>,
     headers: HashMap<u128, ImplRow, Alloc<'a>>,
     adts: HashMap<u128, AdtRow, Alloc<'a>>,
     sigs: HashMap<u128, SigRow, Alloc<'a>>,
-    assoc: HashMap<u128, AssocDef, Alloc<'a>>,
+    assoc: HashMap<u128, AssocRow, Alloc<'a>>,
     opaques: HashMap<u128, OpaqueRow, Alloc<'a>>,
-    lang: HashMap<Lang, Option<SDef>, Alloc<'a>>,
+    lang: HashMap<Lang, LangRow, Alloc<'a>>,
+    /// Compact side-log of `(Question, digest)` reads captured when each reusable entry was
+    /// first populated, replayed into later bodies' `ReadList` on cache hits.
+    cached_reads: Vec<(Question, u64), Alloc<'a>>,
+    /// `cached_reads` spans touched via `Facts::*` hits during the current reused body round.
+    body_replayed: RefCell<Vec<Span, Alloc<'a>>>,
+    /// Whether this cache is being reused across consecutive bodies in a stretch.
+    reuse_mode: bool,
+    /// Monotonic per-body-round generation; an entry with `touched_gen == body_gen` has
+    /// already recorded/replayed its reads in the active round.
+    body_gen: u32,
+    /// Current body's owner key (whose own `FnSig` is excluded from cross-body persistence
+    /// because an unresolved inferred output is answered differently inside its own body).
+    reuse_owner: ItemKey,
+    /// Persistent arena lengths at the start of the active reused round, for rollback on
+    /// holed, gapped, or errored rounds.
+    round_snap: RoundSnap,
+    /// Keys inserted during the active reused round and whether each is eligible to persist.
+    round_added: Vec<(AddedKey, bool), Alloc<'a>>,
+    /// Body-local `assoc_def` keys inserted into `self.names` during the active round.
+    round_inner_names: Vec<u128, Alloc<'a>>,
     /// `assoc_def(trait, name)` back to its trait and name.
     pub names: HashMap<u128, (ItemKey, Name), Alloc<'a>>,
     /// Each closure and async block an opaque's hidden type holds ([`Self::body_terms`]), by
@@ -333,6 +441,8 @@ pub fn shape(s: SShape) -> Shape {
         SShape::Str => Shape::Str,
         SShape::Never => Shape::Never,
         SShape::Tuple(n) => Shape::Tuple(n),
+        SShape::Record(s, n) => Shape::Record(s, n),
+        SShape::Union(n) => Shape::Union(n),
         SShape::Ref(x) => Shape::Ref(m(x)),
         SShape::Ptr(x) => Shape::Ptr(m(x)),
         SShape::Array => Shape::Array,
@@ -348,6 +458,60 @@ pub fn shape(s: SShape) -> Shape {
         SShape::AnyFloat => Shape::AnyFloat,
         SShape::Blanket => Shape::Param,
     }
+}
+
+/// Inverse of [`shape`] for shapes that have a single `SShape` bucket in `FactCache::impls`.
+fn sshape(s: Shape) -> Option<SShape> {
+    use blaze_solve::term::{FloatTy as SF, IntTy as SI, UintTy as SU};
+    let m = |m: Mutbl| match m {
+        Mutbl::Not => SMutbl::Not,
+        Mutbl::Mut => SMutbl::Mut,
+    };
+    Some(match s {
+        Shape::Bool => SShape::Bool,
+        Shape::Char => SShape::Char,
+        Shape::Int(i) => SShape::Int(match i {
+            IntTy::Isize => SI::Isize,
+            IntTy::I8 => SI::I8,
+            IntTy::I16 => SI::I16,
+            IntTy::I32 => SI::I32,
+            IntTy::I64 => SI::I64,
+            IntTy::I128 => SI::I128,
+        }),
+        Shape::Uint(u) => SShape::Uint(match u {
+            UintTy::Usize => SU::Usize,
+            UintTy::U8 => SU::U8,
+            UintTy::U16 => SU::U16,
+            UintTy::U32 => SU::U32,
+            UintTy::U64 => SU::U64,
+            UintTy::U128 => SU::U128,
+        }),
+        Shape::Float(f) => SShape::Float(match f {
+            FloatTy::F16 => SF::F16,
+            FloatTy::F32 => SF::F32,
+            FloatTy::F64 => SF::F64,
+            FloatTy::F128 => SF::F128,
+        }),
+        Shape::Str => SShape::Str,
+        Shape::Never => SShape::Never,
+        Shape::Tuple(n) => SShape::Tuple(n),
+        Shape::Record(s, n) => SShape::Record(s, n),
+        Shape::Union(n) => SShape::Union(n),
+        Shape::Ref(x) => SShape::Ref(m(x)),
+        Shape::Ptr(x) => SShape::Ptr(m(x)),
+        Shape::Array => SShape::Array,
+        Shape::Slice => SShape::Slice,
+        Shape::Pat => SShape::Pat,
+        Shape::Adt(k) => SShape::Adt(SDef(k.0)),
+        Shape::Foreign(k) => SShape::Foreign(SDef(k.0)),
+        Shape::FnDef(k) => SShape::FnDef(SDef(k.0)),
+        Shape::FnPtr(n) => SShape::FnPtr(n),
+        Shape::Dynamic(d) => SShape::Dynamic(SDef(d.map_or(0, |k| k.0))),
+        Shape::AnyInt => SShape::AnyInt,
+        Shape::AnyFloat => SShape::AnyFloat,
+        Shape::Param => SShape::Blanket,
+        Shape::Closure | Shape::Opaque(_) => return None,
+    })
 }
 
 /// typeck's lang item of the solver's.
@@ -388,12 +552,16 @@ pub fn lang_item(l: Lang) -> LangItem {
         Lang::AsyncFnOnceOutput => LangItem::AsyncFnOnceOutput,
         Lang::CallOnceFuture => LangItem::CallOnceFuture,
         Lang::CallRefFuture => LangItem::CallRefFuture,
+        Lang::From => LangItem::From,
+        Lang::Enum => LangItem::Enum,
+        Lang::UnitEnum => LangItem::UnitEnum,
+        Lang::TryAsDyn => LangItem::TryAsDyn,
     }
 }
 
 /// The solver's lang item of typeck's, for the ones the solver knows.
 fn solver_lang(l: LangItem) -> Option<Lang> {
-    const ALL: [Lang; 35] = [
+    const ALL: [Lang; 39] = [
         Lang::Sized,
         Lang::MetaSized,
         Lang::PointeeSized,
@@ -429,6 +597,10 @@ fn solver_lang(l: LangItem) -> Option<Lang> {
         Lang::AsyncFnOnceOutput,
         Lang::CallOnceFuture,
         Lang::CallRefFuture,
+        Lang::From,
+        Lang::Enum,
+        Lang::UnitEnum,
+        Lang::TryAsDyn,
     ];
     ALL.into_iter().find(|&s| lang_item(s) == l)
 }
@@ -440,6 +612,7 @@ impl<'a> FactCache<'a> {
             nodes: Vec::new_in(alloc),
             lists: Vec::new_in(alloc),
             preds: Vec::new_in(alloc),
+            where_bounds: Vec::new_in(alloc),
             assoc_tys: Vec::new_in(alloc),
             impl_assoc: Vec::new_in(alloc),
             fields: Vec::new_in(alloc),
@@ -449,6 +622,10 @@ impl<'a> FactCache<'a> {
             impls: HashMap::new_in(alloc),
             impl_cols: HashMap::new_in(alloc),
             impl_columns: Vec::new_in(alloc),
+            header_cols: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
+            header_impl_defs: Vec::new_in(alloc),
+            header_columns: Vec::new_in(alloc),
+            survivor_scratch: Vec::new_in(alloc),
             fp_scratch: Vec::new_in(alloc),
             col_scratch: Vec::new_in(alloc),
             headers: HashMap::new_in(alloc),
@@ -457,6 +634,14 @@ impl<'a> FactCache<'a> {
             assoc: HashMap::new_in(alloc),
             opaques: HashMap::new_in(alloc),
             lang: HashMap::new_in(alloc),
+            cached_reads: Vec::new_in(alloc),
+            body_replayed: RefCell::new(Vec::new_in(alloc)),
+            reuse_mode: false,
+            body_gen: 0,
+            reuse_owner: ItemKey(0),
+            round_snap: RoundSnap::default(),
+            round_added: Vec::new_in(alloc),
+            round_inner_names: Vec::new_in(alloc),
             names: HashMap::new_in(alloc),
             hidden_bodies: HashMap::new_in(alloc),
             retries: 0,
@@ -474,6 +659,189 @@ impl<'a> FactCache<'a> {
             first_impl_only: false,
             #[cfg(test)]
             drop_const_clauses: false,
+        }
+    }
+
+    /// Begins a single-threaded stretch-reused body round for `owner`: clears all per-body
+    /// ephemeral state (`opaques`, `hidden_bodies`, `holds`, `specializes`, `conditions`,
+    /// `seen`, `memo`, replay log), snapshots persistent arenas for rollback on holed/gapped/
+    /// errored rounds, and advances `body_gen` so cached entries touched during this round
+    /// replay their exact `(Question, digest)` side-logs into `ReadList`.
+    pub fn begin_body_reuse(&mut self, owner: ItemKey) {
+        self.clear_ephemeral();
+        self.reuse_mode = true;
+        self.reuse_owner = owner;
+        if self.body_gen == u32::MAX {
+            for r in self.traits.values() {
+                r.touched_gen.set(0);
+            }
+            for r in self.impls.values() {
+                r.touched_gen.set(0);
+            }
+            for r in self.headers.values() {
+                r.touched_gen.set(0);
+            }
+            for r in self.adts.values() {
+                r.touched_gen.set(0);
+            }
+            for r in self.sigs.values() {
+                r.touched_gen.set(0);
+            }
+            for r in self.assoc.values() {
+                r.touched_gen.set(0);
+            }
+            for r in self.lang.values() {
+                r.touched_gen.set(0);
+            }
+            self.body_gen = 1;
+        } else {
+            self.body_gen += 1;
+        }
+        self.round_snap = RoundSnap {
+            nodes: self.nodes.len(),
+            lists: self.lists.len(),
+            preds: self.preds.len(),
+            where_bounds: self.where_bounds.len(),
+            assoc_tys: self.assoc_tys.len(),
+            impl_assoc: self.impl_assoc.len(),
+            fields: self.fields.len(),
+            variants: self.variants.len(),
+            impl_defs: self.impl_defs.len(),
+            impl_columns: self.impl_columns.len(),
+            cached_reads: self.cached_reads.len(),
+            erased: self.erased,
+        };
+    }
+
+    /// Finishes the active stretch-reused body round:
+    /// - When `commit` is `true`, retains all eligible cross-body entries added this round and
+    ///   evicts non-reusable entries (body-local `INNER`, `owner`'s own `FnSig`, `where const`
+    ///   impls, `dyn_compat::Gap` traits, or any holed entry).
+    /// - When `commit` is `false` (holed round, gapped round, error, or unwind), rolls back
+    ///   every entry and persistent arena append made during this round.
+    /// Always clears all per-body ephemeral state (`opaques`, `holds`, `specializes`, etc.).
+    pub fn end_body_reuse(&mut self, commit: bool) {
+        if !commit {
+            let n = self.round_added.len();
+            for i in 0..n {
+                if let Some(&(key, _)) = self.round_added.get(i) {
+                    self.remove_added(key);
+                }
+            }
+            self.nodes.truncate(self.round_snap.nodes);
+            self.lists.truncate(self.round_snap.lists);
+            self.preds.truncate(self.round_snap.preds);
+            self.where_bounds.truncate(self.round_snap.where_bounds);
+            self.assoc_tys.truncate(self.round_snap.assoc_tys);
+            self.impl_assoc.truncate(self.round_snap.impl_assoc);
+            self.fields.truncate(self.round_snap.fields);
+            self.variants.truncate(self.round_snap.variants);
+            self.impl_defs.truncate(self.round_snap.impl_defs);
+            self.impl_columns.truncate(self.round_snap.impl_columns);
+            self.cached_reads.truncate(self.round_snap.cached_reads);
+            self.erased = self.round_snap.erased;
+        } else {
+            let n = self.round_added.len();
+            for i in 0..n {
+                if let Some(&(key, reusable)) = self.round_added.get(i)
+                    && !reusable
+                {
+                    self.remove_added(key);
+                }
+            }
+        }
+        self.clear_ephemeral();
+    }
+
+    fn remove_added(&mut self, key: AddedKey) {
+        match key {
+            AddedKey::Trait(k) => {
+                self.traits.remove(&k);
+            }
+            AddedKey::Impls(d, s) => {
+                self.impls.remove(&(d, s));
+                self.impl_cols.remove(&(d, s));
+            }
+            AddedKey::Header(k) => {
+                self.headers.remove(&k);
+            }
+            AddedKey::Adt(k) => {
+                self.adts.remove(&k);
+            }
+            AddedKey::Sig(k) => {
+                self.sigs.remove(&k);
+            }
+            AddedKey::Assoc(d) => {
+                self.assoc.remove(&d);
+            }
+            AddedKey::Lang(l) => {
+                self.lang.remove(&l);
+            }
+        }
+    }
+
+    fn clear_ephemeral(&mut self) {
+        self.opaques.clear();
+        self.hidden_bodies.clear();
+        self.holds.clear();
+        self.cond_args.clear();
+        self.specializes.clear();
+        self.conditions.clear();
+        self.seen.clear();
+        self.memo.clear();
+        self.body_replayed.get_mut().clear();
+        self.round_added.clear();
+        for &d in self.round_inner_names.iter() {
+            self.names.remove(&d);
+        }
+        self.round_inner_names.clear();
+        self.header_cols.clear();
+        self.header_impl_defs.clear();
+        self.header_columns.clear();
+        self.retries = 0;
+        self.counted = Converted::default();
+    }
+
+    /// Whether any cached entry from an earlier body was hit during the active round.
+    pub fn has_replayed_reads(&self) -> bool {
+        !self.body_replayed.borrow().is_empty()
+    }
+
+    /// Visits every `(Question, digest)` read replayed from stretch-cached entries touched
+    /// during the active round.
+    pub fn for_each_replayed_read(&self, mut f: impl FnMut(Question, u64)) {
+        let spans = self.body_replayed.borrow();
+        for &span in spans.iter() {
+            for &(q, d) in span.get(&self.cached_reads) {
+                f(q, d);
+            }
+        }
+    }
+
+    /// Marks `touched_gen` for the active reused round and appends `reads` to the replay log
+    /// if this entry came from an earlier body and has not yet been touched in this round.
+    #[inline]
+    fn touch_row(&self, touched_gen: &Cell<u32>, reads: Span) {
+        if self.reuse_mode && touched_gen.get() != self.body_gen {
+            touched_gen.set(self.body_gen);
+            if reads.len > 0 {
+                self.body_replayed.borrow_mut().push(reads);
+            }
+        }
+    }
+
+    fn record_name(&mut self, d: u128, trait_: ItemKey, name: Name) {
+        let inserted = self.names.insert(d, (trait_, name)).is_none();
+        if inserted && self.reuse_mode && is_inner_def(trait_.0) {
+            self.round_inner_names.push(d);
+        }
+    }
+
+    fn push_read<W: World>(&mut self, reads: &Reads<'_, '_, W>, q: Question, reusable: &mut bool) {
+        if let Some(d) = reads.recorded(q) {
+            self.cached_reads.push((q, d));
+        } else {
+            *reusable = false;
         }
     }
 
@@ -577,6 +945,8 @@ impl<'a> FactCache<'a> {
         match q {
             SQ::TraitDef(d) => self.fill_trait(ItemKey(d.0), reads),
             SQ::Impls(d, s) => {
+                let holes_before = reads.hole_count();
+                let reads_start = self.cached_reads.len();
                 let got = reads.impls_of(ItemKey(d.0), shape(s))?;
                 #[cfg(test)]
                 let got = if self.first_impl_only { &got[..got.len().min(1)] } else { got };
@@ -585,9 +955,18 @@ impl<'a> FactCache<'a> {
                 // the header (prefilter.rs, trait_goals.rs `assemble_impls`). The solver read
                 // every one of them before this too (each was a candidate), one stop and
                 // retry per header; now the bucket's are read in this one fill.
+                let mut all_headers_reusable = true;
                 for k in got {
-                    if !self.headers.contains_key(&k.0) {
+                    if let Some(existing) = self.headers.get(&k.0) {
+                        self.touch_row(&existing.touched_gen, existing.reads);
+                        all_headers_reusable &= existing.reusable && !is_inner_def(k.0);
+                    } else {
                         self.fill_impl(*k, reads)?;
+                        if let Some(added) = self.headers.get(&k.0) {
+                            all_headers_reusable &= added.reusable && !is_inner_def(k.0);
+                        } else {
+                            all_headers_reusable = false;
+                        }
                     }
                 }
                 let start = self.impl_defs.len();
@@ -604,10 +983,29 @@ impl<'a> FactCache<'a> {
                     self.fp_scratch.push(fp);
                 }
                 let stride = prefilter::columns_of(&self.fp_scratch, &mut self.col_scratch);
-                let at = self.impl_columns.len() as u32;
+                let at = u32::try_from(self.impl_columns.len()).unwrap_or(u32::MAX);
                 self.impl_columns.extend_from_slice(&self.col_scratch);
+                let mut reusable = self.reuse_mode
+                    && all_headers_reusable
+                    && !is_inner_def(d.0)
+                    && !shape_is_body_local(s)
+                    && reads.hole_count() == holes_before;
+                let row_reads = if self.reuse_mode {
+                    let s_start = self.cached_reads.len();
+                    self.push_read(reads, Question::ImplsOf(ItemKey(d.0), shape(s)), &mut reusable);
+                    Span::of(&self.cached_reads, s_start)
+                } else {
+                    let _ = reads_start;
+                    Span::default()
+                };
                 self.impl_cols.insert((d.0, s), (at, stride));
-                self.impls.insert((d.0, s), (span, h.finish()));
+                self.impls.insert(
+                    (d.0, s),
+                    ImplsRow { span, digest: h.finish(), reads: row_reads, touched_gen: Cell::new(self.body_gen) },
+                );
+                if self.reuse_mode {
+                    self.round_added.push((AddedKey::Impls(d.0, s), reusable));
+                }
                 Ok(())
             }
             SQ::ImplHeader(d) => self.fill_impl(ItemKey(d.0), reads),
@@ -616,25 +1014,51 @@ impl<'a> FactCache<'a> {
             SQ::Assoc(d) => self.fill_assoc(d.0, reads),
             SQ::Opaque(d) | SQ::OpaqueHidden(d) => self.fill_opaque(ItemKey(d.0), reads),
             SQ::Lang(l) => {
+                let holes_before = reads.hole_count();
+                let reads_start = self.cached_reads.len();
+                let mut reusable = self.reuse_mode;
                 let item = lang_item(l);
                 let got = match item.assoc_type() {
                     // An associated type: `assoc_def(trait, name)`, the one name the solver
                     // gives it (`LangItem::assoc_type`), once the trait is seen to declare it.
-                    Some((trait_lang, name)) => match reads.lang_item(trait_lang)? {
-                        Some(t) => {
-                            let name = Name::of(name);
-                            match reads.assoc_item(t, name)? {
-                                Some(a) if a.kind == crate::world::AssocKind::Type => Some(ItemKey(assoc_def(t, name))),
-                                _ => {
-                                    return Err(CheckError::Malformed(Malformed::NoRecord(Question::AssocItem(t, name))).into());
+                    Some((trait_lang, name)) => {
+                        let found_trait = reads.lang_item(trait_lang)?;
+                        if self.reuse_mode {
+                            self.push_read(reads, Question::Lang(trait_lang), &mut reusable);
+                        }
+                        match found_trait {
+                            Some(t) => {
+                                let name = Name::of(name);
+                                let assoc = reads.assoc_item(t, name)?;
+                                if self.reuse_mode {
+                                    self.push_read(reads, Question::AssocItem(t, name), &mut reusable);
+                                }
+                                match assoc {
+                                    Some(a) if a.kind == crate::world::AssocKind::Type => Some(ItemKey(assoc_def(t, name))),
+                                    _ => {
+                                        return Err(CheckError::Malformed(Malformed::NoRecord(Question::AssocItem(t, name))).into());
+                                    }
                                 }
                             }
+                            None => None,
                         }
-                        None => None,
-                    },
-                    None => reads.lang_item(item)?,
+                    }
+                    None => {
+                        let got = reads.lang_item(item)?;
+                        if self.reuse_mode {
+                            self.push_read(reads, Question::Lang(item), &mut reusable);
+                        }
+                        got
+                    }
                 };
-                self.lang.insert(l, got.map(|k| SDef(k.0)));
+                if reads.hole_count() > holes_before || got.is_some_and(|k| is_inner_def(k.0)) {
+                    reusable = false;
+                }
+                let row_reads = if self.reuse_mode { Span::of(&self.cached_reads, reads_start) } else { Span::default() };
+                self.lang.insert(l, LangRow { def: got.map(|k| SDef(k.0)), reads: row_reads, touched_gen: Cell::new(self.body_gen) });
+                if self.reuse_mode {
+                    self.round_added.push((AddedKey::Lang(l), reusable));
+                }
                 Ok(())
             }
             // Coherence's question; a body's check runs in analysis mode, which never asks it.
@@ -750,6 +1174,8 @@ impl<'a> FactCache<'a> {
                 PNode::Str => K::Str,
                 PNode::Never => K::Never,
                 PNode::Tuple(l) => K::Tuple(list(l)?),
+                PNode::Record(schema, l) => K::Record(schema.0, list(l)?),
+                PNode::Union(l) => K::Union(list(l)?),
                 PNode::Ref(m, p) => K::Ref(STy(erased), ty(p)?, mutbl(m)),
                 PNode::Ptr(m, p) => K::RawPtr(ty(p)?, mutbl(m)),
                 PNode::Array(e, n) => K::Array(ty(e)?, ty(n)?),
@@ -774,7 +1200,9 @@ impl<'a> FactCache<'a> {
                 }
                 PNode::Alias { trait_, name, args } => {
                     let d = assoc_def(trait_, name);
-                    self.names.insert(d, (trait_, name));
+                    if self.names.insert(d, (trait_, name)).is_none() && self.reuse_mode && is_inner_def(trait_.0) {
+                        self.round_inner_names.push(d);
+                    }
                     K::Alias(Rigid::No, SAlias::Projection, SDef(d), list(args)?)
                 }
                 PNode::Opaque(k, l) => K::Alias(Rigid::No, SAlias::Opaque, SDef(k.0), list(l)?),
@@ -783,7 +1211,9 @@ impl<'a> FactCache<'a> {
                 PNode::ExTrait(k, l) => K::ExTrait(SDef(k.0), list(l)?),
                 PNode::ExProj { trait_, name, args, term } => {
                     let d = assoc_def(trait_, name);
-                    self.names.insert(d, (trait_, name));
+                    if self.names.insert(d, (trait_, name)).is_none() && self.reuse_mode && is_inner_def(trait_.0) {
+                        self.round_inner_names.push(d);
+                    }
                     K::ExProj(SDef(d), list(args)?, ty(term)?)
                 }
                 PNode::ExAuto(k) => K::ExAuto(SDef(k.0)),
@@ -805,7 +1235,7 @@ impl<'a> FactCache<'a> {
                 }
                 PClause::Projection { trait_, args, name, term } => {
                     let d = assoc_def(trait_, name);
-                    self.names.insert(d, (trait_, name));
+                    self.record_name(d, trait_, name);
                     let args = self.list(c, args)?;
                     let term = self.ty(c, term)?;
                     let alias = self.nodes.len() as u32;
@@ -819,12 +1249,384 @@ impl<'a> FactCache<'a> {
                     }
                     Pred::ConstHolds { cond: SDef(cond.0), args: self.list(c, args)? }
                 }
+                PClause::ForFields { container, trait_, args } => Pred::ForFields {
+                    container: self.ty(c, container)?,
+                    trait_: SDef(trait_.0),
+                    args_after_self: self.list(c, args)?,
+                },
                 // Outlives clauses are the borrow checker's (D148); the checker takes them as true.
                 PClause::TypeOutlives { .. } | PClause::RegionOutlives { .. } => continue,
             };
             self.preds.push(p);
         }
         Ok(())
+    }
+
+    /// Whether a slot slice carries any region the trait solver distinguishes from erased
+    /// (`'static`, or a clause-bound `for<'a>` lifetime).
+    fn has_solver_region(slots: &[Region], binders: u32) -> bool {
+        slots.iter().any(|&r| {
+            r == Region::Static || (binders > 0 && matches!(r, Region::Late { binder: 0, var } if var < binders))
+        })
+    }
+
+    /// Converts one region slot to a solver region term at binder depth `depth`.
+    fn region_term(&mut self, r: Region, binders: u32, depth: u32, used_bound: &mut bool) -> STy {
+        match r {
+            Region::Static => {
+                let s = STy(self.nodes.len() as u32);
+                self.nodes.push(K::ReStatic);
+                s
+            }
+            Region::Late { binder: 0, var } if binders > 0 && var < binders => {
+                *used_bound = true;
+                let s = STy(self.nodes.len() as u32);
+                self.nodes.push(K::ReBound(depth, var));
+                s
+            }
+            _ => self.erased(),
+        }
+    }
+
+    /// Converts `root` with its pre-order region column `slots`, preserving `'static` and
+    /// `for<'a>` (`Late { binder: 0, var }`) on `Ref` and `Dynamic` nodes. Falls back to
+    /// `self.ty(c, root)` if no solver-relevant region appears or the column cannot be walked.
+    fn ty_with_regions(
+        &mut self,
+        c: Conv<'_>,
+        root: PTy,
+        slots: &[Region],
+        arity: &dyn Arity,
+        binders: u32,
+        used_bound: &mut bool,
+    ) -> Result<STy, Stop> {
+        if !Self::has_solver_region(slots, binders) {
+            return self.ty(c, root);
+        }
+        let mut pos = 0usize;
+        let mut budget = MOST_REGION_STEPS;
+        let mut local_bound = false;
+        if let Some(s) = self.ty_regions_rec(c, root, slots, &mut pos, arity, binders, 0, &mut budget, &mut local_bound)?
+            && pos == slots.len()
+        {
+            *used_bound |= local_bound;
+            return Ok(s);
+        }
+        self.ty(c, root)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ty_regions_rec(
+        &mut self,
+        c: Conv<'_>,
+        t: PTy,
+        slots: &[Region],
+        pos: &mut usize,
+        arity: &dyn Arity,
+        binders: u32,
+        depth: u32,
+        budget: &mut u32,
+        used_bound: &mut bool,
+    ) -> Result<Option<STy>, Stop> {
+        if *budget == 0 || depth > 128 {
+            return Ok(None);
+        }
+        *budget -= 1;
+        let node = c.t.node(t).map_err(Stop::from)?;
+        let Ok(own) = region_arity(t, node, arity) else {
+            return Ok(None);
+        };
+        let own_len = own as usize;
+        let Some(own_slots) = slots.get(*pos..pos.saturating_add(own_len)) else {
+            return Ok(None);
+        };
+        *pos += own_len;
+
+        let k = match node {
+            PNode::Ref(m, p) => {
+                let Some(&r) = own_slots.first() else { return Ok(None) };
+                let r = self.region_term(r, binders, depth, used_bound);
+                let Some(p) = self.ty_regions_rec(c, p, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::Ref(r, p, mutbl(m))
+            }
+            PNode::Dynamic(l) => {
+                let Some(&r) = own_slots.first() else { return Ok(None) };
+                let r = self.region_term(r, binders, depth, used_bound);
+                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::Dynamic(l, r)
+            }
+            PNode::Ptr(m, p) => {
+                let Some(p) = self.ty_regions_rec(c, p, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::RawPtr(p, mutbl(m))
+            }
+            PNode::Slice(e) => {
+                let Some(e) = self.ty_regions_rec(c, e, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::Slice(e)
+            }
+            PNode::Array(e, n) => {
+                let Some(e) = self.ty_regions_rec(c, e, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                let n = self.ty(c, n)?;
+                K::Array(e, n)
+            }
+            PNode::Pat(b, l) => {
+                let Some(b) = self.ty_regions_rec(c, b, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                let l = self.list(c, l)?;
+                K::Pat(b, l)
+            }
+            PNode::Tuple(l) => {
+                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::Tuple(l)
+            }
+            PNode::Record(schema, l) => {
+                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::Record(schema.0, l)
+            }
+            PNode::Union(l) => {
+                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::Union(l)
+            }
+            PNode::Adt(k, l) => {
+                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::Adt(SDef(k.0), l)
+            }
+            PNode::FnDef(k, l) => {
+                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::FnDef(SDef(k.0), l)
+            }
+            PNode::FnPtr(l, h) => {
+                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth + 1, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::FnPtr(l, h)
+            }
+            PNode::Alias { trait_, name, args } => {
+                let d = assoc_def(trait_, name);
+                if self.names.insert(d, (trait_, name)).is_none() && self.reuse_mode && is_inner_def(trait_.0) {
+                    self.round_inner_names.push(d);
+                }
+                let Some(args) = self.ty_regions_list(c, args, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::Alias(Rigid::No, SAlias::Projection, SDef(d), args)
+            }
+            PNode::Opaque(k, l) => {
+                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::Alias(Rigid::No, SAlias::Opaque, SDef(k.0), l)
+            }
+            PNode::ExTrait(k, l) => {
+                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth + 1, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::ExTrait(SDef(k.0), l)
+            }
+            PNode::ExProj { trait_, name, args, term } => {
+                let d = assoc_def(trait_, name);
+                if self.names.insert(d, (trait_, name)).is_none() && self.reuse_mode && is_inner_def(trait_.0) {
+                    self.round_inner_names.push(d);
+                }
+                let Some(args) = self.ty_regions_list(c, args, slots, pos, arity, binders, depth + 1, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                let Some(term) = self.ty_regions_rec(c, term, slots, pos, arity, binders, depth + 1, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::ExProj(SDef(d), args, term)
+            }
+            PNode::Bool
+            | PNode::Char
+            | PNode::Int(_)
+            | PNode::Uint(_)
+            | PNode::Float(_)
+            | PNode::Str
+            | PNode::Never
+            | PNode::Param(_)
+            | PNode::ConstParam(_)
+            | PNode::ConstValue { .. }
+            | PNode::Error
+            | PNode::ExAuto(_)
+            | PNode::Foreign(_) => return Ok(Some(self.ty(c, t)?)),
+            PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } | PNode::Infer => {
+                return Err(CheckError::Malformed(Malformed::BodyTypeInRecord(c.q)).into());
+            }
+        };
+        let s = STy(self.nodes.len() as u32);
+        self.nodes.push(k);
+        Ok(Some(s))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ty_regions_list(
+        &mut self,
+        c: Conv<'_>,
+        l: crate::ids::List,
+        slots: &[Region],
+        pos: &mut usize,
+        arity: &dyn Arity,
+        binders: u32,
+        child_depth: u32,
+        budget: &mut u32,
+        used_bound: &mut bool,
+    ) -> Result<Option<SList>, Stop> {
+        let mut terms: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(l.len as usize, self.alloc);
+        for i in l.range() {
+            let p = c.t.list_slot(i as usize).ok_or(CheckError::Malformed(Malformed::NoRecord(c.q)))?;
+            let Some(st) = self.ty_regions_rec(c, p, slots, pos, arity, binders, child_depth, budget, used_bound)? else {
+                return Ok(None);
+            };
+            terms.push(st);
+        }
+        let start = self.lists.len() as u32;
+        self.lists.extend_from_slice(&terms);
+        Ok(Some(SList { start, len: l.len }))
+    }
+
+    /// Converts impl where-clauses with their optional `HeadRegionRead`, recording higher-ranked
+    /// binder counts into `self.where_bounds` when any clause emits `ReBound`.
+    fn clauses_with_regions(
+        &mut self,
+        cs: &[PClause],
+        regions: Option<&dyn HeadRegionRead>,
+        c: Conv<'_>,
+    ) -> Result<Span, Stop> {
+        let Some(hr) = regions else {
+            self.clauses(cs, c)?;
+            return Ok(Span::default());
+        };
+        let n_reg = hr.clause_count();
+        let mut any_interesting = false;
+        for i in 0..n_reg {
+            if let Some((_, binders, col)) = hr.clause(i)
+                && Self::has_solver_region(col.as_slice(), binders)
+            {
+                any_interesting = true;
+                break;
+            }
+        }
+        if !any_interesting {
+            self.clauses(cs, c)?;
+            return Ok(Span::default());
+        }
+        let arity = hr.arity();
+        let bounds_start = self.where_bounds.len();
+        let mut any_bound = false;
+        let mut reg_idx = 0usize;
+        for (nth, cl) in cs.iter().enumerate() {
+            let nth32 = nth as u32;
+            while reg_idx < n_reg {
+                match hr.clause(reg_idx) {
+                    Some((r_nth, _, _)) if r_nth < nth32 => reg_idx += 1,
+                    _ => break,
+                }
+            }
+            let clause_reg = match hr.clause(reg_idx) {
+                Some((r_nth, binders, col)) if r_nth == nth32 => Some((binders, col)),
+                _ => None,
+            };
+            let mut used_bound = false;
+            let mut bound = 0u32;
+            let p = match *cl {
+                PClause::Trait { trait_, args } => {
+                    let sargs = match clause_reg {
+                        Some((binders, col)) if Self::has_solver_region(col.as_slice(), binders) => {
+                            let mut terms: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(args.len as usize, self.alloc);
+                            for (k, i) in args.range().enumerate() {
+                                let p = c.t.list_slot(i as usize).ok_or(CheckError::Malformed(Malformed::NoRecord(c.q)))?;
+                                let st = match col.child(k as u32) {
+                                    Some(sl) => self.ty_with_regions(c, p, sl, arity, binders, &mut used_bound)?,
+                                    None => self.ty(c, p)?,
+                                };
+                                terms.push(st);
+                            }
+                            if used_bound {
+                                bound = binders;
+                                any_bound = true;
+                            }
+                            let start = self.lists.len() as u32;
+                            self.lists.extend_from_slice(&terms);
+                            SList { start, len: args.len }
+                        }
+                        _ => self.list(c, args)?,
+                    };
+                    Pred::Trait { trait_: SDef(trait_.0), args: sargs, polarity: Polarity::Positive }
+                }
+                PClause::Projection { trait_, args, name, term } => {
+                    let d = assoc_def(trait_, name);
+                    self.record_name(d, trait_, name);
+                    let (sargs, sterm) = match clause_reg {
+                        Some((binders, col)) if Self::has_solver_region(col.as_slice(), binders) => {
+                            let mut terms: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(args.len as usize, self.alloc);
+                            for (k, i) in args.range().enumerate() {
+                                let p = c.t.list_slot(i as usize).ok_or(CheckError::Malformed(Malformed::NoRecord(c.q)))?;
+                                let st = match col.child(k as u32) {
+                                    Some(sl) => self.ty_with_regions(c, p, sl, arity, binders, &mut used_bound)?,
+                                    None => self.ty(c, p)?,
+                                };
+                                terms.push(st);
+                            }
+                            let sterm = match col.child(args.len) {
+                                Some(sl) => self.ty_with_regions(c, term, sl, arity, binders, &mut used_bound)?,
+                                None => self.ty(c, term)?,
+                            };
+                            if used_bound {
+                                bound = binders;
+                                any_bound = true;
+                            }
+                            let start = self.lists.len() as u32;
+                            self.lists.extend_from_slice(&terms);
+                            (SList { start, len: args.len }, sterm)
+                        }
+                        _ => (self.list(c, args)?, self.ty(c, term)?),
+                    };
+                    let alias = self.nodes.len() as u32;
+                    self.nodes.push(K::Alias(Rigid::No, SAlias::Projection, SDef(d), sargs));
+                    Pred::Projection { alias: STy(alias), term: sterm }
+                }
+                PClause::Const { cond, args } => {
+                    #[cfg(test)]
+                    if self.drop_const_clauses {
+                        continue;
+                    }
+                    Pred::ConstHolds { cond: SDef(cond.0), args: self.list(c, args)? }
+                }
+                PClause::ForFields { container, trait_, args } => Pred::ForFields {
+                    container: self.ty(c, container)?,
+                    trait_: SDef(trait_.0),
+                    args_after_self: self.list(c, args)?,
+                },
+                PClause::TypeOutlives { .. } | PClause::RegionOutlives { .. } => continue,
+            };
+            self.preds.push(p);
+            self.where_bounds.push(bound);
+        }
+        if !any_bound {
+            self.where_bounds.truncate(bounds_start);
+            return Ok(Span::default());
+        }
+        Ok(Span::of(&self.where_bounds, bounds_start))
     }
 
     /// An answer's portable table is the call's whole converted table (its handles are
@@ -857,8 +1659,14 @@ impl<'a> FactCache<'a> {
     }
 
     fn fill_trait<W: World>(&mut self, k: ItemKey, reads: &mut Reads<'_, '_, W>) -> Result<(), Stop> {
+        let holes_before = reads.hole_count();
+        let reads_start = self.cached_reads.len();
+        let mut reusable = self.reuse_mode && !is_inner_def(k.0);
         let q = Question::TraitDef(k);
         let Some(t) = reads.trait_def(k)? else { return Err(CheckError::Malformed(Malformed::NoRecord(q)).into()) };
+        if self.reuse_mode {
+            self.push_read(reads, q, &mut reusable);
+        }
         let por = self.start();
         let c = self.table(q, t.types);
         let supers = self.preds.len();
@@ -877,13 +1685,16 @@ impl<'a> FactCache<'a> {
         let mut bounds_digest = 0u64;
         for a in t.assoc_types {
             let d = assoc_def(k, a.name);
-            self.names.insert(d, (k, a.name));
+            self.record_name(d, k, a.name);
             let default = match a.default {
                 Some(p) => Some(self.ty(c, p)?),
                 None => None,
             };
             let bq = Question::Predicates(a.item);
             let bounds = reads.predicates(a.item)?;
+            if self.reuse_mode {
+                self.push_read(reads, bq, &mut reusable);
+            }
             let bc = self.table(bq, bounds.types);
             let start = self.preds.len();
             self.clauses(bounds.clauses, bc)?;
@@ -898,10 +1709,21 @@ impl<'a> FactCache<'a> {
             // Error;` under `trait Error: Sized + StdError` is a `StdError` too): the solver
             // reads these as they are given (`item_bounds::elaborate_item_bounds`).
             let supers_read = self.elaborate_item_bounds(start, reads)?;
+            if self.reuse_mode {
+                let end = self.preds.len();
+                for idx in start..end {
+                    if let Some(&Pred::Trait { trait_: st, polarity: Polarity::Positive, .. }) = self.preds.get(idx) {
+                        self.push_read(reads, Question::TraitDef(ItemKey(st.0)), &mut reusable);
+                    }
+                }
+            }
             bounds_digest = bounds_digest.rotate_left(1) ^ digest("blaze-typeck assoc bound supertraits", &supers_read);
             // The associated type's own parameters (`type Out<T>;`), after the trait's: part
             // of the trait's facts and of their digest.
             let own_generics = Self::own_generics(k, a.name, Some(t.generics), reads)?;
+            if self.reuse_mode {
+                self.push_read(reads, Question::AssocGenerics(k, a.name), &mut reusable);
+            }
             bounds_digest = bounds_digest.rotate_left(1) ^ digest("blaze-typeck assoc generics", &u64::from(own_generics));
             self.assoc_tys.push(AssocTy {
                 def: SDef(d),
@@ -931,83 +1753,216 @@ impl<'a> FactCache<'a> {
         // a gap the world could not decide. A gap is no "not": it sets `DYN_UNDECIDED`, and a
         // solver goal that needs the verdict stops naming the trait (blaze-solve builtin.rs
         // `dyn_compatible`, rule 3) instead of answering No for every `dyn Tr + Send: Send`.
-        match crate::dyn_compat::verdict(reads, k)? {
+        let dyn_verdict = crate::dyn_compat::verdict(reads, k)?;
+        match dyn_verdict {
             crate::dyn_compat::Verdict::Compatible => flags |= STraitFlags::DYN_COMPATIBLE,
-            crate::dyn_compat::Verdict::Gap { .. } => flags |= STraitFlags::DYN_UNDECIDED,
+            crate::dyn_compat::Verdict::Gap { .. } => {
+                flags |= STraitFlags::DYN_UNDECIDED;
+                reusable = false;
+            }
             crate::dyn_compat::Verdict::Not { .. } => {}
         }
+        if self.reuse_mode && reusable {
+            // Replay-capture the exact supertrait `TraitDef` reads that `dyn_compat::verdict`
+            // performed in the same BFS order and stopping at the same `by` trait.
+            let mut list = [ItemKey(0); crate::dyn_compat::MAX_SUPERTRAITS];
+            list[0] = k;
+            let mut len = 1usize;
+            let mut at = 0usize;
+            while at < len {
+                let Some(&cur) = list.get(at) else {
+                    reusable = false;
+                    break;
+                };
+                at += 1;
+                if cur != k {
+                    self.push_read(reads, Question::TraitDef(cur), &mut reusable);
+                }
+                if matches!(dyn_verdict, crate::dyn_compat::Verdict::Not { by, member: None, .. } if by == cur) {
+                    break;
+                }
+                if let Some(def) = reads.trait_def(cur)? {
+                    for clause in def.supertraits {
+                        let PClause::Trait { trait_: st, args } = *clause else { continue };
+                        let Ok(list_args) = def.types.list(args) else {
+                            reusable = false;
+                            break;
+                        };
+                        let Some((&first, _)) = list_args.split_first() else { continue };
+                        if def.types.node(first).ok() != Some(PNode::Param(0)) {
+                            continue;
+                        }
+                        self.push_read(reads, Question::TraitDef(st), &mut reusable);
+                        if reads.trait_def(st)?.is_some_and(|d| d.lang == Some(LangItem::Sized)) {
+                            continue;
+                        }
+                        if list.get(..len).is_some_and(|s| s.contains(&st)) {
+                            continue;
+                        }
+                        if let Some(slot) = list.get_mut(len) {
+                            *slot = st;
+                            len += 1;
+                        } else {
+                            reusable = false;
+                            break;
+                        }
+                    }
+                } else {
+                    reusable = false;
+                }
+                if matches!(dyn_verdict, crate::dyn_compat::Verdict::Not { by, .. } if by == cur) {
+                    break;
+                }
+            }
+        }
+        let lang = match t.lang.and_then(solver_lang) {
+            Some(l) => Some(l),
+            None => {
+                let is_try_as_dyn = reads.lang_item(LangItem::TryAsDyn)? == Some(k);
+                if self.reuse_mode {
+                    self.push_read(reads, Question::Lang(LangItem::TryAsDyn), &mut reusable);
+                }
+                is_try_as_dyn.then_some(Lang::TryAsDyn)
+            }
+        };
+        if reads.hole_count() > holes_before {
+            reusable = false;
+        }
+        let row_reads = if self.reuse_mode { Span::of(&self.cached_reads, reads_start) } else { Span::default() };
         let row = TraitRow {
             flags: STraitFlags(flags),
             generics: t.generics,
-            lang: t.lang.and_then(solver_lang),
+            lang,
             supers,
             assoc,
             item_bounds,
             por: self.end(por),
             digest: digest("blaze-typeck trait", &reads.digest(q)?) ^ digest("blaze-typeck trait item bounds", &bounds_digest),
+            reads: row_reads,
+            touched_gen: Cell::new(self.body_gen),
+            reusable,
         };
         self.traits.insert(k.0, row);
+        if self.reuse_mode {
+            self.round_added.push((AddedKey::Trait(k.0), reusable));
+        }
         Ok(())
     }
 
     fn fill_impl<W: World>(&mut self, k: ItemKey, reads: &mut Reads<'_, '_, W>) -> Result<(), Stop> {
+        let holes_before = reads.hole_count();
+        let reads_start = self.cached_reads.len();
+        let mut reusable = self.reuse_mode && !is_inner_def(k.0);
         let q = Question::ImplHeader(k);
         let Some(h) = reads.impl_header(k)? else { return Err(CheckError::Malformed(Malformed::NoRecord(q)).into()) };
         let Some(trait_) = h.trait_ else { return Err(CheckError::Malformed(Malformed::NoRecord(q)).into()) };
+        if is_inner_def(trait_.0) {
+            reusable = false;
+        }
+        if self.reuse_mode {
+            self.push_read(reads, q, &mut reusable);
+            // `Reads::impl_header` checks trait arity via `reads.trait_def(trait_)`.
+            self.push_read(reads, Question::TraitDef(trait_), &mut reusable);
+        }
         let wc = reads.predicates(k)?;
+        if self.reuse_mode {
+            self.push_read(reads, Question::Predicates(k), &mut reusable);
+        }
         let por = self.start();
         let c = self.table(q, h.types);
-        // The trait's arguments, self first: a list of its own.
-        let self_ty = self.ty(c, h.self_ty)?;
+        // The trait's arguments, self first: a list of its own. Preserve `'static` slots from the
+        // impl's head regions so `impl From<&'static str> for T` never satisfies `for<'s> From<&'s str>`.
+        let hdr_regions = h.regions.and_then(|hr| hr.impl_header().map(|cols| (hr.arity(), cols)));
+        let mut dummy_bound = false;
+        let self_ty = match hdr_regions {
+            Some((arity, (self_col, _))) => {
+                self.ty_with_regions(c, h.self_ty, self_col.as_slice(), arity, 0, &mut dummy_bound)?
+            }
+            None => self.ty(c, h.self_ty)?,
+        };
         let mut terms: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(h.trait_args.list().len as usize + 1, self.alloc);
         terms.push(self_ty);
-        for i in h.trait_args.list().range() {
+        for (idx, i) in h.trait_args.list().range().enumerate() {
             let p = h.types.list_slot(i).ok_or(CheckError::Malformed(Malformed::NoRecord(q)))?;
-            terms.push(self.ty(c, p)?);
+            let st = match hdr_regions.and_then(|(arity, (_, tc))| tc.and_then(|tc| tc.child(idx as u32 + 1)).map(|sl| (arity, sl))) {
+                Some((arity, sl)) => self.ty_with_regions(c, p, sl, arity, 0, &mut dummy_bound)?,
+                None => self.ty(c, p)?,
+            };
+            terms.push(st);
         }
         let args = SList { start: self.lists.len() as u32, len: terms.len() as u32 };
         self.lists.extend_from_slice(&terms);
         let assoc = self.impl_assoc.len();
         for &(name, v) in h.assoc_types {
             let d = assoc_def(trait_, name);
-            self.names.insert(d, (trait_, name));
+            self.record_name(d, trait_, name);
             let value = self.ty(c, v)?;
             // An impl's `type Out<X> = ..;` has the parameters its trait declares for `Out`
             // (the value is over the impl's generics, then those): the count is the trait's.
             let own_generics = Self::own_generics(trait_, name, None, reads)?;
+            if self.reuse_mode {
+                self.push_read(reads, Question::AssocGenerics(trait_, name), &mut reusable);
+            }
             self.impl_assoc.push(ImplAssoc { trait_item: SDef(d), value, own_generics, is_default: false });
         }
         let assoc = Span::of(&self.impl_assoc, assoc);
         let wcc = self.table(Question::Predicates(k), wc.types);
         let wheres = self.preds.len();
-        self.clauses(wc.clauses, wcc)?;
+        let where_bounds = self.clauses_with_regions(wc.clauses, wc.regions, wcc)?;
         let wheres = Span::of(&self.preds, wheres);
         for c in wc.clauses {
             if let PClause::Const { cond, .. } = *c {
                 self.conditions.push((cond.0, trait_.0));
+                reusable = false;
             }
         }
+        if reads.hole_count() > holes_before {
+            reusable = false;
+        }
+        let row_reads = if self.reuse_mode { Span::of(&self.cached_reads, reads_start) } else { Span::default() };
         let row = ImplRow {
             generics: h.generics,
             polarity: h.polarity,
             trait_: SDef(trait_.0),
             args,
             wheres,
+            where_bounds,
             assoc,
             por: self.end(por),
             digest: digest("blaze-typeck impl", &reads.digest(q)?) ^ digest("blaze-typeck impl where", &reads.digest(Question::Predicates(k))?),
+            reads: row_reads,
+            touched_gen: Cell::new(self.body_gen),
+            reusable,
         };
         self.headers.insert(k.0, row);
+        if self.reuse_mode {
+            self.round_added.push((AddedKey::Header(k.0), reusable));
+        }
         Ok(())
     }
 
     fn fill_adt<W: World>(&mut self, k: ItemKey, reads: &mut Reads<'_, '_, W>) -> Result<(), Stop> {
+        let holes_before = reads.hole_count();
+        let reads_start = self.cached_reads.len();
+        let mut reusable = self.reuse_mode && !is_inner_def(k.0);
         let q = Question::Adt(k);
         let Some(a) = reads.adt(k)? else { return Err(CheckError::Malformed(Malformed::NoRecord(q)).into()) };
+        if self.reuse_mode {
+            self.push_read(reads, q, &mut reusable);
+        }
         let wc = reads.predicates(k)?;
+        if self.reuse_mode {
+            self.push_read(reads, Question::Predicates(k), &mut reusable);
+        }
         let mut flags = match a.kind {
             AdtKind::Struct => AdtFlags::STRUCT,
-            AdtKind::Enum => AdtFlags::ENUM,
+            AdtKind::Enum => {
+                if a.variants.iter().all(|v| v.ctor == crate::world::CtorKind::Unit) {
+                    AdtFlags::ENUM | AdtFlags::UNIT_ENUM
+                } else {
+                    AdtFlags::ENUM
+                }
+            }
             AdtKind::Union => AdtFlags::UNION,
         };
         for (l, f) in [
@@ -1015,14 +1970,26 @@ impl<'a> FactCache<'a> {
             (LangItem::PhantomData, AdtFlags::PHANTOM_DATA),
             (LangItem::ManuallyDrop, AdtFlags::MANUALLY_DROP),
         ] {
-            if reads.lang_item(l)? == Some(k) {
+            let is_lang = reads.lang_item(l)? == Some(k);
+            if self.reuse_mode {
+                self.push_read(reads, Question::Lang(l), &mut reusable);
+            }
+            if is_lang {
                 flags |= f;
             }
         }
-        if let Some(drop) = reads.lang_item(LangItem::Drop)?
-            && !reads.impls_of(drop, Shape::Adt(k))?.is_empty()
-        {
-            flags |= AdtFlags::HAS_DROP;
+        let drop_lang = reads.lang_item(LangItem::Drop)?;
+        if self.reuse_mode {
+            self.push_read(reads, Question::Lang(LangItem::Drop), &mut reusable);
+        }
+        if let Some(drop) = drop_lang {
+            let drop_impls = reads.impls_of(drop, Shape::Adt(k))?;
+            if self.reuse_mode {
+                self.push_read(reads, Question::ImplsOf(drop, Shape::Adt(k)), &mut reusable);
+            }
+            if !drop_impls.is_empty() {
+                flags |= AdtFlags::HAS_DROP;
+            }
         }
         let por = self.start();
         let c = self.table(q, a.types);
@@ -1044,13 +2011,32 @@ impl<'a> FactCache<'a> {
             _ => None,
         };
         // Only an enum's discriminant type is read (any other type's is `u8`).
+        // For structs, read `AUTO_COPY_PUB` (Blaze edition transparent all-`pub` structs).
+        let mut auto_copy_pub = false;
         let discr = match a.kind {
-            AdtKind::Enum => match reads.attrs(k)?.discr() {
-                crate::world::DiscrRepr::Unread => blaze_solve::facts::Discr::Unread,
-                crate::world::DiscrRepr::Int(i) => blaze_solve::facts::Discr::Int(int(i)),
-                crate::world::DiscrRepr::Uint(u) => blaze_solve::facts::Discr::Uint(uint(u)),
-            },
-            AdtKind::Struct | AdtKind::Union => blaze_solve::facts::Discr::Unread,
+            AdtKind::Enum => {
+                let attrs = reads.attrs(k)?;
+                if self.reuse_mode {
+                    self.push_read(reads, Question::Attrs(k), &mut reusable);
+                }
+                match attrs.discr() {
+                    crate::world::DiscrRepr::Unread => blaze_solve::facts::Discr::Unread,
+                    crate::world::DiscrRepr::Int(i) => blaze_solve::facts::Discr::Int(int(i)),
+                    crate::world::DiscrRepr::Uint(u) => blaze_solve::facts::Discr::Uint(uint(u)),
+                }
+            }
+            AdtKind::Struct => {
+                let attrs = reads.attrs(k)?;
+                if self.reuse_mode {
+                    self.push_read(reads, Question::Attrs(k), &mut reusable);
+                }
+                if attrs.0 & crate::world::TypeAttrs::AUTO_COPY_PUB != 0 {
+                    flags |= AdtFlags::AUTO_COPY_PUB;
+                    auto_copy_pub = true;
+                }
+                blaze_solve::facts::Discr::Unread
+            }
+            AdtKind::Union => blaze_solve::facts::Discr::Unread,
         };
         let fields = Span::of(&self.fields, fields);
         let variants = Span::of(&self.variants, variants);
@@ -1058,6 +2044,10 @@ impl<'a> FactCache<'a> {
         let wheres = self.preds.len();
         self.clauses(wc.clauses, wcc)?;
         let wheres = Span::of(&self.preds, wheres);
+        if reads.hole_count() > holes_before {
+            reusable = false;
+        }
+        let row_reads = if self.reuse_mode { Span::of(&self.cached_reads, reads_start) } else { Span::default() };
         let row = AdtRow {
             flags: AdtFlags(flags),
             generics: a.generics,
@@ -1067,15 +2057,29 @@ impl<'a> FactCache<'a> {
             discr,
             wheres,
             por: self.end(por),
-            digest: digest("blaze-typeck adt", &reads.digest(q)?) ^ digest("blaze-typeck adt where", &reads.digest(Question::Predicates(k))?) ^ digest("blaze-typeck adt discr", &(discr_code(discr) as u32)),
+            digest: digest("blaze-typeck adt", &reads.digest(q)?)
+                ^ digest("blaze-typeck adt where", &reads.digest(Question::Predicates(k))?)
+                ^ digest("blaze-typeck adt discr", &(discr_code(discr) as u32))
+                ^ digest("blaze-typeck adt auto_copy_pub", &u32::from(auto_copy_pub)),
+            reads: row_reads,
+            touched_gen: Cell::new(self.body_gen),
         };
         self.adts.insert(k.0, row);
+        if self.reuse_mode {
+            self.round_added.push((AddedKey::Adt(k.0), reusable));
+        }
         Ok(())
     }
 
     fn fill_sig<W: World>(&mut self, k: ItemKey, reads: &mut Reads<'_, '_, W>) -> Result<(), Stop> {
+        let holes_before = reads.hole_count();
+        let reads_start = self.cached_reads.len();
+        let mut reusable = self.reuse_mode && !is_inner_def(k.0) && k != self.reuse_owner;
         let q = Question::FnSig(k);
         let Some(s) = reads.fn_sig(k)? else { return Err(CheckError::Malformed(Malformed::NoRecord(q)).into()) };
+        if self.reuse_mode {
+            self.push_read(reads, q, &mut reusable);
+        }
         let por = self.start();
         let c = self.table(q, s.types);
         let mut terms: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(s.inputs.len() + 1, self.alloc);
@@ -1094,51 +2098,105 @@ impl<'a> FactCache<'a> {
         if s.header.abi != crate::ids::Abi::Rust || s.header.c_variadic {
             flags |= FnSigDef::NOT_FN_ABI;
         }
+        if reads.hole_count() > holes_before {
+            reusable = false;
+        }
+        let row_reads = if self.reuse_mode { Span::of(&self.cached_reads, reads_start) } else { Span::default() };
         let row = SigRow {
             generics: s.parent_count + s.own_count,
             flags,
             io,
             por: self.end(por),
             digest: digest("blaze-typeck sig", &reads.digest(q)?),
+            reads: row_reads,
+            touched_gen: Cell::new(self.body_gen),
         };
         self.sigs.insert(k.0, row);
+        if self.reuse_mode {
+            self.round_added.push((AddedKey::Sig(k.0), reusable));
+        }
         Ok(())
     }
 
     fn fill_assoc<W: World>(&mut self, d: u128, reads: &mut Reads<'_, '_, W>) -> Result<(), Stop> {
+        let holes_before = reads.hole_count();
         // An associated type the cache named by `assoc_def`: its trait's generics.
         if let Some(&(trait_, _)) = self.names.get(&d) {
-            self.fill_trait(trait_, reads)?;
-            let row = self.traits.get(&trait_.0).copied();
-            let generics = row.map_or(0, |t| t.generics);
-            // Its own parameters, as the trait's facts filed them (`fill_trait`).
-            let own_generics = row.and_then(|t| t.assoc.get(&self.assoc_tys).iter().find(|a| a.def == SDef(d)).map(|a| a.own_generics)).unwrap_or(0);
+            if let Some(existing) = self.traits.get(&trait_.0) {
+                self.touch_row(&existing.touched_gen, existing.reads);
+            } else {
+                self.fill_trait(trait_, reads)?;
+            }
+            let (generics, own_generics, row_reads, trait_reusable) = match self.traits.get(&trait_.0) {
+                Some(t) => {
+                    let own = t.assoc.get(&self.assoc_tys).iter().find(|a| a.def == SDef(d)).map_or(0, |a| a.own_generics);
+                    (t.generics, own, t.reads, t.reusable)
+                }
+                None => (0, 0, Span::default(), false),
+            };
             // The count is part of what the associated type is: two traits' types never
             // share `d`, but one type whose count changed is another answer.
             let digest = digest("blaze-typeck assoc", &ItemKey(d)) ^ digest("blaze-typeck assoc own generics", &u64::from(own_generics));
+            let reusable = self.reuse_mode && trait_reusable && !is_inner_def(trait_.0) && reads.hole_count() == holes_before;
             self.assoc.insert(
                 d,
-                AssocDef {
-                    container: SDef(trait_.0),
-                    trait_: Some(SDef(trait_.0)),
-                    kind: AssocKind::Type,
-                    parent_generics: generics,
-                    own_generics,
-                    digest,
+                AssocRow {
+                    def: AssocDef {
+                        container: SDef(trait_.0),
+                        trait_: Some(SDef(trait_.0)),
+                        kind: AssocKind::Type,
+                        parent_generics: generics,
+                        own_generics,
+                        digest,
+                    },
+                    reads: row_reads,
+                    touched_gen: Cell::new(self.body_gen),
                 },
             );
+            if self.reuse_mode {
+                self.round_added.push((AddedKey::Assoc(d), reusable));
+            }
             return Ok(());
         }
+        let reads_start = self.cached_reads.len();
+        let mut reusable = self.reuse_mode && !is_inner_def(d);
         let q = Question::AssocParent(ItemKey(d));
         let Some(p) = reads.assoc_parent(ItemKey(d))? else {
             return Err(CheckError::Malformed(Malformed::NoRecord(q)).into());
         };
+        if is_inner_def(p.container.0) {
+            reusable = false;
+        }
+        if self.reuse_mode {
+            self.push_read(reads, q, &mut reusable);
+        }
         let (trait_, generics) = match reads.trait_def(p.container)? {
-            Some(t) => (Some(SDef(p.container.0)), t.generics),
-            None => match reads.impl_header(p.container)? {
-                Some(h) => (h.trait_.map(|t| SDef(t.0)), h.generics),
-                None => return Err(CheckError::Malformed(Malformed::NoRecord(q)).into()),
-            },
+            Some(t) => {
+                if self.reuse_mode {
+                    self.push_read(reads, Question::TraitDef(p.container), &mut reusable);
+                }
+                (Some(SDef(p.container.0)), t.generics)
+            }
+            None => {
+                if self.reuse_mode {
+                    self.push_read(reads, Question::TraitDef(p.container), &mut reusable);
+                }
+                match reads.impl_header(p.container)? {
+                    Some(h) => {
+                        if self.reuse_mode {
+                            self.push_read(reads, Question::ImplHeader(p.container), &mut reusable);
+                            if let Some(t) = h.trait_ {
+                                if is_inner_def(t.0) {
+                                    reusable = false;
+                                }
+                                self.push_read(reads, Question::TraitDef(t), &mut reusable);
+                            }
+                        }
+                        (h.trait_.map(|t| SDef(t.0)), h.generics)
+                    }
+                    None => return Err(CheckError::Malformed(Malformed::NoRecord(q)).into()),
+                }
+            }
         };
         let kind = match p.kind {
             crate::world::AssocKind::Fn { .. } => AssocKind::Fn,
@@ -1148,14 +2206,31 @@ impl<'a> FactCache<'a> {
         // A trait's associated type named by its own item: its own parameters as the world
         // counts them. A fn's own generics are its signature's, not filed here.
         let own_generics = match (kind, trait_) {
-            (AssocKind::Type, Some(t)) if t == SDef(p.container.0) => Self::own_generics(p.container, p.name, Some(generics), reads)?,
+            (AssocKind::Type, Some(t)) if t == SDef(p.container.0) => {
+                let own = Self::own_generics(p.container, p.name, Some(generics), reads)?;
+                if self.reuse_mode {
+                    self.push_read(reads, Question::AssocGenerics(p.container, p.name), &mut reusable);
+                }
+                own
+            }
             _ => 0,
         };
+        if reads.hole_count() > holes_before {
+            reusable = false;
+        }
+        let row_reads = if self.reuse_mode { Span::of(&self.cached_reads, reads_start) } else { Span::default() };
         let digest = digest("blaze-typeck assoc parent", &p) ^ digest("blaze-typeck assoc own generics", &u64::from(own_generics));
         self.assoc.insert(
             d,
-            AssocDef { container: SDef(p.container.0), trait_, kind, parent_generics: generics, own_generics, digest },
+            AssocRow {
+                def: AssocDef { container: SDef(p.container.0), trait_, kind, parent_generics: generics, own_generics, digest },
+                reads: row_reads,
+                touched_gen: Cell::new(self.body_gen),
+            },
         );
+        if self.reuse_mode {
+            self.round_added.push((AddedKey::Assoc(d), reusable));
+        }
         Ok(())
     }
 
@@ -1370,6 +2445,111 @@ impl<'a> FactCache<'a> {
         Portable { nodes: p.nodes.get(&self.nodes), lists: p.lists.get(&self.lists) }
     }
 
+    /// Prefilters `bucket` (from `reads.impls_of(trait_, shape)`) against `goal_args` using
+    /// SIMD fingerprint columns (`blaze_solve::prefilter`), appending surviving impl keys in
+    /// bucket order into `out`.
+    ///
+    /// - Reuses solver-filled `impl_cols` when already cached (zero extra reads).
+    /// - Keeps direct scan for small buckets (`<= 16` impls).
+    /// - For larger uncached buckets (`> 16`), builds and caches header-only fingerprint columns
+    ///   via `reads.impl_header` (never touching `reads.predicates`).
+    pub(crate) fn prefilter_impls<W: World>(
+        &mut self,
+        trait_: ItemKey,
+        shape: Shape,
+        bucket: &[ItemKey],
+        terms: &crate::infer::Terms<'_>,
+        goal_args: SList,
+        reads: &mut Reads<'_, '_, W>,
+        out: &mut Vec<ItemKey, Alloc<'_>>,
+    ) -> Result<(), crate::instance::ResolveError> {
+        if bucket.is_empty() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        let first_only = self.first_impl_only;
+        #[cfg(not(test))]
+        let first_only = false;
+        let goal_fp = prefilter::fingerprint_goal(terms, goal_args);
+        if !first_only
+            && let Some(ss) = sshape(shape)
+            && let Some(r) = self.impls.get(&(trait_.0, ss))
+            && let Some(&(at, stride)) = self.impl_cols.get(&(trait_.0, ss))
+            && r.span.len as usize == bucket.len()
+        {
+            let impls = r.span.get(&self.impl_defs);
+            let at_usize = usize::try_from(at).unwrap_or(usize::MAX);
+            let col_len = prefilter::WIDTH.saturating_mul(usize::try_from(stride).unwrap_or(usize::MAX));
+            if let Some(bytes) = self.impl_columns.get(at_usize..at_usize.saturating_add(col_len)) {
+                let len = u32::try_from(impls.len()).unwrap_or(u32::MAX);
+                self.survivor_scratch.clear();
+                prefilter::filter(&goal_fp, Columns { bytes, stride, len }, &mut self.survivor_scratch);
+                for &idx in self.survivor_scratch.iter() {
+                    if let Some(&d) = impls.get(idx as usize) {
+                        out.push(ItemKey(d.0));
+                    }
+                }
+                return Ok(());
+            }
+        }
+        if bucket.len() <= crate::machine::NAME_HASH_THRESHOLD {
+            out.extend_from_slice(bucket);
+            return Ok(());
+        }
+        if !self.header_cols.contains_key(&(trait_, shape)) {
+            let def_start = self.header_impl_defs.len();
+            self.fp_scratch.clear();
+            let mut terms_buf: Vec<STy, Alloc<'a>> = Vec::new_in(self.alloc);
+            for &imp in bucket {
+                let q = Question::ImplHeader(imp);
+                let Some(h) = reads.impl_header(imp)? else {
+                    return Err(crate::instance::ResolveError::Missing(q));
+                };
+                if h.trait_ != Some(trait_) || h.polarity != crate::world::ImplPolarity::Positive {
+                    continue;
+                }
+                let por = self.start();
+                let c = self.table(q, h.types);
+                let self_ty = self.ty(c, h.self_ty)?;
+                terms_buf.clear();
+                terms_buf.push(self_ty);
+                for i in h.trait_args.list().range() {
+                    let p = h.types.list_slot(i).ok_or(CheckError::Malformed(Malformed::NoRecord(q)))?;
+                    terms_buf.push(self.ty(c, p)?);
+                }
+                let args = SList { start: self.lists.len() as u32, len: terms_buf.len() as u32 };
+                self.lists.extend_from_slice(&terms_buf);
+                let por = self.end(por);
+                let fp = prefilter::fingerprint_impl(self.portable(por), args);
+                self.header_impl_defs.push(imp);
+                self.fp_scratch.push(fp);
+            }
+            let span = Span::of(&self.header_impl_defs, def_start);
+            let stride = prefilter::columns_of(&self.fp_scratch, &mut self.col_scratch);
+            let at = u32::try_from(self.header_columns.len()).unwrap_or(u32::MAX);
+            self.header_columns.extend_from_slice(&self.col_scratch);
+            self.header_cols.insert((trait_, shape), (span, at, stride));
+        }
+        if let Some(&(span, at, stride)) = self.header_cols.get(&(trait_, shape)) {
+            let impls = span.get(&self.header_impl_defs);
+            let at_usize = usize::try_from(at).unwrap_or(usize::MAX);
+            let col_len = prefilter::WIDTH.saturating_mul(usize::try_from(stride).unwrap_or(usize::MAX));
+            if let Some(bytes) = self.header_columns.get(at_usize..at_usize.saturating_add(col_len)) {
+                let len = u32::try_from(impls.len()).unwrap_or(u32::MAX);
+                self.survivor_scratch.clear();
+                prefilter::filter(&goal_fp, Columns { bytes, stride, len }, &mut self.survivor_scratch);
+                for &idx in self.survivor_scratch.iter() {
+                    if let Some(&imp) = impls.get(idx as usize) {
+                        out.push(imp);
+                    }
+                }
+                return Ok(());
+            }
+        }
+        out.extend_from_slice(bucket);
+        Ok(())
+    }
+
     /// The allocator the cache is in.
     pub fn alloc(&self) -> Alloc<'a> {
         self.alloc
@@ -1379,6 +2559,7 @@ impl<'a> FactCache<'a> {
 impl Facts for FactCache<'_> {
     fn trait_def(&self, _: Seal, t: SDef) -> Fetch<TraitDef<'_>> {
         let r = self.traits.get(&t.0).ok_or(Missing)?;
+        self.touch_row(&r.touched_gen, r.reads);
         Ok(TraitDef {
             flags: r.flags,
             generics: r.generics,
@@ -1393,16 +2574,28 @@ impl Facts for FactCache<'_> {
     }
 
     fn impls(&self, _: Seal, t: SDef, shape: SShape) -> Fetch<ImplSet<'_>> {
-        let &(span, digest) = self.impls.get(&(t.0, shape)).ok_or(Missing)?;
+        let r = self.impls.get(&(t.0, shape)).ok_or(Missing)?;
         let &(at, stride) = self.impl_cols.get(&(t.0, shape)).ok_or(Missing)?;
-        let impls = span.get(&self.impl_defs);
+        let impls = r.span.get(&self.impl_defs);
+        if self.reuse_mode && r.touched_gen.get() != self.body_gen {
+            self.touch_row(&r.touched_gen, r.reads);
+            for &imp in impls {
+                if let Some(h) = self.headers.get(&imp.0) {
+                    self.touch_row(&h.touched_gen, h.reads);
+                }
+            }
+        }
         // `fill_one` writes both entries together, the columns `WIDTH * stride` bytes at `at`.
-        let bytes = &self.impl_columns[at as usize..at as usize + prefilter::WIDTH * stride as usize];
-        Ok(ImplSet { impls, columns: Columns { bytes, stride, len: impls.len() as u32 }, digest })
+        let at_usize = usize::try_from(at).unwrap_or(usize::MAX);
+        let col_len = prefilter::WIDTH.saturating_mul(usize::try_from(stride).unwrap_or(usize::MAX));
+        let bytes = self.impl_columns.get(at_usize..at_usize.saturating_add(col_len)).ok_or(Missing)?;
+        let len = u32::try_from(impls.len()).unwrap_or(u32::MAX);
+        Ok(ImplSet { impls, columns: Columns { bytes, stride, len }, digest: r.digest })
     }
 
     fn impl_header(&self, _: Seal, i: SDef) -> Fetch<ImplHeader<'_>> {
         let r = self.headers.get(&i.0).ok_or(Missing)?;
+        self.touch_row(&r.touched_gen, r.reads);
         Ok(ImplHeader {
             generics: r.generics,
             polarity: r.polarity,
@@ -1410,6 +2603,7 @@ impl Facts for FactCache<'_> {
             trait_: r.trait_,
             args: r.args,
             where_clauses: r.wheres.get(&self.preds),
+            where_clause_bounds: r.where_bounds.get(&self.where_bounds),
             assoc: r.assoc.get(&self.impl_assoc),
             portable: self.portable(r.por),
             digest: r.digest,
@@ -1418,6 +2612,7 @@ impl Facts for FactCache<'_> {
 
     fn adt(&self, _: Seal, d: SDef) -> Fetch<AdtDef<'_>> {
         let r = self.adts.get(&d.0).ok_or(Missing)?;
+        self.touch_row(&r.touched_gen, r.reads);
         Ok(AdtDef {
             flags: r.flags,
             generics: r.generics,
@@ -1433,11 +2628,14 @@ impl Facts for FactCache<'_> {
 
     fn fn_sig(&self, _: Seal, d: SDef) -> Fetch<FnSigDef<'_>> {
         let r = self.sigs.get(&d.0).ok_or(Missing)?;
+        self.touch_row(&r.touched_gen, r.reads);
         Ok(FnSigDef { generics: r.generics, inputs_output: r.io, flags: r.flags, portable: self.portable(r.por), digest: r.digest })
     }
 
     fn assoc(&self, _: Seal, d: SDef) -> Fetch<AssocDef> {
-        self.assoc.get(&d.0).copied().ok_or(Missing)
+        let r = self.assoc.get(&d.0).ok_or(Missing)?;
+        self.touch_row(&r.touched_gen, r.reads);
+        Ok(r.def)
     }
 
     fn opaque(&self, _: Seal, d: SDef) -> Fetch<OpaqueDef<'_>> {
@@ -1453,7 +2651,9 @@ impl Facts for FactCache<'_> {
     }
 
     fn lang(&self, _: Seal, l: Lang) -> Fetch<Option<SDef>> {
-        self.lang.get(&l).copied().ok_or(Missing)
+        let r = self.lang.get(&l).ok_or(Missing)?;
+        self.touch_row(&r.touched_gen, r.reads);
+        Ok(r.def)
     }
 
     fn is_local(&self, _: Seal, _: SDef) -> Fetch<bool> {

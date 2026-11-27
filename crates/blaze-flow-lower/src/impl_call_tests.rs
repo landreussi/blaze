@@ -97,7 +97,7 @@ impl Facts for Heads {
         Some(AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes, union: false, is_enum: false, is_box: false })
     }
     fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
-        Some(CalleeFacts { writes_lifetimes: false, self_ref: false })
+        Some(CalleeFacts { writes_lifetimes: false, self_ref: false, c_variadic: false })
     }
     fn call_bounds(&self, item: ItemKey) -> Option<CallBounds<'_>> {
         (item == self.take).then_some(CallBounds { outlives: &[], unread_below: 0, trait_bounded: TRAIT_BOUNDED })
@@ -228,7 +228,7 @@ fn an_impl_lifetime_relates_exactly() {
     let root = call_take(&mut b, w.wrap);
     let (got, _) = run(&w, &b, root, true);
     std::println!("an_impl_lifetime_relates_exactly without rows (control): {got:?}");
-    assert!(matches!(got, Err(Refusal { form: Form::CallHiddenInput { input: 0, .. }, .. })), "{got:?}");
+    assert!(matches!(got, Err(Refusal { form: Form::OneRule { .. }, .. })), "{got:?}");
 }
 
 /// `fn bad(s: S) { take::<Keep<'_>>(&s); }` with `impl<'a> Tr for Keep<'a> { type Out =

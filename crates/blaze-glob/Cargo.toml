@@ -13,6 +13,9 @@ repository.workspace = true
 [lib]
 doctest = false
 
+[dependencies]
+blaze-own.workspace = true
+
 [dev-dependencies]
 blaze-sim.workspace = true
 

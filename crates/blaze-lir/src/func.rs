@@ -11,11 +11,8 @@
 //! otherwise (`attrs`, `locs`, a parameter's facts, a range); one that is a parent or an
 //! optional place is [`NONE`] for none.
 
-use std::{
-    alloc::{Allocator, Global},
-    fmt,
-    ops::Range,
-};
+use core::{fmt, ops::Range};
+use alloc::{alloc::Allocator, alloc::Global, vec::Vec};
 
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
@@ -215,11 +212,22 @@ pub enum Conv {
     Wasm,
     /// `extern "rust-cold"`: LLVM's `preserve_mostcc`.
     PreserveMost,
+    /// Blaze zero-branch `Result`/`?` ABI: returns `(val, is_err)` with `val` in `X0` and
+    /// `is_err` in the CPU Carry flag (`C = 0` on `Ok`, `C = 1` on `Err`), preserving the
+    /// Return Address Stack (RAS) with zero tag register and single-instruction `b.cs` error branch.
+    BlazeResult,
 }
 
 impl Conv {
-    pub const ALL: [Conv; 6] =
-        [Conv::C, Conv::SysV64, Conv::Win64, Conv::Aapcs, Conv::Wasm, Conv::PreserveMost];
+    pub const ALL: [Conv; 7] = [
+        Conv::C,
+        Conv::SysV64,
+        Conv::Win64,
+        Conv::Aapcs,
+        Conv::Wasm,
+        Conv::PreserveMost,
+        Conv::BlazeResult,
+    ];
 
     pub const fn from_byte(byte: u8) -> Option<Conv> {
         match (byte as usize) < Conv::ALL.len() {
@@ -236,6 +244,7 @@ impl Conv {
             Conv::Aapcs => "aapcs",
             Conv::Wasm => "wasm",
             Conv::PreserveMost => "preserve_most",
+            Conv::BlazeResult => "blaze_result",
         }
     }
 
@@ -894,6 +903,11 @@ macro_rules! define {
         impl<A: Allocator> Func<A> {
             pub fn view(&self) -> View<'_> {
                 View { head: self.head, $( $name: &self.$name, )* }
+            }
+
+            /// The allocator holding this function's columns.
+            pub fn allocator(&self) -> &A {
+                self.ops.allocator()
             }
         }
 

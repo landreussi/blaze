@@ -681,16 +681,28 @@ pub fn lower_signature<'a, 't>(
     cfg: &mut dyn Cfg,
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
+    lower_signature_with_scratch(text, edition, cfg, alloc, alloc)
+}
+
+/// [`lower_signature`] separating the output allocator `alloc` (kept in [`Lowered`]) from
+/// `scratch` (used for temporary token/range columns and machine stacks, dropped before return).
+pub fn lower_signature_with_scratch<'a, 's, 't>(
+    text: &'t str,
+    edition: Edition,
+    cfg: &mut dyn Cfg,
+    alloc: Alloc<'a>,
+    scratch: Alloc<'s>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
     // A text that spells `$crate` is read from its words, `$crate` one of them ([`spelled_words`]).
-    if let Some(w) = spelled_words(text, edition, alloc) {
-        return lower_signature_words(text, w.item_words(), edition, cfg, alloc);
+    if let Some(w) = spelled_words(text, edition, scratch) {
+        return lower_signature_words_with_scratch(text, w.item_words(), edition, cfg, alloc, scratch);
     }
     let end = u32::try_from(text.len()).expect("an item of over 4 GiB: ranges are u32 pairs");
     let pe = parser_edition(edition);
     let lexed = parser::LexedStr::new_outline(pe, text);
-    let (words, ranges) = input_columns(&lexed, pe, alloc);
+    let (words, ranges) = input_columns(&lexed, pe, scratch);
     let output = parser::Reparser::top_level_item().parse_outline(parser::Tokens::new(&words, true));
-    let mut m = machine::Machine::new(text, Mode::Signature, edition, cfg, None, alloc);
+    let mut m = machine::Machine::new_with_scratch(text, Mode::Signature, edition, cfg, None, alloc, scratch);
     feed::feed_input(&mut m, &output, ranges, end);
     m.finish()
 }
@@ -711,6 +723,63 @@ fn input_columns<'a>(lexed: &parser::LexedStr<'_>, pe: parser::Edition, alloc: A
     });
     words.extend((0..parser::Tokens::PAD).map(|_| parser::Tokens::EOF_WORD));
     (words, ranges)
+}
+
+/// Lowers one item's signature with the given Blaze syntax [`parser::Extensions`] enabled
+/// (e.g. `Extensions::UNIQ.with(Extensions::RECORDS)` for `#![blaze::uniq]` and `#![blaze::records]`).
+pub fn lower_signature_with_extensions<'a, 't>(
+    text: &'t str,
+    edition: Edition,
+    extensions: parser::Extensions,
+    cfg: &mut dyn Cfg,
+    alloc: Alloc<'a>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
+    lower_signature_with_extensions_and_scratch(text, edition, extensions, cfg, alloc, alloc)
+}
+
+/// [`lower_signature_with_extensions`] separating output allocator `alloc` from temporary `scratch`.
+pub fn lower_signature_with_extensions_and_scratch<'a, 's, 't>(
+    text: &'t str,
+    edition: Edition,
+    extensions: parser::Extensions,
+    cfg: &mut dyn Cfg,
+    alloc: Alloc<'a>,
+    scratch: Alloc<'s>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
+    if extensions.is_none() {
+        return lower_signature_with_scratch(text, edition, cfg, alloc, scratch);
+    }
+    let pe = parser_edition(edition);
+    let lexed = parser::LexedStr::new(pe, text);
+    let mut input = lexed.to_input(pe);
+    input.mark_extensions(0, extensions);
+    let output = parser::Reparser::top_level_item().parse_outline(input.tokens());
+    let mut m = machine::Machine::new_with_scratch(text, Mode::Signature, edition, cfg, None, alloc, scratch);
+    feed::feed(&mut m, &lexed, &output, 0);
+    m.finish()
+}
+
+/// Lowers one item's body with the given Blaze syntax [`parser::Extensions`] enabled
+/// (e.g. `Extensions::UNIQ.with(Extensions::RECORDS)`).
+pub fn lower_body_with_extensions<'a, 't>(
+    text: &'t str,
+    edition: Edition,
+    extensions: parser::Extensions,
+    cfg: &mut dyn Cfg,
+    values: &mut dyn ValueNames,
+    alloc: Alloc<'a>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
+    if extensions.is_none() {
+        return lower_body(text, edition, cfg, values, alloc);
+    }
+    let pe = parser_edition(edition);
+    let lexed = parser::LexedStr::new(pe, text);
+    let mut input = lexed.to_input(pe);
+    input.mark_extensions(0, extensions);
+    let output = parser::Reparser::top_level_item().parse(input.tokens());
+    let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, Some(values), alloc);
+    feed::feed(&mut m, &lexed, &output, 0);
+    m.finish()
 }
 
 /// [`lower_signature`] as it was: the whole text lexed ([`parser::LexedStr::new`]), every body
@@ -913,6 +982,67 @@ pub fn lower_body_expanding_marked<'a, 't>(
     m.finish()
 }
 
+/// As [`lower_body_expanding`], with explicit Blaze syntax [`parser::Extensions`] enabled.
+pub fn lower_body_expanding_with_extensions<'a, 't>(
+    text: &'t str,
+    edition: Edition,
+    extensions: parser::Extensions,
+    cfg: &mut dyn Cfg,
+    values: &mut dyn ValueNames,
+    expand: &mut dyn Expand,
+    alloc: Alloc<'a>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
+    if extensions.is_none() {
+        return lower_body_expanding(text, edition, cfg, values, expand, alloc);
+    }
+    if let Some(w) = spelled_words(text, edition, alloc) {
+        return lower_body_words_expanding(text, w.item_words(), edition, cfg, values, expand, alloc);
+    }
+    let pe = parser_edition(edition);
+    let lexed = parser::LexedStr::new(pe, text);
+    let mut input = lexed.to_input(pe);
+    input.mark_extensions(0, extensions);
+    let output = parser::Reparser::top_level_item().parse(input.tokens());
+    let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, Some(values), alloc);
+    expand.begin_body();
+    feed::feed_expanding(&mut m, &lexed, &output, 0, expand);
+    m.finish()
+}
+
+/// As [`lower_body_expanding_marked`], with explicit Blaze syntax [`parser::Extensions`] enabled.
+pub fn lower_body_expanding_marked_with_extensions<'a, 't>(
+    marks: mark_site::ItemMarks<'t>,
+    edition: Edition,
+    extensions: parser::Extensions,
+    cfg: &mut dyn Cfg,
+    values: &mut dyn ValueNames,
+    expand: &mut dyn Expand,
+    alloc: Alloc<'a>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
+    if extensions.is_none() {
+        return lower_body_expanding_marked(marks, edition, cfg, values, expand, alloc);
+    }
+    let text = marks.text();
+    if let Some(w) = spelled_words(text, edition, alloc) {
+        let output = parser::Reparser::top_level_item().parse(parser::Tokens::new(&w.words, false));
+        let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, Some(values), alloc);
+        m.mark_item(marks);
+        expand.begin_body();
+        feed::feed_words(&mut m, &output, &w.ranges, Some(expand));
+        return m.finish();
+    }
+    let pe = parser_edition(edition);
+    let lexed = parser::LexedStr::new(pe, text);
+    let mut input = lexed.to_input(pe);
+    input.mark_extensions(0, extensions);
+    let output = parser::Reparser::top_level_item().parse(input.tokens());
+    let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, Some(values), alloc);
+    m.mark_item(marks);
+    expand.begin_body();
+    feed::feed_expanding(&mut m, &lexed, &output, 0, expand);
+    m.finish()
+}
+
 /// An item written by an item macro (a `macro_rules!` call at item position, a derive), as
 /// the expander wrote it: the parser's `words` (ending in [`parser::Tokens::PAD`] `EOF`
 /// words) and each word's range in `text`, the item's text. `$crate` is one word here, a path
@@ -931,8 +1061,20 @@ pub fn lower_signature_words<'a, 't>(
     cfg: &mut dyn Cfg,
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
+    lower_signature_words_with_scratch(text, words, edition, cfg, alloc, alloc)
+}
+
+/// [`lower_signature_words`] separating output allocator `alloc` from temporary `scratch`.
+pub fn lower_signature_words_with_scratch<'a, 's, 't>(
+    text: &'t str,
+    words: ItemWords<'_>,
+    edition: Edition,
+    cfg: &mut dyn Cfg,
+    alloc: Alloc<'a>,
+    scratch: Alloc<'s>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
     let output = parser::Reparser::top_level_item().parse_outline(parser::Tokens::new(words.words, false));
-    let mut m = machine::Machine::new(text, Mode::Signature, edition, cfg, None, alloc);
+    let mut m = machine::Machine::new_with_scratch(text, Mode::Signature, edition, cfg, None, alloc, scratch);
     feed::feed_words(&mut m, &output, words.ranges, None);
     m.finish()
 }

@@ -99,11 +99,11 @@ fn an_options_struct_from_another_crate() {
         script: None,
     });
     let texts = WithDep { base: &inputs.texts, dep, files: &dep_files };
-    let names = resolve_crates(&crates, sysroot, &texts, &Serial, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("resolve_crates (two crates): {e}"));
+    let names = resolve_crates(&crates, sysroot, &texts, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates (two crates): {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
     let sources = [SourceFile { path: "src/main.rs", text: USER }];
     let mut front = Front2::new(&names, &frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
-    let prepared = Prepares::new_in(alloc);
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
     let mut buckets = None;
 
@@ -133,7 +133,7 @@ fn an_options_struct_from_another_crate() {
     let lines = lines.join("\n");
     assert_eq!(got[0].1, "clean", "`made` must check clean\n{lines}");
     assert_eq!(got[1].1, "clean", "`sum` must check clean\n{lines}");
-    assert!(got[2].1.starts_with("diags ") && got[2].1.matches("MissingFields").count() == 1, "`missing` leaves `name` (no default) unwritten: one E0063\n{lines}");
+    assert!(got[2].1.starts_with("diags ") && got[2].1.matches("(MissingFields,").count() == 1, "`missing` leaves `name` (no default) unwritten: one E0063\n{lines}");
     // Named as the library's head spells it (front2/check.rs `name_about`).
     assert!(got[2].1.contains("about `name`"), "`missing`'s E0063 names the field `name`\n{lines}");
 

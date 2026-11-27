@@ -74,7 +74,7 @@ pub(crate) struct Binding {
     pub(crate) drops: bool,
 }
 
-impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
+impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
     /// Opens a scope; its mark is the schedule's length.
     pub(crate) fn open(&mut self) -> usize {
         let m = self.sched.len();
@@ -133,6 +133,49 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
         }
     }
 
+    /// Drops entries `0..below` in reverse order (parameters last) while keeping entries
+    /// `below..sched.len()` live (the freshly-evaluated callee and arguments of a `become` tail
+    /// call). If a drop of entry `i < below` unwinds, its cleanup path drops `below..sched.len()`
+    /// in reverse order before chaining into `self.chain(i)`.
+    pub(crate) fn emit_exit_below(&mut self, below: usize, span: Span) -> Result<(), LowerError> {
+        let mut i = below;
+        while i > 0 {
+            i -= 1;
+            let Some(&x) = self.sched.get(i) else { return self.refuse(crate::Construct::Malformed, self.body.root) };
+            if x.drops {
+                let base_unwind = self.chain(i);
+                // Chain any droppable tail-call argument temps (`below..`) ahead of `base_unwind`.
+                let mut head = match base_unwind {
+                    Unwind::Cleanup(b) => Some(b),
+                    _ => None,
+                };
+                for j in below..self.sched.len() {
+                    let Some(&arg_e) = self.sched.get(j) else { continue };
+                    if arg_e.drops {
+                        let next_c = match head {
+                            Some(b) => b,
+                            None => self.resume_block(),
+                        };
+                        let blk = self.b.new_block(BlockKind::Cleanup);
+                        self.pending.push(Pending::Drop { block: blk, place: arg_e.place, next: next_c });
+                        head = Some(blk);
+                    }
+                }
+                let unwind = match head {
+                    Some(b) => Unwind::Cleanup(b),
+                    None => Unwind::Continue,
+                };
+                let next = self.b.new_block(BlockKind::Normal);
+                self.b.terminate(StmtKind::Drop { place: x.place, target: next, unwind }, span);
+                self.b.start(next);
+            }
+            if x.storage {
+                self.b.push(StmtKind::StorageDead(x.local), span);
+            }
+        }
+        Ok(())
+    }
+
     /// The exit rows from here down to schedule length `to`: each entry above it, last first,
     /// dropped when its type needs drop (that drop unwinding to the chain below it), then its
     /// storage ended. The schedule is not changed.
@@ -140,7 +183,7 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
         let mut i = self.sched.len();
         while i > to {
             i -= 1;
-            let x = self.sched[i];
+            let Some(&x) = self.sched.get(i) else { return self.refuse(crate::Construct::Malformed, self.body.root) };
             if x.drops {
                 let unwind = self.chain(i);
                 let next = self.b.new_block(BlockKind::Normal);
@@ -161,7 +204,7 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
         let mut i = to;
         while i > from {
             i -= 1;
-            let x = self.sched[i];
+            let Some(&x) = self.sched.get(i) else { return self.refuse(crate::Construct::Malformed, self.body.root) };
             if x.drops {
                 let unwind = self.chain(i);
                 let next = self.b.new_block(BlockKind::Normal);
@@ -187,12 +230,12 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
 
     /// The unwind edge that drops every droppable entry below schedule index `top`.
     pub(crate) fn chain(&mut self, top: usize) -> Unwind {
-        let mut todo: Vec<usize, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<usize, A> = Vec::new_in(self.alloc);
         let mut below: Option<Block> = None;
-        let mut j = top;
+        let mut j = top.min(self.sched.len());
         while j > 0 {
             j -= 1;
-            let x = self.sched[j];
+            let Some(&x) = self.sched.get(j) else { continue };
             if !x.drops {
                 continue;
             }
@@ -204,13 +247,16 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
         }
         // `todo` holds the entries without a block, highest first: make them lowest first.
         while let Some(i) = todo.pop() {
+            let Some(place) = self.sched.get(i).map(|x| x.place) else { continue };
             let next = match below {
                 Some(b) => b,
                 None => self.resume_block(),
             };
             let block = self.b.new_block(BlockKind::Cleanup);
-            self.pending.push(Pending::Drop { block, place: self.sched[i].place, next });
-            self.sched[i].cleanup = Some(block);
+            self.pending.push(Pending::Drop { block, place, next });
+            if let Some(entry) = self.sched.get_mut(i) {
+                entry.cleanup = Some(block);
+            }
             below = Some(block);
         }
         match below {
@@ -240,8 +286,8 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
     /// Fills each cleanup block made, after the body's last normal block.
     pub(crate) fn fill_cleanups(&mut self, span: Span) {
         let mut i = 0;
-        while i < self.pending.len() {
-            match self.pending[i] {
+        while let Some(&pending) = self.pending.get(i) {
+            match pending {
                 Pending::Drop { block, place, next } => {
                     self.b.start(block);
                     self.b.terminate(StmtKind::Drop { place, target: next, unwind: Unwind::Terminate }, span);

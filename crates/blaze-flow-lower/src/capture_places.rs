@@ -20,12 +20,12 @@
 
 use blaze_flow::{Local, Place, Proj};
 use blaze_typeck::env_fields::{Cover, cover, use_path};
-use blaze_typeck::{CaptureKind, CaptureProj, ClosureKind, EnvField, ExprId, Mutbl, PNode};
+use blaze_typeck::{AdjustKind, CaptureKind, CaptureProj, ClosureKind, EnvField, ExprId, Mutbl, PNode};
 use core::alloc::Allocator;
 
 use crate::{Facts, Form, Lower, Refusal, TyD};
 
-impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_, F, A, R> {
+impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, F, A, R> {
     /// How a closure of `kind` reaches field `how` (closure.rs `run_closure`'s table): owned
     /// (`None`), or through a reference of this mutability, the environment's own when the bool
     /// is set.
@@ -70,45 +70,66 @@ impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_,
     }
 
     /// The closure body's use `e` of a captured place, when its root is held by PROJECTED
-    /// fields (blaze-typeck env_fields.rs `cover`): `Ok(true)` with the place pushed, `Ok(false)`
-    /// when the ordinary descent lowers it (a place under a field: the descent meets the
-    /// field's own place on its way down; a root held whole; no captured root), a refusal by
-    /// name when only parts of the place are held. Called from `eval` after its `Adjust` task,
-    /// so the expression's own adjustments apply to what is pushed.
-    pub(crate) fn place_capture_use(&mut self, e: ExprId) -> Result<bool, Refusal> {
+    /// fields (blaze-typeck env_fields.rs `cover`): `Ok(Some(skip))` with the place pushed and
+    /// `skip` leading builtin `AdjustKind::Deref` rows already peeled (for multi-deref
+    /// `truncate_capture_for_optimization` captures such as `name: &&str` captured as `&**name`),
+    /// `Ok(None)` when the ordinary descent lowers it (a place under a field: the descent meets
+    /// the field's own place on its way down; a root held whole; no captured root), a refusal by
+    /// name when only parts of the place are held.
+    pub(crate) fn place_capture_use(&mut self, e: ExprId) -> Result<Option<u32>, Refusal> {
         if !self.env_now.iter().any(|f| !f.is_whole()) {
-            return Ok(false);
+            return Ok(None);
         }
         let path = match use_path(self.body, self.ck, e, 0) {
             Ok(Some(p)) => p,
-            Ok(None) => return Ok(false),
+            Ok(None) => return Ok(None),
             Err(_) => return self.refuse(Form::Malformed, e),
         };
         if !self.env_now.iter().any(|f| f.base == path.root && !f.is_whole()) {
-            return Ok(false);
+            return Ok(None);
         }
-        match cover(self.ck, &self.env_now, &path) {
-            Cover::Exact(j) => match self.field_places.get(j).copied().flatten() {
-                Some((place, ty, _)) => {
-                    self.push_place(place, ty);
-                    Ok(true)
+        let (lo, hi) = self.adjust_rows(e);
+        let max_derefs = self.ck.adjusts.column::<1>()
+            .get(lo..hi)
+            .map_or(0, |rows| rows.iter().take_while(|&&k| matches!(k, AdjustKind::Deref { overloaded: None })).count());
+        let max_derefs = u32::try_from(max_derefs).unwrap_or(u32::MAX);
+        for skip in 0..=max_derefs {
+            let cur_path = if skip == 0 {
+                path
+            } else {
+                match use_path(self.body, self.ck, e, skip) {
+                    Ok(Some(p)) => p,
+                    Ok(None) => break,
+                    Err(_) => return self.refuse(Form::Malformed, e),
                 }
-                None => self.refuse(Form::Malformed, e),
-            },
-            Cover::Under { .. } => Ok(false),
-            // The field is `&*r` by shared reference: `r`'s value is the field's pointer, the
-            // argument local itself (`&T` as the lowering lays a reference, `wrap`).
-            Cover::RefOf(j) => match self.field_places.get(j).copied().flatten() {
-                Some((_, ty, Some(Mutbl::Not))) => {
-                    let l = Local(1 + j as u32);
-                    let at = self.place_of(l);
-                    self.push_place(at, TyD { wrap: Some(Mutbl::Not), ty: ty.ty });
-                    Ok(true)
-                }
-                _ => self.refuse(Form::CapturePlace, e),
-            },
-            Cover::Above | Cover::NotCaptured => self.refuse(Form::CapturePlace, e),
+            };
+            match cover(self.ck, &self.env_now, &cur_path) {
+                Cover::Exact(j) => match self.field_places.get(j).copied().flatten() {
+                    Some((place, ty, _)) => {
+                        self.push_place(place, ty);
+                        return Ok(Some(skip));
+                    }
+                    None => return self.refuse(Form::Malformed, e),
+                },
+                Cover::Under { .. } if skip == 0 => return Ok(None),
+                Cover::Under { .. } => break,
+                // The field is `&*r` or `&mut *r`: `r`'s value is the field's pointer, the
+                // argument local itself (`&T` / `&mut T` as the lowering lays a reference, `wrap`).
+                Cover::RefOf(j) => match self.field_places.get(j).copied().flatten() {
+                    Some((_, ty, Some(m))) => {
+                        let Ok(j32) = u32::try_from(j) else { return self.refuse(Form::Malformed, e) };
+                        let l = Local(1 + j32);
+                        let at = self.place_of(l);
+                        self.push_place(at, TyD { wrap: Some(m), ty: ty.ty });
+                        return Ok(Some(skip));
+                    }
+                    _ => return self.refuse(Form::CapturePlace, e),
+                },
+                Cover::Above => continue,
+                Cover::NotCaptured => return self.refuse(Form::CapturePlace, e),
+            }
         }
+        self.refuse(Form::CapturePlace, e)
     }
 
     /// The owner's place of environment field `f` of the closure (or block) made at `e`, and
@@ -121,12 +142,44 @@ impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_,
     /// variant or a union, an index (the analysis truncates at one; a row with one is
     /// malformed).
     pub(crate) fn capture_source(&mut self, f: EnvField, e: ExprId) -> Result<(Place, TyD), Refusal> {
-        if self.env_now.iter().any(|g| g.base == f.base && !g.is_whole()) {
-            return self.refuse(Form::CapturePlace, e);
-        }
         let ck = self.ck;
-        let (mut at, mut ty) = self.binding_place(f.base, e)?;
-        for i in 0..f.len {
+        let (mut at, mut ty, start_i) = if self.env_now.iter().any(|g| g.base == f.base && !g.is_whole()) {
+            // Inside an outer closure that holds projected fields of `f.base`: find the
+            // enclosing projected field (prefix of `f`) or a `RefOf` field (`&*f`), and
+            // project any remaining steps from it.
+            let mut found = None;
+            for (j, g) in self.env_now.iter().enumerate() {
+                if g.base != f.base || g.is_whole() {
+                    continue;
+                }
+                let n = g.len as usize;
+                let m = f.len as usize;
+                let common = (0..n.min(m)).take_while(|&i| g.proj(ck, i as u32).map(|(p, _)| p) == f.proj(ck, i as u32).map(|(p, _)| p)).count();
+                if common == n {
+                    if let Some((place, pty, _)) = self.field_places.get(j).copied().flatten() {
+                        found = Some((place, pty, g.len));
+                        break;
+                    }
+                } else if common == m
+                    && n == m + 1
+                    && matches!(g.how, CaptureKind::ByRef | CaptureKind::ByMutRef)
+                    && g.proj(ck, m as u32).is_some_and(|(p, _)| p == CaptureProj::Deref)
+                    && let Some((_, pty, Some(mutbl))) = self.field_places.get(j).copied().flatten()
+                {
+                    let l = Local(1 + j as u32);
+                    found = Some((self.place_of(l), TyD { wrap: Some(mutbl), ty: pty.ty }, f.len));
+                    break;
+                }
+            }
+            match found {
+                Some(x) => x,
+                None => return self.refuse(Form::CapturePlace, e),
+            }
+        } else {
+            let (p, t) = self.binding_place(f.base, e)?;
+            (p, t, 0)
+        };
+        for i in start_i..f.len {
             let Some((proj, after)) = f.proj(ck, i) else { return self.refuse(Form::Malformed, e) };
             let child = TyD::of(after);
             at = match proj {
@@ -145,21 +198,25 @@ impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_,
                     if ty.wrap.is_some() {
                         return self.refuse(Form::Malformed, e);
                     }
+                    let mut is_union = false;
                     let drop_type = match self.node(ty.ty, e)? {
-                        PNode::Tuple(_) if variant == 0 => false,
+                        PNode::Tuple(_) | PNode::Record(..) if variant == 0 => false,
                         PNode::Adt(k, _) => {
                             let facts = self.adt_facts(k, e)?;
-                            if facts.union {
-                                return self.refuse(Form::Union, e);
-                            }
                             if facts.is_enum || variant != 0 {
                                 return self.refuse(Form::CapturePlace, e);
                             }
+                            is_union = facts.union;
                             facts.drop_impl
                         }
                         _ => return self.refuse(Form::Malformed, e),
                     };
-                    self.project(at, ty, Proj::Field(field), child, drop_type, e)?
+                    let proj = if is_union {
+                        Proj::Subslice { from: field, to: field, from_end: false }
+                    } else {
+                        Proj::Field(field)
+                    };
+                    self.project(at, ty, proj, child, drop_type, e)?
                 }
                 CaptureProj::Index => return self.refuse(Form::Malformed, e),
             };

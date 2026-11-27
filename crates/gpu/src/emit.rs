@@ -302,7 +302,7 @@ pub fn emit_msl(module: &ShaderModule<'_>, out: &mut dyn Write) -> fmt::Result {
         }
         writeln!(out, ") {{")?;
         for stmt in helper.body {
-            write_msl_stmt(out, None, stmt, 1)?;
+            write_stmt(ShaderLang::Msl, out, None, stmt, 1)?;
         }
         writeln!(out, "}}\n")?;
     }
@@ -400,7 +400,7 @@ pub fn emit_msl(module: &ShaderModule<'_>, out: &mut dyn Write) -> fmt::Result {
 
         writeln!(out, ") {{")?;
         for stmt in entry.body {
-            write_msl_stmt(out, Some(d), stmt, 1)?;
+            write_stmt(ShaderLang::Msl, out, Some(d), stmt, 1)?;
         }
         writeln!(out, "}}\n")?;
     }
@@ -470,33 +470,66 @@ fn write_indent(out: &mut dyn Write, depth: usize) -> fmt::Result {
     Ok(())
 }
 
-fn write_msl_stmt(out: &mut dyn Write, desc: Option<&EntryDesc>, stmt: &IrStmt<'_>, depth: usize) -> fmt::Result {
+#[derive(Copy, Clone)]
+enum ShaderLang {
+    Msl,
+    Wgsl,
+}
+
+impl ShaderLang {
+    fn write_expr(self, out: &mut dyn Write, desc: Option<&EntryDesc>, expr: &IrExpr<'_>) -> fmt::Result {
+        match self {
+            Self::Msl => write_msl_expr(out, desc, expr),
+            Self::Wgsl => write_wgsl_expr(out, expr),
+        }
+    }
+}
+
+fn write_stmt(
+    lang: ShaderLang,
+    out: &mut dyn Write,
+    desc: Option<&EntryDesc>,
+    stmt: &IrStmt<'_>,
+    depth: usize,
+) -> fmt::Result {
     write_indent(out, depth)?;
     match stmt {
         IrStmt::Let { name, ty, mutable, init } => {
-            if !*mutable {
-                write!(out, "const ")?;
+            match lang {
+                ShaderLang::Msl => {
+                    if !*mutable {
+                        write!(out, "const ")?;
+                    }
+                    match ty {
+                        Some(t) => write_msl_ty(out, *t)?,
+                        None => write!(out, "auto")?,
+                    }
+                    write!(out, " {name}")?;
+                }
+                ShaderLang::Wgsl => {
+                    write!(out, "{} {name}", if *mutable { "var" } else { "let" })?;
+                    if let Some(t) = ty {
+                        write!(out, ": ")?;
+                        write_wgsl_ty(out, *t)?;
+                    }
+                }
             }
-            match ty {
-                Some(t) => write_msl_ty(out, *t)?,
-                None => write!(out, "auto")?,
-            }
-            write!(out, " {name} = ")?;
-            write_msl_expr(out, desc, init)?;
+            write!(out, " = ")?;
+            lang.write_expr(out, desc, init)?;
             writeln!(out, ";")
         }
         IrStmt::Assign { target, value } => {
-            write_msl_expr(out, desc, target)?;
+            lang.write_expr(out, desc, target)?;
             write!(out, " = ")?;
-            write_msl_expr(out, desc, value)?;
+            lang.write_expr(out, desc, value)?;
             writeln!(out, ";")
         }
         IrStmt::If { cond, then_body, else_body } => {
             write!(out, "if (")?;
-            write_msl_expr(out, desc, cond)?;
+            lang.write_expr(out, desc, cond)?;
             writeln!(out, ") {{")?;
             for s in *then_body {
-                write_msl_stmt(out, desc, s, depth + 1)?;
+                write_stmt(lang, out, desc, s, depth + 1)?;
             }
             write_indent(out, depth)?;
             if else_body.is_empty() {
@@ -504,44 +537,56 @@ fn write_msl_stmt(out: &mut dyn Write, desc: Option<&EntryDesc>, stmt: &IrStmt<'
             } else {
                 writeln!(out, "}} else {{")?;
                 for s in *else_body {
-                    write_msl_stmt(out, desc, s, depth + 1)?;
+                    write_stmt(lang, out, desc, s, depth + 1)?;
                 }
                 write_indent(out, depth)?;
                 writeln!(out, "}}")
             }
         }
         IrStmt::ForRange { var, start, end, body } => {
-            write!(out, "for (uint {var} = ")?;
-            write_msl_expr(out, desc, start)?;
+            match lang {
+                ShaderLang::Msl => write!(out, "for (uint {var} = ")?,
+                ShaderLang::Wgsl => write!(out, "for (var {var}: u32 = ")?,
+            }
+            lang.write_expr(out, desc, start)?;
             write!(out, "; {var} < ")?;
-            write_msl_expr(out, desc, end)?;
-            writeln!(out, "; {var} += 1u) {{")?;
+            lang.write_expr(out, desc, end)?;
+            match lang {
+                ShaderLang::Msl => writeln!(out, "; {var} += 1u) {{")?,
+                ShaderLang::Wgsl => writeln!(out, "; {var} = {var} + 1u) {{")?,
+            }
             for s in *body {
-                write_msl_stmt(out, desc, s, depth + 1)?;
+                write_stmt(lang, out, desc, s, depth + 1)?;
             }
             write_indent(out, depth)?;
             writeln!(out, "}}")
         }
         IrStmt::While { cond, body } => {
             write!(out, "while (")?;
-            write_msl_expr(out, desc, cond)?;
+            lang.write_expr(out, desc, cond)?;
             writeln!(out, ") {{")?;
             for s in *body {
-                write_msl_stmt(out, desc, s, depth + 1)?;
+                write_stmt(lang, out, desc, s, depth + 1)?;
             }
             write_indent(out, depth)?;
             writeln!(out, "}}")
         }
-        IrStmt::WorkgroupBarrier => writeln!(out, "threadgroup_barrier(mem_flags::mem_threadgroup);"),
-        IrStmt::Discard => writeln!(out, "discard_fragment();"),
+        IrStmt::WorkgroupBarrier => match lang {
+            ShaderLang::Msl => writeln!(out, "threadgroup_barrier(mem_flags::mem_threadgroup);"),
+            ShaderLang::Wgsl => writeln!(out, "workgroupBarrier();"),
+        },
+        IrStmt::Discard => match lang {
+            ShaderLang::Msl => writeln!(out, "discard_fragment();"),
+            ShaderLang::Wgsl => writeln!(out, "discard;"),
+        },
         IrStmt::Return(None) => writeln!(out, "return;"),
         IrStmt::Return(Some(e)) => {
             write!(out, "return ")?;
-            write_msl_expr(out, desc, e)?;
+            lang.write_expr(out, desc, e)?;
             writeln!(out, ";")
         }
         IrStmt::Expr(e) => {
-            write_msl_expr(out, desc, e)?;
+            lang.write_expr(out, desc, e)?;
             writeln!(out, ";")
         }
     }
@@ -623,7 +668,7 @@ fn write_msl_expr(out: &mut dyn Write, desc: Option<&EntryDesc>, expr: &IrExpr<'
         }
         IrExpr::Construct(ty, args) => {
             write_msl_ty(out, *ty)?;
-            if matches!(ty, IrTy::Struct(_)) {
+            if matches!(ty, IrTy::Struct(_) | IrTy::Array(_, _)) {
                 write!(out, "{{")?;
                 for (i, a) in args.iter().enumerate() {
                     if i > 0 {
@@ -696,6 +741,189 @@ fn write_msl_expr(out: &mut dyn Write, desc: Option<&EntryDesc>, expr: &IrExpr<'
 /// Emits `module` as **WGSL** into `out`, with exact `@group(0) @binding(N)` layout matching
 /// [`EntryDesc::wgsl_binding`] and [`EntryDesc::wgsl_sizes_binding`].
 pub fn emit_wgsl(module: &ShaderModule<'_>, out: &mut dyn Write) -> fmt::Result {
+    emit_wgsl_inner(module, out, false)
+}
+
+/// Emits a linked graphics pipeline `module` (vertex + fragment sharing a single `@group(0)` bind
+/// group) as **WGSL** into `out`.
+///
+/// Unlike [`emit_wgsl`], resource parameters across all entries are assigned sequential,
+/// collision-free `@group(0) @binding(0..N)` indices in order of first appearance, parameters with
+/// identical names shared across stages are emitted once, and `_gpu_sizes` is emitted only if any
+/// entry body actually reads [`IrExpr::BufferLen`].
+pub fn emit_wgsl_pipeline(module: &ShaderModule<'_>, out: &mut dyn Write) -> fmt::Result {
+    emit_wgsl_inner(module, out, true)
+}
+
+fn stmts_use_buffer_len(stmts: &[IrStmt<'_>]) -> bool {
+    let mut stack: [&[IrStmt<'_>]; 32] = [&[]; 32];
+    let mut top: usize = 0;
+    if let Some(slot) = stack.get_mut(top) {
+        *slot = stmts;
+        top += 1;
+    }
+    while top > 0 {
+        top -= 1;
+        let Some(&slice) = stack.get(top) else { break };
+        for stmt in slice {
+            match stmt {
+                IrStmt::Let { init, .. } => {
+                    if expr_uses_buffer_len(init) {
+                        return true;
+                    }
+                }
+                IrStmt::Assign { target, value } => {
+                    if expr_uses_buffer_len(target) || expr_uses_buffer_len(value) {
+                        return true;
+                    }
+                }
+                IrStmt::If { cond, then_body, else_body } => {
+                    if expr_uses_buffer_len(cond) {
+                        return true;
+                    }
+                    if let Some(slot) = stack.get_mut(top) {
+                        *slot = then_body;
+                        top += 1;
+                    }
+                    if let Some(slot) = stack.get_mut(top) {
+                        *slot = else_body;
+                        top += 1;
+                    }
+                }
+                IrStmt::ForRange { start, end, body, .. } => {
+                    if expr_uses_buffer_len(start) || expr_uses_buffer_len(end) {
+                        return true;
+                    }
+                    if let Some(slot) = stack.get_mut(top) {
+                        *slot = body;
+                        top += 1;
+                    }
+                }
+                IrStmt::While { cond, body } => {
+                    if expr_uses_buffer_len(cond) {
+                        return true;
+                    }
+                    if let Some(slot) = stack.get_mut(top) {
+                        *slot = body;
+                        top += 1;
+                    }
+                }
+                IrStmt::Return(Some(e)) | IrStmt::Expr(e) => {
+                    if expr_uses_buffer_len(e) {
+                        return true;
+                    }
+                }
+                IrStmt::WorkgroupBarrier | IrStmt::Discard | IrStmt::Return(None) => {}
+            }
+        }
+    }
+    false
+}
+
+fn expr_uses_buffer_len(root: &IrExpr<'_>) -> bool {
+    let mut stack: [Option<&IrExpr<'_>>; 64] = [None; 64];
+    let mut top: usize = 0;
+    if let Some(slot) = stack.get_mut(top) {
+        *slot = Some(root);
+        top += 1;
+    }
+    while top > 0 {
+        top -= 1;
+        let Some(Some(expr)) = stack.get(top).copied() else { break };
+        match expr {
+            IrExpr::BufferLen(_) => return true,
+            IrExpr::Unary(_, a) | IrExpr::Field(a, _) | IrExpr::Cast(_, a) => {
+                if let Some(slot) = stack.get_mut(top) {
+                    *slot = Some(a);
+                    top += 1;
+                }
+            }
+            IrExpr::Binary(_, a, b) | IrExpr::Index(a, b) => {
+                if let Some(slot) = stack.get_mut(top) {
+                    *slot = Some(a);
+                    top += 1;
+                }
+                if let Some(slot) = stack.get_mut(top) {
+                    *slot = Some(b);
+                    top += 1;
+                }
+            }
+            IrExpr::Construct(_, args) | IrExpr::Call(_, args) => {
+                for a in *args {
+                    if let Some(slot) = stack.get_mut(top) {
+                        *slot = Some(a);
+                        top += 1;
+                    }
+                }
+            }
+            IrExpr::Sample2d { uv, level, .. } => {
+                if let Some(slot) = stack.get_mut(top) {
+                    *slot = Some(uv);
+                    top += 1;
+                }
+                if let Some(lvl) = level {
+                    if let Some(slot) = stack.get_mut(top) {
+                        *slot = Some(lvl);
+                        top += 1;
+                    }
+                }
+            }
+            IrExpr::Load2d { coord, level, .. } => {
+                if let Some(slot) = stack.get_mut(top) {
+                    *slot = Some(coord);
+                    top += 1;
+                }
+                if let Some(slot) = stack.get_mut(top) {
+                    *slot = Some(level);
+                    top += 1;
+                }
+            }
+            IrExpr::LitF32(_)
+            | IrExpr::LitU32(_)
+            | IrExpr::LitI32(_)
+            | IrExpr::LitBool(_)
+            | IrExpr::Var(_)
+            | IrExpr::ThreadGlobal(_)
+            | IrExpr::ThreadLocal(_)
+            | IrExpr::ThreadGroup(_) => {}
+        }
+    }
+    false
+}
+
+fn write_wgsl_binding_decl(
+    out: &mut dyn Write,
+    group: u32,
+    binding: u32,
+    name: &str,
+    kind: Kind,
+    elem_ty: IrTy,
+) -> fmt::Result {
+    write!(out, "@group({group}) @binding({binding}) ")?;
+    match kind {
+        Kind::Uniform { .. } => {
+            write!(out, "var<uniform> {name}: ")?;
+            write_wgsl_ty(out, elem_ty)?;
+            writeln!(out, ";")
+        }
+        Kind::Storage { .. } => {
+            write!(out, "var<storage, read> {name}: array<")?;
+            write_wgsl_ty(out, elem_ty)?;
+            writeln!(out, ">;")
+        }
+        Kind::RawOut { .. } => {
+            write!(out, "var<storage, read_write> {name}: array<")?;
+            write_wgsl_ty(out, elem_ty)?;
+            writeln!(out, ">;")
+        }
+        Kind::Tlas => writeln!(out, "var {name}: acceleration_structure;"),
+        Kind::Texture2d => writeln!(out, "var {name}: texture_2d<f32>;"),
+        Kind::Sampler => writeln!(out, "var {name}: sampler;"),
+        _ => Ok(()),
+    }
+}
+
+fn emit_wgsl_inner(module: &ShaderModule<'_>, out: &mut dyn Write, unified_pipeline: bool) -> fmt::Result {
     for s in module.structs {
         writeln!(out, "struct {} {{", s.name)?;
         for f in s.fields {
@@ -717,51 +945,72 @@ pub fn emit_wgsl(module: &ShaderModule<'_>, out: &mut dyn Write) -> fmt::Result 
         }
     }
 
-    // Emit module-scope resource bindings for each entry.
-    for entry in module.entries {
-        let d = entry.desc;
+    if unified_pipeline {
+        let mut emitted_names: [&str; 64] = [""; 64];
+        let mut emitted_len: usize = 0;
+        let mut next_binding: u32 = 0;
         let mut any_binding = false;
-        for (i, p) in d.params.iter().enumerate() {
-            let Some((group, binding)) = d.wgsl_binding(i) else {
-                continue;
-            };
-            any_binding = true;
-            let elem_ty = entry.param_types.get(i).copied().unwrap_or(IrTy::U32);
-            write!(out, "@group({group}) @binding({binding}) ")?;
-            match p.kind {
-                Kind::Uniform { .. } => {
-                    write!(out, "var<uniform> {}: ", p.name)?;
-                    write_wgsl_ty(out, elem_ty)?;
-                    writeln!(out, ";")?;
+        let mut uses_sizes = false;
+        for entry in module.entries {
+            let d = entry.desc;
+            for (i, p) in d.params.iter().enumerate() {
+                let Some((group, _)) = d.wgsl_binding(i) else {
+                    continue;
+                };
+                let mut already = false;
+                let mut k = 0usize;
+                while k < emitted_len {
+                    if let Some(prev) = emitted_names.get(k) {
+                        if *prev == p.name {
+                            already = true;
+                            break;
+                        }
+                    }
+                    k += 1;
                 }
-                Kind::Storage { .. } => {
-                    write!(out, "var<storage, read> {}: array<", p.name)?;
-                    write_wgsl_ty(out, elem_ty)?;
-                    writeln!(out, ">;")?;
+                if already {
+                    continue;
                 }
-                Kind::RawOut { .. } => {
-                    write!(out, "var<storage, read_write> {}: array<", p.name)?;
-                    write_wgsl_ty(out, elem_ty)?;
-                    writeln!(out, ">;")?;
+                if let Some(slot) = emitted_names.get_mut(emitted_len) {
+                    *slot = p.name;
+                    emitted_len += 1;
                 }
-                Kind::Tlas => {
-                    writeln!(out, "var {}: acceleration_structure;", p.name)?;
-                }
-                Kind::Texture2d => {
-                    writeln!(out, "var {}: texture_2d<f32>;", p.name)?;
-                }
-                Kind::Sampler => {
-                    writeln!(out, "var {}: sampler;", p.name)?;
-                }
-                _ => {}
+                let binding = next_binding;
+                next_binding += 1;
+                any_binding = true;
+                let elem_ty = entry.param_types.get(i).copied().unwrap_or(IrTy::U32);
+                write_wgsl_binding_decl(out, group, binding, p.name, p.kind, elem_ty)?;
+            }
+            if d.wgsl_sizes_binding().is_some() && stmts_use_buffer_len(entry.body) {
+                uses_sizes = true;
             }
         }
-        if let Some((group, binding)) = d.wgsl_sizes_binding() {
+        if uses_sizes {
             any_binding = true;
-            writeln!(out, "@group({group}) @binding({binding}) var<storage, read> _gpu_sizes: array<u32>;")?;
+            writeln!(out, "@group(0) @binding({next_binding}) var<storage, read> _gpu_sizes: array<u32>;")?;
         }
         if any_binding {
             writeln!(out)?;
+        }
+    } else {
+        for entry in module.entries {
+            let d = entry.desc;
+            let mut any_binding = false;
+            for (i, p) in d.params.iter().enumerate() {
+                let Some((group, binding)) = d.wgsl_binding(i) else {
+                    continue;
+                };
+                any_binding = true;
+                let elem_ty = entry.param_types.get(i).copied().unwrap_or(IrTy::U32);
+                write_wgsl_binding_decl(out, group, binding, p.name, p.kind, elem_ty)?;
+            }
+            if let Some((group, binding)) = d.wgsl_sizes_binding() {
+                any_binding = true;
+                writeln!(out, "@group({group}) @binding({binding}) var<storage, read> _gpu_sizes: array<u32>;")?;
+            }
+            if any_binding {
+                writeln!(out)?;
+            }
         }
     }
 
@@ -781,7 +1030,7 @@ pub fn emit_wgsl(module: &ShaderModule<'_>, out: &mut dyn Write) -> fmt::Result 
         }
         writeln!(out, " {{")?;
         for stmt in helper.body {
-            write_wgsl_stmt(out, stmt, 1)?;
+            write_stmt(ShaderLang::Wgsl, out, None, stmt, 1)?;
         }
         writeln!(out, "}}\n")?;
     }
@@ -837,7 +1086,7 @@ pub fn emit_wgsl(module: &ShaderModule<'_>, out: &mut dyn Write) -> fmt::Result 
         }
         writeln!(out, " {{")?;
         for stmt in entry.body {
-            write_wgsl_stmt(out, stmt, 1)?;
+            write_stmt(ShaderLang::Wgsl, out, None, stmt, 1)?;
         }
         writeln!(out, "}}\n")?;
     }
@@ -893,81 +1142,6 @@ fn write_wgsl_ty(out: &mut dyn Write, ty: IrTy) -> fmt::Result {
             write!(out, "array<")?;
             write_wgsl_ty(out, *elem)?;
             write!(out, ", {n}>")
-        }
-    }
-}
-
-fn write_wgsl_stmt(out: &mut dyn Write, stmt: &IrStmt<'_>, depth: usize) -> fmt::Result {
-    write_indent(out, depth)?;
-    match stmt {
-        IrStmt::Let { name, ty, mutable, init } => {
-            write!(out, "{} {name}", if *mutable { "var" } else { "let" })?;
-            if let Some(t) = ty {
-                write!(out, ": ")?;
-                write_wgsl_ty(out, *t)?;
-            }
-            write!(out, " = ")?;
-            write_wgsl_expr(out, init)?;
-            writeln!(out, ";")
-        }
-        IrStmt::Assign { target, value } => {
-            write_wgsl_expr(out, target)?;
-            write!(out, " = ")?;
-            write_wgsl_expr(out, value)?;
-            writeln!(out, ";")
-        }
-        IrStmt::If { cond, then_body, else_body } => {
-            write!(out, "if (")?;
-            write_wgsl_expr(out, cond)?;
-            writeln!(out, ") {{")?;
-            for s in *then_body {
-                write_wgsl_stmt(out, s, depth + 1)?;
-            }
-            write_indent(out, depth)?;
-            if else_body.is_empty() {
-                writeln!(out, "}}")
-            } else {
-                writeln!(out, "}} else {{")?;
-                for s in *else_body {
-                    write_wgsl_stmt(out, s, depth + 1)?;
-                }
-                write_indent(out, depth)?;
-                writeln!(out, "}}")
-            }
-        }
-        IrStmt::ForRange { var, start, end, body } => {
-            write!(out, "for (var {var}: u32 = ")?;
-            write_wgsl_expr(out, start)?;
-            write!(out, "; {var} < ")?;
-            write_wgsl_expr(out, end)?;
-            writeln!(out, "; {var} = {var} + 1u) {{")?;
-            for s in *body {
-                write_wgsl_stmt(out, s, depth + 1)?;
-            }
-            write_indent(out, depth)?;
-            writeln!(out, "}}")
-        }
-        IrStmt::While { cond, body } => {
-            write!(out, "while (")?;
-            write_wgsl_expr(out, cond)?;
-            writeln!(out, ") {{")?;
-            for s in *body {
-                write_wgsl_stmt(out, s, depth + 1)?;
-            }
-            write_indent(out, depth)?;
-            writeln!(out, "}}")
-        }
-        IrStmt::WorkgroupBarrier => writeln!(out, "workgroupBarrier();"),
-        IrStmt::Discard => writeln!(out, "discard;"),
-        IrStmt::Return(None) => writeln!(out, "return;"),
-        IrStmt::Return(Some(e)) => {
-            write!(out, "return ")?;
-            write_wgsl_expr(out, e)?;
-            writeln!(out, ";")
-        }
-        IrStmt::Expr(e) => {
-            write_wgsl_expr(out, e)?;
-            writeln!(out, ";")
         }
     }
 }

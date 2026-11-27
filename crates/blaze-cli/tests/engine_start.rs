@@ -55,13 +55,10 @@ const CALLS_TEST_ONLY_BROKEN: &str = "#[cfg(test)]\nfn broken() -> u8 {\n    \"n
 const BROKEN: &str = "fn broken() -> u8 {\n    \"not a number\"\n}\n\n#[test]\nfn fine() {}\n\n#[test]\nfn calls() {\n    broken();\n}\n";
 const FIXED: &str = "fn broken() -> u8 {\n    7\n}\n\n#[test]\nfn fine() {}\n\n#[test]\nfn calls() {\n    broken();\n}\n";
 
-/// The status of a `check` that found nothing, while borrows are notes: 3, never 0 (main.rs
-/// `STATUSES`, `blaze explain 3`: "check: incomplete: the stages that ran found nothing, but a
-/// stage `check` is defined to run is not built yet or did not run whole ..."; the borrows stage
-/// is off while body_types.rs `BORROWS_ARE_ERRORS` is false, so a clean check is incomplete).
-const CLEAN_CHECK: Option<i32> = Some(3);
+/// The status of a `check` that found nothing with `BORROWS_ARE_ERRORS = true`: 0.
+const CLEAN_CHECK: Option<i32> = Some(0);
 /// What [`CLEAN_CHECK`]'s evidence says.
-const CLEAN_CHECK_RULE: &str = "a clean check exits 3 while borrows are notes (`blaze explain 3`: \"check: incomplete: the stages that ran found nothing\"; BORROWS_ARE_ERRORS is false)";
+const CLEAN_CHECK_RULE: &str = "a clean check exits 0 when every stage (including borrows) runs clean";
 
 struct Said {
     stdout: String,
@@ -75,6 +72,10 @@ impl Said {
     }
 }
 
+fn pause_poll() {
+    std::thread::sleep(Duration::from_millis(10));
+}
+
 /// A scratch package of `files` and its home; `check` is given both, then they are removed.
 fn fixture<T>(name: &str, files: &[(&str, &str)], check: impl FnOnce(&Path, &Path) -> T) -> T {
     let base = fresh_home(name, true);
@@ -85,7 +86,15 @@ fn fixture<T>(name: &str, files: &[(&str, &str)], check: impl FnOnce(&Path, &Pat
         write(&dir, name, source);
     }
     let result = check(&dir, &home);
-    std::fs::remove_dir_all(&base).expect("remove the scratch command fixture");
+    // A detached `blaze gc --background` child may still be unlinking its lock file inside `home`.
+    for attempt in 0..100 {
+        match std::fs::remove_dir_all(&base) {
+            Ok(()) => break,
+            Err(_) if !base.exists() => break,
+            Err(_) if attempt + 1 < 100 => pause_poll(),
+            Err(err) => panic!("remove the scratch command fixture: {err}"),
+        }
+    }
     result
 }
 
@@ -121,7 +130,7 @@ fn blaze(dir: &Path, home: &Path, command: &str, args: &[&str]) -> Said {
             let _ = child.wait();
             panic!("`blaze {command}` past {DEADLINE:?} in {}: the command hung (rule 18)", dir.display());
         }
-        std::thread::sleep(Duration::from_millis(10));
+        pause_poll();
     };
     Said {
         stdout: std::fs::read_to_string(stdout).expect("read blaze's standard output"),
@@ -516,5 +525,76 @@ fn a_constructor_of_an_adt_whose_head_has_an_error_is_not_run() {
         );
         assert!(!said.stdout.lines().any(|line| line.contains("NOT RUN fine") || line.starts_with("FAILED fine")), "{}", said.evidence("`fine` ran"));
         assert_ne!(said.code, Some(0), "{}", said.evidence("a test NOT RUN fails the command"));
+    });
+}
+
+/// A blaze-edition binary's root `fn main` is D104's implicit `#[::std::main]` input (the whole
+/// item, including its body), whose expansion is stored in `CrateScope`. Editing ONLY inside
+/// `fn main`'s body leaves `Outline::surface()` unchanged; `CrateScope` must record a read of
+/// `definition_cell` for the root's top-level `fn main` (engine_names.rs `finish`, rule 21) and
+/// include expansion record keys in `CrateScope`'s `out` (names.rs `OUT_DOMAIN` 3), so both a
+/// warm run and a run after deleting `.blaze/v2` while keeping the home store print the edited
+/// output instead of the stale cached `"v1"` expansion.
+#[test]
+#[cfg(target_os = "macos")]
+fn editing_blaze_edition_main_body_rebuilds_warm_and_after_checkout_clean() {
+    let main_for = |word: &str| format!("fn main(cx: &Cx, out: Out) -> Result<(), Error> {{\n    out.line(cx, \"{word}\")?;\n    Ok(())\n}}\n");
+    fixture("engine_start_blaze_edit_main", &[("Cargo.toml", BLAZE_BIN), ("src/main.rs", &main_for("v1"))], |dir, home| {
+        let first = blaze(dir, home, "run", &[]);
+        assert_eq!((first.code, first.stdout.as_str()), (Some(0), "v1\n"), "{}", first.evidence("initial blaze-2026.11 run prints v1"));
+
+        // Warm edit: ONLY inside `fn main`'s body.
+        write(dir, "src/main.rs", &main_for("v2"));
+        let warm = blaze(dir, home, "run", &[]);
+        assert_eq!((warm.code, warm.stdout.as_str()), (Some(0), "v2\n"), "{}", warm.evidence("warm edit inside fn main prints v2"));
+
+        // Edit again and run `blaze clean` (removes `.blaze/v2` while keeping `home` store).
+        write(dir, "src/main.rs", &main_for("v3"));
+        let cleaned = blaze(dir, home, "clean", &[]);
+        assert_eq!(cleaned.code, Some(0), "{}", cleaned.evidence("blaze clean removes .blaze/v2"));
+        let after_clean = blaze(dir, home, "run", &[]);
+        assert_eq!((after_clean.code, after_clean.stdout.as_str()), (Some(0), "v3\n"), "{}", after_clean.evidence("edit + remove .blaze/v2 prints v3"));
+    });
+}
+
+/// Fixing a syntax error in a struct (`pub gen: u32,` -> `pub generation: u32,`) must immediately
+/// invalidate every `BodyCheck` that previously failed on a head depending on that struct, even
+/// when the functions' own bodies are untouched (rule 21: engine_bodies.rs places failed head
+/// cells via `owners.place` instead of recording an unplaced `head_cell_id`). Tested both warm
+/// and after removing `.blaze/v2` while keeping the `home` store.
+#[test]
+#[cfg(target_os = "macos")]
+fn fixing_syntax_error_in_struct_invalidates_stale_failed_bodies() {
+    let source = |field: &str| {
+        format!(
+            "pub struct EntityRec {{\n    pub {field}: u32,\n}}\n\n\
+             fn use_rec(_e: &EntityRec) -> u32 {{\n    0\n}}\n\n\
+             fn direct() -> u32 {{\n    let e = EntityRec {{ generation: 1 }};\n    e.generation\n}}\n\n\
+             fn main(cx: &Cx, out: Out) -> Result<(), Error> {{\n    let e = EntityRec {{ generation: 1 }};\n    let _ = use_rec(&e) + direct();\n    out.line(cx, \"fixed\")?;\n    Ok(())\n}}\n"
+        )
+    };
+    fixture("engine_start_fix_struct_syntax", &[("Cargo.toml", BLAZE_BIN), ("src/main.rs", &source("gen"))], |dir, home| {
+        let broken = blaze(dir, home, "check", &[]);
+        assert_ne!(broken.code, Some(0), "{}", broken.evidence("syntax error in EntityRec fails check"));
+        assert!(broken.stdout.contains("could not be frozen") || broken.stderr.contains("could not be frozen"), "{}", broken.evidence("bodies record head freeze failure"));
+
+        // Warm repair: ONLY fix the struct field name; leave `use_rec`, `direct`, and `main` untouched.
+        write(dir, "src/main.rs", &source("generation"));
+        let warm = blaze(dir, home, "run", &[]);
+        assert!(!warm.stderr.contains("could not be frozen"), "{}", warm.evidence("warm repair clears stale head failure"));
+        assert!(!warm.stderr.contains("pub gen"), "{}", warm.evidence("warm repair does not cite old syntax error"));
+        assert_eq!((warm.code, warm.stdout.as_str()), (Some(0), "fixed\n"), "{}", warm.evidence("warm repair runs and prints fixed"));
+
+        // Re-introduce the syntax error, check, repair again, remove `.blaze/v2` while keeping `home` store, and run.
+        write(dir, "src/main.rs", &source("gen"));
+        let broken2 = blaze(dir, home, "check", &[]);
+        assert_ne!(broken2.code, Some(0), "{}", broken2.evidence("second broken check fails"));
+        write(dir, "src/main.rs", &source("generation"));
+        let cleaned = blaze(dir, home, "clean", &[]);
+        assert_eq!(cleaned.code, Some(0), "{}", cleaned.evidence("blaze clean removes .blaze/v2"));
+        let after_clean = blaze(dir, home, "run", &[]);
+        assert!(!after_clean.stderr.contains("could not be frozen"), "{}", after_clean.evidence("after-clean repair clears stale head failure"));
+        assert!(!after_clean.stderr.contains("pub gen"), "{}", after_clean.evidence("after-clean repair does not cite old syntax error"));
+        assert_eq!((after_clean.code, after_clean.stdout.as_str()), (Some(0), "fixed\n"), "{}", after_clean.evidence("after-clean repair runs and prints fixed"));
     });
 }

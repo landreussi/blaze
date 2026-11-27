@@ -53,7 +53,7 @@ pub(crate) fn shim(argv: &[&str], env_clear: bool, env_ops: &[(bool, &str, &str)
 pub(crate) fn script(c_mode: CMode, spawner: Option<Arc<dyn Executor + Send + Sync>>, spawn_setting: SpawnSetting) -> Arc<Script> {
     Arc::new(Script {
         package: "spawner 0.0.0".to_owned(),
-        tree: Tree::Mem { files: Arc::new(vec![("gen.pl".to_owned(), b"print \"ret\\n\";\n".to_vec())]), git: None },
+        tree: Tree::Mem { files: Arc::new(vec![("gen.pl".to_owned(), b"print \"ret\\n\";\n".to_vec())]), submodules: Arc::from([]), git: None },
         // The workspace's root package: its tree is served at `/workspace` (the model reads
         // `/workspace/gen.pl`).
         root: crate::script_sandbox::ScriptRoot::member("").expect("the root package"),
@@ -64,6 +64,7 @@ pub(crate) fn script(c_mode: CMode, spawner: Option<Arc<dyn Executor + Send + Sy
         limits: LIMITS,
         table: Arc::new(Vec::new()),
         probes: None,
+        c_probes: None,
         spawner,
         step: ContentId([3; 32]),
         spawn_setting: Arc::new(spawn_setting),
@@ -380,7 +381,7 @@ fn recorded_answers_a_second_time_without_the_inner_executor() {
     let _ = std::fs::remove_dir_all(&store);
     std::fs::create_dir_all(&store).expect("a temporary folder");
     let (io, root) = native_world(&store).unwrap_or_else(|error| panic!("the records' world: {error}"));
-    let records = DirStore::build_scripts(&io, &root);
+    let records = DirStore::build_scripts(io.spawner(), io.boot().ok(), &root);
     let calls = AtomicU32::new(0);
     let recorded = Recorded { inner: Counting { calls: &calls }, records: &records };
     let text = |value: &str| blaze_own::String::from_str_in(value, alloc);

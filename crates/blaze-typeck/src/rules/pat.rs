@@ -17,9 +17,8 @@
 //! pattern's type needs no result of theirs.
 //!
 //! Omitted for now: recording the peeled references (`pat_adjustments`, which MIR building
-//! reads), `box` and deref patterns, the
-//! or-pattern check that every alternative binds a name at one type, and the 2024 rule's exact
-//! diagnostic split (one code here).
+//! reads), `box` and deref patterns, checking that every alternative binds the exact same set of
+//! names (E0408), and the 2024 rule's exact diagnostic split (one code here).
 
 use blaze_own::{Alloc, Vec};
 
@@ -27,7 +26,7 @@ use crate::body::{Lit, Pat};
 use crate::diag::{About, At, DiagCode};
 use crate::error::Stop;
 use crate::ids::{Edition, Mutbl, PatId};
-use crate::machine::{Frame, Lower, Machine};
+use crate::machine::{FieldNameSet, Frame, Lower, Machine};
 use crate::ty::{Cause, Ty, TyList, TyView, TypeCtx};
 use crate::world::World;
 
@@ -43,7 +42,15 @@ fn peeled_mode(mode: u32, m: Mutbl) -> u32 {
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// One pattern. `f.expect` holds the expected type, `f.a` the default binding mode.
     pub(crate) fn step_pat(&mut self, f: Frame, p: PatId) -> Result<(), Stop> {
+        if f.state == 1 {
+            return self.unify_or_bindings(p);
+        }
         let pat = self.body.pat(p)?;
+        if let Pat::Or { alts } = pat
+            && self.body.pat_list(alts)?.len() >= 2
+        {
+            self.resume(f, 1)?;
+        }
         let mut expected = f.expect.to_option().unwrap_or(self.common.err);
         let mut mode = f.a;
         // A path pattern's type is known before it meets the expected type, and a constant of
@@ -64,7 +71,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
                 None => true,
             },
-            Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Slice { .. } | Pat::Range { .. } => true,
+            Pat::Tuple { .. }
+            | Pat::TupleStruct { .. }
+            | Pat::Struct { .. }
+            | Pat::Record { .. }
+            | Pat::Slice { .. }
+            | Pat::Range { .. } => true,
             Pat::Lit(l) | Pat::NegLit(l) => !matches!(l, Lit::Str | Lit::ByteStr(_) | Lit::CStr),
             Pat::Missing | Pat::Wild | Pat::Bind { .. } | Pat::Ref { .. } | Pat::Or { .. } => false,
         };
@@ -95,7 +107,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         match pat {
             Pat::Missing => Ok(self.common.err),
             Pat::Wild => Ok(expected),
-            Pat::Bind { ann, name, sub } => {
+            Pat::Bind { ann, name, sub, ty: None } => {
                 let explicit = ann.mutable || ann.by_ref.is_some();
                 // By the edition of the pattern's own words, not the body's (rustc
                 // migration.rs `emit`: a hard error when a label's span is
@@ -120,6 +132,95 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 self.local_ty[p.ix()] = local;
                 if let Some(sub) = sub {
                     self.push_pat(sub, expected, mode)?;
+                }
+                Ok(expected)
+            }
+            Pat::Bind { ann, name, sub, ty: Some(pty) } => {
+                let ann_ty = self.lower_body_ty(pty, at)?;
+                let mut cur_expected = self.try_structurally_resolve(expected)?;
+                let mut cur_mode = mode;
+                // Peel references on `expected` when it points to a structural union and the
+                // written type annotation itself is not a reference (so matching `&err` with
+                // `e: FsError` binds `e: &FsError`).
+                if !matches!(self.view(ann_ty), TyView::Ref(..)) && self.peels_to_union(cur_expected)? {
+                    for _ in 0..crate::machine::RECURSION_LIMIT {
+                        let t = self.try_structurally_resolve(cur_expected)?;
+                        match self.view(t) {
+                            TyView::Ref(m, inner) => {
+                                cur_mode = peeled_mode(cur_mode, m);
+                                cur_expected = inner;
+                            }
+                            _ => {
+                                cur_expected = t;
+                                break;
+                            }
+                        }
+                    }
+                }
+                let explicit = ann.mutable || ann.by_ref.is_some();
+                if explicit && cur_mode != 0 && self.body.pat_edition(p) >= Edition::E2024 {
+                    self.diag(DiagCode::BindingModifier2024, at, About::found_named(cur_expected, name));
+                }
+                let by_ref = match ann.by_ref {
+                    Some(m) => Some(m),
+                    None if ann.mutable => None,
+                    None => match cur_mode {
+                        1 => Some(Mutbl::Not),
+                        2 => Some(Mutbl::Mut),
+                        _ => None,
+                    },
+                };
+                let resolved = self.try_structurally_resolve(cur_expected)?;
+                if let TyView::Union(members) = self.view(resolved) {
+                    let n = self.ty.list_len(members);
+                    let mut matched: Option<u32> = None;
+                    let mut count = 0u32;
+                    for v in 0..n {
+                        let mv = self.ty.list_get(members, v);
+                        if self.probe(|m| m.unify(mv, ann_ty))? {
+                            matched = Some(v);
+                            count += 1;
+                            if count > 1 {
+                                break;
+                            }
+                        }
+                    }
+                    if count == 1
+                        && let Some(v) = matched
+                        && self.unify(self.ty.list_get(members, v), ann_ty)?
+                    {
+                        self.union_pats.push((p, crate::columns::UnionPat::Variant(v)));
+                        let local = match by_ref {
+                            Some(m) => self.mk(TyView::Ref(m, ann_ty))?,
+                            None => ann_ty,
+                        };
+                        if let Some(slot) = self.local_ty.get_mut(p.ix()) {
+                            *slot = local;
+                        }
+                        if let Some(sub) = sub {
+                            self.push_pat(sub, ann_ty, cur_mode)?;
+                        }
+                    } else {
+                        self.diag(DiagCode::Mismatch, at, About::types(resolved, ann_ty));
+                        if let Some(slot) = self.local_ty.get_mut(p.ix()) {
+                            *slot = self.common.err;
+                        }
+                        if let Some(sub) = sub {
+                            self.push_pat(sub, self.common.err, cur_mode)?;
+                        }
+                    }
+                } else {
+                    self.demand_eq(at, cur_expected, ann_ty)?;
+                    let local = match by_ref {
+                        Some(m) => self.mk(TyView::Ref(m, ann_ty))?,
+                        None => ann_ty,
+                    };
+                    if let Some(slot) = self.local_ty.get_mut(p.ix()) {
+                        *slot = local;
+                    }
+                    if let Some(sub) = sub {
+                        self.push_pat(sub, ann_ty, cur_mode)?;
+                    }
                 }
                 Ok(expected)
             }
@@ -227,7 +328,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 let declared = adt.fields.get(v.fields.range()).unwrap_or(&[]);
                 let mut tys: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(fps.len(), self.alloc);
                 for fp in fps {
-                    match declared.iter().find(|d| d.name == fp.name) {
+                    match self.find_adt_field(adt_key, variant, declared, fp.name).and_then(|i| declared.get(i as usize)) {
                         Some(d) => tys.push(self.lower(adt.types, d.ty, Lower::Args(args), Cause::Pat(fp.pat))?),
                         None => {
                             self.diag(DiagCode::NoSuchFieldPat, At::Pat(fp.pat), About::name(fp.name));
@@ -241,11 +342,58 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     if fps.len() != 1 {
                         self.diag(DiagCode::UnionPatternFields, at, About::Count { expected: 1, got: fps.len() as u32, found: Some(expected) });
                     }
-                } else if !rest && let Some(missing) = declared.iter().find(|d| !fps.iter().any(|fp| fp.name == d.name)) {
-                    self.diag(DiagCode::MissingFieldPats, at, About::found_named(expected, missing.name));
+                } else if !rest {
+                    let fp_set = FieldNameSet::new(fps, self.alloc);
+                    if let Some(missing) = declared.iter().find(|d| !fp_set.contains(d.name)) {
+                        self.diag(DiagCode::MissingFieldPats, at, About::found_named(expected, missing.name));
+                    }
                 }
                 for (fp, &t) in fps.iter().zip(tys.iter()).rev() {
                     self.push_pat(fp.pat, t, mode)?;
+                }
+                Ok(expected)
+            }
+            Pat::Record { fields, rest } => {
+                let fps = self.body.field_pat_list(fields)?;
+                let t = self.structurally_resolve(expected, at)?;
+                let (schema, field_tys) = match self.view(t) {
+                    TyView::Record(schema, field_tys) => (schema, field_tys),
+                    TyView::Error => {
+                        for fp in fps.iter().rev() {
+                            self.push_pat(fp.pat, self.common.err, mode)?;
+                        }
+                        return Ok(expected);
+                    }
+                    _ => {
+                        self.diag(DiagCode::Mismatch, at, About::expected(expected));
+                        for fp in fps.iter().rev() {
+                            self.push_pat(fp.pat, self.common.err, mode)?;
+                        }
+                        return Ok(expected);
+                    }
+                };
+                let n = self.ty.list_len(field_tys);
+                let mut tys: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(fps.len(), self.alloc);
+                for fp in fps {
+                    match self.record_field_index(schema, fp.name) {
+                        Some(idx) if idx < n => tys.push(self.ty.list_get(field_tys, idx)),
+                        _ => {
+                            self.diag(DiagCode::NoField, At::Pat(fp.pat), About::found_named(t, fp.name));
+                            tys.push(self.common.err);
+                        }
+                    }
+                }
+                if !rest {
+                    let fp_set = FieldNameSet::new(fps, self.alloc);
+                    let missing = self.record_names(schema).and_then(|names| {
+                        names.iter().copied().find(|&nm| !fp_set.contains(nm))
+                    });
+                    if let Some(nm) = missing {
+                        self.diag(DiagCode::MissingFields, at, About::found_named(t, nm));
+                    }
+                }
+                for (fp, &ft) in fps.iter().zip(tys.iter()).rev() {
+                    self.push_pat(fp.pat, ft, mode)?;
                 }
                 Ok(expected)
             }
@@ -339,6 +487,105 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 Ok(expected)
             }
         }
+    }
+
+    /// Whether peeling zero or more references off `ty` reaches a structural union.
+    fn peels_to_union(&mut self, mut ty: Ty) -> Result<bool, Stop> {
+        for _ in 0..crate::machine::RECURSION_LIMIT {
+            let t = self.try_structurally_resolve(ty)?;
+            match self.view(t) {
+                TyView::Ref(_, inner) => ty = inner,
+                TyView::Union(_) => return Ok(true),
+                _ => return Ok(false),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Unifies the binding types of every alternative of `Pat::Or` `p` against the first
+    /// alternative's bindings of the same name (rustc E0308 / inference across `(Err(e), _) |
+    /// (_, Err(e))`). Iterative worklist, bounded by `self.body.pats.len()`.
+    fn unify_or_bindings(&mut self, p: PatId) -> Result<(), Stop> {
+        let Pat::Or { alts } = self.body.pat(p)? else {
+            return Ok(());
+        };
+        let pats = self.body.pat_list(alts)?;
+        let Some((&first, rest)) = pats.split_first() else {
+            return Ok(());
+        };
+        if rest.is_empty() {
+            return Ok(());
+        }
+        let limit = self.body.pats.len().saturating_mul(2).saturating_add(16);
+        let mut first_binds: Vec<(crate::ids::Name, Ty), Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut work: Vec<PatId, Alloc<'a>> = Vec::new_in(self.alloc);
+        work.push(first);
+        let mut steps = 0usize;
+        while let Some(cur) = work.pop() {
+            steps += 1;
+            if steps > limit {
+                return Ok(());
+            }
+            match self.body.pat(cur)? {
+                Pat::Bind { name, sub, .. } => {
+                    if let Some(&ty) = self.local_ty.get(cur.ix())
+                        && !first_binds.iter().any(|&(n, _)| n == name)
+                    {
+                        first_binds.push((name, ty));
+                    }
+                    if let Some(sub) = sub {
+                        work.push(sub);
+                    }
+                }
+                Pat::Ref { inner, .. } => work.push(inner),
+                Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } | Pat::Or { alts: elems } => {
+                    work.extend_from_slice(self.body.pat_list(elems)?);
+                }
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
+                    for fp in self.body.field_pat_list(fields)? {
+                        work.push(fp.pat);
+                    }
+                }
+                Pat::Missing | Pat::Wild | Pat::Lit(_) | Pat::NegLit(_) | Pat::Path(_) | Pat::Range { .. } => {}
+            }
+        }
+        if first_binds.is_empty() {
+            return Ok(());
+        }
+        for &alt in rest {
+            work.clear();
+            work.push(alt);
+            let mut alt_steps = 0usize;
+            while let Some(cur) = work.pop() {
+                alt_steps += 1;
+                if alt_steps > limit {
+                    break;
+                }
+                match self.body.pat(cur)? {
+                    Pat::Bind { name, sub, .. } => {
+                        if let Some(&(_, first_ty)) = first_binds.iter().find(|&&(n, _)| n == name)
+                            && let Some(&alt_ty) = self.local_ty.get(cur.ix())
+                        {
+                            self.demand_eq(At::Pat(cur), first_ty, alt_ty)?;
+                        }
+                        if let Some(sub) = sub {
+                            work.push(sub);
+                        }
+                    }
+                    Pat::Ref { inner, .. } => work.push(inner),
+                    Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } | Pat::Or { alts: elems } => {
+                        work.extend_from_slice(self.body.pat_list(elems)?);
+                    }
+                    Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
+                        for fp in self.body.field_pat_list(fields)? {
+                            work.push(fp.pat);
+                        }
+                    }
+                    Pat::Missing | Pat::Wild | Pat::Lit(_) | Pat::NegLit(_) | Pat::Path(_) | Pat::Range { .. } => {}
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Pushes `pats` against the element types `tys`, `..` at `rest` skipping the middle

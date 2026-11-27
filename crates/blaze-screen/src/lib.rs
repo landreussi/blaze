@@ -34,8 +34,10 @@ pub mod text;
 
 pub use encode::{encode, encode_status};
 pub use run_line::{
-    Answered, LineBuf, PATH_BYTES, RUN_EVERY_MS, RUN_QUIET_MS, RunStatus, RunStatusOpts, Stage, StatusFrame, StatusLine, Step,
-    Unwatched, Watch,
+    ActiveGroupRef, ActiveItemRef, Activity, Answered, HINT_BYTES, ITEM_LABEL_BYTES, LineBuf, MAX_GROUP_ITEMS,
+    PATH_BYTES, RUN_EVERY_MS, RUN_QUIET_MS, RunStatus, RunStatusOpts, STATUS_VERB_WIDTH, Stage, StatusBlock,
+    StatusFrame, StatusGroup, StatusItem, StatusLine, StatusVerb, Step, Unwatched, WORK_KINDS, Watch, WorkKind,
+    write_command_line, write_elapsed_secs, write_status_line,
 };
 pub use event::{BinaryEnd, Built, Command, Event, Link, Ran, Stamped, Test, Verdict, Why};
 pub use frame::{Ended, Frame, Line, Mark, Progress, Role, Span};

@@ -145,10 +145,13 @@ fn setting<'s>(store: &'s Path, native: Option<NativeSetting<'s>>) -> Setting<'s
         host: HOST,
         table: Arc::new(Vec::new()),
         probes: None,
+        c_probes: None,
         c_mode: CMode::Built,
         mode: Mode::Build,
         native,
         spawn_setting: Arc::new(SpawnSetting::off()),
+        files_digest: None,
+        deps_digest: None,
     }
 }
 
@@ -173,7 +176,7 @@ fn a_native_placed_script_with_a_setting_reaches_its_binary_lookup() {
     let runtime = ScriptRuntime::new(&store).unwrap_or_else(|e| panic!("{e}"));
     let setting_with = |native| setting(&store, native);
     let run = |setting: &Setting<'_>| {
-        let tree = Tree::Mem { files: Arc::new(Vec::new()), git: None };
+        let tree = Tree::Mem { files: Arc::new(Vec::new()), submodules: Arc::from([]), git: None };
         outputs(&runtime, setting, &graph, UnitId(0), tree, ScriptRoot::package(), &[], alloc)
     };
 

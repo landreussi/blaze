@@ -33,14 +33,14 @@ use blaze_scope::resolve::Names;
 use blaze_surface::ImplFlags;
 use blaze_typeck::{AssocItem, AssocKind, ItemKey, Mutbl, Name, PNode, PTy, PTys, Shape};
 
-use super::heads::{CoherenceMarks, HeadError, Store, Want, lower};
+use super::heads::{CoherenceMarks, HeadError, Store, Want, with_lowered};
 use super::tables::view::BodyHeadFacts;
 use super::index::Index;
 use super::keys::{Keys, checker_of};
 use super::linked::{Linked, RootsError};
 use super::rows::Rows;
 use super::source::NamesSource;
-use super::types::{PRIMS, children, path_texts};
+use super::types::{PRIMS, children_into, path_texts};
 use crate::resolve::{Kind, Ns, ResolveError};
 
 mod asked;
@@ -50,8 +50,8 @@ mod records;
 pub use asked::{Ask, BucketRead, INCOHERENT_FACT, UNFILED_LIST};
 pub use records::{
     BucketReadUnion,
-    AdmitError, BucketSource, ImplQuestionError, ImplShelf, ImplShelfOpts, ImplTables, ImplTablesDone, ImplTablesFailed, ItemsIndex, NoTables, ShelfError, ShelfSource, ShelvedTwice, TRAIT_HELD, TableSet, TablesError, TablesReadError, bucket_cell, cell_read, check_framed, cells_of, framed,
-    impl_tables_name, impl_tables_task, row_answers, row_digest, rows_key, trait_cell, write_impl_tables,
+    AdmitError, BucketSource, ImplChunk, ImplQuestionError, ImplShelf, ImplShelfOpts, ImplTables, ImplTablesDone, ImplTablesFailed, ItemsIndex, NoTables, ShelfError, ShelfSource, ShelvedTwice, TRAIT_HELD, TableSet, TablesError, TablesReadError, bucket_cell, cell_read, check_framed, cells_of, file_impl_rows_chunk, finish_impl_tables, framed,
+    impl_tables_name, impl_tables_out, impl_tables_task, row_answers, row_digest, rows_key, trait_cell, write_impl_tables,
 };
 
 /// A candidate impl whose header the store does not hold when the answer is made, or an
@@ -239,6 +239,8 @@ pub(crate) fn shape_of(t: PTys<'_>, p: PTy) -> Option<Shape> {
         PNode::Str => Shape::Str,
         PNode::Never => Shape::Never,
         PNode::Tuple(l) => Shape::Tuple(l.len),
+        PNode::Record(s, l) => Shape::Record(s.0, l.len),
+        PNode::Union(l) => Shape::Union(l.len),
         PNode::Ref(m, _) => Shape::Ref(m),
         PNode::Ptr(m, _) => Shape::Ptr(m),
         PNode::Array(..) => Shape::Array,
@@ -370,17 +372,22 @@ impl Unread {
 /// filed by the aliased type's constructor.
 /// `Err` where it is a builtin the checker has no type for (blaze's `i80`): no question the
 /// checker asks is at that type.
-fn written_shape<'n, S: NamesSource<'n>>(names: S, module: LibKey, params: &[(Name, u32)], v: &View<'_>, t: lf::TypeId) -> Result<Option<Shape>, NoCheckerType> {
+fn written_shape<'n, S: NamesSource<'n>>(names: S, module: LibKey, params: &[(Name, u32)], v: &View<'_>, t: lf::TypeId, alloc: blaze_own::Alloc<'_>) -> Result<Option<Shape>, NoCheckerType> {
     match shape_step(names, module, params, v, t) {
         None => Ok(None),
         Some(Written::Shape(s)) => Ok(Some(s)),
         Some(Written::NoCheckerType) => Err(NoCheckerType),
-        Some(Written::Alias(k)) => alias_shape(names, k),
+        Some(Written::Alias(k)) => alias_shape(names, k, alloc),
     }
 }
 
 /// A self type that is a builtin the checker has no type for.
+#[derive(Clone, Copy)]
 struct NoCheckerType;
+
+/// Cache of resolved type-alias shapes (`LibKey -> Shape`), shared across all crates and rows
+/// filed in one [`BucketIndex`] so shared aliases like `U256`/`B256` are lowered at most once.
+type AliasShapes = HashMap<LibKey, Result<Option<Shape>, NoCheckerType>, blaze_own::Alloc<'static>>;
 
 /// The most aliases one chain is followed through (`type A = B; type B = C;`); past it the
 /// impl is filed for every shape, which is never a wrong answer.
@@ -388,9 +395,9 @@ const MOST_ALIAS_HOPS: u32 = 64;
 
 /// The constructor of the type alias `alias` stands for, following aliases of aliases as a
 /// loop; `None` where the aliased type is no constructor read here (a parameter, `dyn`).
-fn alias_shape<'n, S: NamesSource<'n>>(names: S, mut alias: LibKey) -> Result<Option<Shape>, NoCheckerType> {
+fn alias_shape<'n, S: NamesSource<'n>>(names: S, mut alias: LibKey, alloc: blaze_own::Alloc<'_>) -> Result<Option<Shape>, NoCheckerType> {
     for _ in 0..MOST_ALIAS_HOPS {
-        let Some(step) = alias_step(names, alias) else { return Ok(None) };
+        let Some(step) = alias_step(names, alias, alloc) else { return Ok(None) };
         match step {
             Written::Shape(s) => return Ok(Some(s)),
             Written::NoCheckerType => return Err(NoCheckerType),
@@ -400,16 +407,28 @@ fn alias_shape<'n, S: NamesSource<'n>>(names: S, mut alias: LibKey) -> Result<Op
     Ok(None)
 }
 
+/// [`alias_shape`] backed by a reusable cache across rows and crates.
+fn alias_shape_cached<'n, S: NamesSource<'n>>(names: S, alias: LibKey, cache: &mut AliasShapes, alloc: blaze_own::Alloc<'_>) -> Result<Option<Shape>, NoCheckerType> {
+    if let Some(&hit) = cache.get(&alias) {
+        return hit;
+    }
+    let got = alias_shape(names, alias, alloc);
+    cache.insert(alias, got);
+    got
+}
+
 /// What the type alias `alias` stands for, one step.
-fn alias_step<'n, S: NamesSource<'n>>(names: S, alias: LibKey) -> Option<Written> {
+fn alias_step<'n, S: NamesSource<'n>>(names: S, alias: LibKey, alloc: blaze_own::Alloc<'_>) -> Option<Written> {
     let text = names.signature_text_of(alias)?.text;
     let module = names.home_of(alias)?;
-    let low = lower(names, alias, text).ok()?;
-    let v = low.view();
-    let mut params = Vec::new_in(Global);
-    super::heads::param_names(&v, 0, &mut params, super::heads::Consts::Skip).ok()?;
-    let t = v.head_opt(head::TY)?;
-    shape_step(names, module, &params, &v, lf::TypeId(t))
+    with_lowered(names, alias, text, |v| {
+        let mut params = blaze_own::Vec::new_in(alloc);
+        super::heads::param_names(v, 0, &mut params, super::heads::Consts::Skip).ok()?;
+        let t = v.head_opt(head::TY)?;
+        shape_step(names, module, &params, v, lf::TypeId(t))
+    })
+    .ok()
+    .flatten()
 }
 
 /// What one written type is: a constructor, a path to a type alias to read next, or a builtin
@@ -421,7 +440,6 @@ enum Written {
 }
 
 fn shape_step<'n, S: NamesSource<'n>>(names: S, module: LibKey, params: &[(Name, u32)], v: &View<'_>, t: lf::TypeId) -> Option<Written> {
-    let mut kids = Vec::new_in(Global);
     let shape = match v.ty(t).ok()? {
         lf::TypeRef::Ref { mutbl, .. } => Some(Shape::Ref(mutbl)),
         lf::TypeRef::Ptr { mutbl, .. } => Some(Shape::Ptr(mutbl)),
@@ -429,8 +447,9 @@ fn shape_step<'n, S: NamesSource<'n>>(names: S, module: LibKey, params: &[(Name,
         lf::TypeRef::Array { .. } => Some(Shape::Array),
         lf::TypeRef::Never => Some(Shape::Never),
         lf::TypeRef::Tuple(_) => {
-            children(v, t, &mut kids).ok()?;
-            Some(Shape::Tuple(u32::try_from(kids.len()).ok()?))
+            let mut count = 0u32;
+            children_into(v, t, &mut |_| count = count.saturating_add(1)).ok()?;
+            Some(Shape::Tuple(count))
         }
         lf::TypeRef::Path(p) => {
             let (abs, texts, segs, _) = path_texts(v, p).ok()?;
@@ -441,8 +460,8 @@ fn shape_step<'n, S: NamesSource<'n>>(names: S, module: LibKey, params: &[(Name,
                 return None;
             }
             match (crate::resolve::Paths { names }).path(module, abs, &texts, Ns::Type) {
-                Ok(f) if f.consumed as usize == texts.len() && matches!(f.kind, Kind::Struct | Kind::Enum | Kind::Union) => Some(Shape::Adt(checker_of(f.key))),
-                Ok(f) if f.consumed as usize == texts.len() => match f.kind {
+                Ok(f) if usize::try_from(f.consumed).ok() == Some(texts.len()) && matches!(f.kind, Kind::Struct | Kind::Enum | Kind::Union) => Some(Shape::Adt(checker_of(f.key))),
+                Ok(f) if usize::try_from(f.consumed).ok() == Some(texts.len()) => match f.kind {
                     Kind::Builtin(name) => prim_shape(name),
                     Kind::TypeAlias => return Some(Written::Alias(f.key)),
                     Kind::WideInt { .. } => return Some(Written::NoCheckerType),
@@ -459,44 +478,47 @@ fn shape_step<'n, S: NamesSource<'n>>(names: S, module: LibKey, params: &[(Name,
 
 /// Files an impl by its header's text, with what bounds it when its self type is a path that
 /// was read to no constructor ([`PathSelf`]; `None` for any other impl).
-fn file<'n, S: NamesSource<'n>>(names: S, key: LibKey, module: LibKey) -> (Filed, Option<PathSelf>) {
+fn file<'n, S: NamesSource<'n>>(names: S, key: LibKey, module: LibKey, alloc: blaze_own::Alloc<'_>) -> (Filed, Option<PathSelf>) {
     let Some(it) = names.signature_text_of(key) else { return (Filed::Unread(Unread::NoText, None), None) };
-    let Ok(low) = lower(names, key, it.text) else { return (Filed::Unread(Unread::Unlowered, None), None) };
-    let v = low.view();
-    let mut params = Vec::new_in(Global);
-    if super::heads::param_names(&v, 0, &mut params, super::heads::Consts::Skip).is_err() {
-        return (Filed::Unread(Unread::Generics, None), None);
-    }
-    let self_ty = lf::TypeId(v.head[head::SELF_TY]);
-    let Ok(self_shape) = written_shape(names, module, &params, &v, self_ty) else { return (Filed::NoCheckerType, None) };
-    let path_self = self_shape.is_none() && is_named_path(&params, &v, self_ty);
-    let Some(t) = v.head_opt(head::TRAIT) else { return (Filed::Inherent(self_shape), path_self.then_some(PathSelf::Inherent)) };
-    let Ok(lf::TypeRef::Path(p)) = v.ty(lf::TypeId(t)) else { return (Filed::Unread(Unread::TraitNotAPath, self_shape), None) };
-    let Ok((abs, texts, _, at)) = path_texts(&v, p) else { return (Filed::Unread(Unread::PathUnread, self_shape), None) };
-    let path: Box<str> = format!("{}{}", if abs { "::" } else { "" }, texts.join("::")).into_boxed_str();
-    // Its trait written with no type or const argument ([`Homes::bare`]).
-    let bare = written_args(&v, p).is_ok_and(|n| n == 0);
-    // The trait path is read where its first token's mark says (front2 item_site.rs,
-    // token-mark-F1), as the impl's head reads it (heads.rs `impl_`): a macro's
-    // `$crate::Tr` (written `crate::Tr` in the expansion, with the macro crate's mark) and a
-    // def-site `Tr` of a `macro` name the macro's trait, not a path of the impl's module. Read
-    // at the module, such an impl was filed unread: a candidate of EVERY trait question at its
-    // shape, so each question made its whole head, associated types' values included
-    // (primefield's `type ByteSize = U<{ <$name as ..>::PARAMS.modulus()..div_ceil(8) }>`),
-    // and a constant's own evaluation that asked any trait of the type met that head needing
-    // the constant itself (`ConstFail::Nested`, tempo census r20: 1,402 fns of p256).
-    let marks = match super::item_site::item_marks(names, key, it.text) {
-        Ok(m) => m,
-        Err(lost) => return (Filed::Unread(Unread::Site { path, why: format!("{lost}").into_boxed_str() }, self_shape), None),
-    };
-    match super::item_site::resolve_written(&crate::resolve::Paths { names }, marks, module, &v, p, abs, &texts, Ns::Type, at) {
-        Ok(f) if f.kind == Kind::Trait && f.consumed as usize == texts.len() && v.head[head::FLAGS] & sig::NEGATIVE != 0 => (Filed::Negative(checker_of(f.key), self_shape), None),
-        Ok(f) if f.kind == Kind::Trait && f.consumed as usize == texts.len() => {
-            (Filed::Trait(checker_of(f.key), self_shape, bare), path_self.then(|| PathSelf::Trait { of: names.crate_of(f.key), bare }))
+    match with_lowered(names, key, it.text, |v| {
+        let mut params = blaze_own::Vec::new_in(alloc);
+        if super::heads::param_names(v, 0, &mut params, super::heads::Consts::Skip).is_err() {
+            return (Filed::Unread(Unread::Generics, None), None);
         }
-        Ok(f) => (Filed::Unread(Unread::NotATrait { path, kind: f.kind, consumed: f.consumed, written: texts.len() as u32 }, self_shape), None),
-        Err(super::types::Why::Resolve(why, _)) => (Filed::Unread(Unread::Resolve { path, why }, self_shape), None),
-        Err(other) => (Filed::Unread(Unread::Site { path, why: format!("{other:?}").into_boxed_str() }, self_shape), None),
+        let self_ty = lf::TypeId(v.head[head::SELF_TY]);
+        let Ok(self_shape) = written_shape(names, module, &params, v, self_ty, alloc) else { return (Filed::NoCheckerType, None) };
+        let path_self = self_shape.is_none() && is_named_path(&params, v, self_ty);
+        let Some(t) = v.head_opt(head::TRAIT) else { return (Filed::Inherent(self_shape), path_self.then_some(PathSelf::Inherent)) };
+        let Ok(lf::TypeRef::Path(p)) = v.ty(lf::TypeId(t)) else { return (Filed::Unread(Unread::TraitNotAPath, self_shape), None) };
+        let Ok((abs, texts, _, at)) = path_texts(v, p) else { return (Filed::Unread(Unread::PathUnread, self_shape), None) };
+        let path: Box<str> = format!("{}{}", if abs { "::" } else { "" }, texts.join("::")).into_boxed_str();
+        // Its trait written with no type or const argument ([`Homes::bare`]).
+        let bare = written_args(v, p).is_ok_and(|n| n == 0);
+        // The trait path is read where its first token's mark says (front2 item_site.rs,
+        // token-mark-F1), as the impl's head reads it (heads.rs `impl_`): a macro's
+        // `$crate::Tr` (written `crate::Tr` in the expansion, with the macro crate's mark) and a
+        // def-site `Tr` of a `macro` name the macro's trait, not a path of the impl's module. Read
+        // at the module, such an impl was filed unread: a candidate of EVERY trait question at its
+        // shape, so each question made its whole head, associated types' values included
+        // (primefield's `type ByteSize = U<{ <$name as ..>::PARAMS.modulus()..div_ceil(8) }>`),
+        // and a constant's own evaluation that asked any trait of the type met that head needing
+        // the constant itself (`ConstFail::Nested`, tempo census r20: 1,402 fns of p256).
+        let marks = match super::item_site::item_marks(names, key, it.text) {
+            Ok(m) => m,
+            Err(lost) => return (Filed::Unread(Unread::Site { path, why: format!("{lost}").into_boxed_str() }, self_shape), None),
+        };
+        match super::item_site::resolve_written(&crate::resolve::Paths { names }, marks, module, v, p, abs, &texts, Ns::Type, at) {
+            Ok(f) if f.kind == Kind::Trait && f.consumed as usize == texts.len() && v.head[head::FLAGS] & sig::NEGATIVE != 0 => (Filed::Negative(checker_of(f.key), self_shape), None),
+            Ok(f) if f.kind == Kind::Trait && f.consumed as usize == texts.len() => {
+                (Filed::Trait(checker_of(f.key), self_shape, bare), path_self.then(|| PathSelf::Trait { of: names.crate_of(f.key), bare }))
+            }
+            Ok(f) => (Filed::Unread(Unread::NotATrait { path, kind: f.kind, consumed: f.consumed, written: texts.len() as u32 }, self_shape), None),
+            Err(super::types::Why::Resolve(why, _)) => (Filed::Unread(Unread::Resolve { path, why }, self_shape), None),
+            Err(other) => (Filed::Unread(Unread::Site { path, why: format!("{other:?}").into_boxed_str() }, self_shape), None),
+        }
+    }) {
+        Ok(got) => got,
+        Err(_) => (Filed::Unread(Unread::Unlowered, None), None),
     }
 }
 
@@ -561,11 +583,15 @@ enum PathSelf {
 /// With it, whether the impl is a BLANKET trait impl: its self type as written is one name that
 /// is one of its own generic parameters (`impl<T> Tr<..> for T`), read from the same tokens
 /// ([`Homes::blanket`] says which questions such an impl can answer).
-fn written_trait<'n, S: NamesSource<'n>>(names: S, at: &super::index::ImplAt<'n>) -> (Option<&'n str>, bool) {
+fn default_alloc() -> blaze_own::Alloc<'static> {
+    blaze_own::Alloc::global()
+}
+
+fn written_trait<'n, S: NamesSource<'n>>(names: S, at: &super::index::ImplAt<'n>, alloc: blaze_own::Alloc<'_>) -> (Option<&'n str>, bool) {
     // A crate with no edition (over records: no items record, filed by the source) reads as a
     // header that does not read.
     let Some(edition) = names.edition_of(at.krate) else { return (None, false) };
-    let Ok(h) = blaze_file_items::impl_header(at.header, edition, blaze_own::Alloc::global()) else { return (None, false) };
+    let Ok(h) = blaze_file_items::impl_header(at.header, edition, alloc) else { return (None, false) };
     let blanket = h.trait_.is_some() && h.params.iter().any(|p| *p == h.self_ty);
     (h.trait_, blanket)
 }
@@ -592,7 +618,7 @@ fn bare_text(trait_text: &str) -> bool {
 /// of: under that trait's "any" list when the names library resolves the path to a trait in the
 /// impl's module, else unread with why (a trait impl, so a candidate of trait questions only).
 /// Its self type's shape is not read here (`None`: a candidate at every shape of its trait).
-fn file_by_text<'n, S: NamesSource<'n>>(names: S, module: LibKey, trait_text: &str) -> Filed {
+fn file_by_text<'n, S: NamesSource<'n>>(names: S, module: LibKey, trait_text: &str, alloc: blaze_own::Alloc<'_>) -> Filed {
     let whole = trait_text.trim();
     // The path before its generic arguments (`Tr<..>`) or its parenthesized ones (`Fn(..)`).
     let head = whole.split(['<', '(']).next().unwrap_or("").trim();
@@ -600,7 +626,7 @@ fn file_by_text<'n, S: NamesSource<'n>>(names: S, module: LibKey, trait_text: &s
         Some(rest) => (true, rest),
         None => (false, head),
     };
-    let mut texts: Vec<&str, Global> = Vec::new_in(Global);
+    let mut texts: blaze_own::Vec<&str, blaze_own::Alloc<'_>> = blaze_own::Vec::new_in(alloc);
     for s in rest.split("::") {
         let s = s.trim();
         let ident = s.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') && s.chars().all(|c| c.is_alphanumeric() || c == '_');
@@ -612,22 +638,22 @@ fn file_by_text<'n, S: NamesSource<'n>>(names: S, module: LibKey, trait_text: &s
     let bare = head.len() == whole.len();
     let path: Box<str> = Box::from(head);
     match (crate::resolve::Paths { names }).path(module, abs, &texts, Ns::Type) {
-        Ok(f) if f.kind == Kind::Trait && f.consumed as usize == texts.len() => Filed::Trait(checker_of(f.key), None, bare),
-        Ok(f) => Filed::Unread(Unread::NotATrait { path, kind: f.kind, consumed: f.consumed, written: texts.len() as u32 }, None),
+        Ok(f) if f.kind == Kind::Trait && usize::try_from(f.consumed).ok() == Some(texts.len()) => Filed::Trait(checker_of(f.key), None, bare),
+        Ok(f) => Filed::Unread(Unread::NotATrait { path, kind: f.kind, consumed: f.consumed, written: u32::try_from(texts.len()).unwrap_or(u32::MAX) }, None),
         Err(why) => Filed::Unread(Unread::Resolve { path, why }, None),
     }
 }
 
-/// A path as an impl row holds it (`a::b`, `::a::b`: written, without arguments): whether it
-/// is global, and its segments. `None` for a segment that is no plain identifier (`r#a`, a
-/// macro's `$crate`): such an impl is filed from its header's text, where the lowering spells
-/// the segment.
-fn row_path(path: &str) -> Option<(bool, Vec<&str, Global>)> {
+/// A path as an impl row holds it (`a::b`, `::a::b`: written, without arguments): fills `out`
+/// with its segments and returns whether it is global. `None` for a segment that is no plain
+/// identifier (`r#a`, a macro's `$crate`): such an impl is filed from its header's text, where
+/// the lowering spells the segment.
+fn row_path_into<'p, A: core::alloc::Allocator>(path: &'p str, out: &mut blaze_own::Vec<&'p str, A>) -> Option<bool> {
+    out.clear();
     let (abs, rest) = match path.strip_prefix("::") {
         Some(rest) => (true, rest),
         None => (false, path),
     };
-    let mut texts: Vec<&str, Global> = Vec::new_in(Global);
     for s in rest.split("::") {
         // An expansion's text writes a path's tokens apart (`:: core :: clone :: Clone`, a
         // derive's impl): the row keeps the path as written.
@@ -636,9 +662,9 @@ fn row_path(path: &str) -> Option<(bool, Vec<&str, Global>)> {
         if !ident {
             return None;
         }
-        texts.push(s);
+        out.push(s);
     }
-    Some((abs, texts))
+    Some(abs)
 }
 
 /// What a self type's head path names, as [`file_row`] keeps it per (module, path).
@@ -657,14 +683,17 @@ enum SelfAt {
 /// (the rows are sorted by trait path, then module, so each run of equal (trait path, module)
 /// is resolved once) and each self path met, by the module it is written in. One per crate
 /// filed; dropped when its rows are.
-struct RowNames<'n> {
+struct RowNames<'n, 'm, 'a> {
     /// The run's trait path, its module, the crate the path's root names (token-mark-2 R2: two
     /// rows of one text and module may name two crates' `crate`), and the trait it names
     /// (`None`: not a trait as written: each impl of the run is filed from its header's text,
     /// which says why). `selves` is keyed by the self path's root the same way.
     /// The trait is kept with the crate it is defined in ([`PathSelf::Trait`]).
     run: Option<(&'n str, LibKey, Option<blaze_id::CrateItemKey>, Result<(ItemKey, Option<usize>), RowMiss>)>,
-    selves: HashMap<(LibKey, &'n str, Option<blaze_id::CrateItemKey>), SelfAt, Global>,
+    selves: HashMap<(LibKey, &'n str, Option<blaze_id::CrateItemKey>), SelfAt, blaze_own::Alloc<'a>>,
+    path_buf: blaze_own::Vec<&'n str, blaze_own::Alloc<'a>>,
+    aliases: Option<&'m mut AliasShapes>,
+    alloc: blaze_own::Alloc<'a>,
 }
 
 /// Files an impl by its ROW of the items record ([`ImplRow`]: its trait's path and its self
@@ -688,7 +717,7 @@ struct RowNames<'n> {
 ///
 /// The third answer is what bounds an impl whose self path was read to no constructor
 /// ([`PathSelf`], as `file` gives it).
-fn file_row<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowNames<'n>) -> Result<(Filed, bool, Option<PathSelf>), RowMiss> {
+fn file_row<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowNames<'n, '_, '_>) -> Result<(Filed, bool, Option<PathSelf>), RowMiss> {
     if row.header_unread {
         return Err(RowMiss::HeaderUnread);
     }
@@ -705,10 +734,13 @@ fn file_row<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowN
     let trait_ = match kept.run {
         Some((path, module, root, trait_)) if path == trait_path && module == row.module && root == row.trait_root => trait_,
         _ => {
-            let trait_ = row_path(trait_path).ok_or(RowMiss::TraitPath).and_then(|(abs, texts)| match paths.path_with(row.module, row.trait_root, abs, &texts, Ns::Type) {
-                Ok(f) if f.kind == Kind::Trait && f.consumed as usize == texts.len() => Ok((checker_of(f.key), names.crate_of(f.key))),
-                Ok(_) | Err(_) => Err(RowMiss::NoTrait),
-            });
+            let trait_ = match row_path_into(trait_path, &mut kept.path_buf) {
+                None => Err(RowMiss::TraitPath),
+                Some(abs) => match paths.path_with(row.module, row.trait_root, abs, &kept.path_buf, Ns::Type) {
+                    Ok(f) if f.kind == Kind::Trait && usize::try_from(f.consumed).ok() == Some(kept.path_buf.len()) => Ok((checker_of(f.key), names.crate_of(f.key))),
+                    Ok(_) | Err(_) => Err(RowMiss::NoTrait),
+                },
+            };
             kept.run = Some((trait_path, row.module, row.trait_root, trait_));
             trait_
         }
@@ -735,7 +767,7 @@ enum RowSelf {
 /// `Err` where the row does not name it ([`SelfHead::Other`], a path segment that is no plain
 /// identifier). [`file_row`]'s first step, and what files an impl whose text did not read by
 /// the head its row read ([`textless`]).
-fn row_self<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowNames<'n>) -> Result<RowSelf, RowMiss> {
+fn row_self<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowNames<'n, '_, '_>) -> Result<RowSelf, RowMiss> {
     let paths = crate::resolve::Paths { names };
     let mut path_self = false;
     let shape = match row.head {
@@ -756,17 +788,23 @@ fn row_self<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowN
                 Some(at) => at,
                 None => {
                     // The arms of `shape_step`'s path case, over the row's path.
-                    let at = match row_path(written) {
+                    let at = match row_path_into(written, &mut kept.path_buf) {
                         None => SelfAt::Text,
-                        Some((abs, texts)) => match paths.path_with(row.module, row.self_root, abs, &texts, Ns::Type) {
-                            Ok(f) if f.consumed as usize == texts.len() => match f.kind {
+                        Some(abs) => match paths.path_with(row.module, row.self_root, abs, &kept.path_buf, Ns::Type) {
+                            Ok(f) if usize::try_from(f.consumed).ok() == Some(kept.path_buf.len()) => match f.kind {
                                 Kind::Struct | Kind::Enum | Kind::Union => SelfAt::Shape(Some(Shape::Adt(checker_of(f.key)))),
                                 Kind::Builtin(name) => SelfAt::Shape(prim_shape(name)),
-                                Kind::TypeAlias => match alias_shape(names, f.key) {
-                                    Ok(Some(shape)) => SelfAt::Shape(Some(shape)),
-                                    Ok(None) => SelfAt::Unread,
-                                    Err(NoCheckerType) => SelfAt::NoCheckerType,
-                                },
+                                Kind::TypeAlias => {
+                                    let resolved = match kept.aliases.as_deref_mut() {
+                                        Some(cache) => alias_shape_cached(names, f.key, cache, kept.alloc),
+                                        None => alias_shape(names, f.key, kept.alloc),
+                                    };
+                                    match resolved {
+                                        Ok(Some(shape)) => SelfAt::Shape(Some(shape)),
+                                        Ok(None) => SelfAt::Unread,
+                                        Err(NoCheckerType) => SelfAt::NoCheckerType,
+                                    }
+                                }
                                 Kind::WideInt { .. } => SelfAt::NoCheckerType,
                                 _ => SelfAt::Unread,
                             },
@@ -811,6 +849,19 @@ pub enum RowMiss {
     NoTrait = 5,
 }
 
+impl RowMiss {
+    const fn index(self) -> usize {
+        match self {
+            RowMiss::HeaderUnread => 0,
+            RowMiss::TraitUnread => 1,
+            RowMiss::SelfOther => 2,
+            RowMiss::SelfPath => 3,
+            RowMiss::TraitPath => 4,
+            RowMiss::NoTrait => 5,
+        }
+    }
+}
+
 /// The classes of [`RowMiss`], in the order of [`Buckets::row_misses`].
 pub const ROW_MISSES: [&str; 6] = ["header unread", "trait unread", "self type other", "self path not plain", "trait path not plain", "trait not resolved"];
 
@@ -848,9 +899,37 @@ pub struct FileCounts {
 /// `file_row` resolves each run of equal (trait path, module) once, and the impls read from
 /// text are filed by key. Every impl of `rows` is handed over exactly once.
 pub(crate) fn file_rows<'n, S: NamesSource<'n>>(names: S, krate: usize, rows: &[ImplRow<'n>], each: &mut dyn FnMut(Filing)) -> FileCounts {
+    file_rows_in(names, krate, rows, None, default_alloc(), each)
+}
+
+fn file_rows_with_aliases<'n, S: NamesSource<'n>>(
+    names: S,
+    krate: usize,
+    rows: &[ImplRow<'n>],
+    aliases: Option<&mut AliasShapes>,
+    each: &mut dyn FnMut(Filing),
+) -> FileCounts {
+    let alloc = aliases.as_ref().map_or_else(default_alloc, |cache| *cache.allocator());
+    file_rows_in(names, krate, rows, aliases, alloc, each)
+}
+
+fn file_rows_in<'n, S: NamesSource<'n>>(
+    names: S,
+    krate: usize,
+    rows: &[ImplRow<'n>],
+    aliases: Option<&mut AliasShapes>,
+    alloc: blaze_own::Alloc<'_>,
+    each: &mut dyn FnMut(Filing),
+) -> FileCounts {
     let mut counts = FileCounts::default();
-    let mut kept = RowNames { run: None, selves: HashMap::new_in(Global) };
-    let mut impls: Vec<super::index::ImplAt<'n>, Global> = Vec::new_in(Global);
+    let mut kept = RowNames {
+        run: None,
+        selves: HashMap::new_in(alloc),
+        path_buf: blaze_own::Vec::new_in(alloc),
+        aliases,
+        alloc,
+    };
+    let mut impls: blaze_own::Vec<super::index::ImplAt<'n>, blaze_own::Alloc<'_>> = blaze_own::Vec::new_in(alloc);
     for row in rows.iter() {
         // A refused derive's gap (D193 point 5, blaze-scope `ImplRow::refused_call`): no impl
         // item, so no text to read; filed by what its row reads (`textless`: a trait impl of an
@@ -866,7 +945,9 @@ pub(crate) fn file_rows<'n, S: NamesSource<'n>>(names: S, krate: usize, rows: &[
                 each(Filing { key: row.key, filed, blanket, by_text: false, unread_bare: false, path_self });
             }
             Err(miss) => {
-                counts.row_misses[miss as usize] += 1;
+                if let Some(slot) = counts.row_misses.get_mut(miss.index()) {
+                    *slot += 1;
+                }
                 match names.impl_with_header(krate, row.key, row.module) {
                     Some(at) => impls.push(at),
                     // Its text did not read (the source filed why): unread, filed by what its
@@ -878,9 +959,9 @@ pub(crate) fn file_rows<'n, S: NamesSource<'n>>(names: S, krate: usize, rows: &[
     }
     // By key: the order impls are filed in is a function of the records.
     impls.sort_by_key(|at| at.key);
-    counts.from_text = impls.len() as u32;
+    counts.from_text = u32::try_from(impls.len()).unwrap_or(u32::MAX);
     for at in impls.iter() {
-        each(file_text(names, at));
+        each(file_text(names, at, alloc));
     }
     counts
 }
@@ -890,12 +971,12 @@ pub(crate) fn file_rows<'n, S: NamesSource<'n>>(names: S, krate: usize, rows: &[
 /// trait (`Filed::Inherent`) or did not lower (`NoText`, `Unlowered`, `Generics`): it is then
 /// never a candidate of an inherent question. Only an impl whose header text does not read
 /// stays blind.
-fn file_text<'n, S: NamesSource<'n>>(names: S, at: &super::index::ImplAt<'n>) -> Filing {
-    let (written, blanket) = written_trait(names, at);
-    let (filed, path_self, by_text) = match (file(names, at.key, at.module), written) {
+fn file_text<'n, S: NamesSource<'n>>(names: S, at: &super::index::ImplAt<'n>, alloc: blaze_own::Alloc<'_>) -> Filing {
+    let (written, blanket) = written_trait(names, at, alloc);
+    let (filed, path_self, by_text) = match (file(names, at.key, at.module, alloc), written) {
         // Filed by its text's trait, its self type not read: not bounded.
-        ((Filed::Inherent(_), _), Some(t)) => (file_by_text(names, at.module, t), None, true),
-        ((Filed::Unread(why, _), _), Some(t)) if !why.is_trait_impl() => (file_by_text(names, at.module, t), None, true),
+        ((Filed::Inherent(_), _), Some(t)) => (file_by_text(names, at.module, t, alloc), None, true),
+        ((Filed::Unread(why, _), _), Some(t)) if !why.is_trait_impl() => (file_by_text(names, at.module, t, alloc), None, true),
         ((f, path_self), _) => (f, path_self, false),
     };
     Filing { key: at.key, filed, blanket, by_text, unread_bare: written.is_some_and(bare_text), path_self }
@@ -911,7 +992,7 @@ fn file_text<'n, S: NamesSource<'n>>(names: S, at: &super::index::ImplAt<'n>) ->
 /// constructor: a header whose tokens did not read, an inherent impl, and a self head the row
 /// does not name (`SelfHead::Other`, a path of no plain identifiers) stay candidates of every
 /// question, as `file` files an impl with no text.
-fn textless<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowNames<'n>) -> Filing {
+fn textless<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowNames<'n, '_, '_>) -> Filing {
     let filing = |filed: Filed, unread_bare: bool| Filing { key: row.key, filed, blanket: false, by_text: false, unread_bare, path_self: None };
     if row.header_unread || !row.has_trait {
         return filing(Filed::Unread(Unread::NoText, None), false);
@@ -1016,6 +1097,8 @@ fn trait_local<'s, 'n, S: NamesSource<'n>>(facts: BodyHeadFacts<'_, 's, S>, keys
         | Shape::Str
         | Shape::Never
         | Shape::Tuple(_)
+        | Shape::Record(..)
+        | Shape::Union(_)
         | Shape::Slice
         | Shape::Array
         | Shape::Ptr(_)
@@ -1045,6 +1128,8 @@ fn inherent_local<'s, 'n, S: NamesSource<'n>>(facts: BodyHeadFacts<'_, 's, S>, k
         | Shape::Str
         | Shape::Never
         | Shape::Tuple(_)
+        | Shape::Record(..)
+        | Shape::Union(_)
         | Shape::Slice
         | Shape::Array
         | Shape::Ref(_)
@@ -1140,13 +1225,37 @@ fn trait_crates(home: Option<usize>, shape: Shape, local_type: Local, parameters
     // ([`Homes::blanket`]): the one narrowing that needs nothing but the trait's crate.
     let wide = Homes { blanket: Home::In(home, None), ..Homes::ANY };
     let local = match shape {
-        Shape::Adt(_) | Shape::Dynamic(Some(_)) => {
+        Shape::Adt(_) | Shape::Foreign(_) | Shape::Dynamic(Some(_)) => {
             let Local::In(c) = local_type else { return wide };
             Some(c)
         }
         // Never a local type of any crate (no fundamental type is built in but references).
-        Shape::Bool | Shape::Char | Shape::Int(_) | Shape::Uint(_) | Shape::Float(_) | Shape::AnyInt | Shape::AnyFloat | Shape::Str | Shape::Never | Shape::Tuple(_) | Shape::Slice | Shape::Array | Shape::Ptr(_) | Shape::FnPtr(_) => None,
-        _ => return wide,
+        // Matches `trait_local`: unnameable and placeholder shapes (`Param`, `Closure`, `FnDef`,
+        // `Opaque`, `Pat`, `Dynamic(None)`) are also never local to any downstream crate, so a
+        // 1-parameter trait narrows to `home` alone instead of scanning every linked crate.
+        Shape::Bool
+        | Shape::Char
+        | Shape::Int(_)
+        | Shape::Uint(_)
+        | Shape::Float(_)
+        | Shape::AnyInt
+        | Shape::AnyFloat
+        | Shape::Str
+        | Shape::Never
+        | Shape::Tuple(_)
+        | Shape::Record(..)
+        | Shape::Union(_)
+        | Shape::Slice
+        | Shape::Array
+        | Shape::Ptr(_)
+        | Shape::FnPtr(_)
+        | Shape::FnDef(_)
+        | Shape::Closure
+        | Shape::Param
+        | Shape::Opaque(_)
+        | Shape::Pat
+        | Shape::Dynamic(None) => None,
+        Shape::Ref(_) => return wide,
     };
     let by_self = Home::In(home, local);
     match parameters {
@@ -1176,7 +1285,7 @@ pub fn inherent_home<'s, 'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &
 fn inherent_crates<'s, 'n, S: NamesSource<'n>>(facts: BodyHeadFacts<'_, 's, S>, keys: &Keys, shape: Shape, marks: Option<CoherenceMarks>) -> Homes {
     let nominal = match shape {
         Shape::Adt(k) | Shape::Dynamic(Some(k)) => k,
-        Shape::Bool | Shape::Char | Shape::Int(_) | Shape::Uint(_) | Shape::Float(_) | Shape::AnyInt | Shape::AnyFloat | Shape::Str | Shape::Never | Shape::Tuple(_) | Shape::Slice | Shape::Array | Shape::Ptr(_) | Shape::Ref(_) | Shape::FnPtr(_) => {
+        Shape::Bool | Shape::Char | Shape::Int(_) | Shape::Uint(_) | Shape::Float(_) | Shape::AnyInt | Shape::AnyFloat | Shape::Str | Shape::Never | Shape::Tuple(_) | Shape::Record(..) | Shape::Union(_) | Shape::Slice | Shape::Array | Shape::Ptr(_) | Shape::Ref(_) | Shape::FnPtr(_) => {
             return Homes::one(Home::Incoherent);
         }
         _ => return Homes::ANY,
@@ -1203,8 +1312,9 @@ fn negative_fits(filed: Option<Shape>, asked: Shape) -> bool {
     }
 }
 
-fn push<K: core::hash::Hash + Eq, V>(m: &mut HashMap<K, Vec<V, Global>, Global>, k: K, v: V) {
-    m.entry(k).or_insert_with(|| Vec::new_in(Global)).push(v);
+fn push<K: core::hash::Hash + Eq, V>(m: &mut HashMap<K, blaze_own::Vec<V, blaze_own::Alloc<'static>>, blaze_own::Alloc<'static>>, k: K, v: V) {
+    let alloc = *m.allocator();
+    m.entry(k).or_insert_with(|| blaze_own::Vec::new_in(alloc)).push(v);
 }
 
 /// The impls filed by their headers as written, and the answers made so far.
@@ -1233,83 +1343,100 @@ fn push<K: core::hash::Hash + Eq, V>(m: &mut HashMap<K, Vec<V, Global>, Global>,
 /// (between rounds, `&mut Buckets`) reaches the index through [`Buckets::index_get_mut`], which
 /// takes no runtime borrow. No `unsafe`.
 pub struct Buckets {
+    alloc: blaze_own::Alloc<'static>,
     /// Each trait question's answer, by the trait, the shape and whose impls it may hold
     /// ([`Seen`]).
-    answers: Rows<(ItemKey, Shape, Seen), Vec<ItemKey, Global>>,
+    answers: Rows<(ItemKey, Shape, Seen), blaze_own::Vec<ItemKey, blaze_own::Alloc<'static>>, blaze_own::Alloc<'static>>,
     /// Per answered trait question, the least-keyed candidate whose header failed: the
     /// question's gap. Only a question that HAS such a candidate is a gap of the body asking it,
     /// so a body's outcome never depends on which other bodies or rounds lowered what first.
-    answer_failed: Rows<(ItemKey, Shape, Seen), LibKey>,
+    answer_failed: Rows<(ItemKey, Shape, Seen), LibKey, blaze_own::Alloc<'static>>,
+    /// Trait questions whose answer read a provisional impl header during constant evaluation
+    /// (`Store::provisional_impls`): cleared once the waited-on constant finishes so the final
+    /// `ImplHead` is lowered and cached.
+    provisional_answers: OnceCell<RefCell<blaze_own::Vec<(ItemKey, Shape, Seen), blaze_own::Alloc<'static>>>>,
     /// Each crate's sight ([`SightRow`]), made once at its first checked body's first trait
     /// question ([`Buckets::sight`]) in the store's allocator, which that question names.
     sights: OnceCell<Rows<usize, SightRow, blaze_own::Alloc<'static>>>,
     /// A test's removed cause ([`Buckets::plant_whole_program_sight`]): every question sees
     /// every crate's impls, as before answers were keyed by what they see.
     whole_program_sight: bool,
-    inherent: Rows<(Shape, Name), Vec<AssocItem, Global>>,
+    inherent: Rows<(Shape, Name), blaze_own::Vec<AssocItem, blaze_own::Alloc<'static>>, blaze_own::Alloc<'static>>,
     /// The answered inherent questions (a shape and a name), each with its least-keyed failed
     /// candidate, if any: only an impl that declares a member of the name is a candidate.
-    inherent_done: Rows<(Shape, Name), Option<LibKey>>,
+    inherent_done: Rows<(Shape, Name), Option<LibKey>, blaze_own::Alloc<'static>>,
     index: RefCell<BucketIndex>,
+}
+
+/// Per-crate cached facts on [`BucketIndex`].
+#[derive(Clone, Copy)]
+pub(super) struct CrateState {
+    /// Whether the crate's root turns on `rustc_attrs` ([`Home::Incoherent`]).
+    pub(super) incoherent: bool,
+    /// Cached `linked::links_unit(krate == 0, names.proc_macro(krate) == Some(true))` so
+    /// repeated impl questions do not re-query `names.proc_macro(krate)` on every crate.
+    pub(super) linked: Option<bool>,
 }
 
 /// What [`Buckets`] files impls in and counts: every field but the answers, mutated through
 /// one `RefCell` ([`Buckets`]'s docs).
 pub struct BucketIndex {
-    by_shape: HashMap<(ItemKey, Shape), Vec<LibKey, Global>, Global>,
-    any: HashMap<ItemKey, Vec<LibKey, Global>, Global>,
+    alloc: blaze_own::Alloc<'static>,
+    by_shape: HashMap<(ItemKey, Shape), blaze_own::Vec<LibKey, blaze_own::Alloc<'static>>, blaze_own::Alloc<'static>>,
+    any: HashMap<ItemKey, blaze_own::Vec<LibKey, blaze_own::Alloc<'static>>, blaze_own::Alloc<'static>>,
     /// Every unread impl ([`Buckets::is_unread`]).
-    unread: HashSet<LibKey, Global>,
+    unread: HashSet<LibKey, blaze_own::Alloc<'static>>,
     /// Trait impls whose trait path failed, by their self type's shape where it was read
     /// (then also under `AnyInt`/`AnyFloat`), else in `unread_any`: candidates of trait
     /// questions at that shape only, never of inherent ones.
-    unread_by_shape: HashMap<Shape, Vec<LibKey, Global>, Global>,
-    unread_any: Vec<LibKey, Global>,
+    unread_by_shape: HashMap<Shape, blaze_own::Vec<LibKey, blaze_own::Alloc<'static>>, blaze_own::Alloc<'static>>,
+    unread_any: blaze_own::Vec<LibKey, blaze_own::Alloc<'static>>,
     /// Impls not read far enough to tell trait from inherent (no text, not lowered, generics
     /// refused): candidates of every question.
-    unread_blind: Vec<LibKey, Global>,
-    inherent_by_shape: HashMap<Shape, Vec<LibKey, Global>, Global>,
+    unread_blind: blaze_own::Vec<LibKey, blaze_own::Alloc<'static>>,
+    inherent_by_shape: HashMap<Shape, blaze_own::Vec<LibKey, blaze_own::Alloc<'static>>, blaze_own::Alloc<'static>>,
     /// Inherent impls whose self type's shape was not read ([`Buckets::is_unsure`]).
-    inherent_any: HashSet<LibKey, Global>,
+    inherent_any: HashSet<LibKey, blaze_own::Alloc<'static>>,
     /// How many impl headers the questions made the store lower.
     pub lowered: u32,
     /// Impls on a self type the checker has no type for (blaze's `i80`), filed nowhere.
     pub no_checker_type: u32,
     /// The unread candidates whose header failed, with why (sorted by key): left out of the
     /// answers; a gap of each body that asks a question they are candidates of.
-    pub failed: Vec<(LibKey, Box<str>), Global>,
+    pub failed: blaze_own::Vec<(LibKey, Box<str>), blaze_own::Alloc<'static>>,
     /// Why each unread impl's trait path was not filed (in filing order).
-    pub unread_why: Vec<(LibKey, Unread), Global>,
+    pub unread_why: blaze_own::Vec<(LibKey, Unread), blaze_own::Alloc<'static>>,
     /// The negative impls, by trait ([`Filed::Negative`]), each with its self type's shape
     /// (`None`: any), in filing order: no trait question's candidates.
-    negative: HashMap<ItemKey, Vec<(LibKey, Option<Shape>), Global>, Global>,
+    negative: HashMap<ItemKey, blaze_own::Vec<(LibKey, Option<Shape>), blaze_own::Alloc<'static>>, blaze_own::Alloc<'static>>,
     /// Each impl's crate, by key: known without reading its header.
-    krates: HashMap<LibKey, usize, Global>,
+    krates: HashMap<LibKey, usize, blaze_own::Alloc<'static>>,
     /// The home each answered trait question was narrowed to ([`trait_home`]).
-    homes: HashMap<(ItemKey, Shape), Homes, Global>,
+    homes: HashMap<(ItemKey, Shape), Homes, blaze_own::Alloc<'static>>,
     /// The trait impls whose trait path is written with no generic arguments.
-    bare: HashSet<LibKey, Global>,
-    /// Per crate: whether its root turns on `rustc_attrs` ([`Home::Incoherent`]).
-    incoherent: Vec<bool, Global>,
+    bare: HashSet<LibKey, blaze_own::Alloc<'static>>,
+    /// Per crate: whether its root turns on `rustc_attrs` ([`Home::Incoherent`]) and whether
+    /// it is a linked (non-proc-macro or root) unit.
+    crate_state: blaze_own::Vec<CrateState, blaze_own::Alloc<'static>>,
     /// The trait impls filed by their header's text ([`file_by_text`]) because the lowered
     /// header did not name their trait: each is a defect of the lowering or of the block's
     /// module to remove at its home, counted here so it is seen. A set: [`Buckets::answer`]
     /// asks it of each candidate (it was a vector searched by halves that, over
     /// [`Buckets::lazy`], was never sorted across crates, so a search could miss a member).
-    pub by_text: HashSet<LibKey, Global>,
+    pub by_text: HashSet<LibKey, blaze_own::Alloc<'static>>,
     /// The blanket trait impls (`impl<T> Tr<..> for T`, by their header's tokens:
     /// [`written_trait`]), read or unread: each is judged by [`Homes::blanket`], so an
     /// unread one is a candidate only of questions about a trait of its own crate.
-    blanket: HashSet<LibKey, Global>,
+    blanket: HashSet<LibKey, blaze_own::Alloc<'static>>,
     /// The impls whose self path was read to no constructor that the coherence rules bound
     /// to their crate's local types ([`PathSelf`]), each with its crate: filed at every
     /// shape, but a candidate only of a question whose [`Homes::local`] may be that crate's,
     /// so a refused one is no gap of a question at a primitive, a parameter or a type of
     /// another crate.
-    bounded: HashMap<LibKey, usize, Global>,
+    bounded: HashMap<LibKey, usize, blaze_own::Alloc<'static>>,
     /// Over [`Buckets::lazy`]: per crate, whether its impls were filed ([`Buckets::admit`]).
     /// Empty over [`Buckets::new`], which files every crate's.
-    lazy_filed: Vec<bool, Global>,
+    lazy_filed: blaze_own::Vec<bool, blaze_own::Alloc<'static>>,
     /// Over [`Buckets::lazy`]: how many impls [`Buckets::admit`] filed from their rows of the
     /// items record, no text opened ([`file_row`]).
     pub filed_from_rows: u32,
@@ -1327,20 +1454,39 @@ pub struct BucketIndex {
     indexed: asked::Indexed,
     /// The cells already offered to this body, allocated by its caller on the first lookup.
     table_reads: Option<BucketReadUnion<blaze_own::Alloc<'static>>>,
+    /// Cached `Home::Any` `NoImplsOf` precheck results per trait, allocated in the body's
+    /// scratch allocator on the first `Home::Any` trait lookup.
+    tables_cache: Option<records::TablesCache>,
+    /// Resolved type-alias shapes reused across all crates filed in this index.
+    alias_shapes: Option<AliasShapes>,
 }
 
 impl Buckets {
     /// No impl filed, no crate known, no question answered.
     fn of(index: BucketIndex) -> Buckets {
+        let alloc = index.alloc;
         Buckets {
-            answers: Rows::new_in(Global),
-            answer_failed: Rows::new_in(Global),
+            alloc,
+            answers: Rows::new_in(alloc),
+            answer_failed: Rows::new_in(alloc),
+            provisional_answers: OnceCell::new(),
             sights: OnceCell::new(),
             whole_program_sight: false,
-            inherent: Rows::new_in(Global),
-            inherent_done: Rows::new_in(Global),
+            inherent: Rows::new_in(alloc),
+            inherent_done: Rows::new_in(alloc),
             index: RefCell::new(index),
         }
+    }
+
+    /// Wraps an already-populated [`BucketIndex`] with fresh empty per-store answer tables.
+    pub(crate) fn from_index(index: BucketIndex) -> Buckets {
+        Buckets::of(index)
+    }
+
+    /// Consumes these buckets and returns the underlying [`BucketIndex`] so its crate-level
+    /// impl filing work can be reused across stores over the same [`NamesSource`].
+    pub(crate) fn into_index(self) -> BucketIndex {
+        self.index.into_inner()
     }
 
     /// The impl index the names source `names` is answered from: over the solved names every
@@ -1348,31 +1494,49 @@ impl Buckets {
     /// both paths call: check.rs `make_once` on the first impl fill, and `check_rounds_as`
     /// before round 0 of a seeded body.
     pub fn for_source<'n, S: NamesSource<'n>>(names: S, index: &Index<'_>) -> Buckets {
+        Self::for_source_in(names, index, default_alloc())
+    }
+
+    /// As [`Buckets::for_source`], backing the bucket tables and answers in `alloc`.
+    pub fn for_source_in<'n, S: NamesSource<'n>>(names: S, index: &Index<'_>, alloc: blaze_own::Alloc<'static>) -> Buckets {
         match names.solved() {
-            Some(solved) => Buckets::new(solved, index),
-            None => Buckets::lazy(names),
+            Some(solved) => Buckets::new_in(solved, index, alloc),
+            None => Buckets::lazy_in(names, alloc),
         }
+    }
+
+    /// The backing allocator used for this table's admitted rows and sight caches.
+    pub(super) fn alloc(&self) -> blaze_own::Alloc<'static> {
+        self.alloc
     }
 
     /// Files every impl of `index` by its header as written.
     pub fn new(names: &Names<'_>, index: &Index<'_>) -> Buckets {
-        let mut b = BucketIndex::empty();
+        Self::new_in(names, index, default_alloc())
+    }
+
+    /// As [`Buckets::new`], backing the bucket tables and answers in `alloc`.
+    pub fn new_in(names: &Names<'_>, index: &Index<'_>, alloc: blaze_own::Alloc<'static>) -> Buckets {
+        let mut b = BucketIndex::empty_in(alloc);
         b.krates.extend(index.impls.iter().map(|at| (at.key, at.krate)));
         // `#![feature(rustc_attrs)]` is an inner attribute of the crate root, the first file
         // read; a mention anywhere in that text keeps the crate on the wide side.
-        b.incoherent.extend(names.crates().iter().map(|c| blaze_scope::items_record::root_may_write_incoherent(c)));
+        b.crate_state.extend(names.crates().iter().map(|c| CrateState {
+            incoherent: blaze_scope::items_record::root_may_write_incoherent(c),
+            linked: None,
+        }));
         b.file_all(names, &index.impls);
         // Each refused derive's gap (D193 point 5), as the items record writes it: the solve's
         // values give the same rows (blaze-scope `each_refused_impl_row`, the one home).
         for (krate, c) in names.crates().iter().enumerate() {
-            let mut gaps: Vec<ImplRow<'_>, Global> = Vec::new_in(Global);
+            let mut gaps: blaze_own::Vec<ImplRow<'_>, blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(alloc);
             blaze_scope::items_record::each_refused_impl_row(c, &mut |row| gaps.push(row));
             if gaps.is_empty() {
                 continue;
             }
             // By key: the order impls are filed in is a function of the names.
             gaps.sort_unstable_by_key(|row| row.key);
-            let counts = file_rows(names, krate, &gaps, &mut |f| b.take(names, krate, f));
+            let counts = file_rows_in(names, krate, &gaps, None, alloc, &mut |f| b.take(names, krate, f));
             b.count(counts);
         }
         Buckets::of(b)
@@ -1382,11 +1546,16 @@ impl Buckets {
     /// [`Buckets::admit`] files the impls of the crates the question's home admits, from the
     /// source's impl rows ([`NamesSource::each_impl`]); a crate is filed once.
     pub fn lazy<'n, S: NamesSource<'n>>(names: S) -> Buckets {
-        let mut b = BucketIndex::empty();
+        Self::lazy_in(names, default_alloc())
+    }
+
+    /// As [`Buckets::lazy`], backing the bucket tables and answers in `alloc`.
+    pub fn lazy_in<'n, S: NamesSource<'n>>(names: S, alloc: blaze_own::Alloc<'static>) -> Buckets {
+        let mut b = BucketIndex::empty_in(alloc);
         let crates = names.crate_count();
         // Unknown until asked ([`Buckets::admit`]): the wide side, as `admits` reads a crate
         // with no row.
-        b.incoherent.resize(crates, true);
+        b.crate_state.resize(crates, CrateState { incoherent: true, linked: None });
         b.lazy_filed.resize(crates, false);
         Buckets::of(b)
     }
@@ -1447,6 +1616,7 @@ impl Buckets {
         match names.impl_tables() {
             Some(tables) => ix.admit_tables(names, keys, home, ask, tables, alloc),
             None => {
+                ix.ensure_alias_cache(alloc);
                 let whole = ix.admit(names, home);
                 Ok(whole + ix.admit_asked(names, keys, home, ask)?)
             }
@@ -1457,15 +1627,15 @@ impl Buckets {
         self.index().is_lazy()
     }
 
-    pub fn trait_candidates(&self, trait_: ItemKey, shape: Shape, home: Homes) -> Vec<LibKey, Global> {
+    pub fn trait_candidates(&self, trait_: ItemKey, shape: Shape, home: Homes) -> blaze_own::Vec<LibKey, blaze_own::Alloc<'static>> {
         self.index().trait_candidates(trait_, shape, home)
     }
 
-    pub fn negative_of(&self, trait_: ItemKey, shape: Shape, home: Homes) -> Vec<LibKey, Global> {
+    pub fn negative_of(&self, trait_: ItemKey, shape: Shape, home: Homes) -> blaze_own::Vec<LibKey, blaze_own::Alloc<'static>> {
         self.index().negative_of(trait_, shape, home)
     }
 
-    pub fn inherent_candidates(&self, shape: Shape, home: Homes) -> Vec<LibKey, Global> {
+    pub fn inherent_candidates(&self, shape: Shape, home: Homes) -> blaze_own::Vec<LibKey, blaze_own::Alloc<'static>> {
         self.index().inherent_candidates(shape, home)
     }
 
@@ -1522,14 +1692,18 @@ impl Buckets {
     }
 
     /// The unread impls filed at no shape ([`BucketIndex::shapeless_unread`]), in filing order.
-    pub(crate) fn shapeless_unread(&self) -> Vec<LibKey, Global> {
-        let mut out = Vec::new_in(Global);
+    pub(crate) fn shapeless_unread(&self) -> blaze_own::Vec<LibKey, blaze_own::Alloc<'static>> {
+        let mut out = blaze_own::Vec::new_in(self.alloc);
         out.extend(self.index().shapeless_unread());
         out
     }
 
-    pub fn trait_reads(&self, trait_: ItemKey, shape: Shape) -> Ref<'_, [BucketRead]> {
-        Ref::map(self.index(), |ix| ix.trait_reads(trait_, shape))
+    pub fn trait_reads(&self, trait_: ItemKey, shape: Shape) -> blaze_own::Vec<BucketRead, Global> {
+        self.index().trait_reads(trait_, shape)
+    }
+
+    pub(super) fn with_trait_reads<R>(&self, trait_: ItemKey, shape: Shape, f: impl FnOnce(&[BucketRead], Option<(&[BucketRead], &[BucketRead])>) -> R) -> R {
+        self.index().with_trait_reads(trait_, shape, f)
     }
 
     pub fn inherent_reads(&self, shape: Shape) -> Ref<'_, [BucketRead]> {
@@ -1566,37 +1740,59 @@ impl Buckets {
 }
 
 impl BucketIndex {
-    /// No impl filed, no crate known.
-    fn empty() -> BucketIndex {
+    /// No impl filed, no crate known, backed by `alloc`.
+    fn empty_in(alloc: blaze_own::Alloc<'static>) -> BucketIndex {
         BucketIndex {
-            by_shape: HashMap::new_in(Global),
-            any: HashMap::new_in(Global),
-            unread: HashSet::new_in(Global),
-            unread_by_shape: HashMap::new_in(Global),
-            unread_any: Vec::new_in(Global),
-            unread_blind: Vec::new_in(Global),
-            inherent_by_shape: HashMap::new_in(Global),
-            inherent_any: HashSet::new_in(Global),
+            alloc,
+            by_shape: HashMap::new_in(alloc),
+            any: HashMap::new_in(alloc),
+            unread: HashSet::new_in(alloc),
+            unread_by_shape: HashMap::new_in(alloc),
+            unread_any: blaze_own::Vec::new_in(alloc),
+            unread_blind: blaze_own::Vec::new_in(alloc),
+            inherent_by_shape: HashMap::new_in(alloc),
+            inherent_any: HashSet::new_in(alloc),
             lowered: 0,
             no_checker_type: 0,
-            failed: Vec::new_in(Global),
-            unread_why: Vec::new_in(Global),
-            negative: HashMap::new_in(Global),
-            krates: HashMap::new_in(Global),
-            homes: HashMap::new_in(Global),
-            bare: HashSet::new_in(Global),
-            incoherent: Vec::new_in(Global),
-            by_text: HashSet::new_in(Global),
-            blanket: HashSet::new_in(Global),
-            bounded: HashMap::new_in(Global),
-            lazy_filed: Vec::new_in(Global),
+            failed: blaze_own::Vec::new_in(alloc),
+            unread_why: blaze_own::Vec::new_in(alloc),
+            negative: HashMap::new_in(alloc),
+            krates: HashMap::new_in(alloc),
+            homes: HashMap::new_in(alloc),
+            bare: HashSet::new_in(alloc),
+            crate_state: blaze_own::Vec::new_in(alloc),
+            by_text: HashSet::new_in(alloc),
+            blanket: HashSet::new_in(alloc),
+            bounded: HashMap::new_in(alloc),
+            lazy_filed: blaze_own::Vec::new_in(alloc),
             filed_from_rows: 0,
             filed_from_text: 0,
             row_misses: [0; 6],
             no_rows: false,
             table_reads: None,
-            indexed: asked::Indexed::new(),
+            tables_cache: None,
+            indexed: asked::Indexed::new(alloc),
+            alias_shapes: None,
         }
+    }
+
+    fn ensure_alias_cache(&mut self, alloc: blaze_own::Alloc<'static>) {
+        if self.alias_shapes.is_none() {
+            self.alias_shapes = Some(HashMap::new_in(alloc));
+        }
+    }
+
+    /// Resets per-store bookkeeping so this index can back a fresh [`Buckets`] over another
+    /// [`Store`] while keeping all crate-level impl filings and bucket lookups intact.
+    pub(crate) fn clear_for_store(&mut self) {
+        self.failed.clear();
+        self.lowered = 0;
+        self.table_reads = None;
+    }
+
+    /// Number of crates whose unfiled impl list has already been filed in this index.
+    pub(crate) fn unfiled_crates_len(&self) -> usize {
+        self.indexed.unfiled.len()
     }
 
     /// THE CAUSE REMOVED, for tests/front2_records.rs only (rule 23): from now on
@@ -1638,7 +1834,7 @@ impl BucketIndex {
             }
             if [all, bare, blanket].contains(&Home::Incoherent) {
                 // Not answered (no record: the source filed it): the wide side.
-                self.incoherent[krate] = names.may_write_incoherent(krate).unwrap_or(true);
+                self.crate_state[krate].incoherent = names.may_write_incoherent(krate).unwrap_or(true);
             }
             if !(self.admits(all, krate) || self.admits(bare, krate) || self.admits(blanket, krate)) {
                 continue;
@@ -1647,16 +1843,19 @@ impl BucketIndex {
             filed += 1;
             // A proc-macro unit the program reaches answers none of its questions; the
             // program's own crate (0) does, a proc macro's too (linked.rs `links_unit`).
-            if !super::linked::links_unit(krate == 0, names.proc_macro(krate) == Some(true)) {
+            if !self.crate_linked(names, krate) {
                 continue;
             }
-            let mut rows: Vec<ImplRow<'n>, Global> = Vec::new_in(Global);
+            let mut rows: blaze_own::Vec<ImplRow<'n>, blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(self.alloc);
             if !self.no_rows && names.each_impl_row(krate, &mut |row| rows.push(row)) {
-                let counts = file_rows(names, krate, &rows, &mut |f| self.take(names, krate, f));
+                let mut aliases = self.alias_shapes.take();
+                let alloc = self.alloc;
+                let counts = file_rows_in(names, krate, &rows, aliases.as_mut(), alloc, &mut |f| self.take(names, krate, f));
+                self.alias_shapes = aliases;
                 self.count(counts);
             } else {
                 // Every impl of a source with no impl rows is read from its header's text.
-                let mut impls: Vec<super::index::ImplAt<'n>, Global> = Vec::new_in(Global);
+                let mut impls: blaze_own::Vec<super::index::ImplAt<'n>, blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(self.alloc);
                 names.each_impl(krate, &mut |at| impls.push(at));
                 // By key: the order impls are filed in is a function of the records.
                 impls.sort_by_key(|at| at.key);
@@ -1669,8 +1868,9 @@ impl BucketIndex {
 
     /// Files each impl of `impls` by its header as written.
     fn file_all<'n, S: NamesSource<'n>>(&mut self, names: S, impls: &[super::index::ImplAt<'n>]) {
+        let alloc = self.alloc;
         for at in impls.iter() {
-            let f = file_text(names, at);
+            let f = file_text(names, at, alloc);
             self.take(names, at.krate, f);
         }
     }
@@ -1776,8 +1976,8 @@ impl BucketIndex {
     }
 
     /// The candidates for `trait_` at `shape`, each once.
-    pub fn trait_candidates(&self, trait_: ItemKey, shape: Shape, home: Homes) -> Vec<LibKey, Global> {
-        let mut out = Vec::new_in(Global);
+    pub fn trait_candidates(&self, trait_: ItemKey, shape: Shape, home: Homes) -> blaze_own::Vec<LibKey, blaze_own::Alloc<'static>> {
+        let mut out = blaze_own::Vec::new_in(self.alloc);
         out.extend_from_slice(self.by_shape.get(&(trait_, shape)).map_or(&[], |v| v.as_slice()));
         out.extend_from_slice(self.any.get(&trait_).map_or(&[], |v| v.as_slice()));
         out.extend_from_slice(self.unread_by_shape.get(&shape).map_or(&[], |v| v.as_slice()));
@@ -1793,7 +1993,7 @@ impl BucketIndex {
     /// impl is judged by `home.bare`, any other by `home.all`). A blanket impl is judged by
     /// `home.blanket` first: its trait's crate alone, the narrowest of the three. A bounded
     /// impl ([`Buckets::bounded`]) is also judged by `home.local`.
-    fn keep_home(&self, out: &mut Vec<LibKey, Global>, home: Homes) {
+    fn keep_home(&self, out: &mut blaze_own::Vec<LibKey, blaze_own::Alloc<'static>>, home: Homes) {
         if home == Homes::ANY {
             return;
         }
@@ -1809,13 +2009,27 @@ impl BucketIndex {
         });
     }
 
+    /// Whether `krate` is linked for impl lookup (root or non-proc-macro), memoized once per
+    /// crate on this [`BucketIndex`] so repeated impl questions do not re-query `names.proc_macro`
+    /// and re-offer `NameCell::Root` on every crate.
+    pub(super) fn crate_linked<'n, S: NamesSource<'n>>(&mut self, names: S, krate: usize) -> bool {
+        if let Some(linked) = self.crate_state.get(krate).and_then(|s| s.linked) {
+            return linked;
+        }
+        let linked = super::linked::links_unit(krate == 0, names.proc_macro(krate) == Some(true));
+        if let Some(slot) = self.crate_state.get_mut(krate) {
+            slot.linked = Some(linked);
+        }
+        linked
+    }
+
     /// Whether an impl written in crate `krate` can be in `home`.
     pub fn admits(&self, home: Home, krate: usize) -> bool {
         match home {
             Home::Any => true,
             Home::In(a, b) => krate == a || b == Some(krate),
             // A crate the names library has no row for stays on the wide side.
-            Home::Incoherent => self.incoherent.get(krate).copied().unwrap_or(true),
+            Home::Incoherent => self.crate_state.get(krate).map_or(true, |s| s.incoherent),
         }
     }
 
@@ -1842,8 +2056,8 @@ impl BucketIndex {
     /// for `{integer}`). Over the impl tables a question reads only its shape's buckets, so
     /// the trait's other negatives are filed only by other questions; read whole, the answer
     /// depended on what was asked before (rule 21; tests/front2_buckets_order.rs found it).
-    pub fn negative_of(&self, trait_: ItemKey, shape: Shape, home: Homes) -> Vec<LibKey, Global> {
-        let mut out = Vec::new_in(Global);
+    pub fn negative_of(&self, trait_: ItemKey, shape: Shape, home: Homes) -> blaze_own::Vec<LibKey, blaze_own::Alloc<'static>> {
+        let mut out = blaze_own::Vec::new_in(self.alloc);
         let filed = self.negative.get(&trait_).map_or(&[][..], |v| v.as_slice());
         out.extend(filed.iter().filter(|(_, at)| negative_fits(*at, shape)).map(|(k, _)| *k));
         self.keep_home(&mut out, home);
@@ -1852,8 +2066,8 @@ impl BucketIndex {
     }
 
     /// The candidates for an inherent fn of `shape`, each once.
-    pub fn inherent_candidates(&self, shape: Shape, home: Homes) -> Vec<LibKey, Global> {
-        let mut out = Vec::new_in(Global);
+    pub fn inherent_candidates(&self, shape: Shape, home: Homes) -> blaze_own::Vec<LibKey, blaze_own::Alloc<'static>> {
+        let mut out = blaze_own::Vec::new_in(self.alloc);
         out.extend_from_slice(self.inherent_by_shape.get(&shape).map_or(&[], |v| v.as_slice()));
         out.extend(self.inherent_any.iter().copied());
         // A trait impl (its trait written in its header's text, though unread, refused or
@@ -1921,15 +2135,8 @@ impl Buckets {
         if self.answers.contains_key(&asked) {
             return Ok(());
         }
-        let view = store.tys.view();
-        let mut got = Vec::new_in(Global);
-        // Candidates come sorted, so the first failed one is the least key.
-        let mut first_failed = None;
-        {
-            // The index borrowed once (`Buckets::index_mut`): inside, only the index's own
-            // methods and reads of `store`'s rows.
-            let mut ix = self.index_mut();
-            ix.homes.insert((trait_, shape), home);
+        let candidates = {
+            let ix = self.index();
             // The negative impls are candidates too: the solver reads their polarity (a negative
             // impl decides an auto trait's structural rule and never meets a positive goal).
             let mut candidates = ix.trait_candidates(trait_, shape, home);
@@ -1937,12 +2144,37 @@ impl Buckets {
             candidates.retain(|k| sight.sees(ix.krate(*k)));
             candidates.sort_unstable();
             candidates.dedup();
-            for k in candidates {
+            candidates
+        };
+        self.answer_candidates(store, trait_, shape, home, sight, &candidates)
+    }
+
+    /// [`Buckets::answer`] reusing the caller's already assembled, sight-filtered, sorted, and
+    /// deduplicated candidate list (`check::trait_question`).
+    pub(crate) fn answer_candidates(&self, store: &Store<'_>, trait_: ItemKey, shape: Shape, home: Homes, sight: Sight<'_>, candidates: &[LibKey]) -> Result<(), Unfilled> {
+        let asked = (trait_, shape, sight.seen);
+        if self.answers.contains_key(&asked) {
+            return Ok(());
+        }
+        let view = store.tys.view();
+        let mut got = blaze_own::Vec::new_in(self.alloc);
+        // Candidates come sorted, so the first failed one is the least key.
+        let mut first_failed = None;
+        let mut used_provisional = false;
+        {
+            // The index borrowed once (`Buckets::index_mut`): inside, only the index's own
+            // methods and reads of `store`'s rows.
+            let mut ix = self.index_mut();
+            ix.homes.insert((trait_, shape), home);
+            for &k in candidates {
                 if ix.has_failed(k) {
                     first_failed = first_failed.or(Some(k));
                     continue;
                 }
-                let h = store.impls.get(&checker_of(k)).ok_or(Unfilled::Impl(k))?;
+                let (h, provisional) = store.impl_or_provisional(checker_of(k)).ok_or(Unfilled::Impl(k))?;
+                if provisional {
+                    used_provisional = true;
+                }
                 // A header built WITHOUT the trait its text names answers nothing: it is the
                 // question's gap, never an impl left out of the answer unseen.
                 if h.trait_.is_none() && ix.by_text.contains(&k) {
@@ -1961,7 +2193,26 @@ impl Buckets {
             self.answer_failed.insert(asked, k);
         }
         self.answers.insert(asked, got);
+        if used_provisional {
+            let list = self.provisional_answers.get_or_init(|| RefCell::new(blaze_own::Vec::new_in(store.tys.alloc())));
+            let mut list = list.borrow_mut();
+            if !list.iter().any(|&a| a == asked) {
+                list.push(asked);
+            }
+        }
         Ok(())
+    }
+
+    /// Removes trait question answers that depended on provisional impl headers so subsequent
+    /// checks lower and cache the complete `ImplHead`.
+    pub(super) fn clear_provisional(&self) {
+        let Some(list) = self.provisional_answers.get() else { return };
+        let mut list = list.borrow_mut();
+        for &asked in list.iter() {
+            self.answers.remove(&asked);
+            self.answer_failed.remove(&asked);
+        }
+        list.clear();
     }
 
     /// A test's removed cause (rule 23): every trait question, a checked body's too, takes the
@@ -2018,7 +2269,7 @@ impl Buckets {
         }
         let view = store.tys.view();
         let mut first_failed = None;
-        let mut got = Vec::new_in(Global);
+        let mut got = blaze_own::Vec::new_in(self.alloc);
         for &k in candidates {
             if self.has_failed(k) {
                 first_failed = first_failed.or(Some(k));
@@ -2102,5 +2353,45 @@ impl Buckets {
             return None;
         }
         Some(self.inherent.get(&(shape, name)).map_or(&[], |v| v.as_slice()))
+    }
+}
+
+#[cfg(test)]
+mod trait_crates_tests {
+    use super::{Home, Homes, ItemKey, Local, Mutbl, Shape, trait_crates};
+
+    #[test]
+    fn unnameable_and_foreign_shapes_narrow_trait_homes_by_orphan_rules() {
+        let home = Some(3);
+        let one_param = (1, false);
+        let defaulted_two = (2, true);
+        let multi_param = (2, false);
+        let only_home = Home::In(3, None);
+
+        for shape in [
+            Shape::Param,
+            Shape::Closure,
+            Shape::FnDef(ItemKey(7)),
+            Shape::Opaque(ItemKey(8)),
+            Shape::Pat,
+            Shape::Dynamic(None),
+        ] {
+            let h1 = trait_crates(home, shape, Local::Nowhere, one_param);
+            assert_eq!(h1, Homes { all: only_home, bare: only_home, blanket: only_home, local: Local::Any }, "1-param at {shape:?}");
+
+            let h2 = trait_crates(home, shape, Local::Nowhere, defaulted_two);
+            assert_eq!(h2, Homes { all: Home::Any, bare: only_home, blanket: only_home, local: Local::Any }, "defaulted 2-param at {shape:?}");
+
+            let h3 = trait_crates(home, shape, Local::Nowhere, multi_param);
+            assert_eq!(h3, Homes { all: Home::Any, bare: Home::Any, blanket: only_home, local: Local::Any }, "multi-param at {shape:?}");
+        }
+
+        // Foreign types are local to their defining crate (just like non-fundamental ADTs).
+        let foreign = trait_crates(home, Shape::Foreign(ItemKey(9)), Local::In(5), one_param);
+        assert_eq!(foreign, Homes { all: Home::In(3, Some(5)), bare: Home::In(3, Some(5)), blanket: only_home, local: Local::Any });
+
+        // References remain fundamental -> wide (`Home::Any`) for `all` and `bare`.
+        let rf = trait_crates(home, Shape::Ref(Mutbl::Not), Local::Any, one_param);
+        assert_eq!(rf, Homes { all: Home::Any, bare: Home::Any, blanket: only_home, local: Local::Any });
     }
 }

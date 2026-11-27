@@ -28,6 +28,7 @@ const NEW: NewFront<'static> = NewFront { package: "ladder", edition: "2024", sh
 /// The declarations, as core's (clone.rs, marker.rs, ops/function.rs), `no_core`.
 const PRELUDE: &str = "#![feature(no_core, lang_items, unboxed_closures, fn_traits, rustc_attrs)]
 #![no_core]
+#![no_main]
 
 #[lang = \"pointee_sized\"]
 pub trait PointeeSized {}
@@ -38,6 +39,7 @@ pub trait Sized: MetaSized {}
 #[lang = \"legacy_receiver\"]
 pub trait LegacyReceiver: PointeeSized {}
 impl<T: PointeeSized> LegacyReceiver for &T {}
+impl<T: PointeeSized> LegacyReceiver for &mut T {}
 
 #[lang = \"clone\"]
 pub trait Clone: Sized {
@@ -77,6 +79,9 @@ pub trait Fn<Args: Tuple>: FnMut<Args> {
 fn apply<F: FnOnce(&u8) -> u8>(f: F, x: &u8) -> u8 {
     f(x)
 }
+fn apply_mut<T, F: FnMut(&T) -> T>(mut f: F, x: &T) -> T {
+    f(x)
+}
 fn own(x: &u8) -> u8 {
     *x
 }
@@ -94,9 +99,11 @@ fn run(main: &str) -> String {
 #[test]
 fn trait_fn_items_run_as_the_impls_fn() {
     let cases = [
-        ("trait_item", "fn main() -> i32 { let five: u8 = 5; apply(Clone::clone, &five) as i32 }"),
-        ("qualified", "fn main() -> i32 { let five: u8 = 5; apply(<u8 as Clone>::clone, &five) as i32 }"),
-        ("control", "fn main() -> i32 { let five: u8 = 5; apply(own, &five) as i32 }"),
+        ("trait_item", "#[unsafe(no_mangle)] pub extern \"C\" fn main() -> i32 { let five: u8 = 5; apply(Clone::clone, &five) as i32 }"),
+        ("qualified", "#[unsafe(no_mangle)] pub extern \"C\" fn main() -> i32 { let five: u8 = 5; apply(<u8 as Clone>::clone, &five) as i32 }"),
+        ("control", "#[unsafe(no_mangle)] pub extern \"C\" fn main() -> i32 { let five: u8 = 5; apply(own, &five) as i32 }"),
+        // Language-given `Clone::clone` for a tuple passed as an `FnMut` fn item (`iter.map(Clone::clone)` / `slice::concat`).
+        ("tuple_clone_fn_mut", "#[unsafe(no_mangle)] pub extern \"C\" fn main() -> i32 { let pair: (u8, i32) = (1, 4); let out = apply_mut(Clone::clone, &pair); (out.0 as i32) | out.1 }"),
     ];
     for (name, main) in cases {
         let said = run(main);

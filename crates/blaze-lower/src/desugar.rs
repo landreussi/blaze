@@ -53,7 +53,7 @@ pub(crate) struct ForParts {
     pub(crate) inner_loop: ExprId,
 }
 
-impl Machine<'_, '_, '_> {
+impl Machine<'_, '_, '_, '_> {
     /// A path to a lang item, read by the body.
     fn lang_path(&mut self, lang: LangItem, r: Range) -> PathIdx {
         self.out.langs |= lang.bit();
@@ -80,7 +80,7 @@ impl Machine<'_, '_, '_> {
     fn hygienic_bind(&mut self, name: &str, mutable: bool, r: Range) -> PatId {
         let name = self.synth_name(name, r);
         let ann = BindAnn { by_ref: None, mutable };
-        self.put_pat(Pat::Bind { ann, name, sub: None, shadows: None }, r)
+        self.put_pat(Pat::Bind { ann, name, sub: None, shadows: None, ty: None }, r)
     }
 
     /// `Lang(elems..)` as a pattern.
@@ -111,7 +111,7 @@ impl Machine<'_, '_, '_> {
     }
 
     /// `for PAT in HEAD BODY`; the user's `break`s and `continue`s target `inner_loop`.
-    pub(crate) fn for_loop(&mut self, pat: PatId, head: ExprId, body: ExprId, r: Range) -> ForParts {
+    pub(crate) fn for_loop(&mut self, pat: PatId, head: ExprId, body: ExprId, cost: LoopCost, r: Range) -> ForParts {
         let head_r = self.out.expr_ranges[head.0 as usize];
         // `None => break`
         let break_ = if plant_for_drops_break() {
@@ -133,7 +133,7 @@ impl Machine<'_, '_, '_> {
         let inner = self.put_expr(Expr::Match { scrutinee: next, arms, source: MatchSource::ForLoop }, head_r);
         let stmt = self.put_stmt(Stmt::Expr { expr: inner, semi: false });
         let loop_body = self.block_of(&[stmt], None, BlockKind::Plain, r);
-        let inner_loop = self.put_expr(Expr::Loop { body: loop_body, source: LoopSource::ForLoop }, r);
+        let inner_loop = self.put_expr(Expr::Loop { body: loop_body, source: LoopSource::ForLoop, cost }, r);
         if let Ok(Expr::Break { value, .. }) = Expr::decode(self.out.exprs[break_.0 as usize]) {
             self.out.exprs[break_.0 as usize] = Expr::Break { value, target: Some(inner_loop) }.encode();
         }
@@ -145,13 +145,13 @@ impl Machine<'_, '_, '_> {
     }
 
     /// `while COND BODY`: `loop { if COND BODY else { break } }`. Returns the loop.
-    pub(crate) fn while_loop(&mut self, cond: ExprId, body: ExprId, r: Range) -> ExprId {
+    pub(crate) fn while_loop(&mut self, cond: ExprId, body: ExprId, cost: LoopCost, r: Range) -> ExprId {
         let break_ = self.put_expr(Expr::Break { value: None, target: None }, r);
         let stmt = self.put_stmt(Stmt::Expr { expr: break_, semi: false });
         let else_ = self.block_of(&[stmt], None, BlockKind::Plain, r);
         let if_ = self.put_expr(Expr::If { cond, then: body, else_: Some(else_) }, r);
         let block = self.block_of(&[], Some(if_), BlockKind::Plain, r);
-        let lp = self.put_expr(Expr::Loop { body: block, source: LoopSource::While }, r);
+        let lp = self.put_expr(Expr::Loop { body: block, source: LoopSource::While, cost }, r);
         self.out.exprs[break_.0 as usize] = Expr::Break { value: None, target: Some(lp) }.encode();
         lp
     }
@@ -258,7 +258,7 @@ impl Machine<'_, '_, '_> {
                 // `x: T` => `x: T`, then `let x = x;`, the written pattern kept.
                 Some(name) => {
                     let ann = BindAnn { by_ref: None, mutable: false };
-                    let param = self.put_pat(Pat::Bind { ann, name, sub: None, shadows: None }, pr);
+                    let param = self.put_pat(Pat::Bind { ann, name, sub: None, shadows: None, ty: None }, pr);
                     let init = self.hygienic_local(param, pr);
                     stmts.push(self.put_stmt(Stmt::Let { pat: orig, ty: None, init: Some(init), else_: None }));
                     params.push(param.0);

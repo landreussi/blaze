@@ -324,6 +324,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     run_with(tape, plant, width_now)
 }
 
+/// The invariant: every test row finishes once with its child's verified report digest or typed non-pass outcome, never counting a killed or corrupt child as passed.
 #[test]
 fn each_row_ends_once_with_the_result_its_child_gives() {
     check(Config::cases(500), |tape| run(tape, Plant::None));
@@ -504,6 +505,10 @@ fn a_child_takes_its_steps_in_order_and_reports_once() {
         names.push(step.index());
         if let Step::Sandbox { profile } = step {
             assert!(profile.contains("(deny default)") && profile.contains("(subpath \"/tmp/blaze-test/t4\")"));
+            assert!(profile.contains("(allow file-write* (subpath \"/tmp/blaze-test/t4\") (subpath \"/private/tmp\") (literal \"/dev/null\"))"));
+            assert!(profile.contains("(allow network-bind (local ip \"localhost:*\") (subpath \"/tmp/blaze-test/t4\") (subpath \"/private/tmp\"))"));
+            assert!(profile.contains("(allow network-inbound (local ip \"localhost:*\") (subpath \"/tmp/blaze-test/t4\") (subpath \"/private/tmp\"))"));
+            assert!(profile.contains("(allow network-outbound (remote ip \"localhost:*\") (subpath \"/tmp/blaze-test/t4\") (subpath \"/private/tmp\"))"));
         }
     }
     assert_eq!(names, vec![0, 1, 2, 3, 4, 5, 7]);

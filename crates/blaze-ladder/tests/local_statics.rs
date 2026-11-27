@@ -138,11 +138,11 @@ fn fixture(text: &str) -> Fixture {
     let crates = inputs.crates();
     let keys: &'static [CrateItemKey] = Vec::leak(crates.iter().map(|c| c.key).collect());
     let crate_names: &'static [&'static str] = Vec::leak(crates.iter().map(|c| leak(c.name)).collect());
-    let names = inputs.resolve(&crates, a).unwrap_or_else(|e| panic!("the fixture's one solve: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("the fixture's one solve: {e}"));
     let mut kept = Kept::default();
     for c in names.crates().iter() {
-        kept.names.push(aligned(&names_record::encode(c, a).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), a));
-        kept.items.push(aligned(&items_record::encode_with(c, &names, a).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), a));
+        kept.names.push(aligned(&names_record::encode(c, a).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
+        kept.items.push(aligned(&items_record::encode_with(c, &names, a).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
         kept.files.push(c.files.iter().map(|f| (f.package.as_str().to_string(), leak(f.text))).collect());
         kept.expansions.push(c.expansions.iter().filter_map(|(call, e)| e.made.map(|m| (*call, leak(m.text)))).collect());
         kept.origins.push(c.expansions.iter().filter_map(|(call, e)| e.made.as_ref().map(|m| (*call, made_origins(*call, &m.origins)))).collect());
@@ -569,6 +569,75 @@ fn absent() -> Maybe {
     );
 }
 
+/// The `eyre::DefaultHandler` -> `Box::new` -> `SizedTypeProperties::LAYOUT` shape: a generic
+/// associated constant (`Props::SIZE`, mirroring `SizedTypeProperties::LAYOUT`) calls `size_of`
+/// on a struct holding a TAIT (`type LazyResolve = impl FnOnce() -> u64`) whose defining fn
+/// returns a closure capturing a struct and is never called. Constant evaluation's layout
+/// (`ConstsWorld::opaque_hidden`) must check the defining fn on demand (capturing its closure
+/// facts too) and lay out the struct cleanly instead of refusing "field 0 ... has no ground form".
+#[test]
+fn const_layout_of_struct_holding_uncalled_tait_closure_succeeds() {
+    walks_clean(
+        "const layout of uncalled tait closure",
+        "#[rustc_intrinsic]
+const fn size_of<T>() -> usize;
+
+struct Capture {
+    a: u64,
+    b: u64,
+}
+
+mod helper {
+    pub(super) type LazyResolve = impl super::FnOnce() -> u64;
+
+    #[define_opaque(LazyResolve)]
+    pub(super) fn lazy_resolve(c: super::Capture) -> LazyResolve {
+        move || c.a + c.b
+    }
+}
+
+enum Inner {
+    None,
+    Captured(helper::LazyResolve),
+}
+
+struct Holder {
+    f: Inner,
+}
+
+trait Props: Sized {
+    const SIZE: usize = size_of::<Self>();
+}
+
+impl<T> Props for T {}
+
+#[inline(never)]
+fn layout_size<T>() -> usize {
+    T::SIZE
+}",
+        "layout_size::<Holder>() as i32",
+    );
+}
+
+/// An enum with >64 explicit discriminant constants (mirroring `nix::errno::consts::Errno`, which
+/// has 107 `= libc::E*` variants on macOS and 133 on Linux): `lazy/fill.rs` (`adt_row` / `make_want`)
+/// and the other `NeedConst` driver loops must evaluate every explicit discriminant instead of
+/// stopping at 64 (`MOST_ADT_LENS`).
+#[test]
+fn enum_with_more_than_64_const_discriminants_builds_row() {
+    use core::fmt::Write as _;
+    let mut items = blaze_own::String::new_in(alloc());
+    for i in 1..=80 {
+        let _ = writeln!(items, "const C{i}: i32 = {i};");
+    }
+    items.push_str("#[repr(i32)]\nenum BigErrno {\n    Zero = 0,\n");
+    for i in 1..=80 {
+        let _ = writeln!(items, "    E{i} = C{i},");
+    }
+    items.push_str("}\n#[inline(never)]\nfn pick(e: BigErrno) -> i32 {\n    match e {\n        BigErrno::E80 => 3,\n        _ => 4,\n    }\n}\n");
+    walks_clean("big errno discriminants", &items, "pick(BigErrno::E80)");
+}
+
 /// The twin: the same alias where its defining fn IS called (`some` calls `make`), so the walk
 /// checks `make` by the call: 3 (`Maybe::Some`).
 /// Prints "local static opaque called: {counts}; run status 3".
@@ -705,4 +774,685 @@ fn handle_tip() -> i32 {{
     );
     let refusal = try_walk(&fixture(&program(&items, "handle_tip()"))).expect_err("`file!()` in a body of a program with no package");
     assert!(refusal.contains("HostError { ask: Place, why: Refused }"), "refused at the place question: {refusal}");
+}
+
+/// Regression for `tempo-ext` (`Iterator::chain` with `std::env::SplitPaths`): a TAIT alias
+/// (`type SplitPaths = Map<impl FnMut(u8) -> bool>`) wrapped in a struct and passed to a generic
+/// trait method whose post-analysis `Reveal::All` ground resolution asks for the alias opaque's
+/// hidden type must define the alias via `#[define_opaque(..)]` and reveal it instead of failing
+/// with `Gap { Hidden(AliasOpaque { .. }) }`.
+#[test]
+fn tait_alias_opaque_revealed_in_generic_trait_method_runs() {
+    runs_to_three(
+        "tait alias opaque in generic trait method",
+        "mod unix {
+    use super::{FnMut, Sized};
+
+    pub struct Map<F> {
+        pub val: u8,
+        pub f: F,
+    }
+
+    pub type SplitPaths = Map<impl FnMut(u8) -> bool>;
+
+    #[define_opaque(SplitPaths)]
+    pub fn split_paths(val: u8) -> SplitPaths {
+        fn is_three(b: u8) -> bool {
+            b == 3
+        }
+        Map { val, f: is_three }
+    }
+}
+
+pub struct SplitPaths {
+    inner: unix::SplitPaths,
+}
+
+trait MyIter {
+    type Item;
+    fn first(&mut self) -> Self::Item;
+    fn chain<U: MyIntoIter<Item = Self::Item>>(self, other: U) -> Chain<Self, U::IntoIter>
+    where
+        Self: Sized,
+    {
+        Chain { a: self, b: other.into_iter() }
+    }
+}
+
+trait MyIntoIter {
+    type Item;
+    type IntoIter: MyIter<Item = Self::Item>;
+    fn into_iter(self) -> Self::IntoIter;
+}
+
+impl<I: MyIter> MyIntoIter for I {
+    type Item = I::Item;
+    type IntoIter = I;
+    fn into_iter(self) -> I {
+        self
+    }
+}
+
+struct Once(i32);
+impl MyIter for Once {
+    type Item = i32;
+    fn first(&mut self) -> i32 {
+        self.0
+    }
+}
+
+impl MyIter for SplitPaths {
+    type Item = i32;
+    fn first(&mut self) -> i32 {
+        if (self.inner.f)(self.inner.val) { 3 } else { 0 }
+    }
+}
+
+struct Chain<A, B> {
+    a: A,
+    b: B,
+}
+
+impl<A: MyIter<Item = i32>, B: MyIter<Item = i32>> Chain<A, B> {
+    fn sum(&mut self) -> i32 {
+        self.a.first() + self.b.first()
+    }
+}
+
+#[inline(never)]
+fn run_chain() -> i32 {
+    let sp = SplitPaths { inner: unix::split_paths(3) };
+    let mut c = Once(0).chain(sp);
+    c.sum()
+}",
+        "run_chain()",
+    );
+}
+
+/// Regression for `tempo-chainspec` (`test_tempo_hardforks_in_inner_hardforks`): calling a
+/// required trait fn returning `impl Trait` (RPITIT) in lazy mode — both when the selected impl
+/// fn returns its own `impl Trait` and when it returns a concrete type — and passing the RPITIT
+/// value into another method must table/check the trait fn and selected impl fn on demand rather
+/// than failing with "whose trait fn or selected impl fn is not in the program".
+#[test]
+fn rpitit_trait_and_impl_fn_built_lazily_runs() {
+    runs_to_three(
+        "rpitit lazy trait and impl fn",
+        "trait MyIter {
+    fn next_val(&mut self) -> i32;
+    fn read_once(mut self) -> i32
+    where
+        Self: Sized,
+    {
+        self.next_val()
+    }
+}
+
+struct One(i32);
+impl MyIter for One {
+    fn next_val(&mut self) -> i32 {
+        self.0
+    }
+}
+
+trait Hardforks {
+    fn forks_iter(&self) -> impl MyIter;
+}
+
+struct SpecOpaque(i32);
+impl Hardforks for SpecOpaque {
+    fn forks_iter(&self) -> impl MyIter {
+        One(self.0)
+    }
+}
+
+struct SpecConcrete(i32);
+impl Hardforks for SpecConcrete {
+    fn forks_iter(&self) -> One {
+        One(self.0)
+    }
+}
+
+#[inline(never)]
+fn check_both() -> i32 {
+    let a = SpecOpaque(1).forks_iter().read_once();
+    let b = SpecConcrete(2).forks_iter().read_once();
+    a + b
+}",
+        "check_both()",
+    );
+}
+
+/// Regression for `tempo-dkg-onchain-artifacts` (`bytes::buf::buf_impl::Buf::try_get_u32`):
+/// a local `const SIZE: usize = size_of::<$typ>();` inside a macro expansion block used as the
+/// array length in `*const [_; SIZE]` (whose element type `_` has no path node!) inside a closure
+/// in a trait default method must resolve `SIZE` from the enclosing block scope instead of
+/// failing with `NotFound` at the module.
+#[test]
+fn macro_local_const_in_infer_array_ptr_cast_runs() {
+    runs_to_three(
+        "macro local const in infer array ptr cast",
+        "#[rustc_intrinsic]
+const fn size_of<T>() -> usize;
+
+macro_rules! buf_try_get_impl {
+    ($this:ident, $typ:ty) => {{
+        const SIZE: usize = size_of::<$typ>();
+        let f = |src: *const u8| unsafe {
+            let [_, _, _, last] = *(src as *const _ as *const [_; SIZE]);
+            last
+        };
+        f($this.ptr())
+    }};
+}
+
+trait Buf {
+    fn ptr(&self) -> *const u8;
+    fn try_get_u32(&mut self) -> u8 {
+        buf_try_get_impl!(self, u32)
+    }
+}
+
+struct SliceBuf {
+    data: [u8; 4],
+}
+
+impl Buf for SliceBuf {
+    fn ptr(&self) -> *const u8 {
+        &self.data as *const [u8; 4] as *const u8
+    }
+}
+
+#[inline(never)]
+fn read_buf() -> i32 {
+    let mut b = SliceBuf { data: [0, 0, 0, 3] };
+    b.try_get_u32() as i32
+}",
+        "read_buf()",
+    );
+}
+
+/// Regression for cold cached-`Typed` lazy runs referencing body-local foreign statics (plain
+/// `extern "C" { static environ; }` and `#[linkage = "extern_weak"] static pidfd_getpid;`) plus
+/// a Rust static whose initializer carries a transitive `DataTarget::Static` relocation to a
+/// foreign static: `body_statics` and `statics::static_values` must ensure every foreign static's
+/// head in `Store::fns` / `Store::statics` without running `check_body`, and preserve
+/// `extern_weak: true`.
+#[test]
+fn cold_typed_record_foreign_statics_including_extern_weak_and_transitive_ref() {
+    use blaze_ladder::run::make_one::{FromRecord, Twin};
+    use blaze_ladder::seam::FrontEnd;
+
+    let text = "#![feature(no_core, lang_items, linkage)]
+#![no_core]
+#![no_main]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+unsafe extern \"C\" {
+    static TRANSITIVE_EXT: *const u8;
+}
+
+static HOLD_EXT: *const *const u8 = unsafe { &TRANSITIVE_EXT as *const *const u8 };
+
+#[inline(never)]
+fn use_foreign_statics() -> usize {
+    unsafe extern \"C\" {
+        static environ: *const *const u8;
+        #[linkage = \"extern_weak\"]
+        static pidfd_getpid: *const u8;
+    }
+    unsafe {
+        let a = (&environ as *const *const *const u8) as usize;
+        let b = (&pidfd_getpid as *const *const u8) as usize;
+        let c = (&HOLD_EXT as *const *const *const u8) as usize;
+        a ^ b ^ c
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    (use_foreign_statics() & 1) as i32
+}
+";
+
+    let f = fixture(text);
+    let b = builder();
+    let main_key = fn_named(&f, "main");
+    let use_key = fn_named(&f, "use_foreign_statics");
+
+    // 1. Typing oracle walk (`SecondCheck` vs cold `FromRecord::rechecked`): byte-equal entries
+    // and ZERO `check_body` invocations on the reading side.
+    let names = reader(&f);
+    let checking = Maker::new(names, Some(main_key), &b, alloc());
+    let typing = FromRecord::rechecked(names, Some(main_key), alloc()).expect("rechecked double");
+    let reading = Maker::typed(names, Some(main_key), typing, &b, alloc());
+    let mut twin = Twin::new(checking, reading, alloc());
+    let mut store = MemoryStore::new_in(alloc());
+    let (walk, counts) = walk_records(main_key, &EveryItem, &mut store, &b, &producer(), &mut twin, alloc())
+        .unwrap_or_else(|e| panic!("cold typed-record foreign statics walk failed: {e}; log={:?}", logged(names.records)));
+    assert!(logged(names.records).is_empty(), "records log must be empty: {:?}", logged(names.records));
+    assert!(counts.made > 0, "expected makes in walk: {counts}");
+    assert_eq!(twin.compared, counts.make_calls(), "every entry must match byte-for-byte");
+    let program = twin.reading.program().expect("reading program");
+    assert_eq!(program.counts().checked, 0, "cold reading maker must not run check_body");
+
+    // 2. Inspect the emitted code entry of `use_foreign_statics` (byte-identical to the cold
+    // reading maker's): verify plain `environ` (`Space::Outside`) and weak `pidfd_getpid`
+    // (`Space::WeakOutside`).
+    let use_row = (0..walk.len())
+        .find(|&r| walk.tabled(r) == use_key)
+        .expect("use_foreign_statics reached by walk");
+    let use_code_key = walk.key(use_row).expect("use_foreign_statics code key");
+    let bytes = blaze_ladder::code_records::entry_of(&store, use_code_key)
+        .expect("store read")
+        .expect("use_foreign_statics entry bytes");
+    let entry = blaze_ladder::code_records::EntryView::read(bytes).expect("valid EntryView");
+    let mut saw_environ = false;
+    let mut saw_pidfd_getpid = false;
+    for i in 0..entry.record.targets() {
+        let target = entry.record.target(i);
+        match target.space {
+            blaze_code::record::Space::Outside => {
+                if entry.record.name(target.symbol) == Some("environ") {
+                    saw_environ = true;
+                }
+            }
+            blaze_code::record::Space::WeakOutside => {
+                if entry.record.name(target.symbol) == Some("pidfd_getpid") {
+                    saw_pidfd_getpid = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_environ, "expected body-local foreign static `environ` as Space::Outside");
+    assert!(saw_pidfd_getpid, "expected body-local extern_weak static `pidfd_getpid` as Space::WeakOutside");
+
+    // 3. Verify the cold reading `LazyProgram` also recorded the transitive foreign static
+    // `TRANSITIVE_EXT` reached via `HOLD_EXT`'s initializer (`DataTarget::Static`).
+    let mut ext_keys = Vec::new();
+    assert!(names.records.each_item(0, &mut |key, _| {
+        if names.records.kind_of_item(key) == Some(ItemKind::Static)
+            && names.records.name_of(key) == Some("TRANSITIVE_EXT")
+        {
+            ext_keys.push(checker_of(key));
+        }
+    }));
+    let [ext_key] = ext_keys.as_slice() else {
+        panic!("expected one TRANSITIVE_EXT static, found {}", ext_keys.len());
+    };
+    assert_eq!(program.foreign_static(*ext_key), Some("TRANSITIVE_EXT"));
+    assert_eq!(
+        program.static_item(*ext_key),
+        Some(blaze_build::StaticItem { thread_local: false, mutable: false, extern_weak: false })
+    );
+}
+
+/// Regression for cold cached-`Typed` lazy runs of bodies performing overloaded `Deref`,
+/// `DerefMut`, `Index`, and `IndexMut` calls (e.g. `std`'s `<impl CStringArray>::push` doing
+/// `self.ptrs.len()` via `Deref` and `self.ptrs[argc] = ...` via `IndexMut`): none of those
+/// implicit lang-trait methods appear in `checked.callees`, so `table_body_facts` must file
+/// their trait member heads upfront rather than failing with `BuildError::NoAbi`.
+#[test]
+fn cold_typed_record_overloaded_deref_and_index_have_abi_upfront() {
+    use blaze_ladder::run::make_one::{FromRecord, Twin};
+
+    let text = "#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = \"pointee_sized\"]
+trait PointeeSized {}
+
+#[lang = \"meta_sized\"]
+trait MetaSized: PointeeSized {}
+
+#[lang = \"sized\"]
+trait Sized: MetaSized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+#[lang = \"deref\"]
+trait Deref {
+    type Target: ?Sized;
+    fn deref(&self) -> &Self::Target;
+}
+
+#[lang = \"deref_mut\"]
+trait DerefMut: Deref {
+    fn deref_mut(&mut self) -> &mut Self::Target;
+}
+
+#[lang = \"index\"]
+trait Index<Idx: ?Sized> {
+    type Output: ?Sized;
+    fn index(&self, index: Idx) -> &Self::Output;
+}
+
+#[lang = \"index_mut\"]
+trait IndexMut<Idx: ?Sized>: Index<Idx> {
+    fn index_mut(&mut self, index: Idx) -> &mut Self::Output;
+}
+
+struct Inner {
+    first_val: i32,
+    second_val: i32,
+}
+
+impl Inner {
+    fn first(&self) -> i32 {
+        self.first_val
+    }
+    fn bump_second(&mut self) {
+        self.second_val = self.second_val + 1;
+    }
+}
+
+struct Arr {
+    inner: Inner,
+}
+
+impl Deref for Arr {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        &self.inner
+    }
+}
+
+impl DerefMut for Arr {
+    fn deref_mut(&mut self) -> &mut Inner {
+        &mut self.inner
+    }
+}
+
+impl Index<usize> for Arr {
+    type Output = i32;
+    fn index(&self, index: usize) -> &i32 {
+        if index == 0 { &self.inner.first_val } else { &self.inner.second_val }
+    }
+}
+
+impl IndexMut<usize> for Arr {
+    fn index_mut(&mut self, index: usize) -> &mut i32 {
+        if index == 0 { &mut self.inner.first_val } else { &mut self.inner.second_val }
+    }
+}
+
+#[inline(never)]
+fn push_like(arr: &mut Arr) -> i32 {
+    let a = arr.first();
+    arr.bump_second();
+    arr[0] = a + 1;
+    arr[0] + arr[1]
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    let mut arr = Arr { inner: Inner { first_val: 1, second_val: 0 } };
+    push_like(&mut arr)
+}
+";
+
+    let f = fixture(text);
+    let b = builder();
+    let main_key = fn_named(&f, "main");
+    let names = reader(&f);
+    let checking = Maker::new(names, Some(main_key), &b, alloc());
+    let typing = FromRecord::rechecked(names, Some(main_key), alloc()).expect("rechecked double");
+    let reading = Maker::typed(names, Some(main_key), typing, &b, alloc());
+    let mut twin = Twin::new(checking, reading, alloc());
+    let mut store = MemoryStore::new_in(alloc());
+    let (_, counts) = walk_records(main_key, &EveryItem, &mut store, &b, &producer(), &mut twin, alloc())
+        .unwrap_or_else(|e| panic!("cold typed-record deref/index walk failed: {e}; log={:?}", logged(names.records)));
+    assert!(logged(names.records).is_empty(), "records log must be empty: {:?}", logged(names.records));
+    assert!(counts.made > 0, "expected makes in walk: {counts}");
+    assert_eq!(twin.compared, counts.make_calls(), "every entry must match byte-for-byte");
+    assert_eq!(
+        twin.reading.program().expect("reading program").counts().checked,
+        0,
+        "cold reading maker must not run check_body"
+    );
+    assert_eq!(run_whole(text), 3);
+}
+
+/// Regression for cold cached-`Typed` lazy runs of trait-impl methods (`Adts::track_caller`):
+/// when a trait-impl method is loaded from a cached `Typed` record (so `check_body` never ran),
+/// `Want::MemberFn` -> `Want::Impl` populates `store.impls[container]` with `imp.trait_ = Some(t)`,
+/// so `LazyProgram::row` must also ensure `Want::Members(t)` so `seam_rules::track_caller` can
+/// look up the trait's declared method both when the trait method is NOT `#[track_caller]`
+/// (Case A, e.g. `<impl SpecFromIterNested for Vec>::from_iter`) and when it IS `#[track_caller]`
+/// on the trait declaration only (Case B, inherited without repeating the attribute on the impl).
+#[test]
+fn cold_typed_record_trait_impl_method_track_caller_and_inheritance() {
+    use blaze_ladder::run::make_one::{FromRecord, Twin};
+
+    let text = "#![feature(no_core, lang_items, intrinsics, rustc_attrs)]
+#![no_core]
+#![no_main]
+#![allow(internal_features)]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+impl Copy for u32 {}
+
+#[lang = \"panic_location\"]
+struct Location<'a> {
+    file: &'a str,
+    line: u32,
+    col: u32,
+}
+
+#[rustc_intrinsic]
+const fn caller_location() -> &'static Location<'static>;
+
+#[track_caller]
+#[inline(never)]
+fn here() -> u32 {
+    caller_location().line
+}
+
+struct Boxed;
+
+trait PlainTrait {
+    fn call_plain(&self) -> u32;
+}
+
+impl PlainTrait for Boxed {
+    #[inline(never)]
+    fn call_plain(&self) -> u32 {
+        here() // PLAIN_CALL_LINE
+    }
+}
+
+trait TrackedTrait {
+    #[track_caller]
+    fn call_tracked(&self) -> u32;
+}
+
+impl TrackedTrait for Boxed {
+    #[inline(never)]
+    fn call_tracked(&self) -> u32 {
+        here() // TRACKED_INNER_LINE
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    let b = Boxed;
+    let a = <Boxed as PlainTrait>::call_plain(&b);
+    let c = <Boxed as TrackedTrait>::call_tracked(&b); // TRACKED_OUTER_LINE
+    if a == 39 && c == 59 { 3 } else { 1 }
+}
+";
+
+    let plain_line = text.lines().position(|l| l.contains("PLAIN_CALL_LINE")).expect("plain line") + 1;
+    let tracked_outer_line = text.lines().position(|l| l.contains("TRACKED_OUTER_LINE")).expect("tracked line") + 1;
+    assert_eq!(plain_line, 39, "update fixture line numbers if lines shift");
+    assert_eq!(tracked_outer_line, 59, "update fixture line numbers if lines shift");
+
+    let f = fixture(text);
+    let b = builder();
+    let main_key = fn_named(&f, "main");
+    let names = reader(&f);
+    let checking = Maker::new(names, Some(main_key), &b, alloc());
+    let typing = FromRecord::rechecked(names, Some(main_key), alloc()).expect("rechecked double");
+    let reading = Maker::typed(names, Some(main_key), typing, &b, alloc());
+    let mut twin = Twin::new(checking, reading, alloc());
+    let mut store = MemoryStore::new_in(alloc());
+    let (walk, counts) = walk_records(main_key, &EveryItem, &mut store, &b, &producer(), &mut twin, alloc())
+        .unwrap_or_else(|e| panic!("cold typed-record trait impl track_caller walk failed: {e}; log={:?}", logged(names.records)));
+    assert!(logged(names.records).is_empty(), "records log must be empty: {:?}", logged(names.records));
+    assert!(counts.made > 0, "expected makes in walk: {counts}");
+    assert_eq!(twin.compared, counts.make_calls(), "every entry must match byte-for-byte");
+    assert_eq!(
+        twin.reading.program().expect("reading program").counts().checked,
+        0,
+        "cold reading maker must not run check_body"
+    );
+
+    // 2. Truly cold trait-impl method entry (matching a warm CodeRecords hit on `main` and a cold
+    // miss on the trait-impl methods, like `<impl SpecFromIterNested for Vec>::from_iter`): seed a
+    // fresh `MemoryStore` with ONLY `main`'s code entry so the fresh `Maker::typed` never touches
+    // `PlainTrait` or `TrackedTrait` while building `main`, and must build `call_plain` and
+    // `call_tracked` directly from cached `Typed` records.
+    let main_row = (0..walk.len()).find(|&r| walk.tabled(r) == main_key).expect("main row");
+    let main_code_key = walk.key(main_row).expect("main code key");
+    struct OnlyEntry<'a> {
+        seed: &'a MemoryStore<'a>,
+        keep: blaze_ladder::code_records::CodeKey,
+        extra: MemoryStore<'a>,
+    }
+    impl blaze_ladder::code_records::CodeStore for OnlyEntry<'_> {
+        fn get(&self, key: blaze_ladder::code_records::CodeKey) -> Result<Option<&[u8]>, blaze_ladder::code_records::StoreError> {
+            if key == self.keep {
+                return self.seed.get(key);
+            }
+            self.extra.get(key)
+        }
+        fn put(&mut self, class: blaze_ladder::code_records::CodeClass, key: blaze_ladder::code_records::CodeKey, bytes: &[u8]) -> Result<(), blaze_ladder::code_records::StoreError> {
+            self.extra.put(class, key, bytes)
+        }
+        fn pointed(&self, key: blaze_ladder::code_records::CodeKey) -> Result<Option<blaze_ladder::code_records::CodeKey>, blaze_ladder::code_records::StoreError> {
+            if let Some(target) = self.seed.pointed(key)?
+                && target == self.keep
+            {
+                return Ok(Some(target));
+            }
+            self.extra.pointed(key)
+        }
+        fn point(&mut self, class: blaze_ladder::code_records::CodeClass, key: blaze_ladder::code_records::CodeKey, content: blaze_ladder::code_records::CodeKey) -> Result<(), blaze_ladder::code_records::StoreError> {
+            self.extra.point(class, key, content)
+        }
+    }
+    let mut main_only_store = OnlyEntry { seed: &store, keep: main_code_key, extra: MemoryStore::new_in(alloc()) };
+    let names2 = reader(&f);
+    let checking2 = Maker::new(names2, Some(main_key), &b, alloc());
+    let typing2 = FromRecord::rechecked(names2, Some(main_key), alloc()).expect("rechecked double 2");
+    let reading2 = Maker::typed(names2, Some(main_key), typing2, &b, alloc());
+    let mut twin2 = Twin::new(checking2, reading2, alloc());
+    let (_, counts2) = walk_records(main_key, &EveryItem, &mut main_only_store, &b, &producer(), &mut twin2, alloc())
+        .unwrap_or_else(|e| panic!("warm-main cold-impl track_caller walk failed: {e}; log={:?}", logged(names2.records)));
+    assert!(logged(names2.records).is_empty(), "records log must be empty: {:?}", logged(names2.records));
+    assert!(counts2.found >= 1, "expected cached hit on main: {counts2}");
+    assert!(counts2.made >= 2, "expected cold makes for call_plain and call_tracked: {counts2}");
+    assert_eq!(twin2.compared, counts2.make_calls(), "every cold impl entry must match byte-for-byte");
+    assert_eq!(
+        twin2.reading.program().expect("reading2 program").counts().checked,
+        0,
+        "cold reading maker 2 must not run check_body"
+    );
+    assert_eq!(run_whole(text), 3);
+}
+
+/// Regression for cold cached-`Typed` lazy runs of generic fns reading a trait's associated
+/// constant (`T::INFINITY`, e.g. `core::num::imp::traits::Float::INFINITY` in `parse_inf_nan`):
+/// on a cold cached-`Typed` run `store.trait_defs` does not hold the trait yet when `const_at`
+/// evaluates the associated const, so `consts.rs` must recognize trait containers via `NamesSource`
+/// too and select the impl's associated constant (both for required associated constants with no
+/// default body and for defaulted associated constants overridden by an impl).
+#[test]
+fn cold_typed_record_trait_associated_const_required_and_overridden() {
+    use blaze_ladder::run::make_one::{FromRecord, Twin};
+
+    let text = "#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+trait MyFloat {
+    const INFINITY: i32;
+}
+
+trait WithDefault {
+    const VAL: i32 = 1;
+}
+
+struct MarkerA;
+struct MarkerB;
+
+impl MyFloat for MarkerA {
+    const INFINITY: i32 = 1;
+}
+
+impl WithDefault for MarkerA {
+    const VAL: i32 = 2;
+}
+
+impl WithDefault for MarkerB {}
+
+#[inline(never)]
+fn read_req<T: MyFloat>() -> i32 {
+    T::INFINITY
+}
+
+#[inline(never)]
+fn read_def<T: WithDefault>() -> i32 {
+    T::VAL
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    if read_def::<MarkerB>() == 1 {
+        read_req::<MarkerA>() + read_def::<MarkerA>()
+    } else {
+        0
+    }
+}
+";
+
+    let f = fixture(text);
+    let b = builder();
+    let main_key = fn_named(&f, "main");
+    let names = reader(&f);
+    let checking = Maker::new(names, Some(main_key), &b, alloc());
+    let typing = FromRecord::rechecked(names, Some(main_key), alloc()).expect("rechecked double");
+    let reading = Maker::typed(names, Some(main_key), typing, &b, alloc());
+    let mut twin = Twin::new(checking, reading, alloc());
+    let mut store = MemoryStore::new_in(alloc());
+    let (_, counts) = walk_records(main_key, &EveryItem, &mut store, &b, &producer(), &mut twin, alloc())
+        .unwrap_or_else(|e| panic!("cold typed-record trait assoc const walk failed: {e}; log={:?}", logged(names.records)));
+    assert!(logged(names.records).is_empty(), "records log must be empty: {:?}", logged(names.records));
+    assert!(counts.made > 0, "expected makes in walk: {counts}");
+    assert_eq!(twin.compared, counts.make_calls(), "every entry must match byte-for-byte");
+    assert_eq!(
+        twin.reading.program().expect("reading program").counts().checked,
+        0,
+        "cold reading maker must not run check_body"
+    );
+    assert_eq!(run_whole(text), 3);
 }

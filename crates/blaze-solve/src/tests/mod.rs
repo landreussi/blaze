@@ -3,8 +3,10 @@
 
 pub mod plant;
 
+mod auto_copy_pub;
 mod cost;
 mod dyn_undecided;
+mod for_fields;
 mod head_shape;
 mod hidden_cause;
 mod member_not_filed;
@@ -393,4 +395,241 @@ fn control_coinductive_cycle_as_inductive() {
     blaze_sim::control(Config::cases(2), Plant::None, Plant::CoinductiveAsInductive, "a cycle case answers wrong", |t, p| {
         plant::with(p, || cycle_cases(t))
     });
+}
+
+#[test]
+fn record_union_tuple_distinct_unification_and_shapes() {
+    use crate::canon::{Canon, Decode};
+    use crate::term::{IntTy, Shape, UintTy, VarKind, shape_of_kind};
+    use crate::testing::tys::TestTys;
+    use crate::tys::Relate;
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut tys = TestTys::new();
+    let mut deferred = blaze_own::Vec::new_in(alloc);
+
+    let i32_ty = tys.mk(TyKind::Int(IntTy::I32)).expect("mk i32");
+    let u8_ty = tys.mk(TyKind::Uint(UintTy::U8)).expect("mk u8");
+    let elems = tys.mk_list(&[i32_ty, u8_ty]).expect("mk list");
+
+    let tup = tys.mk(TyKind::Tuple(elems)).expect("mk tuple");
+    let rec_a = tys.mk(TyKind::Record(0x1111_2222_3333_4444, elems)).expect("mk record a");
+    let rec_b = tys.mk(TyKind::Record(0x5555_6666_7777_8888, elems)).expect("mk record b");
+    let uni = tys.mk(TyKind::Union(elems)).expect("mk union");
+
+    // Distinct Shape buckets.
+    assert_eq!(shape_of_kind(tys.kind(tup)), Some(Shape::Tuple(2)));
+    assert_eq!(shape_of_kind(tys.kind(rec_a)), Some(Shape::Record(0x1111_2222_3333_4444, 2)));
+    assert_eq!(shape_of_kind(tys.kind(rec_b)), Some(Shape::Record(0x5555_6666_7777_8888, 2)));
+    assert_eq!(shape_of_kind(tys.kind(uni)), Some(Shape::Union(2)));
+    assert_ne!(shape_of_kind(tys.kind(tup)), shape_of_kind(tys.kind(rec_a)));
+    assert_ne!(shape_of_kind(tys.kind(tup)), shape_of_kind(tys.kind(uni)));
+    assert_ne!(shape_of_kind(tys.kind(rec_a)), shape_of_kind(tys.kind(uni)));
+    assert_ne!(shape_of_kind(tys.kind(rec_a)), shape_of_kind(tys.kind(rec_b)));
+
+    // Tuple, Record, Union NEVER unify with each other; distinct Record schemas NEVER unify.
+    assert!(!tys.unify(tup, rec_a, Relate::Lazy, &mut deferred).expect("unify"));
+    assert!(!tys.unify(tup, uni, Relate::Lazy, &mut deferred).expect("unify"));
+    assert!(!tys.unify(rec_a, uni, Relate::Lazy, &mut deferred).expect("unify"));
+    assert!(!tys.unify(rec_a, rec_b, Relate::Lazy, &mut deferred).expect("unify"));
+
+    // Same-schema Record unifies element-wise and binds variables.
+    let v1 = tys.fresh(VarKind::Ty).expect("fresh v1");
+    let rec_a_var_list = tys.mk_list(&[v1, u8_ty]).expect("mk list");
+    let rec_a_var = tys.mk(TyKind::Record(0x1111_2222_3333_4444, rec_a_var_list)).expect("mk rec var");
+    assert!(tys.unify(rec_a, rec_a_var, Relate::Lazy, &mut deferred).expect("unify same schema"));
+    assert_eq!(tys.shallow_resolve(v1), i32_ty);
+
+    // Union unifies element-wise and binds variables.
+    let v2 = tys.fresh(VarKind::Ty).expect("fresh v2");
+    let uni_var_list = tys.mk_list(&[i32_ty, v2]).expect("mk list");
+    let uni_var = tys.mk(TyKind::Union(uni_var_list)).expect("mk union var");
+    assert!(tys.unify(uni, uni_var, Relate::Lazy, &mut deferred).expect("unify union"));
+    assert_eq!(tys.shallow_resolve(v2), u8_ty);
+
+    // Canonicalization roundtrip preserves Record schema and Union identity.
+    let mut canon = Canon::new_in(alloc);
+    let mut words = blaze_own::Vec::new_in(alloc);
+    let mut dec = Decode::new_in(alloc);
+    canon.term(&tys, &mut words, rec_a).expect("canon rec");
+    dec.run(&mut tys, &words).expect("decode rec");
+    assert_eq!(tys.kind(rec_a), TyKind::Record(0x1111_2222_3333_4444, elems));
+    words.clear();
+    canon.clear();
+    canon.term(&tys, &mut words, uni).expect("canon uni");
+    let mut dec2 = Decode::new_in(alloc);
+    dec2.run(&mut tys, &words).expect("decode uni");
+}
+
+/// A higher-ranked region bound (`for<'s> From<&'s str>`) on an impl's where-clause must reject
+/// `impl From<&'static str> for Bytes` while still accepting `impl<'a> From<&'a str> for Owned`.
+#[test]
+fn higher_ranked_region_clause_rejects_static_impl_and_accepts_universal_impl() {
+    use crate::eval::Answer;
+    use crate::facts::{
+        AdtDef, AssocDef, ConstHolds, Facts, Fetch, FnSigDef, ImplFlags, ImplHeader, ImplPolarity, ImplSet, Missing,
+        OpaqueDef, Seal, TraitDef, TraitFlags,
+    };
+    use crate::term::{Def, Lang, Polarity, Pred, Shape};
+    use crate::testing::tys::TestTys;
+
+    const TR_FROM: Def = Def(1);
+    const TR_PICK: Def = Def(2);
+    const ADT_BYTES: Def = Def(10);
+    const ADT_OWNED: Def = Def(11);
+    const IMPL_FROM_BYTES_STATIC: Def = Def(20);
+    const IMPL_FROM_OWNED_ANY: Def = Def(21);
+    const IMPL_PICK_HRTB: Def = Def(22);
+
+    struct MiniWorld;
+
+    // Portable tables:
+    // Bytes: Adt(ADT_BYTES, [])
+    // &'static str: [ReStatic, Str, Ref(0, 1, Not)]
+    static NODES_BYTES_STATIC: [TyKind; 4] = [
+        TyKind::Adt(ADT_BYTES, List::EMPTY),
+        TyKind::ReStatic,
+        TyKind::Str,
+        TyKind::Ref(Ty(1), Ty(2), Mutbl::Not),
+    ];
+    static LISTS_BYTES_STATIC: [Ty; 2] = [Ty(0), Ty(3)];
+
+    // Owned: Adt(ADT_OWNED, [])
+    // &'a str (erased): [ReErased, Str, Ref(0, 1, Not)]
+    static NODES_OWNED_ANY: [TyKind; 4] = [
+        TyKind::Adt(ADT_OWNED, List::EMPTY),
+        TyKind::ReErased,
+        TyKind::Str,
+        TyKind::Ref(Ty(1), Ty(2), Mutbl::Not),
+    ];
+    static LISTS_OWNED_ANY: [Ty; 2] = [Ty(0), Ty(3)];
+
+    // impl<T: for<'s> From<&'s str>> Pick for T
+    static NODES_PICK: [TyKind; 4] = [
+        TyKind::Param(0),
+        TyKind::ReBound(0, 0),
+        TyKind::Str,
+        TyKind::Ref(Ty(1), Ty(2), Mutbl::Not),
+    ];
+    static LISTS_PICK: [Ty; 3] = [Ty(0), Ty(0), Ty(3)];
+    static WHERES_PICK: [Pred; 1] = [Pred::Trait {
+        trait_: TR_FROM,
+        args: List { start: 1, len: 2 },
+        polarity: Polarity::Positive,
+    }];
+    static WHERE_BOUNDS_PICK: [u32; 1] = [1];
+
+    static IMPLS_FROM_BYTES: [Def; 1] = [IMPL_FROM_BYTES_STATIC];
+    static IMPLS_FROM_OWNED: [Def; 1] = [IMPL_FROM_OWNED_ANY];
+    static IMPLS_PICK: [Def; 1] = [IMPL_PICK_HRTB];
+
+    impl Facts for MiniWorld {
+        fn trait_def(&self, _: Seal, t: Def) -> Fetch<TraitDef<'_>> {
+            let generics = match t {
+                TR_FROM => 2,
+                TR_PICK => 1,
+                _ => return Err(Missing),
+            };
+            Ok(TraitDef {
+                flags: TraitFlags(0),
+                generics,
+                lang: None,
+                supertraits: &[],
+                where_clauses: &[],
+                assoc: &[],
+                item_bounds: &[],
+                portable: Portable::EMPTY,
+                digest: t.0 as u64,
+            })
+        }
+
+        fn impls(&self, _: Seal, t: Def, shape: Shape) -> Fetch<ImplSet<'_>> {
+            let impls: &[Def] = match (t, shape) {
+                (TR_FROM, Shape::Adt(ADT_BYTES)) => &IMPLS_FROM_BYTES,
+                (TR_FROM, Shape::Adt(ADT_OWNED)) => &IMPLS_FROM_OWNED,
+                (TR_PICK, _) => &IMPLS_PICK,
+                _ => &[],
+            };
+            Ok(ImplSet { impls, columns: Columns::EMPTY, digest: (t.0 as u64) ^ (impls.len() as u64) })
+        }
+
+        fn impl_header(&self, _: Seal, i: Def) -> Fetch<ImplHeader<'_>> {
+            match i {
+                IMPL_FROM_BYTES_STATIC => Ok(ImplHeader {
+                    generics: 0,
+                    polarity: ImplPolarity::Positive,
+                    flags: ImplFlags(0),
+                    trait_: TR_FROM,
+                    args: List { start: 0, len: 2 },
+                    where_clauses: &[],
+                    where_clause_bounds: &[],
+                    assoc: &[],
+                    portable: Portable { nodes: &NODES_BYTES_STATIC, lists: &LISTS_BYTES_STATIC },
+                    digest: 20,
+                }),
+                IMPL_FROM_OWNED_ANY => Ok(ImplHeader {
+                    generics: 0,
+                    polarity: ImplPolarity::Positive,
+                    flags: ImplFlags(0),
+                    trait_: TR_FROM,
+                    args: List { start: 0, len: 2 },
+                    where_clauses: &[],
+                    where_clause_bounds: &[],
+                    assoc: &[],
+                    portable: Portable { nodes: &NODES_OWNED_ANY, lists: &LISTS_OWNED_ANY },
+                    digest: 21,
+                }),
+                IMPL_PICK_HRTB => Ok(ImplHeader {
+                    generics: 1,
+                    polarity: ImplPolarity::Positive,
+                    flags: ImplFlags(0),
+                    trait_: TR_PICK,
+                    args: List { start: 0, len: 1 },
+                    where_clauses: &WHERES_PICK,
+                    where_clause_bounds: &WHERE_BOUNDS_PICK,
+                    assoc: &[],
+                    portable: Portable { nodes: &NODES_PICK, lists: &LISTS_PICK },
+                    digest: 22,
+                }),
+                _ => Err(Missing),
+            }
+        }
+
+        fn adt(&self, _: Seal, _: Def) -> Fetch<AdtDef<'_>> { Err(Missing) }
+        fn fn_sig(&self, _: Seal, _: Def) -> Fetch<FnSigDef<'_>> { Err(Missing) }
+        fn assoc(&self, _: Seal, _: Def) -> Fetch<AssocDef> { Err(Missing) }
+        fn opaque(&self, _: Seal, _: Def) -> Fetch<OpaqueDef<'_>> { Err(Missing) }
+        fn lang(&self, _: Seal, _: Lang) -> Fetch<Option<Def>> { Ok(None) }
+        fn is_local(&self, _: Seal, _: Def) -> Fetch<bool> { Ok(true) }
+        fn const_holds(&self, _: Seal, _: Def, _: &[Ty]) -> Fetch<ConstHolds> { Err(Missing) }
+        fn specializes(&self, _: Seal, _: Def, _: Def) -> Fetch<bool> { Ok(false) }
+    }
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut tys = TestTys::new();
+    let mut solver = Solver::new_in(alloc);
+    let mut reads = blaze_own::Vec::new_in(alloc);
+    let env = solver.env(&mut tys, &MiniWorld, &[], &mut reads).expect("env");
+
+    // Bytes only has `impl From<&'static str>`: MUST NOT satisfy `Pick` (`for<'s> From<&'s str>`).
+    let bytes = tys.mk(TyKind::Adt(ADT_BYTES, List::EMPTY)).expect("bytes");
+    let bytes_args = tys.mk_list(&[bytes]).expect("bytes args");
+    let bytes_goal = Goal {
+        env,
+        pred: Pred::Trait { trait_: TR_PICK, args: bytes_args, polarity: Polarity::Positive },
+        bound: 0,
+    };
+    let ans_bytes = solver.evaluate(&mut tys, &MiniWorld, TypingMode::Analysis, bytes_goal, &mut reads).expect("eval bytes");
+    assert_eq!(ans_bytes, Answer::No, "Bytes with only From<&'static str> must not satisfy for<'s> From<&'s str>");
+
+    // Owned has `impl<'a> From<&'a str>`: MUST satisfy `Pick` (`for<'s> From<&'s str>`).
+    let owned = tys.mk(TyKind::Adt(ADT_OWNED, List::EMPTY)).expect("owned");
+    let owned_args = tys.mk_list(&[owned]).expect("owned args");
+    let owned_goal = Goal {
+        env,
+        pred: Pred::Trait { trait_: TR_PICK, args: owned_args, polarity: Polarity::Positive },
+        bound: 0,
+    };
+    let ans_owned = solver.evaluate(&mut tys, &MiniWorld, TypingMode::Analysis, owned_goal, &mut reads).expect("eval owned");
+    assert_eq!(ans_owned, Answer::Yes, "Owned with impl<'a> From<&'a str> must satisfy for<'s> From<&'s str>");
 }

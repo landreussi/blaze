@@ -64,11 +64,11 @@ fn check_fns(text: &str, fns: &[&str]) -> Vec<(String, String)> {
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
     let mut front = Front2::new(&names, &frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
-    let prepared = Prepares::new_in(alloc);
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
     let (mut buckets, mut consts) = (None, Consts::default());
     let mut got = Vec::new();
@@ -326,4 +326,30 @@ fn main() {}
         assert!(!o.contains("Nested"), "`{n}`: the constant needed itself: {o}");
     }
     expect("self length", &got, &[true, false]);
+}
+
+/// A multi-statement block const generic argument (`unsafe impl MaxEncodedLen<{ let _sz = ...; _sz + f(_sz) }> for S`,
+/// as expanded by `alloy_rlp_derive::RlpMaxEncodedLen` in `reth-ecies`): `const_term` strips the outer `{ ... }`,
+/// so `anon::file_asked` must wrap the synthetic declaration in `{ ... }` lest `let _sz = ...` parse as a
+/// Rust 2024 `Expr::Let` (`bool`) instead of a statement inside a block.
+#[test]
+fn a_multi_statement_block_const_arg_preserves_its_braces() {
+    const TEXT: &str = "
+const fn extra(n: usize) -> usize { n + 2 }
+trait MaxLen<const N: usize> {}
+trait AssocLen { const LEN: usize; }
+struct A;
+struct B;
+impl AssocLen for A { const LEN: usize = 3; }
+impl AssocLen for B { const LEN: usize = 4; }
+struct S;
+impl MaxLen<{ let _sz = 0usize + <A as AssocLen>::LEN + <B as AssocLen>::LEN; _sz + extra(_sz) }> for S {}
+fn need16<T: MaxLen<16>>() {}
+fn need17<T: MaxLen<17>>() {}
+fn sixteen() { need16::<S>() }
+fn seventeen() { need17::<S>() }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["sixteen", "seventeen"]);
+    expect("block stmt arg", &got, &[true, false]);
 }

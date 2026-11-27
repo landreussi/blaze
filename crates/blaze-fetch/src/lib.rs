@@ -27,9 +27,12 @@
 //! crate's folder, no link out, no two names one on a caseless disk); only then is a record
 //! made, and only a made record is put.
 
+#![cfg_attr(not(test), no_std)]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 
+
+extern crate alloc;
 mod casefold;
 pub mod correct;
 pub mod digest;
@@ -38,6 +41,7 @@ pub mod fetch;
 pub mod index;
 pub mod local;
 pub mod pack;
+pub mod peer;
 pub mod plan;
 pub mod tree;
 pub mod unpack;
@@ -49,7 +53,7 @@ pub use crate::{
     digest::{Algo, Blake3, Digest, DigestRefused, Hashed, Hashing},
     drive::{FetchIo, Reserved, Woke},
     fetch::{Effect, Failed, Limits, Machine, Method, NetFailure, Outcome, Reply, StoreFailure, Why},
-    pack::{File, Mode, PackRefused, PackView},
+    pack::{Codec, File, FileBytes, FileEntry, Mode, PackRefused, PackView},
     plan::{Plan, PlanRefused, Skip, SourceId, Unit},
     unpack::UnpackError,
 };
@@ -68,6 +72,8 @@ pub enum Plant {
     /// A git answer's commit is the first commit object of its pack, not the one whose id the
     /// lock pins: the server's word taken.
     CommitFromServer,
+    /// A git tree's submodule (`0o160000`) row is silently dropped while packing.
+    DropSubmodule,
 }
 
 #[cfg(test)]

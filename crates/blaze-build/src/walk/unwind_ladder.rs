@@ -75,6 +75,8 @@ pub(super) enum DropStep {
     Parts { l: u32, p: Value },
     /// The contents of the `Box` at `p` (`list` its arguments): walk.rs `drop_box_contents`.
     BoxContents { list: List, p: Value },
+    /// The trait object at `data` whose table is `vt`: walk.rs `dyn_glue`.
+    DynGlue { data: Value, vt: Value },
     /// The `Box` of ground type `g` at `p` without its contents: its `Drop` (the free), then its
     /// own fields (walk/moves/boxes.rs `drop_box_free`).
     BoxFree { g: PTy, p: Value },
@@ -98,7 +100,7 @@ pub(super) enum Rung {
     Lands(Block),
 }
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Whether drops built now get unwind ladders: the build unwinds, the block is live, it is
     /// not cleanup code, and the body may unwind.
     fn ladder_applies(&self) -> bool {
@@ -135,7 +137,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 
     /// Performs `step` with `after` owed on its unwind path (and not performed here): one
     /// step of a loop whose remaining iterations are `after`.
-    fn drop_owing(&mut self, step: DropStep, after: DropStep) -> Result<(), BuildError> {
+    pub(super) fn drop_owing(&mut self, step: DropStep, after: DropStep) -> Result<(), BuildError> {
         if !self.ladder_applies() {
             return self.perform(step, false);
         }
@@ -162,6 +164,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             DropStep::Impl { instance, p } => self.call_ptr(instance, p),
             DropStep::Parts { l, p } => self.drop_parts(l as usize, p),
             DropStep::BoxContents { list, p } => self.drop_box_contents(list, p),
+            DropStep::DynGlue { data, vt } => self.dyn_glue(data, vt),
             DropStep::BoxFree { g, p } => self.drop_box_free(g, p),
             DropStep::Elements { elem, data, from, len, stride } => self.elements(elem, data, from, len, stride),
             DropStep::Frame { below } => {
@@ -186,7 +189,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         match h {
             Held::Rest { .. } | Held::Moved { .. } | Held::Temp { .. } => true,
             Held::EnvPlace(j) => self.env_place_pending(j),
-            Held::Pat(p) => match self.owned[p.ix()] {
+            Held::Pat(p) => match self.owned.get(p.ix()).copied().and_then(super::LocalOwn::as_drop) {
                 Some(Owned { flag: Some(_), .. }) => true,
                 Some(Owned { flag: None, .. }) => self.init[p.ix()],
                 None => false,
@@ -226,6 +229,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 DropStep::Field { .. }
                 | DropStep::Impl { .. }
                 | DropStep::BoxContents { .. }
+                | DropStep::DynGlue { .. }
                 | DropStep::BoxFree { .. }
                 | DropStep::Elements { .. } => true,
             };
@@ -318,7 +322,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             }
             return Ok(());
         }
-        let mut steps = Vec::with_capacity_in(n - start, self.alloc.clone());
+        let mut steps = Vec::with_capacity_in(n - start, self.alloc);
         for i in (start..n).rev() {
             steps.push(DropStep::Held(self.scope_pats[i]));
         }
@@ -332,7 +336,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// The drop glue of ground type `g` (layout `l`) at `p` after a `Box`'s contents, or of
     /// any other type: its own `Drop::drop`, whose landing drops all its parts, then its parts.
     pub(super) fn drop_impl_then_parts(&mut self, g: PTy, l: usize, p: Value) -> Result<(), BuildError> {
-        let mut steps = Vec::with_capacity_in(2, self.alloc.clone());
+        let mut steps = Vec::with_capacity_in(2, self.alloc);
         if let Some(item) = self.layouts[l].drop_fn {
             let args = self.ground.intern_list(&[g]).map_err(|_| malformed("the ground table is full"))?;
             steps.push(DropStep::Impl { instance: Instance { item, args }, p });
@@ -352,8 +356,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             Shape::Fields { first, len } => self.drop_fields(p, first, len)?,
             Shape::Enum { id, first, len } => {
                 let exit = self.create();
-                let mut cases = Vec::with_capacity_in(len as usize, self.alloc.clone());
-                let mut bodies = Vec::with_capacity_in(len as usize, self.alloc.clone());
+                let mut cases = Vec::with_capacity_in(len as usize, self.alloc);
+                let mut bodies = Vec::with_capacity_in(len as usize, self.alloc);
                 for v in 0..len {
                     let (ff, fl) = self.layout_variants[(first + v) as usize];
                     if !self.fields_need_drop(ff, fl) {
@@ -388,7 +392,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// `p`, in declaration order, each a step of a ladder (field k's landing drops the fields
     /// after it).
     pub(super) fn drop_fields(&mut self, p: Value, first: u32, len: u32) -> Result<(), BuildError> {
-        let mut steps = Vec::with_capacity_in(len as usize, self.alloc.clone());
+        let mut steps = Vec::with_capacity_in(len as usize, self.alloc);
         for i in first..first + len {
             let (_, off, repr) = self.layout_fields[i as usize];
             if let Repr::Agg(fl) = repr

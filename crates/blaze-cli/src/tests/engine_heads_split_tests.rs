@@ -81,7 +81,10 @@ fn head_rows(io: &Io, g: blaze_own::Alloc<'static>) -> (blaze_ids::ContentId, u3
     let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
     let err = io.need_err().expect("err");
     let mut phases = Phases::new(io.need_clock().expect("a clock"));
-    let judged = crate::engine_why::with_kept(&cx, io, &root, &opts(io, 2, false), &mut phases, &err, |kept| {
+    let fs = io.need_fs().expect("files");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    let judged = crate::engine_why::with_kept(&cx, &fs, &host, &mut rng, &root, &opts(io, 2, false), &mut phases, &err, |kept| {
         let mut each: blaze_own::Vec<(blaze_drive::Name, blaze_ids::ContentId), blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(g);
         for (name, row) in kept.answer.rows.iter().filter(|(name, _)| name.kind == blaze_drive::Kind::Signature) {
             let mut h = blaze_ids::Hasher::new("blaze-cli test: one head row");
@@ -223,4 +226,21 @@ fn split_results_merge_in_split_order_whatever_finished_first() {
 fn the_merge_oracle_catches_arrival_order() {
     let heap = heap();
     control(Config::cases(500), MergePlant::Rule, MergePlant::Arrival, "a split's result out of split order", |tape, plant| merge(tape, plant, heap));
+}
+
+#[test]
+fn large_single_file_splits_across_workers_for_128_cores() {
+    let runs: std::vec::Vec<_> = file_splits(&[256], 256, 16).collect();
+    assert_eq!(runs.len(), 8, "a 256-task mega-file splits into 8 balanced chunks of 32: {runs:?}");
+    assert_eq!(runs.iter().map(|r| r.len()).sum::<usize>(), 256);
+    assert_eq!(runs[0], 0..32);
+    assert_eq!(runs[7], 224..256);
+
+    let wide: std::vec::Vec<_> = file_splits(&[4096], 4096, 512).collect();
+    assert_eq!(wide.len(), 128, "a 4096-task mega-file splits across 128 cores: {}", wide.len());
+    assert_eq!(wide.iter().map(|r| r.len()).sum::<usize>(), 4096);
+
+    // Single-job request keeps the file whole.
+    let single: std::vec::Vec<_> = file_splits(&[256], 256, 1).collect();
+    assert_eq!(single, [0..256]);
 }

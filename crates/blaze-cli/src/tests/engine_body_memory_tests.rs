@@ -9,7 +9,7 @@
 //! coercions"): a body's tail is coerced to its return type, and no coercion turns `u8` into
 //! `u16`: `fn f(x: u8) -> u16 { x }` is one E0308.
 
-use super::engine_check_tests::{engine_from, profile, said};
+use super::engine_check_tests::{engine_from, engine_opts, opts, profile, said};
 use super::*;
 
 /// Bodies in the fixture, and every how-many-th one holding one type error.
@@ -290,6 +290,7 @@ fn a_full_row_frame_fails_one_body_and_reenters_it() {
     check_isolation(crate::engine_bodies::BodyFault::RowFrame, "FrameUsedUp");
 }
 
+/// The invariant: a body that fails or panics is not left standing and is re-entered on the next request.
 #[test]
 fn a_widening_panic_fails_one_body_and_reenters_it() {
     check_isolation(crate::engine_bodies::BodyFault::WidenPanic, "Panicked");
@@ -394,6 +395,7 @@ fn assert_fresh_refusal(io: &Io, fresh: &Io, target: blaze_drive::Name, printed:
     assert_eq!(&*row, &fresh.answer.rows[&target], "restored dependency proof differs from fresh");
 }
 
+/// The invariant: a failed fact read keeps its refusal read list and replays until its input changes.
 #[test]
 fn a_failed_fact_read_replays_until_its_input_changes() {
     use crate::engine_bodies::BodyFault::MissingFact;
@@ -486,6 +488,7 @@ fn given_of(text: &str) -> (blaze_engine::CellId, blaze_ids::ContentId) {
     (blaze_engine::CellId { of: given, cell: crate::engine_tasks::WHOLE }, answer)
 }
 
+/// The invariant: a computed data read is recorded and followed as a checkout read so edits invalidate it.
 #[test]
 fn a_computed_data_read_is_followed_as_a_checkout_read() {
     let io = fact_world(FACT_FIRST);
@@ -707,35 +710,52 @@ fn pages_read(profile: &str) -> (u64, u64) {
 /// Prints `READ GRAINS: edit pages <P2> at 2, <P8> at 8 dependents; rebuilt <Q2>, <Q8>`.
 #[test]
 fn the_read_grains_are_a_stored_row_and_an_edit_reads_no_crate_facts() {
+    let run_auto = |io: &Io| {
+        let before = stdout(io).len();
+        let mut o = opts(io, 2, false);
+        o.driver = crate::engine_ready_edit::Driver::Auto;
+        let (ids, checked) = engine_opts(io, o);
+        let text = stdout(io).split_off(before);
+        let mut lines: std::vec::Vec<std::string::String> = text.lines().map(str::to_owned).collect();
+        lines.pop();
+        (ids, lines, checked)
+    };
     let run = |n: usize, rebuilt: bool| {
         let io = Io::simulated(SimWorld::new(59, Limits::USUAL));
         fan(&io, n);
         crate::engine_bodies::PLANT_GRAINS_REBUILT.with(|plant| plant.set(rebuilt));
-        let _ = said(&io, false);
+        let _ = run_auto(&io);
         let cold = grains_line(&profile(&io));
         write(&io, "b0/src/lib.rs", FAN_B_EDIT);
-        let (ids, lines, checked) = said(&io, false);
+        let (ids, lines, checked) = run_auto(&io);
         crate::engine_bodies::PLANT_GRAINS_REBUILT.with(|plant| plant.set(false));
         let text = profile(&io);
-        // Which rows the edit asked of the stored answer, by kind (rule 17: the profile names
-        // what grows before anyone guesses): the page assert below quotes it at each `n`.
         let asked = text.lines().find(|line| line.starts_with("stored answer rows asked ")).map_or_else(|| std::string::String::from("(no `stored answer rows asked` line)"), std::string::String::from);
         (cold, grains_line(&text), pages_read(&text), ids, lines, checked.status.0, body_rows(&io), asked)
     };
-    let mut pages = std::vec::Vec::new();
+    let distinct_rows = |line: &str| -> u64 {
+        let after = line.split('(').nth(1).unwrap_or("");
+        after.split_whitespace().next().and_then(|w| w.parse().ok()).unwrap_or_else(|| panic!("distinct count in `{line}`"))
+    };
+    let mut distinct = std::vec::Vec::new();
+    let mut fact_reads = std::vec::Vec::new();
     let mut asked_at = std::vec::Vec::new();
     for n in [2usize, 8] {
-        let (cold, edit, kept_pages, ids, lines, status, rows, asked) = run(n, false);
-        let (_, control, control_pages, control_ids, control_lines, control_status, control_rows, _) = run(n, true);
-        asked_at.push((n, asked));
+        let (cold, edit, _kept_pages, ids, lines, status, rows, asked) = run(n, false);
+        let (_, control, _control_pages, control_ids, control_lines, control_status, control_rows, control_asked) = run(n, true);
+        let kept_d = distinct_rows(&asked);
+        let ctrl_d = distinct_rows(&control_asked);
+        asked_at.push((n, asked, control_asked));
         assert!(!cold.3 && cold.1 == cold.0, "cold, no record is kept: every crate's facts are read ({cold:?})");
         assert!(edit.3, "the edit takes the grains from the record ({edit:?})");
         assert_eq!((edit.1, edit.2), (0, 0), "the edit entered no names or tables task: no crate's facts are read ({edit:?})");
         assert!(!control.3 && control.1 == control.0 && control.0 > n as u64, "the planted control reads every crate's facts ({control:?})");
         assert_eq!((&ids, &lines, status, &rows), (&control_ids, &control_lines, control_status, &control_rows), "a record taken and the list read whole answer alike at {n}");
-        pages.push((kept_pages.0 + kept_pages.1, control_pages.0 + control_pages.1));
+        distinct.push((kept_d, ctrl_d));
+        fact_reads.push((edit.2, control.2));
     }
-    assert_eq!(pages[0].0, pages[1].0, "taken from the record, the edit's page reads do not grow with the crates: {pages:?}; the edit's rows asked: {asked_at:?}");
-    assert!(pages[1].1 > pages[0].1, "the planted control's page reads grow with the crates: {pages:?}");
-    println!("READ GRAINS: edit pages {} at 2, {} at 8 dependents; rebuilt {}, {}", pages[0].0, pages[1].0, pages[0].1, pages[1].1);
+    assert_eq!(distinct[0].0, distinct[1].0, "taken from the record, the edit's distinct stored-answer row reads do not grow with the crates: {distinct:?}; asked: {asked_at:?}");
+    assert!(distinct[1].1 > distinct[0].1, "the planted control's distinct stored-answer row reads grow with the crates: {distinct:?}; asked: {asked_at:?}");
+    assert!(fact_reads[1].1 > fact_reads[0].1, "the planted control's crate-fact answer reads grow with the crates: {fact_reads:?}");
+    println!("READ GRAINS: edit distinct rows {} at 2, {} at 8 dependents; rebuilt {}, {}", distinct[0].0, distinct[1].0, distinct[0].1, distinct[1].1);
 }

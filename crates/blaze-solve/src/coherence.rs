@@ -193,6 +193,8 @@ fn orphan_walk_inner<T: Tys, F: Facts, L: Log + ?Sized>(
             TyKind::ReStatic
             | TyKind::ReParam(_)
             | TyKind::ReErased
+            | TyKind::ReBound(..)
+            | TyKind::RePlaceholder(..)
             | TyKind::ConstValue(..)
             | TyKind::ConstParam(_)
             | TyKind::Infer(Var { kind: VarKind::Region | VarKind::Const, .. })
@@ -209,7 +211,9 @@ fn orphan_walk_inner<T: Tys, F: Facts, L: Log + ?Sized>(
             | TyKind::Pat(..)
             | TyKind::RawPtr(..)
             | TyKind::Never
-            | TyKind::Tuple(_) => {}
+            | TyKind::Tuple(_)
+            | TyKind::Record(..)
+            | TyKind::Union(_) => {}
             // The reference panics: the orphan check expects only inference variables.
             TyKind::Param(index) => {
                 let at = core::panic::Location::caller();
@@ -449,6 +453,10 @@ fn const_params<'a>(s: &mut Scratch<'_>, h: &ImplHeader<'_>, alloc: Alloc<'a>) -
     for c in h.where_clauses {
         match *c {
             Pred::Trait { args, .. } | Pred::HostEffect { args, .. } | Pred::ConstHolds { args, .. } => list(args, roots)?,
+            Pred::ForFields { container, args_after_self, .. } => {
+                roots.push(container);
+                list(args_after_self, roots)?;
+            }
             Pred::Projection { alias: a, term: b }
             | Pred::NormalizesTo { alias: a, term: b }
             | Pred::TypeOutlives { ty: a, region: b }
@@ -495,6 +503,11 @@ fn import_pred<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, p: Portable<'_>, pred: 
         Pred::ConstHolds { cond, args: a } => {
             Pred::ConstHolds { cond, args: fold::import_list_at(tys, s, p, a, inst, site)? }
         }
+        Pred::ForFields { container, trait_, args_after_self } => Pred::ForFields {
+            container: fold::import_at(tys, s, p, container, inst, site)?,
+            trait_,
+            args_after_self: fold::import_list_at(tys, s, p, args_after_self, inst, site)?,
+        },
         Pred::WellFormed(x) => Pred::WellFormed(fold::import_at(tys, s, p, x, inst, site)?),
         Pred::ConstEvaluatable(x) => Pred::ConstEvaluatable(fold::import_at(tys, s, p, x, inst, site)?),
         Pred::Projection { alias: a, term: b }
@@ -647,7 +660,7 @@ fn overlap_inner<'a, T: Tys, F: Facts>(
     if la.len != lb.len {
         return Err(Stop::Error(SolveError::Malformed(crate::error::bad_pred())));
     }
-    let mut goals: Vec<Pred, Alloc<'a>> = Vec::new_in(alloc);
+    let mut goals: Vec<(Pred, u32), Alloc<'a>> = Vec::new_in(alloc);
     let mut deferred: Vec<(Ty, Ty), Alloc<'a>> = Vec::new_in(alloc);
     for i in 0..la.len {
         let (x, y) = (tys.list_get(la, i), tys.list_get(lb, i));
@@ -662,29 +675,31 @@ fn overlap_inner<'a, T: Tys, F: Facts>(
                 _ => VarKind::Ty,
             };
             let fresh = tys.fresh(kind)?;
-            goals.push(Pred::Projection { alias, term: fresh });
+            goals.push((Pred::Projection { alias, term: fresh }, 0));
             if !tys.unify(fresh, other, Relate::Lazy, &mut deferred)? {
                 return Ok(Overlap::Disjoint);
             }
         }
     }
-    for &wc in ha.where_clauses {
-        goals.push(import_pred(tys, &mut s, ha.portable, wc, &va, alloc)?);
+    for (i, &wc) in ha.where_clauses.iter().enumerate() {
+        let bound = ha.where_clause_bounds.get(i).copied().unwrap_or(0);
+        goals.push((import_pred(tys, &mut s, ha.portable, wc, &va, alloc)?, bound));
     }
-    for &wc in hb.where_clauses {
-        goals.push(import_pred(tys, &mut s, hb.portable, wc, &vb, alloc)?);
+    for (i, &wc) in hb.where_clauses.iter().enumerate() {
+        let bound = hb.where_clause_bounds.get(i).copied().unwrap_or(0);
+        goals.push((import_pred(tys, &mut s, hb.portable, wc, &vb, alloc)?, bound));
     }
     let env = solver.env(tys, facts, &[], reads)?;
     let mut pending = goals;
-    let mut next: Vec<Pred, Alloc<'a>> = Vec::new_in(alloc);
+    let mut next: Vec<(Pred, u32), Alloc<'a>> = Vec::new_in(alloc);
     for _ in 0..MAX_ROUNDS {
         let bound_before = tys.bindings_len();
         next.clear();
-        for &pred in pending.iter() {
-            match solver.evaluate(tys, facts, TypingMode::Coherence, Goal { env, pred, bound: 0 }, reads)? {
+        for &(pred, bound) in pending.iter() {
+            match solver.evaluate(tys, facts, TypingMode::Coherence, Goal { env, pred, bound }, reads)? {
                 Answer::No => return Ok(Overlap::Disjoint),
                 Answer::Yes => {}
-                Answer::Maybe(_) => next.push(pred),
+                Answer::Maybe(_) => next.push((pred, bound)),
             }
         }
         if next.is_empty() {

@@ -24,11 +24,9 @@
 //! [`Buffers`] is what the kernel says after every option is set, read back with
 //! `getsockopt`: a datagram socket's arrives in [`crate::Done::Bound`].
 //!
-//! Why unsafe: `setsockopt` and `getsockopt` read and write the bytes of a value of the size
-//! given, a `c_int`, a `struct linger` or a name's bytes, each on this function's stack for the
-//! one call; `bind`, `listen` and `connect` read a `sockaddr_storage` of the length
-//! [`crate::net::sockaddr`] wrote. Every descriptor is one this module made and owns, or one
-//! the caller owns for the length of the call.
+//! Production `setsockopt`/`getsockopt` paths are 100% safe via [`crate::pod::bytes_of`] and
+//! [`crate::pod::bytes_of_mut`]. The remaining `unsafe` blocks are strictly in socket bind/connect
+//! helpers that pass a `sockaddr_storage` written by [`crate::net::sockaddr`].
 
 use std::{alloc::Global, fmt};
 
@@ -191,6 +189,14 @@ pub enum Pmtu {
     Omit,
 }
 
+/// An IPv4 multicast group and local interface address (`IP_ADD_MEMBERSHIP`, `ip_mreq`).
+/// `interface` is typically `Ipv4Addr::UNSPECIFIED` (`0.0.0.0`) for the default interface.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct MulticastV4 {
+    pub group: core::net::Ipv4Addr,
+    pub interface: core::net::Ipv4Addr,
+}
+
 /// Every option, by what it does; [`Opt::name`] is the system's name for it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub enum Opt {
@@ -251,11 +257,19 @@ pub enum Opt {
     /// Linux `IP_MTU_DISCOVER`/`IPV6_MTU_DISCOVER`; macOS `IP_DONTFRAG`/`IPV6_DONTFRAG`
     /// ([`Pmtu`]).
     PathMtu,
+    /// `SO_BROADCAST`: permit sending broadcast datagrams on a datagram socket.
+    Broadcast,
+    /// `IP_MULTICAST_TTL`: hop limit for outgoing IPv4 multicast datagrams.
+    MulticastTtl,
+    /// `IP_MULTICAST_LOOP`: whether outgoing IPv4 multicast datagrams loop back to local sockets.
+    MulticastLoop,
+    /// `IP_ADD_MEMBERSHIP`: join an IPv4 multicast group ([`MulticastV4`]).
+    MulticastJoin,
 }
 
 impl Opt {
     /// Every option, in order.
-    pub const ALL: [Opt; 15] = [
+    pub const ALL: [Opt; 19] = [
         Opt::NoDelay,
         Opt::RecvBuffer,
         Opt::SendBuffer,
@@ -271,6 +285,10 @@ impl Opt {
         Opt::Dscp,
         Opt::TcpEcn,
         Opt::PathMtu,
+        Opt::Broadcast,
+        Opt::MulticastTtl,
+        Opt::MulticastLoop,
+        Opt::MulticastJoin,
     ];
 
     /// The system's name for it.
@@ -291,6 +309,10 @@ impl Opt {
             Opt::Dscp => "IP_TOS/IPV6_TCLASS",
             Opt::TcpEcn => "TCP_ENABLE_ECN",
             Opt::PathMtu => "IP_MTU_DISCOVER/IP_DONTFRAG",
+            Opt::Broadcast => "SO_BROADCAST",
+            Opt::MulticastTtl => "IP_MULTICAST_TTL",
+            Opt::MulticastLoop => "IP_MULTICAST_LOOP",
+            Opt::MulticastJoin => "IP_ADD_MEMBERSHIP",
         }
     }
 
@@ -560,6 +582,10 @@ pub struct UdpOptions {
     pub reuse_port: Ask<bool>,
     pub dscp: Ask<Dscp>,
     pub pmtu: Ask<Pmtu>,
+    pub broadcast: Ask<bool>,
+    pub multicast_ttl: Ask<u8>,
+    pub multicast_loop: Ask<bool>,
+    pub multicast_join: Ask<MulticastV4>,
 }
 
 impl UdpOptions {
@@ -571,6 +597,10 @@ impl UdpOptions {
         reuse_port: Ask::Leave,
         dscp: Ask::Leave,
         pmtu: Ask::Leave,
+        broadcast: Ask::Leave,
+        multicast_ttl: Ask::Leave,
+        multicast_loop: Ask::Leave,
+        multicast_join: Ask::Leave,
     };
 }
 
@@ -701,12 +731,20 @@ pub fn check_udp(options: &crate::dgram::Options, platform: Platform) -> Result<
         )),
         false => None,
     };
+    let multicast_join_form = match t.multicast_join.value() {
+        Some(m) if !m.group.is_multicast() => Some(Why::Form("multicast group must be in 224.0.0.0/4")),
+        _ => None,
+    };
     judge(s, platform, Opt::RecvBuffer, how(&t.recv_buffer), bytes_form(&t.recv_buffer))?;
     judge(s, platform, Opt::SendBuffer, how(&t.send_buffer), bytes_form(&t.send_buffer))?;
     judge(s, platform, Opt::ReuseAddress, how(&t.reuse_address), None)?;
     judge(s, platform, Opt::ReusePort, how(&t.reuse_port), None)?;
     judge(s, platform, Opt::Dscp, how(&t.dscp), dscp_conflict)?;
     judge(s, platform, Opt::PathMtu, how(&t.pmtu), pmtu_form)?;
+    judge(s, platform, Opt::Broadcast, how(&t.broadcast), None)?;
+    judge(s, platform, Opt::MulticastTtl, how(&t.multicast_ttl), None)?;
+    judge(s, platform, Opt::MulticastLoop, how(&t.multicast_loop), None)?;
+    judge(s, platform, Opt::MulticastJoin, how(&t.multicast_join), multicast_join_form)?;
     Ok(skipped)
 }
 
@@ -725,11 +763,11 @@ pub(crate) mod native {
 
     use blaze_sys::{
         Fd,
-        posix::{net, types::{c_int, c_void, socklen_t}},
+        posix::{net, types::{c_int, socklen_t}},
     };
 
     use super::{
-        Buffers, Bytes, FastOpen, KeepAlive, Linger, Opt, Platform, Pmtu, Side, Skipped, Tcp, TcpOptions,
+        Buffers, Bytes, FastOpen, KeepAlive, Linger, MulticastV4, Opt, Platform, Pmtu, Side, Skipped, Tcp, TcpOptions,
         check_tcp, check_udp,
     };
 
@@ -772,6 +810,10 @@ pub(crate) mod native {
         Tos,
         TcpEcn,
         PathMtu,
+        Broadcast,
+        MulticastTtl,
+        MulticastLoop,
+        MulticastJoin,
     }
 
     /// The table a setter reads: [`knob`], or a test's planted one.
@@ -807,6 +849,13 @@ pub(crate) mod native {
             (Call::TcpEcn, _) => None,
             (Call::PathMtu, false) => k(IPPROTO_IP, net::IP_MTU_DISCOVER, "IP_MTU_DISCOVER"),
             (Call::PathMtu, true) => k(IPPROTO_IPV6, net::IPV6_MTU_DISCOVER, "IPV6_MTU_DISCOVER"),
+            (Call::Broadcast, _) => k(SOL_SOCKET, net::SO_BROADCAST, "SO_BROADCAST"),
+            (Call::MulticastTtl, false) => k(IPPROTO_IP, net::IP_MULTICAST_TTL, "IP_MULTICAST_TTL"),
+            (Call::MulticastTtl, true) => None,
+            (Call::MulticastLoop, false) => k(IPPROTO_IP, net::IP_MULTICAST_LOOP, "IP_MULTICAST_LOOP"),
+            (Call::MulticastLoop, true) => None,
+            (Call::MulticastJoin, false) => k(IPPROTO_IP, net::IP_ADD_MEMBERSHIP, "IP_ADD_MEMBERSHIP"),
+            (Call::MulticastJoin, true) => None,
         }
     }
 
@@ -834,6 +883,13 @@ pub(crate) mod native {
             (Call::TcpEcn, _) => k(IPPROTO_TCP, MACOS_TCP_ENABLE_ECN, "TCP_ENABLE_ECN"),
             (Call::PathMtu, false) => k(IPPROTO_IP, net::IP_DONTFRAG, "IP_DONTFRAG"),
             (Call::PathMtu, true) => k(IPPROTO_IPV6, net::IPV6_DONTFRAG, "IPV6_DONTFRAG"),
+            (Call::Broadcast, _) => k(SOL_SOCKET, net::SO_BROADCAST, "SO_BROADCAST"),
+            (Call::MulticastTtl, false) => k(IPPROTO_IP, net::IP_MULTICAST_TTL, "IP_MULTICAST_TTL"),
+            (Call::MulticastTtl, true) => None,
+            (Call::MulticastLoop, false) => k(IPPROTO_IP, net::IP_MULTICAST_LOOP, "IP_MULTICAST_LOOP"),
+            (Call::MulticastLoop, true) => None,
+            (Call::MulticastJoin, false) => k(IPPROTO_IP, net::IP_ADD_MEMBERSHIP, "IP_ADD_MEMBERSHIP"),
+            (Call::MulticastJoin, true) => None,
         }
     }
 
@@ -850,12 +906,10 @@ pub(crate) mod native {
         })
     }
 
-    /// `value` written as `knob` of `fd`.
-    fn set_raw(fd: RawFd, knob: Knob, value: *const c_void, len: usize) -> io::Result<()> {
-        // SAFETY: the callers supply an initialized int, two consecutive ints (linger), or a
-        // byte slice, all live for this call. Casting to socklen_t can only shorten the slice.
-        let bytes = unsafe { core::slice::from_raw_parts(value.cast(), len as socklen_t as usize) };
-        net::setsockopt_bytes(Fd::new(fd), knob.level, knob.name, bytes).map_err(|errno| {
+    /// `bytes` written as `knob` of `fd`.
+    fn set_bytes(fd: RawFd, knob: Knob, value: &[u8]) -> io::Result<()> {
+        let len = (value.len() as socklen_t as usize).min(value.len());
+        net::setsockopt_bytes(Fd::new(fd), knob.level, knob.name, &value[..len]).map_err(|errno| {
             let error = io::Error::from_raw_os_error(i32::from(errno.raw()));
             // alloc: an error path.
             io::Error::new(error.kind(), format!("setting socket option {}: {error}", knob.text))
@@ -863,23 +917,61 @@ pub(crate) mod native {
     }
 
     pub(crate) fn set_int(fd: RawFd, knob: Knob, value: c_int) -> io::Result<()> {
-        set_raw(fd, knob, (&raw const value).cast(), size_of::<c_int>())
+        set_bytes(fd, knob, crate::pod::bytes_of(&value))
     }
 
     fn set_linger(fd: RawFd, knob: Knob, value: net::linger) -> io::Result<()> {
-        set_raw(fd, knob, (&raw const value).cast(), size_of::<net::linger>())
+        const {
+            assert!(size_of::<net::linger>() == size_of::<[c_int; 2]>());
+            assert!(align_of::<net::linger>() == align_of::<[c_int; 2]>());
+        }
+        let pair = [value.l_onoff, value.l_linger];
+        set_bytes(fd, knob, crate::pod::bytes_of(&pair))
     }
 
-    fn set_bytes(fd: RawFd, knob: Knob, value: &[u8]) -> io::Result<()> {
-        set_raw(fd, knob, value.as_ptr().cast(), value.len())
+    fn set_mreq(fd: RawFd, knob: Knob, value: MulticastV4) -> io::Result<()> {
+        const {
+            assert!(size_of::<net::ip_mreq>() == size_of::<[u32; 2]>());
+            assert!(align_of::<net::ip_mreq>() == align_of::<[u32; 2]>());
+        }
+        let pair = [
+            u32::from_ne_bytes(value.group.octets()),
+            u32::from_ne_bytes(value.interface.octets()),
+        ];
+        set_bytes(fd, knob, crate::pod::bytes_of(&pair))
+    }
+
+    /// `IP_MULTICAST_TTL` / `IP_MULTICAST_LOOP`: macOS takes `u_char` (`u8`), Linux takes `int`.
+    fn set_multicast_u8(fd: RawFd, knob: Knob, value: u8) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            set_bytes(fd, knob, &[value])
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            set_int(fd, knob, c_int::from(value))
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_multicast_u8(fd: RawFd, knob: Knob) -> io::Result<u8> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut value = [0u8; 1];
+            get_bytes(fd, knob, &mut value)?;
+            Ok(value[0])
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let value = get_int(fd, knob)?;
+            Ok(u8::try_from(value).unwrap_or(0))
+        }
     }
 
     /// `knob` of `fd` read back into `into`: how many bytes the kernel wrote.
-    fn get_raw(fd: RawFd, knob: Knob, into: *mut c_void, len: usize) -> io::Result<usize> {
-        // SAFETY: the callers lend an initialized int, two consecutive ints (linger), or a
-        // byte array exclusively for this call. Every bit pattern is valid in each.
-        let bytes = unsafe { core::slice::from_raw_parts_mut(into.cast(), len as socklen_t as usize) };
-        net::getsockopt_bytes(Fd::new(fd), knob.level, knob.name, bytes).map_err(|errno| {
+    fn get_bytes(fd: RawFd, knob: Knob, into: &mut [u8]) -> io::Result<usize> {
+        let len = (into.len() as socklen_t as usize).min(into.len());
+        net::getsockopt_bytes(Fd::new(fd), knob.level, knob.name, &mut into[..len]).map_err(|errno| {
             let error = io::Error::from_raw_os_error(i32::from(errno.raw()));
             // alloc: an error path.
             io::Error::new(error.kind(), format!("reading socket option {}: {error}", knob.text))
@@ -888,21 +980,25 @@ pub(crate) mod native {
 
     pub(crate) fn get_int(fd: RawFd, knob: Knob) -> io::Result<c_int> {
         let mut value: c_int = 0;
-        get_raw(fd, knob, (&raw mut value).cast(), size_of::<c_int>())?;
+        get_bytes(fd, knob, crate::pod::bytes_of_mut(&mut value))?;
         Ok(value)
     }
 
     #[cfg(test)]
     pub(crate) fn get_linger(fd: RawFd, knob: Knob) -> io::Result<net::linger> {
-        let mut value = net::linger { l_onoff: 0, l_linger: 0 };
-        get_raw(fd, knob, (&raw mut value).cast(), size_of::<net::linger>())?;
-        Ok(value)
+        const {
+            assert!(size_of::<net::linger>() == size_of::<[c_int; 2]>());
+            assert!(align_of::<net::linger>() == align_of::<[c_int; 2]>());
+        }
+        let mut pair = [0 as c_int; 2];
+        get_bytes(fd, knob, crate::pod::bytes_of_mut(&mut pair))?;
+        Ok(net::linger { l_onoff: pair[0], l_linger: pair[1] })
     }
 
     /// A name option's bytes, up to its first NUL.
     #[cfg(test)]
     pub(crate) fn get_name(fd: RawFd, knob: Knob, into: &mut [u8; 16]) -> io::Result<usize> {
-        let got = get_raw(fd, knob, into.as_mut_ptr().cast(), into.len())?;
+        let got = get_bytes(fd, knob, into)?;
         Ok(into[..got].iter().position(|it| *it == 0).unwrap_or(got))
     }
 
@@ -1129,6 +1225,23 @@ pub(crate) mod native {
         if let (Some(mode), true) = (t.pmtu.value(), wanted(Opt::PathMtu)) {
             set(Call::PathMtu, pmtu(mode)).map_err(named)?;
         }
+        if let (Some(on), true) = (t.broadcast.value(), wanted(Opt::Broadcast)) {
+            set(Call::Broadcast, int(on)).map_err(named)?;
+        }
+        if let (Some(ttl), true) = (t.multicast_ttl.value(), wanted(Opt::MulticastTtl)) {
+            match knob(Call::MulticastTtl, v6) {
+                Some(k) => set_multicast_u8(raw, k, ttl).map_err(named)?,
+                None if t.multicast_ttl.may_skip() => {}
+                None => return Err(named(io::Error::new(io::ErrorKind::Unsupported, "IP_MULTICAST_TTL: IPv4-only socket option"))),
+            }
+        }
+        if let (Some(on), true) = (t.multicast_loop.value(), wanted(Opt::MulticastLoop)) {
+            match knob(Call::MulticastLoop, v6) {
+                Some(k) => set_multicast_u8(raw, k, u8::from(on)).map_err(named)?,
+                None if t.multicast_loop.may_skip() => {}
+                None => return Err(named(io::Error::new(io::ErrorKind::Unsupported, "IP_MULTICAST_LOOP: IPv4-only socket option"))),
+            }
+        }
         #[cfg(target_os = "macos")]
         net::bind(Fd::new(raw), &address.storage, address.len)
             .map_err(|errno| ("the bind", io::Error::from_raw_os_error(i32::from(errno.raw()))))?;
@@ -1136,6 +1249,13 @@ pub(crate) mod native {
         // SAFETY: an address of `len` bytes, of the socket's domain.
         if unsafe { libc::bind(raw, (&raw const address.storage).cast(), address.len) } != 0 {
             return Err(("the bind", io::Error::last_os_error()));
+        }
+        if let (Some(mreq), true) = (t.multicast_join.value(), wanted(Opt::MulticastJoin)) {
+            match knob(Call::MulticastJoin, v6) {
+                Some(k) => set_mreq(raw, k, mreq).map_err(named)?,
+                None if t.multicast_join.may_skip() => {}
+                None => return Err(named(io::Error::new(io::ErrorKind::Unsupported, "IP_ADD_MEMBERSHIP: IPv4-only socket option"))),
+            }
         }
         Ok(UdpSocket::from(fd))
     }

@@ -50,6 +50,12 @@ pub(crate) const WORDS: &[&str] = &[
     // Strengthened `ambient-hasher` and `ambient-heap`.
     "rustc_hash", "FxHashMap", "FxHashSet", "ahash", "AHashMap", "AHashSet", "foldhash", "pin", "into_boxed_slice",
     "into_boxed_str",
+    // `mut-ref` (`&mut` / `ref mut` -> `&uniq` / `ref uniq`) and `mut-for-uniq-borrow` (`let mut`).
+    "mut", "ref", "let", "uniq",
+    // `magic-slice-len` (`.get(0..3) == Some(..)`, `.get(at..at + 2)`, `.starts_with(..)` + advance).
+    "get", "starts_with", "Some", "is_some_and", "try_into",
+    // `manual-slice-idioms` (`.len() == 0`, `for i in 0..xs.len()`, `.find(..)` + slice) and `test-ambient-leak`.
+    "len", "find", "in", "crate", "true", "false",
 ];
 
 blaze_phf::name_phf_table!(pub(crate) static WORD = WORDS;);
@@ -160,6 +166,23 @@ pub(crate) const W_INSTANT: u8 = word("Instant");
 pub(crate) const W_SYSTEM_TIME: u8 = word("SystemTime");
 pub(crate) const W_LIBC: u8 = word("libc");
 pub(crate) const W_RUSTIX: u8 = word("rustix");
+pub(crate) const W_MUT: u8 = word("mut");
+pub(crate) const W_REF: u8 = word("ref");
+pub(crate) const W_LET: u8 = word("let");
+pub(crate) const W_UNIQ: u8 = word("uniq");
+pub(crate) const W_GET: u8 = word("get");
+pub(crate) const W_STARTS_WITH: u8 = word("starts_with");
+pub(crate) const W_SOME: u8 = word("Some");
+pub(crate) const W_IS_SOME_AND: u8 = word("is_some_and");
+pub(crate) const W_TRY_INTO: u8 = word("try_into");
+pub(crate) const W_LEN: u8 = word("len");
+pub(crate) const W_FIND: u8 = word("find");
+pub(crate) const W_IN: u8 = word("in");
+pub(crate) const W_CRATE: u8 = word("crate");
+pub(crate) const W_TRUE: u8 = word("true");
+pub(crate) const W_FALSE: u8 = word("false");
+pub(crate) const W_ALLOC_TYPE: u8 = word("Alloc");
+pub(crate) const W_GLOBAL_FN: u8 = word("global");
 
 const fn mark_all(table: &mut [u16; WORDS.len()], words: &[&str], bit: u16) {
     let mut at = 0;
@@ -440,10 +463,10 @@ pub(crate) const SEQS: &[Seq] = &[
     s(&[Wd("thread"), P(SEP), Wd("available_parallelism"), P(OPEN)], Template::BlockingOnPool, none(), DropLast, Row, "the pool's configured worker count passed in"),
     s(&[Wd("hint"), P(SEP), Wd("spin_loop"), P(OPEN)], Template::BlockingOnPool, none(), DropLast, Row, "a bounded wait rather than busy-spinning on a pool thread"),
     // ---- transmute: raw bit reinterpretation.
-    s(&[Wd("mem"), P(SEP), Wd("transmute"), P(OPEN)], Template::Transmute, none(), DropLast, Row, "a safe conversion (`from_ne_bytes`, `to_bits`, or a typed helper)"),
-    s(&[Wd("mem"), P(SEP), Wd("transmute"), P(SEP), P(LT)], Template::Transmute, none(), DropTurbo, Row, "a safe conversion (`from_ne_bytes`, `to_bits`, or a typed helper)"),
-    s(&[Wd("mem"), P(SEP), Wd("transmute_copy"), P(OPEN)], Template::Transmute, none(), DropLast, Row, "a safe conversion (`from_ne_bytes`, `ptr::read_unaligned` with a safety proof, or a typed helper)"),
-    s(&[Wd("mem"), P(SEP), Wd("transmute_copy"), P(SEP), P(LT)], Template::Transmute, none(), DropTurbo, Row, "a safe conversion (`from_ne_bytes`, `ptr::read_unaligned` with a safety proof, or a typed helper)"),
+    s(&[Wd("mem"), P(SEP), Wd("transmute"), P(OPEN)], Template::Transmute, none(), DropLast, Row, "a safe `bstd::pod` / `blaze_own::pod` conversion (`pod::cast`, `pod::cast_slice`, `pod::bytes_of`, `pod::from_bytes`, `CheckedBitPattern`) or `from_ne_bytes`/`to_bits`"),
+    s(&[Wd("mem"), P(SEP), Wd("transmute"), P(SEP), P(LT)], Template::Transmute, none(), DropTurbo, Row, "a safe `bstd::pod` / `blaze_own::pod` conversion (`pod::cast`, `pod::cast_slice`, `pod::bytes_of`, `pod::from_bytes`, `CheckedBitPattern`) or `from_ne_bytes`/`to_bits`"),
+    s(&[Wd("mem"), P(SEP), Wd("transmute_copy"), P(OPEN)], Template::Transmute, none(), DropLast, Row, "a safe `bstd::pod` / `blaze_own::pod` conversion (`pod::pod_read_unaligned`, `pod::cast`, `CheckedBitPattern`) or `from_ne_bytes`"),
+    s(&[Wd("mem"), P(SEP), Wd("transmute_copy"), P(SEP), P(LT)], Template::Transmute, none(), DropTurbo, Row, "a safe `bstd::pod` / `blaze_own::pod` conversion (`pod::pod_read_unaligned`, `pod::cast`, `CheckedBitPattern`) or `from_ne_bytes`"),
 ];
 
 /// The symbols of `seq`.
@@ -486,3 +509,15 @@ const N_NODES: usize = nodes_for(&PATTERNS);
 
 /// The one trie of every sequence, built as the crate compiles.
 pub(crate) static TRIE: Trie<N_NODES, SYMS, N_SEQS> = Trie::build(&PATTERNS);
+
+/// Compile-time proof that `Pass::sequences` and `Pass::lex_run` only need to treat `K::Ident`
+/// words and `K::P(b'.')` as sequence starters when no match is live.
+const _: () = {
+    let mut i = 0;
+    while i < SEQS.len() {
+        if let E::P(sym) = SEQS[i].elems[0] {
+            assert!(sym == DOT, "only DOT punctuation may start a sequence pattern");
+        }
+        i += 1;
+    }
+};

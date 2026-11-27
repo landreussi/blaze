@@ -18,7 +18,7 @@
 //! | `--fix <selector>..` | taken (engine_check.rs `serve`: a quiet check, fix.rs `apply`, a second check, through main.rs `fix_then_check`; the listed findings are in the request's frame, which outlives both checks) |
 //! | `--stats` | taken (engine_check.rs `stats_line`: one line on stderr; the profile holds the rest) |
 //! | `--origin`, `--origin-key` | taken (`Opts::origin`: the store opened with the named origin) |
-//! | `--grant`, `-p`/`--bin`, `-- args` | REFUSED: `run`'s, never `check`'s |
+//! | `--grant`, `-p`/`--bin`, `--open`, `-- args` | REFUSED: `run`'s, never `check`'s |
 //!
 //! A flag of `check` the engine does not take would be listed in [`NOT_TAKEN`] and refused as
 //! [`crate::CliError::NotOnEngine`], naming the flag and why, before anything is read or
@@ -26,7 +26,7 @@
 
 use bstd::entry::Status;
 use bstd::out::Out;
-use bstd::{Cx, Io};
+use bstd::Cx;
 
 use crate::CliError;
 use crate::phases::Phases;
@@ -39,16 +39,29 @@ pub(crate) const NOT_TAKEN: [(&str, &str, fn(&crate::Flags<'_>) -> bool); 0] = [
 /// The command: `check`'s arguments refused where the engine does not honour them, then the
 /// engine's check (engine_check.rs `run`), which prints its findings, notes and closing line
 /// through print.rs and returns the status main.rs `STATUSES` explains.
-pub(crate) fn run(cx: &Cx, io: &Io, out: &Out, phases: &mut Phases, heap: &'static blaze_own::Heap) -> Result<Status, CliError> {
-    let args = io.need_args()?;
-    let flags = crate::flags(&args)?;
+#[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one specific capability")]
+pub(crate) fn run(
+    cx: &Cx,
+    args: &bstd::args::Args,
+    fs: &bstd::fs::Fs,
+    env: Option<&bstd::env::Env>,
+    net: Option<&bstd::net::Net>,
+    host: &bstd::host::Host,
+    clock: &bstd::clock::Clock,
+    rng: &mut bstd::rng::Rng,
+    out: &Out,
+    err: &Out,
+    phases: &mut Phases,
+    heap: &'static blaze_own::Heap,
+) -> Result<Status, CliError> {
+    let flags = crate::flags_in(args, cx.frame())?;
     refuse_not_taken(&flags)?;
-    crate::engine_check::run(cx, io, out, phases, heap)
+    crate::engine_check::run(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap)
 }
 
 /// The first flag given that the engine's check does not take, refused by name (rule 3: never
 /// quietly ignored).
-fn refuse_not_taken(flags: &crate::Flags<'_>) -> Result<(), CliError> {
+pub(crate) fn refuse_not_taken(flags: &crate::Flags<'_>) -> Result<(), CliError> {
     if let Some((flag, why, _)) = NOT_TAKEN.into_iter().find(|(_, _, given)| given(flags)) {
         return Err(CliError::NotOnEngine { flag, why });
     }
@@ -56,7 +69,13 @@ fn refuse_not_taken(flags: &crate::Flags<'_>) -> Result<(), CliError> {
         return Err(CliError::Usage("--grant and the words after -- are `blaze run`'s program's"));
     }
     if flags.select != crate::run_package::Select::NONE {
-        return Err(CliError::Usage("-p and --bin choose `blaze run`'s program"));
+        return Err(CliError::Usage("-p and --bin choose `blaze run`'s or `blaze build`'s program"));
+    }
+    if flags.output.is_some() {
+        return Err(CliError::Usage("-o / --output is `blaze build`'s"));
+    }
+    if flags.open == blaze_run::viewer::OpenExplore::Open {
+        return Err(CliError::Usage("--open is `blaze run`'s"));
     }
     Ok(())
 }

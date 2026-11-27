@@ -100,8 +100,7 @@ fn opened(store: &DirStore, cuts: bool) -> Result<CrateResults, RecordError> {
 /// replaces the first's); then a third runs every key and keeps, and a fourth finds them all.
 fn program(io: &Io, plant: RecordPlant, cuts: bool) -> Result<(), RecordError> {
     let dir = io.need_fs().map_err(|_| RecordError::Files(FilesError::NoTree))?.root();
-    // clone: the world, a refcount.
-    let store = DirStore::on(OnDir { io: io.clone(), dir }, plant);
+    let store = DirStore::on(OnDir { cx: io.spawner(), boot: io.boot().ok(), dir }, plant);
     let (a, b) = (opened(&store, cuts)?, opened(&store, cuts)?);
     for k in 0..KEYS {
         let into = if k % 2 == 0 { &a } else { &b };
@@ -129,6 +128,7 @@ fn runs(count: u32, plant: RecordPlant, cuts: bool) -> Result<bstd::test::Passed
     seeded("blaze-proc-macro", module_path!(), "tables_crash", seeds, Given::NOTHING, move |_: &Cx, io: Io| program(&io, plant, cuts))
 }
 
+/// The invariant: under power cuts, failures, and concurrent writers, every opened proc-macro results table is sealed and whole or absent, and never published before its bytes are whole.
 #[test]
 fn a_crash_or_failure_anywhere_keeps_each_table_whole_or_absent() {
     match runs(1000, RecordPlant::None, true) {
@@ -192,7 +192,7 @@ fn store_on_disk(name: &str, plant: RecordPlant) -> (std::path::PathBuf, DirStor
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("a temporary folder");
     let (io, root) = super::super::native_world(&dir).unwrap_or_else(|error| panic!("the world over {}: {error}", dir.display()));
-    (dir, DirStore::on(OnDir { io, dir: root }, plant))
+    (dir, DirStore::on(OnDir { cx: io.spawner(), boot: io.boot().ok(), dir: root }, plant))
 }
 
 /// Row `k` of the large table: 1.6 MB that no other row holds.

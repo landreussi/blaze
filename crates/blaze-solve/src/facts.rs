@@ -222,6 +222,9 @@ pub struct ImplHeader<'w> {
     /// The trait's arguments, the self type first.
     pub args: List,
     pub where_clauses: &'w [Pred],
+    /// Number of bound regions (`for<'a, ..>`) on each corresponding clause of `where_clauses`
+    /// (empty when all clauses have 0 binders).
+    pub where_clause_bounds: &'w [u32],
     pub assoc: &'w [ImplAssoc],
     pub portable: Portable<'w>,
     pub digest: u64,
@@ -251,6 +254,10 @@ impl AdtFlags {
     pub const NON_EXHAUSTIVE: u16 = 1 << 7;
     /// The ADT has a `Drop` impl (for `Destruct` and `Copy`).
     pub const HAS_DROP: u16 = 1 << 8;
+    /// Blaze edition: transparent all-`pub` no-`Drop` struct eligible for automatic `Copy`/`Clone`.
+    pub const AUTO_COPY_PUB: u16 = 1 << 9;
+    /// Fieldless enum: every variant is a unit variant (`CtorKind::Unit`).
+    pub const UNIT_ENUM: u16 = 1 << 10;
 
     pub const fn has(self, bits: u16) -> bool {
         self.0 & bits != 0

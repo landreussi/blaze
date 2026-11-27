@@ -216,17 +216,20 @@ fn world() -> (Src, Option<LibKey>, &'static blaze_mem::Frame) {
 
 /// [`world`] over `app` as the app's text.
 pub(crate) fn world_of(app: &'static str) -> (Src, Option<LibKey>, &'static blaze_mem::Frame) {
+    let g = a();
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the records reader's frame");
+    let frame: &'static blaze_mem::Frame = blaze_own::Box::leak_static(blaze_own::Box::new_in(frame, g));
+    let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
     let crates = [input("app", "/app/lib.rs", &[("core", CORE_AT)]), input("core", "/core/lib.rs", &[])];
     let sysroot = Sysroot { core: Some(CrateId(CORE_AT as u32)), alloc: None, std: None, bstd: None };
-    let solved = resolve_crates(&crates, sysroot, &Texts { app }, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
-    let solved: &'static Names<'static> = blaze_own::Box::leak(blaze_own::Box::new_in(solved, a()));
-    let g = a();
+    let solved = resolve_crates(&crates, sysroot, &Texts { app }, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let solved: &'static Names<'static> = blaze_own::Box::leak_static(blaze_own::Box::new_in(solved, g));
     let mut kept = Kept { names: AVec::new_in(g), items: AVec::new_in(g), files: AVec::new_in(g), expansions: AVec::new_in(g) };
     let mut crate_names: AVec<'static, &'static str> = AVec::new_in(g);
     let mut crate_keys: AVec<'static, CrateItemKey> = AVec::new_in(g);
     for c in solved.crates().iter() {
-        kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), g));
-        kept.items.push(aligned(&items_record::encode(c, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), g));
+        kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), bump));
+        kept.items.push(aligned(&items_record::encode(c, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), bump));
         let mut files = AVec::new_in(g);
         files.extend(c.files.iter().map(|f| (f.package.as_str(), f.text)));
         kept.files.push(files);
@@ -237,11 +240,9 @@ pub(crate) fn world_of(app: &'static str) -> (Src, Option<LibKey>, &'static blaz
         crate_names.push(c.name);
         crate_keys.push(c.key);
     }
-    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the records reader's frame");
-    let frame: &'static blaze_mem::Frame = blaze_own::Box::leak(blaze_own::Box::new_in(frame, g));
-    let log: &'static Log<'static> = blaze_own::Box::leak(blaze_own::Box::new_in(Log::new(crate_names.leak(), g), g));
-    let load: &'static Kept = blaze_own::Box::leak(blaze_own::Box::new_in(kept, g));
-    let names: Src = blaze_own::Box::leak(blaze_own::Box::new_in(Records::new(crate_keys.leak(), load, log, frame, g), g));
+    let log: &'static Log<'static> = blaze_own::Box::leak_static(blaze_own::Box::new_in(Log::new(crate_names.leak_static(), g), g));
+    let load: &'static Kept = blaze_own::Box::leak_static(blaze_own::Box::new_in(kept, g));
+    let names: Src = blaze_own::Box::leak_static(blaze_own::Box::new_in(Records::new(crate_keys.leak_static(), load, log, frame, g), g));
     let mut sized = None;
     NamesSource::each_lang(names, CORE_AT, &mut |name, key| {
         if name == "sized" {
@@ -979,7 +980,7 @@ fn edited(from: &'static str, old: &str, new: &str) -> &'static str {
     v.extend_from_slice(from[..at].as_bytes());
     v.extend_from_slice(new.as_bytes());
     v.extend_from_slice(from[at + old.len()..].as_bytes());
-    core::str::from_utf8(v.leak()).expect("an edit of UTF-8 by UTF-8")
+    core::str::from_utf8(v.leak_static()).expect("an edit of UTF-8 by UTF-8")
 }
 
 /// D148 across stores (tempo: 9,115 bodies refused `[NoHead]`, every callee whose head came
@@ -1059,18 +1060,18 @@ pub fn unmade(x: &u8) -> &u8 { x }
         let (w, k) = (Want::Fn(lib), checker_of(lib));
         let mut made = Store::new(sized, frame, a());
         let mut keys = Keys::new();
-        made.ensure(names, &mut keys, w).unwrap_or_else(|e| panic!("ensure `{name}`: {e}"));
+        made.ensure(names, &mut keys, w).unwrap_or_else(|e| panic!("ensure '{name}': {e}"));
         if plant {
             made.regions.file_unlaid(k, head_record::Unlaid::NoContainer, head_record::Unlaid::NoContainer.name());
         } else {
             made.regions.file_refused(k);
         }
         let want_kind = if plant { head_record::Unlaid::NoContainer } else { head_record::Unlaid::NotMade };
-        let bytes = export(names, &keys, &mut made, w, Plant::None, a()).unwrap_or_else(|e| panic!("export `{name}`: {e}"));
-        let frozen = FrozenHead::read(&bytes).unwrap_or_else(|e| panic!("read `{name}`: {e}"));
+        let bytes = export(names, &keys, &mut made, w, Plant::None, a()).unwrap_or_else(|e| panic!("export '{name}': {e}"));
+        let frozen = FrozenHead::read(&bytes).unwrap_or_else(|e| panic!("read '{name}': {e}"));
         let other = Store::new(sized, frame, a());
-        file_frozen(names, w, frozen, &other, &Keys::new(), a()).unwrap_or_else(|e| panic!("file `{name}`: {e}"));
-        assert!(other.fns.contains_key(&k), "ORACLE: `{name}`'s head was not filed");
+        file_frozen(names, w, frozen, &other, &Keys::new(), a()).unwrap_or_else(|e| panic!("file '{name}': {e}"));
+        assert!(other.fns.contains_key(&k), "ORACLE: '{name}'s head was not filed");
         assert_eq!(other.regions.unread(k).why, UnreadWhy::Refused { what: want_kind.name() }, "ORACLE: `{name}` reached the other store without its refusal's name");
         // CONTROL: the old filer, the heads alone.
         let old = Store::new(sized, frame, a());
@@ -1240,4 +1241,66 @@ pub fn d(v: &V<u8>) -> &u8 { &v.t }
     assert!(planted.regions.made(k).is_none(), "CONTROL: with `G`'s count unanswered `d`'s column was laid");
     let kind = planted.region_gaps.get(&k).map(crate::front2::heads::RegionGap::unlaid);
     assert_eq!(kind, Some(head_record::Unlaid::Counts), "CONTROL: `d`'s refusal is not `Counts`: {:?}", planted.region_gaps.get(&k));
+}
+
+/// An ADT with RFC 3681 field defaults freezes its synthetic `const _: T = v;` heads inline and
+/// imports cleanly into a fresh store without `HeadRecordError::NoText`.
+#[test]
+fn an_adt_with_field_defaults_freezes_and_imports_inline() {
+    const APP: &str = "#![feature(default_field_values)]
+pub struct Opts {
+    pub limit: u32 = 42,
+}
+";
+    let (names, sized, frame) = world_of(APP);
+    let mut opts = None;
+    NamesSource::each_item(names, APP_AT, &mut |key, _| {
+        if NamesSource::name_of(names, key) == Some("Opts") {
+            opts = Some(key);
+        }
+    });
+    let opts = opts.expect("`Opts` in fixture");
+    let mut maker = Store::new(sized, frame, a());
+    let mut maker_keys = Keys::new();
+    maker.ensure(names, &mut maker_keys, Want::Adt(opts)).unwrap_or_else(|e| panic!("ensure `Opts`: {e}"));
+    let bytes = export(names, &maker_keys, &mut maker, Want::Adt(opts), Plant::None, a()).unwrap_or_else(|e| panic!("export `Opts`: {e}"));
+    let frozen = FrozenHead::read(&bytes).unwrap_or_else(|e| panic!("read `Opts`: {e}"));
+    let seeded = Store::new(sized, frame, a());
+    let seeded_keys = Keys::new();
+    super::head::file_frozen(names, Want::Adt(opts), frozen, &seeded, &seeded_keys, a()).unwrap_or_else(|e| panic!("file `Opts` with inline default: {e}"));
+    let defaults = seeded.field_defaults.get(&checker_of(opts)).expect("field defaults filed");
+    let dk = defaults[0].expect("first field has default key");
+    let head = seeded.fns.get(&dk).expect("synthetic default fn head filed");
+    assert!(head.text_inline, "synthetic field default must keep text_inline");
+    assert_eq!(head.text, "const _: u32 = 42;");
+}
+
+/// A type alias naming `dyn Tr` whose trait has a method returning that alias (like cranelift's
+/// `type OwnedTargetIsa = Arc<dyn TargetIsa>` with `TargetIsa::wrapped -> OwnedTargetIsa`) freezes
+/// cleanly under both freezing orders (`Alias` first and `Tr` first) without a head cycle.
+#[test]
+fn a_trait_method_returning_alias_of_dyn_self_freezes_in_either_order() {
+    const APP: &str = "pub trait Super {}
+pub type Owned<'a> = &'a dyn Isa;
+pub trait Isa: Super {
+    fn wrapped(&self) -> Owned<'_>;
+}
+";
+    let (names, sized, frame) = world_of(APP);
+    let named = |want: &str| {
+        let mut found = None;
+        NamesSource::each_item(names, APP_AT, &mut |key, _| {
+            if NamesSource::name_of(names, key) == Some(want) {
+                found = Some(key);
+            }
+        });
+        found.unwrap_or_else(|| panic!("`{want}` in fixture"))
+    };
+    let (owned, isa) = (named("Owned"), named("Isa"));
+    for order in [[Want::Head(owned), Want::Members(isa)], [Want::Members(isa), Want::Head(owned)]] {
+        let mut seeded = SeededHeads::new(SeededHeadsOpts { names, sized, pointers: crate::front2::receiver::Pointers::NOT_LOOKED_UP, frame, scratch: a(), alloc: a(), consts: None, known: None, owners: None });
+        for want in order {
+            seeded.frozen(want).unwrap_or_else(|e| panic!("order {order:?} failed on {want:?}: {e}"));
+        }
+    }
 }

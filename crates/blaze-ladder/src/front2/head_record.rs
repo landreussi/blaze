@@ -186,7 +186,25 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// 34: an impl's record holds its unstable members after its fn visibilities
 /// (`ImplHead::unstable`: each a name, its feature's text and an optional `implied_by` text;
 /// what method and path lookup's `World::member_unstable` reads).
-pub const VERSION: u32 = 34;
+/// 35: `T_RECORD` terms carry their canonical sorted field names so cross-item signatures keep
+/// `RecordSchema -> &[Name]` mappings.
+/// 36: `PClause::ForFields` (tag 5) for field-quantified bounds `for<F in fields(T)> F: Trait<args...>`.
+/// 37: a trait's record holds each associated type's regions state (laid, softly refused, or
+/// head refused, filed under the associated type's key by `Store::trait_members`) in
+/// `Parts::WithRegions`, left out of the erased digest.
+/// 38: a fn's text slot starts with a mode byte (`0` external whole text, `1` external signature
+/// prefix, `2` inline synthetic text for synthesized fn heads such as RFC 3681 field defaults).
+/// 39: `MemberFrame` carries `is_const` (`const impl` / `const trait` propagates `CONST` to member
+/// fns) and `#[rustc_comptime]` sets `FnQualifiers::CONST`.
+/// 40: ADT `field_regions` lay `PNode::Alias` fields in pre-order again; normalized alias fields
+/// are guarded per body in `borrows.rs` (`suppressed_alias_fields`). Same format, new content for
+/// the same key (rule 21).
+/// 41: ADTs carry per-field visibility bytes (`AdtRow::field_vis`) so `World::member_visible`
+/// checks struct/union field visibility during field-access autoderef.
+/// 42: `FnHead::cost` carries opt-in `#[blaze::cost(..)]` complexity contracts.
+/// 43: `AdtRow` carries `capability` (`#[blaze::capability]`) and `sans_io` (`#![blaze::sans_io]`
+/// scope) flags after `args`.
+pub const VERSION: u32 = 43;
 /// The digest domains: the record's out digest, a fn text's check, the regions digest.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -234,6 +252,8 @@ const T_EX_TRAIT: u8 = 23;
 const T_EX_PROJ: u8 = 24;
 const T_EX_AUTO: u8 = 25;
 const T_FOREIGN: u8 = 26;
+const T_RECORD: u8 = 27;
+const T_UNION: u8 = 28;
 
 /// Where to read an opaque's bounds even when an unrelated head first exposes its type.
 /// A trait method's checker key is `owner`; its bounds are in its trait's `Members` cell.
@@ -446,6 +466,35 @@ pub enum HeadRef<'h, 'n> {
     Opaque { key: ItemKey, fn_: ItemKey, index: u32, preds: Option<&'h Preds>, regions: Option<&'h FiledRegions> },
 }
 
+/// One associated type's regions state in a trait record (form 37): absent until the trait's
+/// members are made, else laid, softly refused, or its item head refused.
+pub enum AssocRegions {
+    None,
+    Laid(FiledRegions),
+    Unlaid(Unlaid),
+    HeadRefused,
+}
+
+impl AssocRegions {
+    pub fn as_ref(&self) -> AssocRegionsRef<'_> {
+        match self {
+            AssocRegions::None => AssocRegionsRef::None,
+            AssocRegions::Laid(r) => AssocRegionsRef::Laid(r),
+            AssocRegions::Unlaid(u) => AssocRegionsRef::Unlaid(*u),
+            AssocRegions::HeadRefused => AssocRegionsRef::HeadRefused,
+        }
+    }
+}
+
+/// Borrowed form of [`AssocRegions`].
+#[derive(Clone, Copy)]
+pub enum AssocRegionsRef<'h> {
+    None,
+    Laid(&'h FiledRegions),
+    Unlaid(Unlaid),
+    HeadRefused,
+}
+
 /// One associated type's side rows of a trait (form 9): what the store files beside the trait's
 /// members, by the trait and the name.
 pub struct AssocSide {
@@ -460,6 +509,9 @@ pub struct AssocSide {
     /// by the trait's members under the associated type's own key (`Store::preds`); none until
     /// the members are made.
     pub bounds: Option<HeadPreds>,
+    /// Its item-bound regions state (form 37), filed under the associated type's own key
+    /// (`Store::regions`); `AssocRegions::None` until the members are made.
+    pub regions: AssocRegions,
 }
 
 /// Where a trait's [`AssocSide`] rows are read from: the store's maps, or a decoded head's own.
@@ -491,6 +543,30 @@ impl AssocSides<'_, '_> {
         match *self {
             AssocSides::Store { store, .. } => item.and_then(|k| store.preds.get(&k)),
             AssocSides::Rows(rows) => rows.iter().find(|r| r.name == name).and_then(|r| r.bounds.as_deref()),
+        }
+    }
+
+    /// `name`'s item-bound regions state (form 37), filed under its key (`item`).
+    pub fn regions(&self, name: Name, item: Option<ItemKey>) -> AssocRegionsRef<'_> {
+        match *self {
+            AssocSides::Store { store, .. } => match item {
+                None => AssocRegionsRef::None,
+                Some(k) => {
+                    if let Some(r) = store.regions.made(k) {
+                        AssocRegionsRef::Laid(r)
+                    } else if let Some(u) = store.regions.unlaid_of(k) {
+                        AssocRegionsRef::Unlaid(u)
+                    } else if store.regions.is_refused(k) {
+                        AssocRegionsRef::HeadRefused
+                    } else {
+                        AssocRegionsRef::None
+                    }
+                }
+            },
+            AssocSides::Rows(rows) => match rows.iter().find(|r| r.name == name) {
+                Some(r) => r.regions.as_ref(),
+                None => AssocRegionsRef::None,
+            },
         }
     }
 }
@@ -665,20 +741,55 @@ pub enum GapWhy<'h> {
 }
 
 impl GapWhy<'_> {
-    /// Its text, written into `out` (a `Why` by its `Debug`, a record's as held).
+    /// Its text, written directly into `out` with zero `Global` allocation (a `Why` by its
+    /// `Debug`, a record's as held).
     fn write_into(self, out: &mut RecordBytes<'_>) {
+        struct BytesWrite<'a, 'b>(&'a mut RecordBytes<'b>);
+        impl core::fmt::Write for BytesWrite<'_, '_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                self.0.extend_from_slice(s.as_bytes());
+                Ok(())
+            }
+        }
         match self {
             GapWhy::Text(text) => out.extend_from_slice(text),
-            GapWhy::Made(why) => out.extend_from_slice(std::format!("{why:?}").as_bytes()),
+            GapWhy::Made(why) => {
+                let _ = core::fmt::Write::write_fmt(&mut BytesWrite(out), format_args!("{why:?}"));
+            }
         }
     }
 
-    /// Whether two say the same text.
+    /// Whether two say the same text, without allocating on `Global`.
     fn same(self, other: GapWhy<'_>) -> bool {
+        struct TextMatch<'a> {
+            rest: &'a [u8],
+            matched: bool,
+        }
+        impl core::fmt::Write for TextMatch<'_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                if !self.matched {
+                    return Ok(());
+                }
+                match self.rest.strip_prefix(s.as_bytes()) {
+                    Some(tail) => self.rest = tail,
+                    None => self.matched = false,
+                }
+                Ok(())
+            }
+        }
+        let matches_text = |why: &super::types::Why, text: &[u8]| -> bool {
+            let mut m = TextMatch { rest: text, matched: true };
+            let _ = core::fmt::Write::write_fmt(&mut m, format_args!("{why:?}"));
+            m.matched && m.rest.is_empty()
+        };
         match (self, other) {
             (GapWhy::Text(a), GapWhy::Text(b)) => a == b,
-            (GapWhy::Made(a), GapWhy::Made(b)) => std::format!("{a:?}") == std::format!("{b:?}"),
-            (GapWhy::Made(why), GapWhy::Text(text)) | (GapWhy::Text(text), GapWhy::Made(why)) => std::format!("{why:?}").as_bytes() == text,
+            (GapWhy::Made(a), GapWhy::Made(b)) => blaze_mem::frame::task(blaze_mem::Tag::Parse, |frame| {
+                let mut buf = blaze_own::String::new_in(frame);
+                let _ = core::fmt::Write::write_fmt(&mut buf, format_args!("{a:?}"));
+                matches_text(b, buf.as_bytes())
+            }),
+            (GapWhy::Made(why), GapWhy::Text(text)) | (GapWhy::Text(text), GapWhy::Made(why)) => matches_text(why, text),
         }
     }
 }
@@ -922,6 +1033,9 @@ enum Parts {
 enum Text {
     Kept,
     Zeroed,
+    /// In-process store-to-store transfer: preserves `text_prefix` mode and length without
+    /// hashing fn text with BLAKE3 (never persisted).
+    InProcess,
 }
 
 /// A prefix ends immediately before the brace recorded by the parser. Checking the brace
@@ -937,6 +1051,186 @@ fn fn_record_text(text: &str, prefix: Option<u32>) -> Option<&[u8]> {
     }
 }
 
+/// Reusable scratch buffers for encoding one or more heads with [`encode_with_digests_into`].
+pub struct EncodeScratch<'b> {
+    terms: RecordBytes<'b>,
+    body: RecordBytes<'b>,
+    seen: HashMap<PTy, u32, Alloc<'b>>,
+    stack: Vec<(PTy, bool), Alloc<'b>>,
+    kids: Vec<PTy, Alloc<'b>>,
+    zero_ranges: Vec<(usize, usize), Alloc<'b>>,
+    erased_skip_ranges: Vec<(usize, usize), Alloc<'b>>,
+}
+
+impl<'b> EncodeScratch<'b> {
+    pub fn new_in(alloc: Alloc<'b>) -> EncodeScratch<'b> {
+        EncodeScratch {
+            terms: RecordBytes::new_in(alloc),
+            body: RecordBytes::new_in(alloc),
+            seen: HashMap::new_in(alloc),
+            stack: Vec::new_in(alloc),
+            kids: Vec::new_in(alloc),
+            zero_ranges: Vec::new_in(alloc),
+            erased_skip_ranges: Vec::new_in(alloc),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.terms.clear();
+        self.body.clear();
+        self.seen.clear();
+        self.stack.clear();
+        self.kids.clear();
+        self.zero_ranges.clear();
+        self.erased_skip_ranges.clear();
+    }
+}
+
+/// Hash `body` while replacing byte intervals in `zeros` with `0u8` and omitting byte intervals
+/// in `skips`. Both slices must be sorted, non-overlapping, and contained within `0..body.len()`.
+fn hash_body_with_edits(h: &mut blaze_ids::Hasher, body: &[u8], zeros: &[(usize, usize)], skips: &[(usize, usize)]) {
+    const ZEROS: [u8; 64] = [0u8; 64];
+    let mut pos = 0usize;
+    let mut zi = 0usize;
+    let mut si = 0usize;
+    loop {
+        let next = match (zeros.get(zi).copied(), skips.get(si).copied()) {
+            (Some(z), Some(sk)) if z.0 <= sk.0 => {
+                zi += 1;
+                (true, z)
+            }
+            (Some(z), None) => {
+                zi += 1;
+                (true, z)
+            }
+            (_, Some(sk)) => {
+                si += 1;
+                (false, sk)
+            }
+            (None, None) => break,
+        };
+        let (is_zero, (s, e)) = next;
+        if s > pos
+            && let Some(slice) = body.get(pos..s)
+        {
+            h.update(slice);
+        }
+        if is_zero {
+            let mut rem = e.saturating_sub(s);
+            while rem > 0 {
+                let n = rem.min(ZEROS.len());
+                if let Some(zslice) = ZEROS.get(..n) {
+                    h.update(zslice);
+                }
+                rem -= n;
+            }
+        }
+        pos = e;
+    }
+    if let Some(tail) = body.get(pos..)
+        && !tail.is_empty()
+    {
+        h.update(tail);
+    }
+}
+
+/// Single-pass equivalent of [`encode_with_origins`], [`reader_digest_with_origins`], and
+/// [`regions_digest_with_origins`]: appends the encoded record bytes directly into `out`, reuses
+/// `scratch` across heads, and returns `(reader_digest, regions_digest)`.
+pub fn encode_with_digests_into<'b>(
+    head: HeadRef<'_, '_>,
+    tys: PTys<'_>,
+    origin: &dyn Fn(ItemKey) -> Result<OpaqueOrigin, HeadRecordError>,
+    scratch: &mut EncodeScratch<'b>,
+    out: &mut RecordBytes<'_>,
+) -> Result<(ContentId, ContentId), HeadRecordError> {
+    if let Some(r) = head.regions() {
+        regions_fit_head(head, r.regions(), tys)?;
+    }
+    let meta = encode_into_scratch(head, tys, Text::Kept, Parts::WithRegions, origin, scratch)?;
+    let header_end = [
+        MAGIC[0],
+        MAGIC[1],
+        MAGIC[2],
+        MAGIC[3],
+        VERSION.to_le_bytes()[0],
+        VERSION.to_le_bytes()[1],
+        VERSION.to_le_bytes()[2],
+        VERSION.to_le_bytes()[3],
+        meta.kind,
+    ];
+    let count_le = meta.count.to_le_bytes();
+    out.reserve(header_end.len() + count_le.len() + scratch.terms.len() + scratch.body.len());
+    out.extend_from_slice(&header_end);
+    out.extend_from_slice(&count_le);
+    out.extend_from_slice(&scratch.terms);
+    out.extend_from_slice(&scratch.body);
+
+    let mut rh = blaze_ids::Hasher::new(REGIONS_DOMAIN);
+    rh.update(&header_end);
+    rh.update(&count_le);
+    rh.update(&scratch.terms);
+    hash_body_with_edits(&mut rh, &scratch.body, &scratch.zero_ranges, &[]);
+    let regions = rh.finish();
+
+    let meaning = if !meta.trait_had_laid_assoc {
+        let mut mh = blaze_ids::Hasher::new(DIGEST_DOMAIN);
+        mh.update(&header_end);
+        mh.update(&meta.erased_count.to_le_bytes());
+        if let Some(terms_slice) = scratch.terms.get(..meta.erased_terms_len) {
+            mh.update(terms_slice);
+        }
+        if let Some(body_slice) = scratch.body.get(..meta.erased_body_len) {
+            hash_body_with_edits(&mut mh, body_slice, &scratch.zero_ranges, &scratch.erased_skip_ranges);
+        }
+        mh.finish()
+    } else {
+        let erased = encode_into_scratch(head, tys, Text::Zeroed, Parts::Erased, origin, scratch)?;
+        let mut mh = blaze_ids::Hasher::new(DIGEST_DOMAIN);
+        mh.update(&header_end);
+        mh.update(&erased.count.to_le_bytes());
+        mh.update(&scratch.terms);
+        mh.update(&scratch.body);
+        mh.finish()
+    };
+
+    Ok((meaning, regions))
+}
+
+/// Fast in-process head transfer encoding: writes a complete `BZHD` record into `out` reusing
+/// `scratch` with `Text::InProcess` and zero BLAKE3 digest computations (`TEXT_DOMAIN`,
+/// `REGIONS_DOMAIN`, `DIGEST_DOMAIN`). Never persisted to CAS; paired with
+/// [`decode_with_origins_boxed_inline_verified`] in the same process over the same `NamesSource`.
+pub(crate) fn encode_in_process_into<'b>(
+    head: HeadRef<'_, '_>,
+    tys: PTys<'_>,
+    origin: &dyn Fn(ItemKey) -> Result<OpaqueOrigin, HeadRecordError>,
+    scratch: &mut EncodeScratch<'b>,
+    out: &mut RecordBytes<'_>,
+) -> Result<(), HeadRecordError> {
+    let meta = encode_into_scratch(head, tys, Text::InProcess, Parts::WithRegions, origin, scratch)?;
+    let [m0, m1, m2, m3] = MAGIC;
+    let [v0, v1, v2, v3] = VERSION.to_le_bytes();
+    let header_end = [m0, m1, m2, m3, v0, v1, v2, v3, meta.kind];
+    let count_le = meta.count.to_le_bytes();
+    out.clear();
+    out.reserve(header_end.len() + count_le.len() + scratch.terms.len() + scratch.body.len());
+    out.extend_from_slice(&header_end);
+    out.extend_from_slice(&count_le);
+    out.extend_from_slice(&scratch.terms);
+    out.extend_from_slice(&scratch.body);
+    Ok(())
+}
+
+struct EncodedMeta {
+    kind: u8,
+    count: u32,
+    erased_count: u32,
+    erased_terms_len: usize,
+    erased_body_len: usize,
+    trait_had_laid_assoc: bool,
+}
+
 fn encode_with<'b>(
     head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>, slot: Text, parts: Parts, origin: &dyn Fn(ItemKey) -> Result<OpaqueOrigin, E>,
 ) -> Result<RecordBytes<'b>, HeadRecordError> {
@@ -945,32 +1239,76 @@ fn encode_with<'b>(
     if let Some(r) = head.regions() {
         regions_fit_head(head, r.regions(), tys)?;
     }
+    let mut scratch = EncodeScratch::new_in(alloc);
+    let meta = encode_into_scratch(head, tys, slot, parts, origin, &mut scratch)?;
+    let mut out = RecordBytes::with_capacity_in(13 + scratch.terms.len() + scratch.body.len(), alloc);
+    out.extend_from_slice(&MAGIC);
+    out.extend_from_slice(&VERSION.to_le_bytes());
+    out.push(meta.kind);
+    out.extend_from_slice(&meta.count.to_le_bytes());
+    out.extend_from_slice(&scratch.terms);
+    out.extend_from_slice(&scratch.body);
+    Ok(out)
+}
+
+fn encode_into_scratch<'b>(
+    head: HeadRef<'_, '_>,
+    tys: PTys<'_>,
+    slot: Text,
+    parts: Parts,
+    origin: &dyn Fn(ItemKey) -> Result<OpaqueOrigin, E>,
+    scratch: &mut EncodeScratch<'b>,
+) -> Result<EncodedMeta, HeadRecordError> {
+    scratch.clear();
+    let alloc = *scratch.body.allocator();
     let mut o = Out {
         tys,
         parts,
         origin,
-        terms: RecordBytes::new_in(alloc),
-        body: RecordBytes::new_in(alloc),
-        seen: HashMap::new_in(alloc),
+        terms: &mut scratch.terms,
+        body: &mut scratch.body,
+        seen: &mut scratch.seen,
         count: 0,
-        stack: Vec::new_in(alloc),
-        kids: Vec::new_in(alloc),
+        stack: &mut scratch.stack,
+        kids: &mut scratch.kids,
+        zero_ranges: &mut scratch.zero_ranges,
+        erased_skip_ranges: &mut scratch.erased_skip_ranges,
     };
+    let mut trait_had_laid_assoc = false;
     let kind = match head {
         HeadRef::Fn { key, head, preds, static_, regions: _, misses } => {
             o.key(key);
-            match slot {
-                Text::Kept => {
-                    let text = fn_record_text(head.text, head.text_prefix).ok_or(E::Shape { what: "a fn text prefix must end at the body's opening brace" })?;
-                    let len = u32::try_from(text.len()).map_err(|_| E::TooBig { what: "a fn's text" })?;
-                    o.flag(head.text_prefix.is_some());
-                    o.u32(len);
-                    o.body.extend_from_slice(&ContentId::of(TEXT_DOMAIN, text).0);
-                }
-                Text::Zeroed => {
-                    o.flag(false);
-                    o.u32(0);
-                    o.body.extend_from_slice(&[0; 32]);
+            if head.text_inline {
+                let text = head.text.as_bytes();
+                let len = u32::try_from(text.len()).map_err(|_| E::TooBig { what: "a synthetic fn's text" })?;
+                o.byte(2);
+                o.u32(len);
+                o.body.extend_from_slice(text);
+            } else {
+                match slot {
+                    Text::Kept => {
+                        let text = fn_record_text(head.text, head.text_prefix).ok_or(E::Shape { what: "a fn text prefix must end at the body's opening brace" })?;
+                        let len = u32::try_from(text.len()).map_err(|_| E::TooBig { what: "a fn's text" })?;
+                        let z_start = o.body.len();
+                        o.byte(u8::from(head.text_prefix.is_some()));
+                        o.u32(len);
+                        o.body.extend_from_slice(&ContentId::of(TEXT_DOMAIN, text).0);
+                        o.zero_ranges.push((z_start, o.body.len()));
+                    }
+                    Text::Zeroed => {
+                        o.byte(0);
+                        o.u32(0);
+                        o.body.extend_from_slice(&[0; 32]);
+                    }
+                    Text::InProcess => {
+                        o.byte(u8::from(head.text_prefix.is_some()));
+                        let len = match head.text_prefix {
+                            Some(end) => end,
+                            None => u32::try_from(head.text.len()).map_err(|_| E::TooBig { what: "a fn's text" })?,
+                        };
+                        o.u32(len);
+                        o.body.extend_from_slice(&[0; 32]);
+                    }
                 }
             }
             o.lib(head.lib);
@@ -988,6 +1326,7 @@ fn encode_with<'b>(
             o.flag(head.has_body);
             o.flag(head.c_variadic);
             o.byte(head.qualifiers.byte());
+            o.body.extend_from_slice(&head.cost.bits().to_le_bytes());
             o.count(head.legacy_const_generics.len(), "a fn's legacy const generic positions")?;
             for &k in &head.legacy_const_generics {
                 o.u32(k);
@@ -1041,6 +1380,10 @@ fn encode_with<'b>(
                 o.name(f.name);
                 o.ty(f.ty)?;
             }
+            o.count(row.field_vis.len(), "an ADT's field visibilities")?;
+            for &vis in &row.field_vis {
+                o.byte(vis.byte());
+            }
             o.repr(row.repr);
             o.opt(row.valid.start, |o, s| {
                 o.body.extend_from_slice(&s.to_le_bytes());
@@ -1051,6 +1394,8 @@ fn encode_with<'b>(
                 Ok(())
             })?;
             o.flag(row.args);
+            o.flag(row.capability);
+            o.flag(row.sans_io);
             o.coherence_marks(row.marks);
             o.u32(row.lifetimes);
             o.field_regions(row)?;
@@ -1158,6 +1503,31 @@ fn encode_with<'b>(
                 // Form 11: its item bounds, by its key in the members part.
                 let item = extra.and_then(|x| x.assoc.iter().find(|a| a.name == n)).map(|a| a.item);
                 o.opt(assoc_side.bounds(n, item), |o, p| o.preds(p))?;
+                // Form 37: its item-bound regions state (left out of the erased digest).
+                if o.parts == Parts::WithRegions {
+                    let s = o.body.len();
+                    match assoc_side.regions(n, item) {
+                        AssocRegionsRef::None => {
+                            o.byte(0);
+                            o.erased_skip_ranges.push((s, o.body.len()));
+                        }
+                        AssocRegionsRef::Laid(r) => {
+                            trait_had_laid_assoc = true;
+                            o.byte(1);
+                            o.regions_section(r)?;
+                        }
+                        AssocRegionsRef::Unlaid(u) => {
+                            o.byte(2);
+                            o.byte(u.byte());
+                            o.body.extend_from_slice(&u.detail());
+                            o.erased_skip_ranges.push((s, o.body.len()));
+                        }
+                        AssocRegionsRef::HeadRefused => {
+                            o.byte(3);
+                            o.erased_skip_ranges.push((s, o.body.len()));
+                        }
+                    }
+                }
             }
             o.container_life(life, slot)?;
             K_TRAIT
@@ -1200,6 +1570,7 @@ fn encode_with<'b>(
             o.opt(frame, |o, f| {
                 o.lib(f.module);
                 o.u32(f.generics);
+                o.flag(f.is_const);
                 o.scope(&f.params, &f.consts, &f.bounds, f.self_)
             })?;
             o.container_life(life, slot)?;
@@ -1228,6 +1599,7 @@ fn encode_with<'b>(
                             o.u32(binder);
                             o.u32(var);
                         }
+                        AliasSlot::ObjectDefault => o.byte(3),
                     }
                 }
                 Ok(())
@@ -1264,38 +1636,36 @@ fn encode_with<'b>(
             K_OPAQUE
         }
     };
+    let erased_count = o.count;
+    let erased_terms_len = o.terms.len();
+    let erased_body_len = o.body.len();
     // Form 22: the regions section, after every kind's fields; left out of the erased digest.
     if parts == Parts::WithRegions {
         o.opt(head.regions(), |o, r| o.regions_section(r))?;
     }
-    let mut out = RecordBytes::new_in(alloc);
-    out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&VERSION.to_le_bytes());
-    out.push(kind);
-    out.extend_from_slice(&o.count.to_le_bytes());
-    out.extend_from_slice(&o.terms);
-    out.extend_from_slice(&o.body);
-    Ok(out)
+    Ok(EncodedMeta { kind, count: o.count, erased_count, erased_terms_len, erased_body_len, trait_had_laid_assoc })
 }
 
 /// The writer: the record's term table (first-use order) and the head's fields after it.
-struct Out<'b, 't, 'o> {
+struct Out<'s, 'b, 't, 'o> {
     tys: PTys<'t>,
     /// Whether region bytes are written (the record, the regions digest) or left out (the
     /// erased digest): the regions section and an outlives clause's regions alike.
     parts: Parts,
     origin: &'o dyn Fn(ItemKey) -> Result<OpaqueOrigin, E>,
-    terms: RecordBytes<'b>,
-    body: RecordBytes<'b>,
+    terms: &'s mut RecordBytes<'b>,
+    body: &'s mut RecordBytes<'b>,
     /// Each term written, by its index in `tys`, to its index in the record's table.
-    seen: HashMap<PTy, u32, Alloc<'b>>,
+    seen: &'s mut HashMap<PTy, u32, Alloc<'b>>,
     count: u32,
     /// The walk's work list: a term, and whether its children are already pushed.
-    stack: Vec<(PTy, bool), Alloc<'b>>,
-    kids: Vec<PTy, Alloc<'b>>,
+    stack: &'s mut Vec<(PTy, bool), Alloc<'b>>,
+    kids: &'s mut Vec<PTy, Alloc<'b>>,
+    zero_ranges: &'s mut Vec<(usize, usize), Alloc<'b>>,
+    erased_skip_ranges: &'s mut Vec<(usize, usize), Alloc<'b>>,
 }
 
-impl Out<'_, '_, '_> {
+impl Out<'_, '_, '_, '_> {
     fn byte(&mut self, b: u8) {
         self.body.push(b);
     }
@@ -1449,8 +1819,12 @@ impl Out<'_, '_, '_> {
         self.byte(tag);
         let ranged = tag >= 9;
         let (a, b) = if ranged && slot == Text::Zeroed { (0, 0) } else { (a, b) };
+        let z_start = self.body.len();
         self.u32(a);
         self.u32(b);
+        if ranged && slot == Text::Kept {
+            self.zero_ranges.push((z_start, self.body.len()));
+        }
     }
     fn ty(&mut self, t: PTy) -> Result<(), E> {
         let at = self.term(t)?;
@@ -1568,15 +1942,25 @@ impl Out<'_, '_, '_> {
                     self.byte(3);
                     self.ty(ty)?;
                     if self.parts == Parts::WithRegions {
+                        let s = self.body.len();
                         self.rregion(region);
+                        self.erased_skip_ranges.push((s, self.body.len()));
                     }
                 }
                 PClause::RegionOutlives { long, short } => {
                     self.byte(4);
                     if self.parts == Parts::WithRegions {
+                        let s = self.body.len();
                         self.rregion(long);
                         self.rregion(short);
+                        self.erased_skip_ranges.push((s, self.body.len()));
                     }
+                }
+                PClause::ForFields { container, trait_, args } => {
+                    self.byte(5);
+                    self.ty(container)?;
+                    self.key(trait_);
+                    self.list(args, "a for-fields clause's arguments")?;
                 }
             }
         }
@@ -1856,6 +2240,8 @@ impl Out<'_, '_, '_> {
                 self.kid_list(ranges)?;
             }
             PNode::Tuple(l)
+            | PNode::Record(_, l)
+            | PNode::Union(l)
             | PNode::Adt(_, l)
             | PNode::FnDef(_, l)
             | PNode::FnPtr(l, _)
@@ -1938,6 +2324,21 @@ impl Out<'_, '_, '_> {
             PNode::Never => self.t8(T_NEVER),
             PNode::Tuple(l) => {
                 self.t8(T_TUPLE);
+                self.tlist(l)?;
+            }
+            PNode::Record(s, l) => {
+                self.t8(T_RECORD);
+                self.terms.extend_from_slice(&s.0.to_le_bytes());
+                let names = self.tys.record_names(s).unwrap_or(&[]);
+                let n = u32::try_from(names.len()).map_err(|_| E::TooBig { what: "a record's field names" })?;
+                self.t32(n);
+                for &nm in names {
+                    self.terms.extend_from_slice(&nm.0.to_le_bytes());
+                }
+                self.tlist(l)?;
+            }
+            PNode::Union(l) => {
+                self.t8(T_UNION);
                 self.tlist(l)?;
             }
             PNode::Ref(m, t) => {
@@ -2108,7 +2509,60 @@ pub fn decode_with_origins<'n>(
     alloc: Mem,
     register: &mut dyn FnMut(ItemKey, OpaqueOrigin) -> Result<(), HeadRecordError>,
 ) -> Result<Head<'n>, HeadRecordError> {
+    decode_with_origins_boxed(bytes, text, tys, alloc, register).map(blaze_own::Box::into_inner)
+}
+
+/// As [`decode_with_origins`], keeping the decoded [`Head`] boxed in `alloc` to avoid placing
+/// a large enum value on the stack during small-stack body checks.
+pub fn decode_with_origins_boxed<'n>(
+    bytes: &[u8],
+    text: Option<&'n str>,
+    tys: &PortableTys<'_>,
+    alloc: Mem,
+    register: &mut dyn FnMut(ItemKey, OpaqueOrigin) -> Result<(), HeadRecordError>,
+) -> Result<blaze_own::Box<Head<'n>, Mem>, HeadRecordError> {
     let record = decode_retaining(bytes, text, tys, alloc)?;
+    for &(key, origin) in record.origins.iter() {
+        register(key, origin)?;
+    }
+    Ok(record.head)
+}
+
+/// Verifies that `text` matches a frozen `FnHead`'s recorded length and `TEXT_DOMAIN` digest.
+pub fn verify_fn_text(text: &str, want_len: u32, text_prefix: Option<u32>, want: [u8; 32]) -> bool {
+    fn_record_text(text, text_prefix)
+        .is_some_and(|part| u32::try_from(part.len()) == Ok(want_len) && ContentId::of(TEXT_DOMAIN, part).0 == want)
+}
+
+/// As [`decode_with_origins_boxed`], using `keep_text` to retain inline synthetic text (such as
+/// RFC 3681 field defaults) into the store's `'n` text frame.
+pub fn decode_with_origins_boxed_inline<'n>(
+    bytes: &[u8],
+    text: Option<&'n str>,
+    tys: &PortableTys<'_>,
+    alloc: Mem,
+    keep_text: &mut dyn FnMut(&str) -> &'n str,
+    register: &mut dyn FnMut(ItemKey, OpaqueOrigin) -> Result<(), HeadRecordError>,
+) -> Result<blaze_own::Box<Head<'n>, Mem>, HeadRecordError> {
+    let record = decode_retaining_with(bytes, text, tys, alloc, Some(keep_text), None)?;
+    for &(key, origin) in record.origins.iter() {
+        register(key, origin)?;
+    }
+    Ok(record.head)
+}
+
+/// As [`decode_with_origins_boxed_inline`], delegating fn-text digest verification to
+/// `verify_text` so a stretch can verify each immutable `(key, prefix, want, text)` once (rule 74).
+pub fn decode_with_origins_boxed_inline_verified<'n>(
+    bytes: &[u8],
+    text: Option<&'n str>,
+    tys: &PortableTys<'_>,
+    alloc: Mem,
+    keep_text: &mut dyn FnMut(&str) -> &'n str,
+    verify_text: &mut dyn FnMut(ItemKey, u32, Option<u32>, [u8; 32], &'n str) -> bool,
+    register: &mut dyn FnMut(ItemKey, OpaqueOrigin) -> Result<(), HeadRecordError>,
+) -> Result<blaze_own::Box<Head<'n>, Mem>, HeadRecordError> {
+    let record = decode_retaining_with(bytes, text, tys, alloc, Some(keep_text), Some(verify_text))?;
     for &(key, origin) in record.origins.iter() {
         register(key, origin)?;
     }
@@ -2118,13 +2572,13 @@ pub fn decode_with_origins<'n>(
 /// A standalone head and its origin table. The table belongs to this record, so writing it
 /// again needs only the table in which its terms were interned.
 pub struct DecodedHead<'n> {
-    head: Head<'n>,
+    head: blaze_own::Box<Head<'n>, Mem>,
     origins: Vec<(ItemKey, OpaqueOrigin), Mem>,
 }
 
 impl<'n> DecodedHead<'n> {
     pub fn as_ref(&self) -> HeadRef<'_, 'n> {
-        self.head.as_ref()
+        (*self.head).as_ref()
     }
 
     pub fn encode<'b>(&self, tys: PTys<'_>, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, HeadRecordError> {
@@ -2138,8 +2592,106 @@ impl<'n> DecodedHead<'n> {
 /// Open a head for standalone inspection or byte-exact rewriting. A store imports with
 /// [`decode_with_origins`] so it also has the routes when another type exposes an opaque.
 pub fn decode_retaining<'n>(bytes: &[u8], text: Option<&'n str>, tys: &PortableTys<'_>, alloc: Mem) -> Result<DecodedHead<'n>, HeadRecordError> {
-    let mut r = In { bytes, at: 0, tys, locals: Vec::new_in(alloc), scratch: Vec::new_in(alloc), origins: Vec::new_in(alloc), alloc };
-    if r.take(4, "the magic")? != &MAGIC[..] {
+    decode_retaining_with(bytes, text, tys, alloc, None, None)
+}
+
+/// Stack-inline `PTy` buffer used by [`In`] so decoding typical head records (<= 64 terms,
+/// <= 16 list items) avoids both `blaze_mem::frame::task` setup and heap scratch allocations.
+enum SmallPTys<'s, const N: usize> {
+    Inline { len: usize, buf: [PTy; N] },
+    Heap(Vec<PTy, Alloc<'s>>),
+}
+
+impl<'s, const N: usize> SmallPTys<'s, N> {
+    fn new() -> Self {
+        Self::Inline { len: 0, buf: [PTy(0); N] }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Inline { len, .. } => *len,
+            Self::Heap(v) => v.len(),
+        }
+    }
+
+    fn get(&self, at: usize) -> Option<&PTy> {
+        match self {
+            Self::Inline { len, buf } => buf.get(..*len).and_then(|s| s.get(at)),
+            Self::Heap(v) => v.get(at),
+        }
+    }
+
+    fn as_slice(&self) -> &[PTy] {
+        match self {
+            Self::Inline { len, buf } => buf.get(..*len).unwrap_or(&[]),
+            Self::Heap(v) => v.as_slice(),
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::Inline { len, .. } => *len = 0,
+            Self::Heap(v) => v.clear(),
+        }
+    }
+
+    fn reserve(&mut self, additional: usize, alloc: Alloc<'s>) {
+        match self {
+            Self::Inline { len, buf } => {
+                let needed = len.saturating_add(additional);
+                if needed > N {
+                    let mut v = Vec::with_capacity_in(needed, alloc);
+                    if let Some(s) = buf.get(..*len) {
+                        v.extend_from_slice(s);
+                    }
+                    *self = Self::Heap(v);
+                }
+            }
+            Self::Heap(v) => v.reserve(additional),
+        }
+    }
+
+    fn push(&mut self, value: PTy, alloc: Alloc<'s>) {
+        match self {
+            Self::Inline { len, buf } => {
+                if let Some(slot) = buf.get_mut(*len) {
+                    *slot = value;
+                    *len += 1;
+                    return;
+                }
+                let mut v = Vec::with_capacity_in(N.saturating_mul(2).max(8), alloc);
+                v.extend_from_slice(buf.as_slice());
+                v.push(value);
+                *self = Self::Heap(v);
+            }
+            Self::Heap(v) => v.push(value),
+        }
+    }
+}
+
+const INLINE_DECODE_TERMS: usize = 64;
+const INLINE_DECODE_SCRATCH: usize = 16;
+
+fn decode_retaining_body<'n, 's>(
+    bytes: &[u8],
+    text: Option<&'n str>,
+    tys: &PortableTys<'_>,
+    alloc: Mem,
+    scratch_alloc: Alloc<'s>,
+    keep_text: Option<&mut dyn FnMut(&str) -> &'n str>,
+    verify_text: Option<&mut dyn FnMut(ItemKey, u32, Option<u32>, [u8; 32], &'n str) -> bool>,
+) -> Result<DecodedHead<'n>, HeadRecordError> {
+    let mut r = In {
+        bytes,
+        at: 0,
+        tys,
+        locals: SmallPTys::new(),
+        scratch: SmallPTys::new(),
+        origins: Vec::new_in(alloc),
+        alloc,
+        scratch_alloc,
+    };
+    if r.take(4, "the magic")? != MAGIC.as_slice() {
         return Err(E::NotThisRecord);
     }
     let found = r.u32("the version")?;
@@ -2148,110 +2700,179 @@ pub fn decode_retaining<'n>(bytes: &[u8], text: Option<&'n str>, tys: &PortableT
     }
     let kind = r.u8("the head's kind")?;
     let terms = r.count("the term table")?;
+    // Each term starts with at least a 1-byte tag, so `bytes.len()` safely bounds capacity.
+    r.locals.reserve(terms.min(bytes.len()), scratch_alloc);
     for _ in 0..terms {
         r.node()?;
     }
-    let head = match kind {
-        K_FN => r.fn_head(text)?,
-        K_ADT => r.adt()?,
-        K_CTOR => {
-            let key = r.key("a constructor's key")?;
-            let adt = r.key("a constructor's ADT")?;
-            let generics = r.u32("a constructor's generics")?;
-            let inputs = r.many("a constructor's inputs", |r| r.ty("a constructor's input"))?;
-            let output = r.ty("a constructor's output")?;
-            Head::Ctor { key, sig: CtorSig { adt, generics, inputs, output }, regions: None }
-        }
-        K_TRAIT => r.trait_()?,
-        K_IMPL => r.impl_()?,
-        K_ALIAS => {
-            let key = r.lib("an alias's key")?;
-            let generics = r.u32("an alias's generics")?;
-            let ty = r.ty("an alias's type")?;
-            let defaults = r.defaults()?;
-            let const_params = r.const_params_own()?;
-            let slots = r.opt("an alias's laid regions", |r| {
-                let lifetimes = r.u32("an alias's lifetime count")?;
-                let slots = r.own("an alias's region slots", |r| match r.u8("an alias's region slot")? {
-                    0 => match r.u32("an alias's lifetime index")? {
-                        i if i < lifetimes => Ok(AliasSlot::Lifetime(i)),
-                        _ => Err(E::Shape { what: "an alias's region slot names a lifetime past its count" }),
-                    },
-                    1 => Ok(AliasSlot::Static),
-                    2 => Ok(AliasSlot::Late { binder: r.u32("an alias's bound lifetime's binder")?, var: r.u32("an alias's bound lifetime's variable")? }),
-                    _ => Err(E::Shape { what: "an alias's region slot of no known kind" }),
-                })?;
-                Ok(AliasRegions { lifetimes, slots })
-            })?;
-            Head::Alias { key, generics, ty, defaults, const_params, slots }
-        }
-        K_ALIAS_REFUSED => {
-            let key = r.lib("a refused alias's key")?;
-            let n = r.count("a refused alias's why")?;
-            let text = r.take(n, "a refused alias's why")?;
-            let mut why = Vec::with_capacity_in(n, r.alloc);
-            why.extend_from_slice(text);
-            Head::AliasRefused { key, why }
-        }
-        K_FN_REFUSED => {
-            let key = r.key("a refused fn's key")?;
-            let n = r.count("a refused fn's why")?;
-            let text = r.take(n, "a refused fn's why")?;
-            let mut why = Vec::with_capacity_in(n, r.alloc);
-            why.extend_from_slice(text);
-            Head::FnRefused { key, why }
-        }
-        K_TRAIT_ALIAS => {
-            let key = r.lib("a trait alias's key")?;
-            let generics = r.u32("a trait alias's generics")?;
-            let clauses = r.many("a trait alias's clauses", |r| r.clause())?;
-            let traits = r.many("a trait alias's traits", |r| Ok((r.lib("a trait alias's trait")?, r.list("a trait alias's trait arguments")?)))?;
-            Head::TraitAlias { key, head: TraitAliasHead { generics, clauses, traits } }
-        }
-        K_OPAQUE => {
-            let key = r.key("an opaque type's key")?;
-            let fn_ = r.key("an opaque type's fn")?;
-            let index = r.u32("an opaque type's index")?;
-            check_opaque_row(key, fn_, index)?;
-            let preds = r.opt("an opaque type's bounds", |r| r.preds())?;
-            Head::Opaque { key, fn_, index, preds, regions: None }
-        }
-        byte => return Err(E::Byte { what: "the head's kind", byte }),
-    };
-    let mut head = head;
+    let mut head = r.decode_head_kind(kind, text, keep_text, verify_text)?;
     // Form 22: the regions section, every column laid again over its type here, once.
     if let Some(filed) = r.opt("a head's regions section", |r| r.regions_section())? {
-        regions_fit_head(head.as_ref(), filed.regions(), tys.view())?;
+        regions_fit_head((*head).as_ref(), filed.regions(), tys.view())?;
         head.set_regions(filed)?;
     }
     if r.at != bytes.len() {
         return Err(E::Trailing { at: r.at });
     }
-    r.origins.sort_unstable_by_key(|&(key, _)| key);
-    for pair in r.origins.windows(2) {
-        let (key, first) = pair[0];
-        let (next, second) = pair[1];
-        if key == next && first != second {
-            return Err(E::ConflictingOpaqueOrigin { key, first, second });
-        }
-    }
-    r.origins.dedup_by_key(|(key, _)| *key);
+    r.dedup_origins()?;
     Ok(DecodedHead { head, origins: r.origins })
 }
 
+fn decode_retaining_with<'n>(
+    bytes: &[u8],
+    text: Option<&'n str>,
+    tys: &PortableTys<'_>,
+    alloc: Mem,
+    keep_text: Option<&mut dyn FnMut(&str) -> &'n str>,
+    verify_text: Option<&mut dyn FnMut(ItemKey, u32, Option<u32>, [u8; 32], &'n str) -> bool>,
+) -> Result<DecodedHead<'n>, HeadRecordError> {
+    // Peek `terms` in the 13-byte header (`magic[4] + version[4] + kind[1] + terms[4]`) so
+    // heads with `<= INLINE_DECODE_TERMS` terms decode entirely on the stack without opening a
+    // `blaze_mem::frame::task` scratch frame.
+    let small_terms = bytes
+        .get(9..13)
+        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+        .map(|b| usize::try_from(u32::from_le_bytes(b)).unwrap_or(usize::MAX))
+        .is_none_or(|terms| terms <= INLINE_DECODE_TERMS);
+    if small_terms {
+        decode_retaining_body(bytes, text, tys, alloc, alloc, keep_text, verify_text)
+    } else {
+        blaze_mem::frame::task(blaze_mem::Tag::Parse, |decode_frame| {
+            let erased = blaze_own::Erased::new(decode_frame);
+            decode_retaining_body(bytes, text, tys, alloc, erased.handle(), keep_text, verify_text)
+        })
+    }
+}
+
 /// The reader: the bytes, where it is, and the record's terms as interned so far.
-struct In<'r, 't, 'a> {
+struct In<'r, 't, 'a, 's> {
     bytes: &'r [u8],
     at: usize,
     tys: &'t PortableTys<'a>,
-    /// The record's term `i` is `locals[i]` in `tys`.
-    locals: Vec<PTy, Mem>,
-    scratch: Vec<PTy, Mem>,
+    /// The record's term `i` is `locals[i]` in `tys` (stack-inline for <= 64 terms, spilling to
+    /// `scratch_alloc` for larger records).
+    locals: SmallPTys<'s, INLINE_DECODE_TERMS>,
+    scratch: SmallPTys<'s, INLINE_DECODE_SCRATCH>,
     origins: Vec<(ItemKey, OpaqueOrigin), Mem>,
     alloc: Mem,
+    scratch_alloc: Alloc<'s>,
 }
 
-impl<'r> In<'r, '_, '_> {
+impl<'r> In<'r, '_, '_, '_> {
+    fn box_head<'n>(&self, head: Head<'n>) -> blaze_own::Box<Head<'n>, Mem> {
+        blaze_own::Box::new_in(head, self.alloc)
+    }
+
+    #[inline(never)]
+    fn decode_head_kind<'n>(
+        &mut self,
+        kind: u8,
+        text: Option<&'n str>,
+        keep_text: Option<&mut dyn FnMut(&str) -> &'n str>,
+        verify_text: Option<&mut dyn FnMut(ItemKey, u32, Option<u32>, [u8; 32], &'n str) -> bool>,
+    ) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
+        match kind {
+            K_FN => self.fn_head(text, keep_text, verify_text),
+            K_ADT => self.adt(),
+            K_CTOR => self.ctor(),
+            K_TRAIT => self.trait_(),
+            K_IMPL => self.impl_(),
+            K_ALIAS => self.alias(),
+            K_ALIAS_REFUSED => self.alias_refused(),
+            K_FN_REFUSED => self.fn_refused(),
+            K_TRAIT_ALIAS => self.trait_alias(),
+            K_OPAQUE => self.opaque(),
+            byte => Err(E::Byte { what: "the head's kind", byte }),
+        }
+    }
+
+    #[inline(never)]
+    fn dedup_origins(&mut self) -> Result<(), E> {
+        self.origins.sort_unstable_by_key(|&(key, _)| key);
+        for pair in self.origins.windows(2) {
+            let (key, first) = pair[0];
+            let (next, second) = pair[1];
+            if key == next && first != second {
+                return Err(E::ConflictingOpaqueOrigin { key, first, second });
+            }
+        }
+        self.origins.dedup_by_key(|(key, _)| *key);
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn ctor<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
+        let key = self.key("a constructor's key")?;
+        let adt = self.key("a constructor's ADT")?;
+        let generics = self.u32("a constructor's generics")?;
+        let inputs = self.own("a constructor's inputs", |r| r.ty("a constructor's input"))?;
+        let output = self.ty("a constructor's output")?;
+        Ok(self.box_head(Head::Ctor { key, sig: CtorSig { adt, generics, inputs, output }, regions: None }))
+    }
+
+    #[inline(never)]
+    fn alias<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
+        let key = self.lib("an alias's key")?;
+        let generics = self.u32("an alias's generics")?;
+        let ty = self.ty("an alias's type")?;
+        let defaults = self.defaults()?;
+        let const_params = self.const_params_own()?;
+        let slots = self.opt("an alias's laid regions", |r| {
+            let lifetimes = r.u32("an alias's lifetime count")?;
+            let slots = r.own("an alias's region slots", |r| match r.u8("an alias's region slot")? {
+                0 => match r.u32("an alias's lifetime index")? {
+                    i if i < lifetimes => Ok(AliasSlot::Lifetime(i)),
+                    _ => Err(E::Shape { what: "an alias's region slot names a lifetime past its count" }),
+                },
+                1 => Ok(AliasSlot::Static),
+                2 => Ok(AliasSlot::Late { binder: r.u32("an alias's bound lifetime's binder")?, var: r.u32("an alias's bound lifetime's variable")? }),
+                3 => Ok(AliasSlot::ObjectDefault),
+                _ => Err(E::Shape { what: "an alias's region slot of no known kind" }),
+            })?;
+            Ok(AliasRegions { lifetimes, slots })
+        })?;
+        Ok(self.box_head(Head::Alias { key, generics, ty, defaults, const_params, slots }))
+    }
+
+    #[inline(never)]
+    fn alias_refused<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
+        let key = self.lib("a refused alias's key")?;
+        let n = self.count("a refused alias's why")?;
+        let text = self.take(n, "a refused alias's why")?;
+        let mut why = Vec::with_capacity_in(n, self.alloc);
+        why.extend_from_slice(text);
+        Ok(self.box_head(Head::AliasRefused { key, why }))
+    }
+
+    #[inline(never)]
+    fn fn_refused<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
+        let key = self.key("a refused fn's key")?;
+        let n = self.count("a refused fn's why")?;
+        let text = self.take(n, "a refused fn's why")?;
+        let mut why = Vec::with_capacity_in(n, self.alloc);
+        why.extend_from_slice(text);
+        Ok(self.box_head(Head::FnRefused { key, why }))
+    }
+
+    #[inline(never)]
+    fn trait_alias<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
+        let key = self.lib("a trait alias's key")?;
+        let generics = self.u32("a trait alias's generics")?;
+        let clauses = self.own("a trait alias's clauses", |r| r.clause())?;
+        let traits = self.own("a trait alias's traits", |r| Ok((r.lib("a trait alias's trait")?, r.list("a trait alias's trait arguments")?)))?;
+        Ok(self.box_head(Head::TraitAlias { key, head: TraitAliasHead { generics, clauses, traits } }))
+    }
+
+    #[inline(never)]
+    fn opaque<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
+        let key = self.key("an opaque type's key")?;
+        let fn_ = self.key("an opaque type's fn")?;
+        let index = self.u32("an opaque type's index")?;
+        check_opaque_row(key, fn_, index)?;
+        let preds = self.opt("an opaque type's bounds", |r| r.preds())?;
+        Ok(self.box_head(Head::Opaque { key, fn_, index, preds, regions: None }))
+    }
+
     fn take(&mut self, n: usize, what: &'static str) -> Result<&'r [u8], E> {
         let bytes: &'r [u8] = self.bytes;
         let short = E::Short { what, at: self.at };
@@ -2341,16 +2962,6 @@ impl<'r> In<'r, '_, '_> {
     fn opt<T>(&mut self, what: &'static str, one: impl FnOnce(&mut Self) -> Result<T, E>) -> Result<Option<T>, E> {
         if self.flag(what)? { Ok(Some(one(self)?)) } else { Ok(None) }
     }
-    /// `n` entries into a list of the head types' own kind (their allocator is theirs).
-    fn many<T, C: Default + Extend<T>>(&mut self, what: &'static str, mut one: impl FnMut(&mut Self) -> Result<T, E>) -> Result<C, E> {
-        let n = self.count(what)?;
-        let mut c = C::default();
-        for _ in 0..n {
-            let v = one(self)?;
-            c.extend(core::iter::once(v));
-        }
-        Ok(c)
-    }
     /// `n` entries into a list in the reader's allocator.
     fn own<T>(&mut self, what: &'static str, mut one: impl FnMut(&mut Self) -> Result<T, E>) -> Result<Vec<T, Mem>, E> {
         let n = self.count(what)?;
@@ -2373,25 +2984,49 @@ impl<'r> In<'r, '_, '_> {
         self.scratch.clear();
         for _ in 0..n {
             let t = self.ty(what)?;
-            self.scratch.push(t);
+            self.scratch.push(t, self.scratch_alloc);
         }
         Ok(())
     }
     /// A list, interned into the table.
     fn list(&mut self, what: &'static str) -> Result<List, E> {
         self.tys_into_scratch(what)?;
-        self.tys.intern_list_shared(&self.scratch).map_err(E::Table)
+        self.tys.intern_list_shared(self.scratch.as_slice()).map_err(E::Table)
     }
     fn intern(&mut self, n: PNode) -> Result<(), E> {
         let t = self.tys.intern_shared(n).map_err(E::Table)?;
-        self.locals.push(t);
+        self.locals.push(t, self.scratch_alloc);
         Ok(())
     }
 
     /// One term of the record's table, interned, its children by earlier indices only.
     fn node(&mut self) -> Result<(), E> {
-        const W: &str = "a term";
-        let n = match self.u8("a term's tag")? {
+        let tag = self.u8("a term's tag")?;
+        if tag == T_DYNAMIC {
+            return self.node_dynamic();
+        }
+        let n = match tag {
+            T_BOOL | T_CHAR | T_INT | T_UINT | T_FLOAT | T_STR | T_NEVER | T_ERROR | T_PARAM | T_CONST_PARAM => self.node_scalar(tag)?,
+            T_TUPLE | T_REF | T_PTR | T_ARRAY | T_SLICE | T_PAT | T_ADT | T_FNDEF | T_FNPTR => self.node_compound(tag)?,
+            T_ALIAS | T_OPAQUE | T_CONST_VALUE | T_EX_TRAIT | T_EX_PROJ | T_EX_AUTO | T_FOREIGN => self.node_item(tag)?,
+            T_RECORD | T_UNION => self.node_structural(tag)?,
+            byte => return Err(E::Byte { what: "a term's tag", byte }),
+        };
+        self.intern(n)
+    }
+
+    #[inline(never)]
+    fn node_dynamic(&mut self) -> Result<(), E> {
+        // Through the table's own constructor, which keeps the one canonical form.
+        self.tys_into_scratch("a trait object's predicates")?;
+        let t = self.tys.dynamic_shared(self.scratch.as_slice()).map_err(E::Table)?;
+        self.locals.push(t, self.scratch_alloc);
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn node_scalar(&mut self, tag: u8) -> Result<PNode, E> {
+        Ok(match tag {
             T_BOOL => PNode::Bool,
             T_CHAR => PNode::Char,
             T_INT => PNode::Int(int_of(self.u8("an integer type")?)?),
@@ -2405,6 +3040,17 @@ impl<'r> In<'r, '_, '_> {
             }),
             T_STR => PNode::Str,
             T_NEVER => PNode::Never,
+            T_ERROR => PNode::Error,
+            T_PARAM => PNode::Param(self.u32("a parameter's index")?),
+            T_CONST_PARAM => PNode::ConstParam(self.u32("a const parameter's index")?),
+            byte => return Err(E::Byte { what: "a term's tag", byte }),
+        })
+    }
+
+    #[inline(never)]
+    fn node_compound(&mut self, tag: u8) -> Result<PNode, E> {
+        const W: &str = "a term";
+        Ok(match tag {
             T_TUPLE => PNode::Tuple(self.list("a tuple's elements")?),
             T_REF => {
                 let m = mutbl_of(self.u8("a reference's mutability")?)?;
@@ -2436,7 +3082,14 @@ impl<'r> In<'r, '_, '_> {
                 let l = self.list("a fn pointer's inputs and output")?;
                 PNode::FnPtr(l, h)
             }
-            T_PARAM => PNode::Param(self.u32("a parameter's index")?),
+            byte => return Err(E::Byte { what: "a term's tag", byte }),
+        })
+    }
+
+    #[inline(never)]
+    fn node_item(&mut self, tag: u8) -> Result<PNode, E> {
+        const W: &str = "a term";
+        Ok(match tag {
             T_ALIAS => {
                 let trait_ = self.key("a projection's trait")?;
                 let name = self.name("a projection's name")?;
@@ -2460,18 +3113,9 @@ impl<'r> In<'r, '_, '_> {
                 self.origins.push((k, origin));
                 PNode::Opaque(k, self.list("an opaque type's arguments")?)
             }
-            T_ERROR => PNode::Error,
             T_CONST_VALUE => {
                 let ty = self.ty(W)?;
                 PNode::ConstValue { ty, bits: self.u128("a const value's bits")? }
-            }
-            T_CONST_PARAM => PNode::ConstParam(self.u32("a const parameter's index")?),
-            T_DYNAMIC => {
-                // Through the table's own constructor, which keeps the one canonical form.
-                self.tys_into_scratch("a trait object's predicates")?;
-                let t = self.tys.dynamic_shared(&self.scratch).map_err(E::Table)?;
-                self.locals.push(t);
-                return Ok(());
             }
             T_EX_TRAIT => {
                 let k = self.key("a trait object's principal")?;
@@ -2486,15 +3130,34 @@ impl<'r> In<'r, '_, '_> {
             T_EX_AUTO => PNode::ExAuto(self.key("a trait object's auto trait")?),
             T_FOREIGN => PNode::Foreign(self.key("an extern type")?),
             byte => return Err(E::Byte { what: "a term's tag", byte }),
-        };
-        self.intern(n)
+        })
     }
 
-    fn named_tys<C: Default + Extend<(Name, PTy)>>(&mut self, what: &'static str) -> Result<C, E> {
-        self.many(what, |r| Ok((r.name(what)?, r.ty(what)?)))
+    #[inline(never)]
+    fn node_structural(&mut self, tag: u8) -> Result<PNode, E> {
+        Ok(match tag {
+            T_RECORD => {
+                let s = blaze_typeck::RecordSchema(self.u64("a record's schema")?);
+                let n = self.u32("a record's field name count")?;
+                let mut names = Vec::with_capacity_in(usize::try_from(n).unwrap_or(0).min(self.bytes.len()), self.scratch_alloc);
+                for _ in 0..n {
+                    names.push(self.name("a record's field name")?);
+                }
+                if n > 0 || s == blaze_typeck::RecordSchema::EMPTY {
+                    self.tys.register_record_schema_shared(s, &names).map_err(E::Table)?;
+                }
+                PNode::Record(s, self.list("a record's fields")?)
+            }
+            T_UNION => PNode::Union(self.list("a union's members")?),
+            byte => return Err(E::Byte { what: "a term's tag", byte }),
+        })
     }
-    fn named_keys<C: Default + Extend<(Name, ItemKey)>>(&mut self, what: &'static str) -> Result<C, E> {
-        self.many(what, |r| Ok((r.name(what)?, r.key(what)?)))
+
+    fn named_tys_own(&mut self, what: &'static str) -> Result<Vec<(Name, PTy), Mem>, E> {
+        self.own(what, |r| Ok((r.name(what)?, r.ty(what)?)))
+    }
+    fn named_keys_own(&mut self, what: &'static str) -> Result<Vec<(Name, ItemKey), Mem>, E> {
+        self.own(what, |r| Ok((r.name(what)?, r.key(what)?)))
     }
     fn defaults(&mut self) -> Result<Vec<Option<PTy>, Mem>, E> {
         self.own("parameter defaults", |r| r.opt("a parameter default", |r| r.ty("a parameter default")))
@@ -2502,30 +3165,28 @@ impl<'r> In<'r, '_, '_> {
     fn const_params_own(&mut self) -> Result<Vec<(u32, PTy), Mem>, E> {
         self.own("const parameters", |r| Ok((r.u32("a const parameter")?, r.ty("a const parameter's type")?)))
     }
-    /// `Out::scope`'s fields, into the store's own lists.
-    fn scope<P, C, B>(&mut self) -> Result<(P, C, B, SelfTy), E>
-    where
-        P: Default + Extend<(Name, u32)>,
-        C: Default + Extend<(u32, PTy)>,
-        B: Default + Extend<ParamBound>,
-    {
-        let params = self.many("a fn's parameters in scope", |r| Ok((r.name("a parameter's name")?, r.u32("a parameter's index")?)))?;
-        let consts = self.many("const parameters", |r| Ok((r.u32("a const parameter")?, r.ty("a const parameter's type")?)))?;
-        let bounds = self.many("a fn's parameter bounds", |r| {
+    fn self_ty(&mut self) -> Result<SelfTy, E> {
+        match self.u8("a fn's `Self`")? {
+            0 => Ok(SelfTy::None),
+            1 => Ok(SelfTy::Trait(self.lib("a fn's `Self` trait")?)),
+            2 => {
+                let t = self.ty("a fn's `Self` type")?;
+                let tr = self.opt("`Self`'s trait", |r| Ok((r.lib("`Self`'s trait")?, r.list("`Self`'s trait arguments")?)))?;
+                Ok(SelfTy::Ty(t, tr))
+            }
+            byte => Err(E::Byte { what: "a fn's `Self`", byte }),
+        }
+    }
+    /// `Out::scope`'s fields, into the reader's allocator (`FnHead`, `MemberFrame`).
+    fn scope_own(&mut self) -> Result<(Vec<(Name, u32), Mem>, Vec<(u32, PTy), Mem>, Vec<ParamBound, Mem>, SelfTy), E> {
+        let params = self.own("a fn's parameters in scope", |r| Ok((r.name("a parameter's name")?, r.u32("a parameter's index")?)))?;
+        let consts = self.own("const parameters", |r| Ok((r.u32("a const parameter")?, r.ty("a const parameter's type")?)))?;
+        let bounds = self.own("a fn's parameter bounds", |r| {
             let param = r.u32("a bound's parameter")?;
             let trait_ = r.lib("a bound's trait")?;
             Ok(ParamBound { param, trait_, args: r.list("a parameter bound's arguments")? })
         })?;
-        let self_ = match self.u8("a fn's `Self`")? {
-            0 => SelfTy::None,
-            1 => SelfTy::Trait(self.lib("a fn's `Self` trait")?),
-            2 => {
-                let t = self.ty("a fn's `Self` type")?;
-                let tr = self.opt("`Self`'s trait", |r| Ok((r.lib("`Self`'s trait")?, r.list("`Self`'s trait arguments")?)))?;
-                SelfTy::Ty(t, tr)
-            }
-            byte => return Err(E::Byte { what: "a fn's `Self`", byte }),
-        };
+        let self_ = self.self_ty()?;
         Ok((params, consts, bounds, self_))
     }
     fn clause(&mut self) -> Result<PClause, E> {
@@ -2552,14 +3213,19 @@ impl<'r> In<'r, '_, '_> {
                 let long = self.rregion()?;
                 PClause::RegionOutlives { long, short: self.rregion()? }
             }
+            5 => {
+                let container = self.ty("a for-fields clause's container")?;
+                let trait_ = self.key("a for-fields clause's trait")?;
+                PClause::ForFields { container, trait_, args: self.list("a for-fields clause's arguments")? }
+            }
             byte => return Err(E::Byte { what: "a clause's tag", byte }),
         })
     }
     /// A head's clauses, boxed where they are made ([`HeadPreds`]): what `opt` and the head's
     /// constructor move is the box.
     fn preds(&mut self) -> Result<HeadPreds, E> {
-        let clauses = self.many("where-clauses", |r| r.clause())?;
-        let conds = self.many("`where const` conditions", |r| Ok(lf::ConstIdx(r.u32("a `where const` condition")?)))?;
+        let clauses = self.own("where-clauses", |r| r.clause())?;
+        let conds = self.own("`where const` conditions", |r| Ok(lf::ConstIdx(r.u32("a `where const` condition")?)))?;
         Ok(blaze_own::Box::new_in(Preds::decoded(clauses, conds, self.alloc), self.alloc))
     }
     fn region(&mut self) -> Result<Region, E> {
@@ -2629,7 +3295,8 @@ impl<'r> In<'r, '_, '_> {
     /// in strict key order, each column laid again over its type by the one counter (a slot
     /// short or long is [`HeadRecordError::Regions`]), each `Param` inside the head's count,
     /// clauses by `nth` and fields by (variant, field) strictly ascending ([`check_parts`]).
-    fn regions_section(&mut self) -> Result<FiledRegions, E> {
+    #[inline(never)]
+    fn regions_arity(&mut self) -> Result<ArityTable, E> {
         let adts = self.own("a head's region arity: ADTs", |r| Ok((r.key("an ADT's key")?, r.u32("an ADT's lifetime count")?)))?;
         let opaques = self.own("a head's region arity: opaque types", |r| Ok((r.key("an opaque type's key")?, r.u32("an opaque type's captures")?)))?;
         let aliases = self.own("a head's region arity: projections", |r| {
@@ -2643,16 +3310,18 @@ impl<'r> In<'r, '_, '_> {
         {
             return Err(E::Shape { what: "a head's region arity table is not in strict key order" });
         }
-        let arity = ArityTable { adts, opaques, aliases, traits };
-        let params = self.rparams()?;
-        let mut regions = HeadRegions::new_in(params, self.alloc);
-        regions.sig = self.opt("a head's signature column", |r| r.rcol(&arity, "a head's signature column"))?;
-        regions.written_output = self.opt("a head's written output column", |r| r.rcol(&arity, "a head's written output column"))?;
+        Ok(ArityTable { adts, opaques, aliases, traits })
+    }
+
+    #[inline(never)]
+    fn regions_clauses(&mut self, arity: &ArityTable, regions: &mut HeadRegions<Mem>) -> Result<(), E> {
+        regions.sig = self.opt("a head's signature column", |r| r.rcol(arity, "a head's signature column"))?;
+        regions.written_output = self.opt("a head's written output column", |r| r.rcol(arity, "a head's written output column"))?;
         let clauses = self.count("a head's clause columns")?;
         for _ in 0..clauses {
             let nth = self.u32("a clause column's place")?;
             let binders = self.u32("a clause column's binders")?;
-            let col = self.rcol(&arity, "a clause's column")?;
+            let col = self.rcol(arity, "a clause's column")?;
             regions.clauses.push(ClauseRegions { nth, binders, col });
         }
         let outlives = self.count("a head's outlives clauses")?;
@@ -2664,25 +3333,40 @@ impl<'r> In<'r, '_, '_> {
             };
             regions.outlives.push(c);
         }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn regions_members(&mut self, arity: &ArityTable, regions: &mut HeadRegions<Mem>) -> Result<(), E> {
         let fields = self.count("a head's field columns")?;
         for _ in 0..fields {
             let variant = self.u32("a field column's variant")?;
             let field = self.u32("a field column's field")?;
-            let col = self.rcol(&arity, "a field's column")?;
+            let col = self.rcol(arity, "a field's column")?;
             regions.fields.push((variant, field, col));
         }
         regions.impl_header = self.opt("an impl's header columns", |r| {
-            let self_ = r.rcol(&arity, "an impl's self type column")?;
-            let trait_ = r.opt("an impl's trait reference column", |r| r.rcol(&arity, "an impl's trait reference column"))?;
+            let self_ = r.rcol(arity, "an impl's self type column")?;
+            let trait_ = r.opt("an impl's trait reference column", |r| r.rcol(arity, "an impl's trait reference column"))?;
             Ok((self_, trait_))
         })?;
         let assocs = self.count("an impl's associated type columns")?;
         for _ in 0..assocs {
             let name = self.name("an impl's associated type's name")?;
-            let col = self.rcol(&arity, "an impl's associated type column")?;
+            let col = self.rcol(arity, "an impl's associated type column")?;
             regions.impl_assoc.push((name, col));
         }
         regions.opaque_captures = self.opt("an opaque type's captures", |r| r.u32("an opaque type's captures"))?;
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn regions_section(&mut self) -> Result<FiledRegions, E> {
+        let arity = self.regions_arity()?;
+        let params = self.rparams()?;
+        let mut regions = HeadRegions::new_in(params, self.alloc);
+        self.regions_clauses(&arity, &mut regions)?;
+        self.regions_members(&arity, &mut regions)?;
         check_parts(&regions)?;
         Ok(FiledRegions::of(regions, arity, self.alloc))
     }
@@ -2713,12 +3397,20 @@ impl<'r> In<'r, '_, '_> {
     fn rcol(&mut self, arity: &ArityTable, what: &'static str) -> Result<RegionCol<Mem>, E> {
         let ty = self.ty(what)?;
         let n = self.count(what)?;
-        let mut slots: Vec<RRegion, Mem> = Vec::with_capacity_in(n, self.alloc);
-        for _ in 0..n {
-            let s = self.rregion()?;
-            slots.push(s);
+        let mut inline = [RRegion::Static; 16];
+        if let Some(slice) = inline.get_mut(..n) {
+            for slot in slice.iter_mut() {
+                *slot = self.rregion()?;
+            }
+            RegionCol::lay(self.tys.view(), ty, arity, slice, self.alloc).map_err(|error| E::Regions { what, error })
+        } else {
+            let mut slots: Vec<RRegion, Mem> = Vec::with_capacity_in(n, self.alloc);
+            for _ in 0..n {
+                let s = self.rregion()?;
+                slots.push(s);
+            }
+            RegionCol::lay(self.tys.view(), ty, arity, &slots, self.alloc).map_err(|error| E::Regions { what, error })
         }
-        RegionCol::lay(self.tys.view(), ty, arity, &slots, self.alloc).map_err(|error| E::Regions { what, error })
     }
     fn rregion(&mut self) -> Result<RRegion, E> {
         Ok(match self.u8("a region's form")? {
@@ -2729,16 +3421,61 @@ impl<'r> In<'r, '_, '_> {
         })
     }
 
-    fn fn_head<'n>(&mut self, text: Option<&'n str>) -> Result<Head<'n>, E> {
+    #[inline(never)]
+    fn fn_head<'n>(
+        &mut self,
+        text: Option<&'n str>,
+        keep_text: Option<&mut dyn FnMut(&str) -> &'n str>,
+        verify_text: Option<&mut dyn FnMut(ItemKey, u32, Option<u32>, [u8; 32], &'n str) -> bool>,
+    ) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
+        let (key, head) = self.fn_head_core(text, keep_text, verify_text)?;
+        let preds = self.opt("a fn's where-clauses", |r| r.preds())?;
+        let static_ = self.opt("a static's mutability", |r| mutbl_of(r.u8("a static's mutability")?))?;
+        let misses = self.fn_head_misses(head.text.len())?;
+        Ok(self.box_head(Head::Fn { key, head, preds, static_, regions: None, misses }))
+    }
+
+    #[inline(never)]
+    fn fn_head_core<'n>(
+        &mut self,
+        text: Option<&'n str>,
+        keep_text: Option<&mut dyn FnMut(&str) -> &'n str>,
+        verify_text: Option<&mut dyn FnMut(ItemKey, u32, Option<u32>, [u8; 32], &'n str) -> bool>,
+    ) -> Result<(ItemKey, FnHead<'n>), E> {
         let key = self.key("a fn's key")?;
-        let prefix = self.flag("a fn text's signature-prefix flag")?;
-        let want_len = self.u32("a fn text's length")?;
-        let want: [u8; 32] = self.array("a fn text's digest")?;
-        let text = text.ok_or(E::NoText)?;
-        let text_prefix = prefix.then_some(want_len);
-        if !fn_record_text(text, text_prefix).is_some_and(|part| part.len() == want_len as usize && ContentId::of(TEXT_DOMAIN, part).0 == want) {
-            return Err(E::Text { key, want_len, got_len: text.len() });
-        }
+        let mode = self.u8("a fn text's mode")?;
+        let (text, text_prefix, text_inline) = match mode {
+            0 | 1 => {
+                let prefix = mode == 1;
+                let want_len = self.u32("a fn text's length")?;
+                let want: [u8; 32] = self.array("a fn text's digest")?;
+                let text = text.ok_or(E::NoText)?;
+                let text_prefix = prefix.then_some(want_len);
+                let ok = match verify_text {
+                    Some(check) => check(key, want_len, text_prefix, want, text),
+                    None => verify_fn_text(text, want_len, text_prefix, want),
+                };
+                if !ok {
+                    return Err(E::Text { key, want_len, got_len: text.len() });
+                }
+                (text, text_prefix, false)
+            }
+            2 => {
+                let len = usize::try_from(self.u32("a synthetic fn text's length")?)
+                    .map_err(|_| E::Shape { what: "a synthetic fn's text length overflows usize" })?;
+                let raw = self.take(len, "a synthetic fn's text")?;
+                let s = core::str::from_utf8(raw).map_err(|_| E::Shape { what: "a synthetic fn's text is not UTF-8" })?;
+                let kept = match keep_text {
+                    Some(keep) => keep(s),
+                    None => match text {
+                        Some(given) if given == s => given,
+                        _ => return Err(E::NoText),
+                    },
+                };
+                (kept, None, true)
+            }
+            byte => return Err(E::Byte { what: "a fn text's mode", byte }),
+        };
         let lib = self.lib("a fn's library key")?;
         let container = self.opt("a fn's container", |r| r.key("a fn's container"))?;
         let parent = self.u32("a fn's parent generics")?;
@@ -2746,44 +3483,53 @@ impl<'r> In<'r, '_, '_> {
         let declared = self.u32("a fn's declared generics")?;
         let self_param = self.flag("a fn's `self` parameter")?;
         let header = header_of(self.u8("a fn's header")?)?;
-        let inputs = self.many("a fn's inputs", |r| r.ty("a fn's input"))?;
+        let inputs = self.own("a fn's inputs", |r| r.ty("a fn's input"))?;
         let output = self.ty("a fn's output")?;
         let has_body = self.flag("a fn's body flag")?;
         let c_variadic = self.flag("a fn's C-variadic flag")?;
         let byte = self.u8("a fn's qualifiers")?;
         let qualifiers = super::heads::FnQualifiers::from_byte(byte).ok_or(E::Byte { what: "a fn's qualifiers", byte })?;
-        let legacy_const_generics = self.many("a fn's legacy const generic positions", |r| r.u32("a legacy const generic position"))?;
+        let cost_bits = u16::from_le_bytes(self.array("a fn's cost contract")?);
+        let cost = tc::CostContract::from_bits(cost_bits).ok_or(E::Shape { what: "a fn's cost contract" })?;
+        let legacy_const_generics = self.own("a fn's legacy const generic positions", |r| r.u32("a legacy const generic position"))?;
         let module = self.lib("a fn's module")?;
-        let (params, consts, bounds, self_) = self.scope()?;
-        let self_assoc = self.named_tys("a fn's `Self` associated types")?;
-        let head = FnHead {
-            lib,
-            text,
-            text_prefix,
-            container,
-            parent,
-            own,
-            declared,
-            self_param,
-            header,
-            c_variadic,
-            qualifiers,
-            legacy_const_generics,
-            inputs,
-            output,
-            has_body,
-            module,
-            params,
-            consts,
-            bounds,
-            self_,
-            self_assoc,
-        };
-        let preds = self.opt("a fn's where-clauses", |r| r.preds())?;
-        let static_ = self.opt("a static's mutability", |r| mutbl_of(r.u8("a static's mutability")?))?;
-        let misses = self.own("a fn's signature misses", |r| {
+        let (params, consts, bounds, self_) = self.scope_own()?;
+        let self_assoc = self.named_tys_own("a fn's `Self` associated types")?;
+        Ok((
+            key,
+            FnHead {
+                lib,
+                text,
+                text_prefix,
+                text_inline,
+                container,
+                parent,
+                own,
+                declared,
+                self_param,
+                header,
+                c_variadic,
+                qualifiers,
+                cost,
+                legacy_const_generics,
+                inputs,
+                output,
+                has_body,
+                module,
+                params,
+                consts,
+                bounds,
+                self_,
+                self_assoc,
+            },
+        ))
+    }
+
+    #[inline(never)]
+    fn fn_head_misses(&mut self, text_len: usize) -> Result<Vec<HeadMiss, Mem>, E> {
+        self.own("a fn's signature misses", |r| {
             let at = blaze_surface::Range::new(r.u32("a signature miss's start")?, r.u32("a signature miss's end")?);
-            if at.start > at.end || at.end as usize > text.len() {
+            if at.start > at.end || usize::try_from(at.end).map_or(true, |end| end > text_len) {
                 return Err(E::Shape { what: "a signature miss's range is not within the fn's text" });
             }
             let n = r.count("a signature miss's words")?;
@@ -2795,11 +3541,11 @@ impl<'r> In<'r, '_, '_> {
                 _ => return Err(E::Shape { what: "a signature miss of no known kind" }),
             };
             Ok(HeadMiss { at, words, of })
-        })?;
-        Ok(Head::Fn { key, head, preds, static_, regions: None, misses })
+        })
     }
 
-    fn adt<'n>(&mut self) -> Result<Head<'n>, E> {
+    #[inline(never)]
+    fn adt<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
         let key = self.lib("an ADT's key")?;
         let kind = match self.u8("an ADT's kind")? {
             0 => tc::AdtKind::Struct,
@@ -2809,7 +3555,7 @@ impl<'r> In<'r, '_, '_> {
         };
         let generics = self.u32("an ADT's generics")?;
         // Both lists' types are the row's (inferred from it below), never named here.
-        let variants = self.many("an ADT's variants", |r| {
+        let variants = self.own("an ADT's variants", |r| {
             let key = r.key("a variant's key")?;
             let name = r.name("a variant's name")?;
             let ctor = match r.u8("a variant's constructor kind")? {
@@ -2822,13 +3568,19 @@ impl<'r> In<'r, '_, '_> {
             let len = r.u32("a variant's field count")?;
             Ok(tc::Variant { key, name, ctor, fields: List { start, len } })
         })?;
-        let fields: std::vec::Vec<tc::Field> = self.many("an ADT's fields", |r| Ok(tc::Field { name: r.name("a field's name")?, ty: r.ty("a field's type")? }))?;
+        let fields = self.own("an ADT's fields", |r| Ok(tc::Field { name: r.name("a field's name")?, ty: r.ty("a field's type")? }))?;
+        let field_vis = self.own("an ADT's field visibilities", |r| {
+            let byte = r.u8("an ADT's field visibility")?;
+            MemberVis::of_byte(byte).ok_or(E::Byte { what: "an ADT's field visibility", byte })
+        })?;
         let repr = self.repr()?;
         let valid = blaze_build::layout::ValidRange {
             start: self.opt("an ADT's valid range start", |r| r.u128("a valid range start"))?,
             end: self.opt("an ADT's valid range end", |r| r.u128("a valid range end"))?,
         };
         let args = self.flag("an ADT's `#[blaze::args]` mark")?;
+        let capability = self.flag("an ADT's `#[blaze::capability]` mark")?;
+        let sans_io = self.flag("an ADT's `#![blaze::sans_io]` scope mark")?;
         let marks = self.coherence_marks()?;
         let lifetimes = self.u32("an ADT's declared lifetime arity")?;
         let mut field_region_at = Vec::with_capacity_in(fields.len(), self.alloc);
@@ -2846,7 +3598,7 @@ impl<'r> In<'r, '_, '_> {
                 field_region_at.push(super::borrows::NO_ROW);
             }
         }
-        let discrs = self.many("an enum's discriminants", |r| Ok(i128::from_le_bytes(r.array("a discriminant")?)))?;
+        let discrs = self.own("an enum's discriminants", |r| Ok(i128::from_le_bytes(r.array("a discriminant")?)))?;
         let defaults = self.defaults()?;
         let const_params = self.const_params_own()?;
         let field_defaults = self.own("an ADT's field defaults", |r| r.opt("a field default", |r| r.key("a field default's key")))?;
@@ -2868,7 +3620,10 @@ impl<'r> In<'r, '_, '_> {
         })?;
         let fieldless = self.opt("a fieldless enum's variant count", |r| r.u32("a fieldless enum's variant count"))?;
         let field_regions = super::borrows::FieldRegions::new(field_region_at, field_region_list, self.alloc);
-        let row = AdtRow { kind, generics, variants, fields, repr, valid, discrs, args, marks, lifetimes, field_regions };
+        let row = AdtRow { kind, generics, variants, fields, field_vis, repr, valid, discrs, args, capability, sans_io, marks, lifetimes, field_regions };
+        if row.field_vis.len() != row.fields.len() {
+            return Err(E::Shape { what: "an ADT's field visibilities are not one per field" });
+        }
         for v in &row.variants {
             let end = v.fields.start.checked_add(v.fields.len);
             if end.and_then(|e| usize::try_from(e).ok()).is_none_or(|e| e > row.fields.len()) {
@@ -2878,7 +3633,7 @@ impl<'r> In<'r, '_, '_> {
         if !field_defaults.is_empty() && field_defaults.len() != row.fields.len() {
             return Err(E::Shape { what: "an ADT's field defaults are not one per field" });
         }
-        Ok(Head::Adt { key, row, defaults, const_params, field_defaults, preds, life, fieldless, regions: None })
+        Ok(self.box_head(Head::Adt { key, row, defaults, const_params, field_defaults, preds, life, fieldless, regions: None }))
     }
 
     fn repr(&mut self) -> Result<ReprAttrs, E> {
@@ -2947,29 +3702,30 @@ impl<'r> In<'r, '_, '_> {
         Ok(MemberFacts { name, shape })
     }
 
-    fn trait_<'n>(&mut self) -> Result<Head<'n>, E> {
+    #[inline(never)]
+    fn trait_<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
         let key = self.lib("a trait's key")?;
         let generics = self.u32("a trait's generics")?;
-        let defaults = self.many("parameter defaults", |r| r.opt("a parameter default", |r| r.ty("a parameter default")))?;
-        let assoc = self.many("a trait's associated types", |r| r.name("an associated type's name"))?;
-        let fns = self.named_keys("a trait's fns")?;
+        let defaults = self.own("parameter defaults", |r| r.opt("a parameter default", |r| r.ty("a parameter default")))?;
+        let assoc = self.own("a trait's associated types", |r| r.name("an associated type's name"))?;
+        let fns = self.named_keys_own("a trait's fns")?;
         let flags = tc::TraitFlags(self.u32("a trait's flags")?);
         let marks = self.coherence_marks()?;
         let all_self_defaults = self.flag("a trait's parameters all default to Self")?;
-        let members = self.many("a trait's member facts", |r| r.member())?;
+        let members = self.own("a trait's member facts", |r| r.member())?;
         let head = TraitHead { generics, defaults, assoc, fns, flags, members, marks, all_self_defaults };
         if head.all_self_defaults != super::heads::all_self_defaults(&head.defaults, self.tys.view()) {
             return Err(E::Shape { what: "a trait's Self-default flag disagrees with its parameter defaults" });
         }
         let extra = self.opt("a trait's members part", |r| {
-            let supertraits = r.many("a trait's supertrait clauses", |r| r.clause())?;
-            let assoc = r.many("a trait's associated type rows", |r| {
+            let supertraits = r.own("a trait's supertrait clauses", |r| r.clause())?;
+            let assoc = r.own("a trait's associated type rows", |r| {
                 let name = r.name("an associated type's name")?;
                 let item = r.key("an associated type's key")?;
                 let default = r.opt("an associated type's default", |r| r.ty("an associated type's default"))?;
                 Ok(tc::AssocTyDef { name, item, default })
             })?;
-            let consts = r.named_keys("a trait's associated constants")?;
+            let consts = r.named_keys_own("a trait's associated constants")?;
             Ok(TraitExtra { supertraits, assoc, consts })
         })?;
         let supers = self.own("a trait's supertraits", |r| Ok((r.lib("a supertrait")?, r.list("a supertrait's arguments")?)))?;
@@ -2998,52 +3754,68 @@ impl<'r> In<'r, '_, '_> {
             if bounds.is_some() && !extra.as_ref().is_some_and(|x| x.assoc.iter().any(|a| a.name == name)) {
                 return Err(E::Shape { what: "an associated type's item bounds with no row in the trait's members part" });
             }
-            assoc_side.push(AssocSide { name, generics, where_, consts, bounds });
+            let regions = match self.u8("an associated type's regions")? {
+                0 => AssocRegions::None,
+                1 => AssocRegions::Laid(self.regions_section()?),
+                2 => {
+                    let byte = self.u8("an associated type's unlaid kind")?;
+                    let detail = self.array::<{ Unlaid::DETAIL }>("an associated type's unlaid detail")?;
+                    let u = Unlaid::of_bytes(byte, detail).ok_or(E::Byte { what: "an associated type's unlaid kind", byte })?;
+                    AssocRegions::Unlaid(u)
+                }
+                3 => AssocRegions::HeadRefused,
+                byte => return Err(E::Byte { what: "an associated type's regions", byte }),
+            };
+            if !matches!(regions, AssocRegions::None) && !extra.as_ref().is_some_and(|x| x.assoc.iter().any(|a| a.name == name)) {
+                return Err(E::Shape { what: "an associated type's regions with no row in the trait's members part" });
+            }
+            assoc_side.push(AssocSide { name, generics, where_, consts, bounds, regions });
         }
         let life = self.container_life()?;
-        Ok(Head::Trait { key, head, extra, supers, const_params, preds, assoc_side, life, regions: None })
+        Ok(self.box_head(Head::Trait { key, head, extra, supers, const_params, preds, assoc_side, life, regions: None }))
     }
 
-    fn impl_<'n>(&mut self) -> Result<Head<'n>, E> {
+    #[inline(never)]
+    fn impl_<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
         let key = self.key("an impl's key")?;
         let generics = self.u32("an impl's generics")?;
         let self_ty = self.ty("an impl's self type")?;
         let trait_ = self.opt("an impl's trait", |r| r.key("an impl's trait"))?;
         let n = self.count("an impl's trait arguments")?;
         self.scratch.clear();
-        self.scratch.push(self_ty);
+        self.scratch.push(self_ty, self.scratch_alloc);
         for _ in 0..n {
             let t = self.ty("an impl's trait argument")?;
-            self.scratch.push(t);
+            self.scratch.push(t, self.scratch_alloc);
         }
         let trait_args = match trait_ {
             None if n == 0 => tc::ArgsAfterSelf::NONE,
             None => return Err(E::Shape { what: "an inherent impl with trait arguments" }),
             Some(_) => {
                 // The trait reference's whole list, `Self` first, split as the lowering does.
-                let with_self = self.tys.intern_list_shared(&self.scratch).map_err(E::Table)?;
+                let with_self = self.tys.intern_list_shared(self.scratch.as_slice()).map_err(E::Table)?;
                 tc::ArgsAfterSelf::split(self.tys.view(), with_self, self_ty)
                     .map_err(|_| E::Shape { what: "an impl's trait arguments do not follow its self type" })?
             }
         };
-        let assoc = self.named_tys("an impl's associated types")?;
-        let fns = self.named_keys("an impl's fns")?;
-        let fn_self = self.many("an impl's fn `self` flags", |r| match r.u8("an impl's fn `self` flag")? {
+        let assoc = self.named_tys_own("an impl's associated types")?;
+        let fns = self.named_keys_own("an impl's fns")?;
+        let fn_self = self.own("an impl's fn `self` flags", |r| match r.u8("an impl's fn `self` flag")? {
             0 => Ok(false),
             1 => Ok(true),
             byte => Err(E::Byte { what: "an impl's fn `self` flag", byte }),
         })?;
-        let fn_vis = self.many("an impl's fn visibilities", |r| {
+        let fn_vis = self.own("an impl's fn visibilities", |r| {
             let byte = r.u8("an impl's fn visibility")?;
             MemberVis::of_byte(byte).ok_or(E::Byte { what: "an impl's fn visibility", byte })
         })?;
-        let unstable = self.many("an impl's unstable members", |r| {
+        let unstable = self.own("an impl's unstable members", |r| {
             let name = r.name("an unstable member's name")?;
             let feature = Box::<str>::from(r.text("an unstable member's feature")?);
             let implied_by = r.opt("an unstable member's `implied_by`", |r| Ok(Box::<str>::from(r.text("an unstable member's `implied_by`")?)))?;
             Ok((name, super::heads::Unstable { feature, implied_by }))
         })?;
-        let consts = self.named_keys("an impl's constants")?;
+        let consts = self.named_keys_own("an impl's constants")?;
         let polarity = match self.u8("an impl's polarity")? {
             0 => tc::ImplPolarity::Positive,
             1 => tc::ImplPolarity::Negative,
@@ -3054,8 +3826,9 @@ impl<'r> In<'r, '_, '_> {
         let frame = self.opt("an impl's members' frame", |r| {
             let module = r.lib("a frame's module")?;
             let generics = r.u32("a frame's generics")?;
-            let (params, consts, bounds, self_) = r.scope()?;
-            Ok(MemberFrame { module, generics, params, consts, bounds, self_ })
+            let is_const = r.flag("a frame's const")?;
+            let (params, consts, bounds, self_) = r.scope_own()?;
+            Ok(MemberFrame { module, generics, is_const, params, consts, bounds, self_ })
         })?;
         let head = ImplHead { generics, self_ty, trait_, trait_args, assoc, fns, fn_self, fn_vis, unstable, consts, polarity };
         if head.fn_self.len() != head.fns.len() {
@@ -3065,7 +3838,7 @@ impl<'r> In<'r, '_, '_> {
             return Err(E::Shape { what: "an impl's fn visibilities are not one per fn" });
         }
         let life = self.container_life()?;
-        Ok(Head::Impl { key, head, preds, frame, life, regions: None })
+        Ok(self.box_head(Head::Impl { key, head, preds, frame, life, regions: None }))
     }
 }
 
@@ -3134,6 +3907,10 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
                 (PClause::Const { cond: c1, args: a1 }, PClause::Const { cond: c2, args: a2 }) => c1 == c2 && l(a1, a2),
                 (PClause::TypeOutlives { ty: t1, region: r1 }, PClause::TypeOutlives { ty: t2, region: r2 }) => t1 == t2 && r1 == r2,
                 (PClause::RegionOutlives { long: l1, short: s1 }, PClause::RegionOutlives { long: l2, short: s2 }) => l1 == l2 && s1 == s2,
+                (
+                    PClause::ForFields { container: c1, trait_: t1, args: a1 },
+                    PClause::ForFields { container: c2, trait_: t2, args: a2 },
+                ) => c1 == c2 && t1 == t2 && l(a1, a2),
                 _ => false,
             })
     };
@@ -3150,6 +3927,7 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(k1 == k2, "a fn's key");
             need!(h1.lib == h2.lib, "a fn's library key");
             need!(h1.text == h2.text, "a fn's text");
+            need!(h1.text_inline == h2.text_inline, "a fn's inline-text flag");
             need!(h1.container == h2.container, "a fn's container");
             need!((h1.parent, h1.own, h1.declared) == (h2.parent, h2.own, h2.declared), "a fn's generic counts");
             need!(h1.self_param == h2.self_param, "a fn's `self` parameter");
@@ -3159,6 +3937,7 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(h1.has_body == h2.has_body, "a fn's body flag");
             need!(h1.c_variadic == h2.c_variadic, "a fn's C-variadic flag");
             need!(h1.qualifiers == h2.qualifiers, "a fn's typing attributes, const qualifier and std-internal binding");
+            need!(h1.cost == h2.cost, "a fn's cost contract");
             need!(h1.legacy_const_generics[..] == h2.legacy_const_generics[..], "a fn's legacy const generic positions");
             need!(h1.module == h2.module, "a fn's module");
             need!(h1.params[..] == h2.params[..], "a fn's parameters in scope");
@@ -3185,8 +3964,11 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(r1.kind == r2.kind && r1.generics == r2.generics, "an ADT's kind or generics");
             need!(r1.variants[..] == r2.variants[..], "an ADT's variants");
             need!(r1.fields[..] == r2.fields[..], "an ADT's fields");
+            need!(r1.field_vis[..] == r2.field_vis[..], "an ADT's field visibilities");
             need!(r1.repr == r2.repr && r1.valid == r2.valid, "an ADT's repr");
             need!(r1.args == r2.args, "an ADT's `#[blaze::args]` mark");
+            need!(r1.capability == r2.capability, "an ADT's `#[blaze::capability]` mark");
+            need!(r1.sans_io == r2.sans_io, "an ADT's `#![blaze::sans_io]` scope mark");
             need!(r1.marks == r2.marks, "an ADT's coherence marks");
             need!(r1.lifetimes == r2.lifetimes, "an ADT's declared lifetime arity");
             need!(r1.field_regions.at[..] == r2.field_regions.at[..] && r1.field_regions.list[..] == r2.field_regions.list[..], "an ADT's field region positions");
@@ -3223,6 +4005,15 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(
                 h1.assoc.iter().all(|&n| preds(s1.bounds(n, item_of(x1, n)), s2.bounds(n, item_of(x2, n)))),
                 "a trait's associated types' item bounds"
+            );
+            need!(
+                h1.assoc.iter().all(|&n| match (s1.regions(n, item_of(x1, n)), s2.regions(n, item_of(x2, n))) {
+                    (AssocRegionsRef::None, AssocRegionsRef::None) | (AssocRegionsRef::HeadRefused, AssocRegionsRef::HeadRefused) => true,
+                    (AssocRegionsRef::Laid(a), AssocRegionsRef::Laid(b)) => regions_same(Some(a), Some(b)),
+                    (AssocRegionsRef::Unlaid(a), AssocRegionsRef::Unlaid(b)) => a == b,
+                    _ => false,
+                }),
+                "a trait's associated types' regions"
             );
             need!(k1 == k2 && h1.generics == h2.generics, "a trait's key or generics");
             need!(h1.defaults[..] == h2.defaults[..], "a trait's parameter defaults");
@@ -3414,6 +4205,24 @@ impl FiledRegions {
     /// under one of its columns counts by these, never by what the store has made since.
     pub fn arity(&self) -> &dyn Arity {
         &self.parts.arity
+    }
+}
+
+impl blaze_typeck::region_facts::HeadRegionRead for FiledRegions {
+    fn arity(&self) -> &dyn Arity {
+        FiledRegions::arity(self)
+    }
+
+    fn impl_header(&self) -> Option<(ColView<'_>, Option<ColView<'_>>)> {
+        self.regions().impl_header.as_ref().map(|(s, t)| (ColView::of(s), t.as_ref().map(ColView::of)))
+    }
+
+    fn clause_count(&self) -> usize {
+        self.regions().clauses.len()
+    }
+
+    fn clause(&self, idx: usize) -> Option<(u32, u32, ColView<'_>)> {
+        self.regions().clauses.get(idx).map(|c| (c.nth, c.binders, ColView::of(&c.col)))
     }
 }
 
@@ -3613,6 +4422,16 @@ pub struct RegionTable {
     unlaid: Rows<ItemKey, (Unlaid, &'static str), Mem>,
 }
 
+impl RegionTable {
+    pub fn clear(&mut self) {
+        let RegionTable { made, refused, forms, unlaid } = self;
+        made.clear();
+        refused.clear();
+        forms.clear();
+        unlaid.clear();
+    }
+}
+
 /// Why a head filed whole has no regions: the kind of its soft refusal, the one name a
 /// reader is told ([`UnreadWhy::Refused`]) and the byte a frozen cell records it by (front2
 /// tables/head.rs form 11: a head of a kind that holds regions is recorded laid or refused,
@@ -3789,6 +4608,11 @@ impl RegionTable {
         self.refused.insert(item, ());
     }
 
+    /// Whether `item`'s head was filed as refused.
+    pub fn is_refused(&self, item: ItemKey) -> bool {
+        self.refused.contains_key(&item)
+    }
+
     /// Files that `item`'s record was of form `found`: reported and rebuilt, never migrated.
     pub fn file_form(&self, item: ItemKey, found: u32) {
         self.forms.insert(item, found);
@@ -3814,27 +4638,27 @@ impl RegionTable {
     }
 
     /// The reader over this table; `alloc` holds the clause views it hands out.
-    pub fn reader(&self, alloc: Mem) -> RegionReader<'_> {
+    pub fn reader<A: core::alloc::Allocator + Copy>(&self, alloc: A) -> RegionReader<'_, A> {
         RegionReader { table: self, views: Rows::new_in(alloc), alloc }
     }
 }
 
 /// [`RegionFacts`] over a [`RegionTable`]: what the flow lowering's `Facts` hands its readers
 /// (pieces L3, L4, L5). Each item's clause views are made once, when first asked, and kept.
-pub struct RegionReader<'s> {
+pub struct RegionReader<'s, A: core::alloc::Allocator + Copy = Mem> {
     table: &'s RegionTable,
-    views: Rows<ItemKey, Vec<ClauseView<'s>, Mem>, Mem>,
-    alloc: Mem,
+    views: Rows<ItemKey, Vec<ClauseView<'s>, A>, A>,
+    alloc: A,
 }
 
-impl<'s> RegionReader<'s> {
+impl<'s, A: core::alloc::Allocator + Copy> RegionReader<'s, A> {
     fn made(&self, item: ItemKey) -> Result<&'s FiledRegions, RegionsUnread> {
         let table: &'s RegionTable = self.table;
         table.made(item).ok_or_else(|| table.unread(item))
     }
 }
 
-impl RegionFacts for RegionReader<'_> {
+impl<A: core::alloc::Allocator + Copy> RegionFacts for RegionReader<'_, A> {
     fn sig(&self, item: ItemKey) -> Result<SigRegions<'_>, RegionsUnread> {
         self.made(item)?.regions().sig_view().ok_or(RegionsUnread { item, why: UnreadWhy::NoHead })
     }
@@ -3844,9 +4668,10 @@ impl RegionFacts for RegionReader<'_> {
             return Ok(&v[..]);
         }
         let r = self.made(item)?;
+        let outlives = &r.regions().outlives[..];
         let mut v = Vec::with_capacity_in(r.regions().clauses.len(), self.alloc);
         for c in r.regions().clauses.iter() {
-            v.push(ClauseView::of(c));
+            v.push(ClauseView::of_in(c, outlives));
         }
         self.views.insert(item, v);
         self.views.get(&item).map(|v| &v[..]).ok_or(RegionsUnread { item, why: UnreadWhy::NoHead })
@@ -4026,7 +4851,9 @@ mod region_tests {
     }
 
     fn ctor(t: &Tys) -> CtorSig {
-        CtorSig { adt: S, generics: 0, inputs: std::vec![t.r], output: t.s }
+        let mut inputs = Vec::with_capacity_in(1, a());
+        inputs.push(t.r);
+        CtorSig { adt: S, generics: 0, inputs, output: t.s }
     }
 
     fn record(t: &Tys, sig: &CtorSig, regions: Option<&FiledRegions>) -> std::vec::Vec<u8> {
@@ -4176,7 +5003,9 @@ mod region_tests {
         // CONTROL: an erased edit, `fn(&u8) -> &u8` in place of `fn(&u8) -> S`, moves both.
         let io = t.tys.intern_list_shared(&[t.r, t.r]).unwrap();
         let f2 = t.tys.intern_shared(PNode::FnPtr(io, RUST)).unwrap();
-        let sig2 = CtorSig { adt: S, generics: 0, inputs: std::vec![t.r], output: t.r };
+        let mut sig2_inputs = Vec::with_capacity_in(1, a());
+        sig2_inputs.push(t.r);
+        let sig2 = CtorSig { adt: S, generics: 0, inputs: sig2_inputs, output: t.r };
         let mut r2 = HeadRegions::new_in(LifetimeParams::new_in(2, a()), a());
         r2.sig = Some(lay(&t, f2, &[RRegion::Param(0), RRegion::Param(0)]));
         let z = FiledRegions::new(r2, &Toy, t.tys.view(), a()).unwrap_or_else(|e| panic!("filed: {e}"));
@@ -4249,5 +5078,45 @@ mod region_tests {
         );
         let control = filed([ASSOC_A, ASSOC_B], 1);
         assert!(control.is_ok(), "CONTROL: columns in name order were refused: {:?}", control.err().map(|e| std::format!("{e}")));
+    }
+
+    /// A head record written with the previous layout version (`34`) is rejected cleanly.
+    #[test]
+    fn previous_version_34_is_rejected() {
+        let t = tys();
+        let sig = ctor(&t);
+        let filed = every_part(&t, RRegion::Param(0));
+        let mut old = record(&t, &sig, Some(&filed));
+        old[4..8].copy_from_slice(&34u32.to_le_bytes());
+        let err = decode(&old, None, &tys_empty(), a()).err().expect("version 34 must be rejected");
+        assert_eq!(form_of(&err), Some(34));
+    }
+
+    /// Single-pass [`encode_with_digests_into`] reusing one [`EncodeScratch`] produces bytes,
+    /// reader digest, and regions digest identical to the separate encoders.
+    #[test]
+    fn encode_with_digests_into_matches_separate_encode_and_digests() {
+        let t = tys();
+        let sig = ctor(&t);
+        let r0 = every_part(&t, RRegion::Param(0));
+        let r1 = every_part(&t, RRegion::Param(1));
+        let cases = [
+            HeadRef::Ctor { key: CTOR, sig: &sig, regions: None },
+            HeadRef::Ctor { key: CTOR, sig: &sig, regions: Some(&r0) },
+            HeadRef::Ctor { key: CTOR, sig: &sig, regions: Some(&r1) },
+        ];
+        let mut scratch = EncodeScratch::new_in(a());
+        let mut payload: RecordBytes<'_> = RecordBytes::new_in(a());
+        for head in cases {
+            let start = payload.len();
+            let (erased, regions) = encode_with_digests_into(head, t.tys.view(), &missing_origin, &mut scratch, &mut payload)
+                .unwrap_or_else(|e| panic!("encode_with_digests_into: {e}"));
+            let want_bytes = encode(head, t.tys.view(), a()).unwrap_or_else(|e| panic!("encode: {e}"));
+            let want_erased = reader_digest(head, t.tys.view(), a()).unwrap_or_else(|e| panic!("reader_digest: {e}"));
+            let want_regions = regions_digest(head, t.tys.view(), a()).unwrap_or_else(|e| panic!("regions_digest: {e}"));
+            assert_eq!(&payload[start..], &want_bytes[..], "payload bytes differ");
+            assert_eq!(erased, want_erased, "erased reader digest differs");
+            assert_eq!(regions, want_regions, "regions digest differs");
+        }
     }
 }

@@ -190,6 +190,13 @@ pub struct ImplTablesDone<'a> {
     pub failed: Option<ImplTablesFailed>,
 }
 
+/// The digest of a crate's written impl tables (`OUT_DOMAIN`).
+pub fn impl_tables_out(records: &CrateImpls<'_>) -> ContentId {
+    let mut out = Hasher::new(OUT_DOMAIN);
+    out.part(&records.directory).part(&records.no_impls_of);
+    out.finish()
+}
+
 /// THE TASK: crate `krate`'s impl tables from its impl rows `rows` (the task's input, which its
 /// key covers), each name the filing asks answered through the read-only view over `records`
 /// with its cells recorded, its buffers in `alloc`. Pure in (rows, records, alloc).
@@ -201,11 +208,10 @@ pub fn impl_tables_task<'n, 'a>(records: &'n Records<'n>, krate: usize, rows: &[
     let reads = recorder.finish();
     let failed = match (written, reads) {
         (Ok(t), Ok(reads)) => {
-            let mut out = Hasher::new(OUT_DOMAIN);
-            out.part(&t.records.directory).part(&t.records.no_impls_of);
+            let out = impl_tables_out(&t.records);
             let mut defines: AVec<'a, (drive::Cell, ContentId)> = AVec::with_capacity_in(t.defines.len(), alloc);
             defines.extend(t.defines.iter().map(|(cell, digest)| (drive::Cell(*cell), *digest)));
-            return ImplTablesDone { name: impl_tables_name(t.krate), key: drive::Key(t.key), out: out.finish(), records: Some(t.records), defines, reads, counts: t.counts, failed: None };
+            return ImplTablesDone { name: impl_tables_name(t.krate), key: drive::Key(t.key), out, records: Some(t.records), defines, reads, counts: t.counts, failed: None };
         }
         (Err(e), _) => ImplTablesFailed::Tables(e),
         (Ok(_), Err(e)) => ImplTablesFailed::Reads(e),
@@ -299,25 +305,35 @@ fn key_of(crate_key: CrateItemKey, digests: impl Iterator<Item = ContentId>) -> 
 
 /// [`key_of`] of `rows` in any order.
 pub fn rows_key(crate_key: CrateItemKey, rows: &[ImplRow<'_>]) -> ContentId {
-    let mut by_key: Vec<(LibKey, ContentId), Global> = Vec::with_capacity_in(rows.len(), Global);
-    by_key.extend(rows.iter().map(|row| (row.key, row_digest(row))));
-    by_key.sort_unstable_by_key(|it| it.0);
-    key_of(crate_key, by_key.iter().map(|it| it.1))
+    blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
+        let mut by_key: blaze_own::Vec<(LibKey, ContentId), &blaze_mem::Frame> = blaze_own::Vec::with_capacity_in(rows.len(), frame);
+        by_key.extend(rows.iter().map(|row| (row.key, row_digest(row))));
+        by_key.sort_unstable_by_key(|it| it.0);
+        key_of(crate_key, by_key.iter().map(|it| it.1))
+    })
 }
 
-/// Crate `krate`'s impl tables from its impl rows `rows` (its items record's, in any order)
-/// and the names `names` resolves them by: a pure function of the two, its buffers in
-/// `alloc`. Every row is filed once ([`file_rows`]); a row blaze-surface refuses is in
-/// [`CrateImpls::refused`], named.
-pub fn write_impl_tables<'n, 'a, S: NamesSource<'n>>(names: S, krate: usize, rows: &[ImplRow<'n>], alloc: Alloc<'a>) -> Result<ImplTables<'a>, TablesError> {
-    let crate_key = names.crate_key(krate).ok_or(TablesError::NoCrateKey { krate })?;
-    // Each row's digest and header flags, by impl key.
-    let mut by_key: AVec<'a, (LibKey, ContentId, surface::ImplFlags)> = AVec::with_capacity_in(rows.len(), alloc);
+/// One contiguous chunk of a crate's impl rows filed independently ([`file_impl_rows_chunk`]),
+/// combined with every other chunk by [`finish_impl_tables`] so large crates can file impls in
+/// parallel across workers while keeping identical output bytes.
+pub struct ImplChunk<A: core::alloc::Allocator> {
+    pub key_digests: blaze_own::Vec<(LibKey, ContentId), A>,
+    pub out: blaze_own::Vec<surface::ImplRow, A>,
+    pub named: blaze_own::Vec<CrateItemKey, A>,
+    pub counts: FileCounts,
+    pub no_checker_type: u32,
+}
+
+/// Files one contiguous slice `rows` of crate `krate`'s impl rows against `names`, returning its
+/// filed rows and row digests for [`finish_impl_tables`].
+pub fn file_impl_rows_chunk<'n, A: core::alloc::Allocator + Copy, S: NamesSource<'n>>(names: S, krate: usize, rows: &[ImplRow<'n>], alloc: A) -> Result<ImplChunk<A>, TablesError> {
+    let mut by_key: blaze_own::Vec<(LibKey, ContentId, surface::ImplFlags), A> = blaze_own::Vec::with_capacity_in(rows.len(), alloc);
     by_key.extend(rows.iter().map(|row| (row.key, row_digest(row), row.flags.intersect(surface::ImplFlags::HEADER))));
     by_key.sort_unstable_by_key(|it| it.0);
-    let key = key_of(crate_key, by_key.iter().map(|it| it.1));
-    let mut out: AVec<'a, surface::ImplRow> = AVec::with_capacity_in(rows.len(), alloc);
-    let mut named: AVec<'a, CrateItemKey> = AVec::new_in(alloc);
+    let mut key_digests: blaze_own::Vec<(LibKey, ContentId), A> = blaze_own::Vec::with_capacity_in(by_key.len(), alloc);
+    key_digests.extend(by_key.iter().map(|it| (it.0, it.1)));
+    let mut out: blaze_own::Vec<surface::ImplRow, A> = blaze_own::Vec::with_capacity_in(rows.len(), alloc);
+    let mut named: blaze_own::Vec<CrateItemKey, A> = blaze_own::Vec::new_in(alloc);
     let mut no_checker_type = 0u32;
     let mut failed: Option<TablesError> = None;
     let counts = file_rows(names, krate, rows, &mut |filing| {
@@ -345,6 +361,34 @@ pub fn write_impl_tables<'n, 'a, S: NamesSource<'n>>(names: S, krate: usize, row
     if let Some(error) = failed {
         return Err(error);
     }
+    Ok(ImplChunk { key_digests, out, named, counts, no_checker_type })
+}
+
+/// Combines filed chunks ([`file_impl_rows_chunk`]) of crate `crate_key` into deterministic
+/// [`ImplTables`] (order-independent across chunk splits).
+pub fn finish_impl_tables<'a, A: core::alloc::Allocator>(crate_key: CrateItemKey, chunks: &[ImplChunk<A>], alloc: Alloc<'a>) -> Result<ImplTables<'a>, TablesError> {
+    let total_digests: usize = chunks.iter().map(|c| c.key_digests.len()).sum();
+    let mut all_digests: AVec<'a, (LibKey, ContentId)> = AVec::with_capacity_in(total_digests, alloc);
+    for c in chunks.iter() {
+        all_digests.extend_from_slice(&c.key_digests);
+    }
+    all_digests.sort_unstable_by_key(|it| it.0);
+    let key = key_of(crate_key, all_digests.iter().map(|it| it.1));
+    let total_out: usize = chunks.iter().map(|c| c.out.len()).sum();
+    let mut out: AVec<'a, surface::ImplRow> = AVec::with_capacity_in(total_out, alloc);
+    let mut named: AVec<'a, CrateItemKey> = AVec::new_in(alloc);
+    let mut counts = FileCounts::default();
+    let mut no_checker_type = 0u32;
+    for c in chunks.iter() {
+        out.extend_from_slice(&c.out);
+        named.extend_from_slice(&c.named);
+        counts.from_rows = counts.from_rows.saturating_add(c.counts.from_rows);
+        counts.from_text = counts.from_text.saturating_add(c.counts.from_text);
+        for (dst, src) in counts.row_misses.iter_mut().zip(c.counts.row_misses.iter()) {
+            *dst = dst.saturating_add(*src);
+        }
+        no_checker_type = no_checker_type.saturating_add(c.no_checker_type);
+    }
     named.sort_unstable();
     named.dedup();
     let records = surface::build_impl_index(crate_key, &out, alloc).map_err(TablesError::Index)?;
@@ -357,6 +401,16 @@ pub fn write_impl_tables<'n, 'a, S: NamesSource<'n>>(names: S, krate: usize, row
     defines.sort_unstable();
     defines.dedup();
     Ok(ImplTables { krate: crate_key, key, records, named, counts, no_checker_type, defines })
+}
+
+/// Crate `krate`'s impl tables from its impl rows `rows` (its items record's, in any order)
+/// and the names `names` resolves them by: a pure function of the two, its buffers in
+/// `alloc`. Every row is filed once ([`file_rows`]); a row blaze-surface refuses is in
+/// [`CrateImpls::refused`], named.
+pub fn write_impl_tables<'n, 'a, S: NamesSource<'n>>(names: S, krate: usize, rows: &[ImplRow<'n>], alloc: Alloc<'a>) -> Result<ImplTables<'a>, TablesError> {
+    let crate_key = names.crate_key(krate).ok_or(TablesError::NoCrateKey { krate })?;
+    let chunk = file_impl_rows_chunk(names, krate, rows, alloc)?;
+    finish_impl_tables(crate_key, &[chunk], alloc)
 }
 
 /// The table row of one filing (module docs' table); `None` for an impl filed nowhere.
@@ -433,7 +487,7 @@ fn self_shape(shape: Shape, lib: &dyn Fn(ItemKey) -> Option<LibKey>) -> Result<S
         Shape::Closure => S::Closure,
         Shape::Dynamic(None) => S::DynMarker,
         Shape::Adt(k) | Shape::Foreign(k) | Shape::Dynamic(Some(k)) => S::Def(lib(k)?),
-        Shape::FnDef(_) | Shape::Param | Shape::Opaque(_) | Shape::AnyInt | Shape::AnyFloat => return Err(Unwritten::Shape),
+        Shape::FnDef(_) | Shape::Param | Shape::Opaque(_) | Shape::AnyInt | Shape::AnyFloat | Shape::Record(..) | Shape::Union(_) => return Err(Unwritten::Shape),
     };
     SelfShape::new(written).map_err(Unwritten::Refused)
 }
@@ -526,8 +580,8 @@ const FLOAT_WIDTHS: [FloatWidth; 4] = [FloatWidth::F16, FloatWidth::F32, FloatWi
 /// name where the shape has no row shape: a nominal type whose library key the key map and the
 /// records do not give, or a shape blaze-surface refuses. Never an empty answer in its place:
 /// a question that reads no bucket answers "no impl", which is not what is known (D193 point 5).
-fn asked_shapes<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> Result<Vec<SelfShape, Global>, ImplQuestionError> {
-    let mut out: Vec<SelfShape, Global> = Vec::new_in(Global);
+fn asked_shapes<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape, alloc: Alloc<'static>) -> Result<AVec<'static, SelfShape>, ImplQuestionError> {
+    let mut out: AVec<'static, SelfShape> = AVec::new_in(alloc);
     let lib = |k: ItemKey| keys.library_in(names, k);
     let mut put = |s: Shape| -> Result<(), ImplQuestionError> {
         let written = self_shape(s, &lib).map_err(|why| match why {
@@ -552,7 +606,7 @@ fn asked_shapes<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> 
                 put(Shape::Float(x))?;
             }
         }
-        Shape::FnDef(_) | Shape::Param | Shape::Opaque(_) => out.push(SelfShape::PLACEHOLDER),
+        Shape::FnDef(_) | Shape::Param | Shape::Opaque(_) | Shape::Record(..) | Shape::Union(_) => out.push(SelfShape::PLACEHOLDER),
         other => put(other)?,
     }
     Ok(out)
@@ -659,6 +713,33 @@ impl fmt::Display for AdmitError {
 
 impl core::error::Error for AdmitError {}
 
+/// Builds a 256-way first-byte prefix offset table over a sorted slice of uniform hash keys
+/// (`ContentId` / `CrateItemKey`), narrowing lookups to ~`len / 256` entries in one L1 load with
+/// zero heap allocation.
+fn prefix_index(len: usize, first_byte: impl Fn(usize) -> u8) -> [u32; 257] {
+    let mut offsets = [0u32; 257];
+    let mut i = 0usize;
+    for b in 0..=255usize {
+        if let Some(slot) = offsets.get_mut(b) {
+            *slot = u32::try_from(i).unwrap_or(u32::MAX);
+        }
+        while i < len && usize::from(first_byte(i)) <= b {
+            i += 1;
+        }
+    }
+    if let Some(end) = offsets.get_mut(256) {
+        *end = u32::try_from(len).unwrap_or(u32::MAX);
+    }
+    offsets
+}
+
+fn prefix_range(prefix: &[u32; 257], byte: u8, len: usize) -> core::ops::Range<usize> {
+    let b = usize::from(byte);
+    let lo = prefix.get(b).and_then(|&v| usize::try_from(v).ok()).unwrap_or(0).min(len);
+    let hi = prefix.get(b + 1).and_then(|&v| usize::try_from(v).ok()).unwrap_or(len).min(len);
+    lo..hi.max(lo)
+}
+
 /// Every crate's impl tables of one request, made ONCE by the Heads stage's tasks and read in
 /// place by every body on every worker (engine.md, "The design" 1): each record's bytes held in
 /// `Global`, because a task's `Alloc` is not `Sync`; immutable once the stage has put them, so
@@ -666,6 +747,8 @@ impl core::error::Error for AdmitError {}
 pub struct ImplShelf {
     /// Sorted by crate key, one each.
     tables: std::vec::Vec<Shelved, Global>,
+    /// 256-way first-byte index into `tables` by `krate.0.0[0]`.
+    prefix: [u32; 257],
 }
 
 /// One crate's tables on an [`ImplShelf`].
@@ -675,6 +758,8 @@ struct Shelved {
     no_impls_of: std::vec::Vec<u8, Global>,
     /// Each bucket record by its content id, sorted.
     buckets: std::vec::Vec<(ContentId, std::vec::Vec<u8, Global>), Global>,
+    /// 256-way first-byte index into `buckets` by `id.0[0]`.
+    prefix: [u32; 257],
 }
 
 /// [`ImplShelf::new`]'s choices: none yet (rule 83).
@@ -749,6 +834,8 @@ struct Opened<'a> {
     no_impls_of: &'a [u8],
     /// Each bucket by its content id, sorted (the form's own order).
     buckets: Option<AVec<'a, (ContentId, &'a [u8])>>,
+    /// 256-way first-byte index into `buckets` by `id.0[0]`.
+    prefix: [u32; 257],
 }
 
 /// [`ImplShelf::put_framed`]'s reading without its copies: the same checks in the same order,
@@ -793,7 +880,11 @@ fn open_framed<'a>(krate: CrateItemKey, bytes: &'a [u8], alloc: Option<Alloc<'a>
     if !bytes.as_ptr().addr().is_multiple_of(FRAMED_ALIGN) {
         return Err(ShelfError::Unaligned { krate });
     }
-    Ok(Opened { krate, directory, no_impls_of, buckets })
+    let prefix = match buckets.as_ref() {
+        Some(list) => prefix_index(list.len(), |i| list.get(i).map_or(0, |(id, _)| id.0[0])),
+        None => [0u32; 257],
+    };
+    Ok(Opened { krate, directory, no_impls_of, buckets, prefix })
 }
 
 /// Where each part of [`framed`]'s form starts: a multiple of this from the payload's first
@@ -833,15 +924,18 @@ pub fn framed<A: core::alloc::Allocator>(records: &CrateImpls<'_>, alloc: A) -> 
     out.extend_from_slice(FRAMED_MAGIC);
     put_part(&mut out, &records.directory[..]);
     put_part(&mut out, &records.no_impls_of[..]);
-    let mut order: std::vec::Vec<usize, Global> = std::vec::Vec::with_capacity_in(records.buckets.len(), Global);
-    order.extend(0..records.buckets.len());
-    order.sort_unstable_by_key(|at| records.buckets[*at].id);
-    put_len(&mut out, order.len());
-    for at in order {
-        let b = &records.buckets[at];
-        out.extend_from_slice(&b.id.0);
-        put_part(&mut out, &b.bytes[..]);
-    }
+    blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
+        let mut order: blaze_own::Vec<usize, &blaze_mem::Frame> = blaze_own::Vec::with_capacity_in(records.buckets.len(), frame);
+        order.extend(0..records.buckets.len());
+        order.sort_unstable_by_key(|at| records.buckets.get(*at).map(|b| b.id));
+        put_len(&mut out, order.len());
+        for at in order {
+            if let Some(b) = records.buckets.get(at) {
+                out.extend_from_slice(&b.id.0);
+                put_part(&mut out, &b.bytes[..]);
+            }
+        }
+    });
     debug_assert_eq!(out.len(), size, "framed's size is what it writes");
     out
 }
@@ -906,12 +1000,13 @@ impl<'b> Unframe<'b> {
 
 impl ImplShelf {
     pub fn new(_opts: ImplShelfOpts) -> ImplShelf {
-        ImplShelf { tables: std::vec::Vec::new_in(Global) }
+        ImplShelf { tables: Default::default(), prefix: [0u32; 257] }
     }
 
     /// Holds crate `krate`'s three kinds of record, copied once.
     pub fn put(&mut self, krate: CrateItemKey, records: &CrateImpls<'_>) -> Result<(), ShelvedTwice> {
-        match self.put_framed(krate, &framed(records, Global)) {
+        let res = blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| self.put_framed(krate, &framed(records, frame)));
+        match res {
             Ok(()) => Ok(()),
             Err(ShelfError::Twice(twice)) => Err(twice),
             // `framed` wrote them this call: a malformed read of its own bytes is this file's fault.
@@ -951,13 +1046,16 @@ impl ImplShelf {
         if r.at != bytes.len() || !buckets.is_sorted_by_key(|(id, _)| *id) {
             return Err(malformed(&r));
         }
-        self.tables.insert(at, Shelved { krate, directory, no_impls_of, buckets });
+        let bucket_prefix = prefix_index(buckets.len(), |i| buckets.get(i).map_or(0, |(id, _)| id.0[0]));
+        self.tables.insert(at, Shelved { krate, directory, no_impls_of, buckets, prefix: bucket_prefix });
+        self.prefix = prefix_index(self.tables.len(), |i| self.tables.get(i).map_or(0, |t| t.krate.0.0[0]));
         Ok(())
     }
 
     /// Whether crate `krate`'s tables are on the shelf.
     pub fn holds(&self, krate: CrateItemKey) -> bool {
-        self.tables.binary_search_by_key(&krate, |t| t.krate).is_ok()
+        let range = prefix_range(&self.prefix, krate.0.0[0], self.tables.len());
+        self.tables.get(range).is_some_and(|slice| slice.binary_search_by_key(&krate, |t| t.krate).is_ok())
     }
 
     /// How many crates' tables it holds.
@@ -970,7 +1068,17 @@ impl ImplShelf {
     }
 
     fn of(&self, krate: CrateItemKey, record: RecordKind) -> Result<&Shelved, NoTables> {
-        self.tables.binary_search_by_key(&krate, |t| t.krate).map(|at| &self.tables[at]).map_err(|_| NoTables { krate, record })
+        let range = prefix_range(&self.prefix, krate.0.0[0], self.tables.len());
+        let slice = self.tables.get(range).ok_or(NoTables { krate, record })?;
+        slice.binary_search_by_key(&krate, |t| t.krate).ok().and_then(|at| slice.get(at)).ok_or(NoTables { krate, record })
+    }
+}
+
+impl Shelved {
+    fn bucket(&self, bucket: ContentId) -> Option<&[u8]> {
+        let range = prefix_range(&self.prefix, bucket.0[0], self.buckets.len());
+        let slice = self.buckets.get(range)?;
+        slice.binary_search_by_key(&bucket, |(id, _)| *id).ok().and_then(|at| slice.get(at)).map(|(_, bytes)| bytes.as_slice())
     }
 }
 
@@ -990,6 +1098,25 @@ enum Held<'a> {
     Paged { shelf: &'a ImplShelf, source: &'a dyn ShelfSource, opened: RefCell<AVec<'a, Opened<'a>>> },
 }
 
+/// Stretch-level inverted index over linked crates' `NoImplsOf` records, shared across every
+/// body checked through one [`TableSet`]. Decodes each crate's `NoImplsOfView` once per stretch
+/// (invalidated on [`TableSet::put`]) and caches per-trait holder lists and `BucketRead` slices.
+struct AnyFilterCache<'a> {
+    linked: AVec<'a, (CrateItemKey, usize)>,
+    krate_ids: AVec<'a, (u128, [u8; 16])>,
+    all_unread_reads: AVec<'a, BucketRead>,
+    unread_positions: AVec<'a, usize>,
+    by_trait_mark: blaze_hash::HashMap<u64, AVec<'a, usize>, Alloc<'a>>,
+    traits: blaze_hash::HashMap<LibKey, CachedTraitAny<'a>, Alloc<'a>>,
+}
+
+struct CachedTraitAny<'a> {
+    name: ProbeName,
+    crates: AVec<'a, CrateItemKey>,
+    indexes: AVec<'a, usize>,
+    reads: AVec<'a, BucketRead>,
+}
+
 /// The impl tables of a set of crates as ONE reader reads them: the [`ImplRecords`] the reader
 /// reads ([`Buckets::admit_tables`]), and every read it made noted. Never shared between
 /// threads (its notes); many readers share one [`ImplShelf`].
@@ -999,6 +1126,7 @@ pub struct TableSet<'a> {
     hashes: RefCell<blaze_own::BTreeMap<surface::BucketKey, surface::BucketHash, Alloc<'a>>>,
     probes: RefCell<HashMap<ProbeKey, ProbeName, Alloc<'a>>>,
     probe_derivations: Cell<usize>,
+    any_cache: RefCell<Option<AnyFilterCache<'a>>>,
     alloc: Alloc<'a>,
 }
 
@@ -1078,7 +1206,12 @@ impl<'a> TableSet<'a> {
         };
         let one = &held[at];
         let found = match (bucket, one.buckets.as_ref()) {
-            (Some(id), Some(buckets)) => Some(buckets.binary_search_by_key(&id, |(one, _)| *one).map(|place| buckets[place].1).map_err(|_| missing)?),
+            (Some(id), Some(buckets)) => {
+                let range = prefix_range(&one.prefix, id.0[0], buckets.len());
+                let slice = buckets.get(range).ok_or(missing)?;
+                let bytes = slice.binary_search_by_key(&id, |(one, _)| *one).ok().and_then(|place| slice.get(place)).map(|(_, b)| *b).ok_or(missing)?;
+                Some(bytes)
+            }
             _ => None,
         };
         Ok((one.directory, one.no_impls_of, found))
@@ -1091,8 +1224,131 @@ impl<'a> TableSet<'a> {
             hashes: RefCell::new(blaze_own::BTreeMap::new_in(alloc)),
             probes: RefCell::new(HashMap::new_in(alloc)),
             probe_derivations: Cell::new(0),
+            any_cache: RefCell::new(None),
             alloc,
         }
+    }
+
+    fn ensure_any_cache(&self, linked: &[(CrateItemKey, usize)]) -> Result<(), TablesReadError> {
+        if self.any_cache.borrow().as_ref().is_some_and(|c| c.linked.as_slice() == linked) {
+            return Ok(());
+        }
+        let alloc = self.alloc;
+        let mut linked_copy = AVec::with_capacity_in(linked.len(), alloc);
+        linked_copy.extend_from_slice(linked);
+        let mut krate_ids = AVec::with_capacity_in(linked.len(), alloc);
+        let mut all_unread_reads = AVec::with_capacity_in(linked.len(), alloc);
+        let mut unread_positions = AVec::new_in(alloc);
+        let mut by_trait_mark: blaze_hash::HashMap<u64, AVec<'a, usize>, Alloc<'a>> = blaze_hash::HashMap::new_in(alloc);
+        for (pos, &(key, _)) in linked.iter().enumerate() {
+            let filter = read_no_impls_of(self, key)?;
+            let krate_id = first16(key.0);
+            krate_ids.push((krate_id, krate_id.to_be_bytes()));
+            let has_unread = filter.has_unread();
+            all_unread_reads.push(BucketRead {
+                krate: krate_id,
+                bucket: ProbeName::UNREAD.fact,
+                answer: u64::from(has_unread),
+            });
+            if has_unread {
+                unread_positions.push(pos);
+            } else {
+                for &mark in filter.trait_marks() {
+                    by_trait_mark.entry(mark).or_insert_with(|| AVec::new_in(alloc)).push(pos);
+                }
+            }
+        }
+        *self.any_cache.borrow_mut() = Some(AnyFilterCache {
+            linked: linked_copy,
+            krate_ids,
+            all_unread_reads,
+            unread_positions,
+            by_trait_mark,
+            traits: blaze_hash::HashMap::new_in(alloc),
+        });
+        Ok(())
+    }
+
+    fn with_any_unread<R>(
+        &self,
+        linked: &[(CrateItemKey, usize)],
+        f: impl FnOnce(&[(u128, [u8; 16])], &[BucketRead]) -> R,
+    ) -> Result<R, TablesReadError> {
+        self.ensure_any_cache(linked)?;
+        let guard = self.any_cache.borrow();
+        let Some(cache) = guard.as_ref() else {
+            return Err(TablesReadError::NoCrateKey { krate: 0 });
+        };
+        Ok(f(&cache.krate_ids, &cache.all_unread_reads))
+    }
+
+    fn with_any_trait<R>(
+        &self,
+        linked: &[(CrateItemKey, usize)],
+        lib_trait: LibKey,
+        f: impl FnOnce(&[(u128, [u8; 16])], ProbeName, &[CrateItemKey], &[usize], &[BucketRead]) -> R,
+    ) -> Result<R, TablesReadError> {
+        self.ensure_any_cache(linked)?;
+        let need_build = self.any_cache.borrow().as_ref().is_some_and(|c| !c.traits.contains_key(&lib_trait));
+        if need_build {
+            let name = self.probe(Probe::Trait(lib_trait));
+            let mark = blaze_impls::trait_mark(lib_trait);
+            let alloc = self.alloc;
+            let mut guard = self.any_cache.borrow_mut();
+            if let Some(cache) = guard.as_mut() {
+                let mut reads = AVec::with_capacity_in(cache.linked.len(), alloc);
+                for &(krate_id, _) in cache.krate_ids.iter() {
+                    reads.push(BucketRead { krate: krate_id, bucket: name.fact, answer: 0 });
+                }
+                let marked: &[usize] = cache.by_trait_mark.get(&mark).map_or(&[], |v| v.as_slice());
+                let unread: &[usize] = cache.unread_positions.as_slice();
+                let mut crates = AVec::with_capacity_in(unread.len() + marked.len(), alloc);
+                let mut indexes = AVec::with_capacity_in(unread.len() + marked.len(), alloc);
+                let (mut ui, mut mi) = (0usize, 0usize);
+                while ui < unread.len() || mi < marked.len() {
+                    let pos = match (unread.get(ui), marked.get(mi)) {
+                        (Some(&u), Some(&m)) if u < m => {
+                            ui += 1;
+                            u
+                        }
+                        (Some(&u), Some(&m)) if m < u => {
+                            mi += 1;
+                            m
+                        }
+                        (Some(&u), Some(_)) => {
+                            ui += 1;
+                            mi += 1;
+                            u
+                        }
+                        (Some(&u), None) => {
+                            ui += 1;
+                            u
+                        }
+                        (None, Some(&m)) => {
+                            mi += 1;
+                            m
+                        }
+                        (None, None) => break,
+                    };
+                    if let Some(row) = reads.get_mut(pos) {
+                        row.answer = 1;
+                    }
+                    if let Some(&(key, krate)) = cache.linked.get(pos) {
+                        crates.push(key);
+                        indexes.push(krate);
+                    }
+                }
+                cache.traits.insert(lib_trait, CachedTraitAny { name, crates, indexes, reads });
+            }
+        }
+        let guard = self.any_cache.borrow();
+        let Some(cache) = guard.as_ref() else {
+            return Err(TablesReadError::NoCrateKey { krate: 0 });
+        };
+        let Some(entry) = cache.traits.get(&lib_trait) else {
+            return Err(TablesReadError::NoCrateKey { krate: 0 });
+        };
+        Ok(f(&cache.krate_ids, entry.name, &entry.crates, &entry.indexes, &entry.reads))
     }
 
     fn probe(&self, probe: Probe) -> ProbeName {
@@ -1117,6 +1373,7 @@ impl<'a> TableSet<'a> {
         let Held::Own { tables: held, ids: held_ids } = &mut self.held else {
             panic!("impl tables put into a set lent from a request's shelf (front2 buckets/records.rs `TableSet::put`)");
         };
+        *self.any_cache.borrow_mut() = None;
         let mut ids: AVec<'a, (ContentId, u32)> = AVec::with_capacity_in(tables.records.buckets.len(), self.alloc);
         ids.extend(tables.records.buckets.iter().enumerate().map(|(at, b)| (b.id, at as u32)));
         ids.sort_unstable();
@@ -1186,16 +1443,9 @@ impl<'a> ImplRecords for TableSet<'a> {
                 let place = ids.binary_search_by_key(&bucket, |it| it.0).map_err(|_| missing)?;
                 Ok(&tables[at].records.buckets[ids[place].1 as usize].bytes)
             }
-            Held::Lent(shelf) => {
-                let one = shelf.of(krate, RecordKind::Bucket)?;
-                let place = one.buckets.binary_search_by_key(&bucket, |(id, _)| *id).map_err(|_| missing)?;
-                Ok(&one.buckets[place].1)
-            }
+            Held::Lent(shelf) => shelf.of(krate, RecordKind::Bucket)?.bucket(bucket).ok_or(missing),
             Held::Paged { shelf, source, opened } => match shelf.of(krate, RecordKind::Bucket) {
-                Ok(one) => {
-                    let place = one.buckets.binary_search_by_key(&bucket, |(id, _)| *id).map_err(|_| missing)?;
-                    Ok(&one.buckets[place].1)
-                }
+                Ok(one) => one.bucket(bucket).ok_or(missing),
                 Err(_) => self.paged_of(*source, opened, krate, Some(bucket), missing).and_then(|(_, _, found)| found.ok_or(missing)),
             },
         }
@@ -1306,7 +1556,128 @@ fn filing_of<'n, S: NamesSource<'n>>(names: S, row: &surface::ImplRow) -> Result
     Ok(Filing { key: row.impl_, filed, blanket, by_text, unread_bare, path_self })
 }
 
+/// Per-body cache for `Home::Any` trait lookups over impl tables, allocated in the body's
+/// scratch `alloc`. Probing `NoImplsOf` for `Probe::UnreadTrait` once per body and
+/// `Probe::Trait(t)` once per distinct trait avoids rescanning all linked crates and
+/// reallocating ~1,000 `BucketRead` rows on every `(trait, shape)` question.
+pub(super) struct TablesCache {
+    alloc: Alloc<'static>,
+    /// All linked crates in index order (`(crate_key, crate_index)`).
+    linked_crates: AVec<'static, (CrateItemKey, usize)>,
+    /// `Probe::UnreadTrait` fact row for every linked crate, probed once per body.
+    all_unread_reads: AVec<'static, BucketRead>,
+    /// Per trait (keyed by checker `ItemKey`), the linked crates whose `NoImplsOf` filter may
+    /// hold the trait, plus the `Probe::Trait` fact row for every linked crate.
+    trait_any_filter: HashMap<ItemKey, TraitAnyFilter, Alloc<'static>>,
+}
+
+struct TraitAnyFilter {
+    crates: AVec<'static, CrateItemKey>,
+    indexes: AVec<'static, usize>,
+    reads: AVec<'static, BucketRead>,
+}
+
+impl TablesCache {
+    pub(super) fn all_unread_reads(&self) -> &[BucketRead] {
+        &self.all_unread_reads
+    }
+
+    pub(super) fn trait_reads_for(&self, trait_: ItemKey) -> &[BucketRead] {
+        self.trait_any_filter.get(&trait_).map_or(&[], |entry| &entry.reads)
+    }
+}
+
+fn read_no_impls_of<'a>(tables: &'a TableSet<'_>, krate: CrateItemKey) -> Result<surface::NoImplsOfView<'a>, TablesReadError> {
+    let bytes = tables.no_impls_of(krate).map_err(|error| {
+        TablesReadError::Lookup(ImplLookupError::Records { krate, record: RecordKind::NoImplsOf, error })
+    })?;
+    let filter = surface::NoImplsOfView::read(bytes).map_err(|error| {
+        TablesReadError::Lookup(ImplLookupError::Format { krate, record: RecordKind::NoImplsOf, error })
+    })?;
+    if filter.krate() != krate {
+        return Err(TablesReadError::Lookup(ImplLookupError::WrongCrate {
+            krate,
+            record: RecordKind::NoImplsOf,
+            found: filter.krate(),
+        }));
+    }
+    Ok(filter)
+}
+
 impl BucketIndex {
+    /// Initializes [`BucketIndex::tables_cache`] on the first `Home::Any` trait question:
+    /// records `NameCell::Root` once per crate (via [`BucketIndex::crate_linked`]) and
+    /// `Probe::UnreadTrait` once per linked crate.
+    fn ensure_tables_cache<'n, S: NamesSource<'n>>(&mut self, names: S, tables: &TableSet<'_>, alloc: Alloc<'static>) -> Result<(), TablesReadError> {
+        if self.tables_cache.is_some() {
+            return Ok(());
+        }
+        let n = self.crate_state.len();
+        let mut linked_crates = AVec::with_capacity_in(n, alloc);
+        for krate in 0..n {
+            if !self.crate_linked(names, krate) {
+                continue;
+            }
+            let key = names.crate_key(krate).ok_or(TablesReadError::NoCrateKey { krate })?;
+            linked_crates.push((key, krate));
+        }
+        let mut all_unread_reads = AVec::with_capacity_in(linked_crates.len(), alloc);
+        let probes = self.table_reads.get_or_insert_with(|| BucketReadUnion::new(alloc));
+        let unread_id = probes.id(u128::from_be_bytes(ProbeName::UNREAD.cell));
+        tables.with_any_unread(&linked_crates, |krate_ids, cached_reads| {
+            for (&(_, krate), &(_, krate_bytes)) in linked_crates.iter().zip(krate_ids.iter()) {
+                if probes.mark(krate, unread_id) {
+                    names.impls_read(TableRead::Impls { krate: krate_bytes, bucket: ProbeName::UNREAD.cell });
+                }
+            }
+            all_unread_reads.extend_from_slice(cached_reads);
+        })?;
+        self.tables_cache = Some(TablesCache {
+            alloc,
+            linked_crates,
+            all_unread_reads,
+            trait_any_filter: HashMap::new_in(alloc),
+        });
+        Ok(())
+    }
+
+    /// Ensures `trait_any_filter` holds `trait_`, probing `NoImplsOf::may_hold_trait(lib_trait)`
+    /// once across all linked crates (via `TableSet`'s stretch-level inverted index) and recording
+    /// `Probe::Trait(lib_trait)` into `names`.
+    fn ensure_trait_any_filter<'n, S: NamesSource<'n>>(
+        &mut self,
+        names: S,
+        trait_: ItemKey,
+        lib_trait: LibKey,
+        tables: &TableSet<'_>,
+        alloc: Alloc<'static>,
+    ) -> Result<(), TablesReadError> {
+        self.ensure_tables_cache(names, tables, alloc)?;
+        let Some(cache) = self.tables_cache.as_mut() else { return Ok(()) };
+        if cache.trait_any_filter.contains_key(&trait_) {
+            return Ok(());
+        }
+        let cache_alloc = cache.alloc;
+        let probes = self.table_reads.get_or_insert_with(|| BucketReadUnion::new(cache_alloc));
+        let entry = tables.with_any_trait(&cache.linked_crates, lib_trait, |krate_ids, name, cached_crates, cached_indexes, cached_reads| {
+            let probe_id = probes.id(u128::from_be_bytes(name.cell));
+            for (&(_, krate), &(_, krate_bytes)) in cache.linked_crates.iter().zip(krate_ids.iter()) {
+                if probes.mark(krate, probe_id) {
+                    names.impls_read(TableRead::Impls { krate: krate_bytes, bucket: name.cell });
+                }
+            }
+            let mut crates = AVec::with_capacity_in(cached_crates.len(), cache_alloc);
+            crates.extend_from_slice(cached_crates);
+            let mut indexes = AVec::with_capacity_in(cached_indexes.len(), cache_alloc);
+            indexes.extend_from_slice(cached_indexes);
+            let mut reads = AVec::with_capacity_in(cached_reads.len(), cache_alloc);
+            reads.extend_from_slice(cached_reads);
+            TraitAnyFilter { crates, indexes, reads }
+        })?;
+        cache.trait_any_filter.insert(trait_, entry);
+        Ok(())
+    }
+
     /// Files what the question `ask` at `home` can be answered from, from the impl tables
     /// `tables` (module docs): the crates `home` admits, as [`Buckets::admit_asked`] chooses
     /// them, each asked through blaze-impls' lookups at every shape `ask`'s stands for. A
@@ -1320,16 +1691,22 @@ impl BucketIndex {
             return Ok(0);
         }
         let Homes { all, bare, blanket, local: _ } = home;
-        let mut reads: Vec<BucketRead, Global> = Vec::new_in(Global);
+        let mut reads: AVec<'static, BucketRead> = AVec::new_in(self.indexed.alloc);
         if [all, bare, blanket].contains(&Home::Incoherent) {
-            match names.incoherent_crates() {
-                Some((crates, digest)) => {
-                    for krate in 0..self.incoherent.len() {
-                        self.incoherent[krate] = crates.contains(&krate);
+            if let Some(digest) = self.indexed.incoherent {
+                reads.push(BucketRead { krate: 0, bucket: INCOHERENT_FACT, answer: digest });
+            } else {
+                match names.incoherent_crates() {
+                    Some((crates, digest)) => {
+                        for krate in 0..self.crate_state.len() {
+                            self.crate_state[krate].incoherent = crates.contains(&krate);
+                        }
+                        let answer = first8(&digest.0);
+                        self.indexed.incoherent = Some(answer);
+                        reads.push(BucketRead { krate: 0, bucket: INCOHERENT_FACT, answer });
                     }
-                    reads.push(BucketRead { krate: 0, bucket: INCOHERENT_FACT, answer: first8(&digest.0) });
+                    None => names.gap("which crates may write an incoherent inherent impl (the records were named no lang crates: `Records::name_lang_crates`)", None),
                 }
-                None => names.gap("which crates may write an incoherent inherent impl (the records were named no lang crates: `Records::name_lang_crates`)", None),
             }
         }
         let (trait_, shape) = match ask {
@@ -1339,26 +1716,39 @@ impl BucketIndex {
         // A question no bucket of which can be asked is refused by name: answered from no
         // bucket it would read "no impl", which is not what is known (D193 point 5). These were
         // a names-log gap and `Ok(0)`, so the body went on to that wrong answer.
-        let shapes = asked_shapes(names, keys, shape)?;
+        let shapes = asked_shapes(names, keys, shape, alloc)?;
         let lib_trait = match trait_ {
             Some(t) => Some(keys.library_in(names, t).ok_or(ImplQuestionError::NoLibraryKey { of: "the trait an impl question is about", key: t })?),
             None => None,
         };
-        // The crates asked, in index order: those `home` admits that the program links.
-        let mut crates: Vec<CrateItemKey, Global> = Vec::new_in(Global);
-        let mut indexes: Vec<usize, Global> = Vec::new_in(Global);
-        for krate in 0..self.incoherent.len() {
-            if !(self.admits(all, krate) || self.admits(bare, krate) || self.admits(blanket, krate)) {
-                continue;
+        // When `home` admits all linked crates for a trait question, share the per-body
+        // `NoImplsOf` precheck across shapes so `candidates_in` only visits matching holders.
+        let uses_any_filter = matches!((trait_, lib_trait), (Some(_), Some(_))) && [all, bare, blanket].contains(&Home::Any);
+        let mut crates: AVec<'static, CrateItemKey> = AVec::new_in(alloc);
+        let mut indexes: AVec<'static, usize> = AVec::new_in(alloc);
+        if let (true, Some(t), Some(lib_t)) = (uses_any_filter, trait_, lib_trait) {
+            self.ensure_trait_any_filter(names, t, lib_t, tables, alloc)?;
+            if let Some(entry) = self.tables_cache.as_ref().and_then(|c| c.trait_any_filter.get(&t)) {
+                crates.reserve(entry.crates.len());
+                indexes.reserve(entry.indexes.len());
+                crates.extend_from_slice(&entry.crates);
+                indexes.extend_from_slice(&entry.indexes);
             }
-            if !crate::front2::linked::links_unit(krate == 0, names.proc_macro(krate) == Some(true)) {
-                continue;
+        } else {
+            // The crates asked, in index order: those `home` admits that the program links.
+            for krate in 0..self.crate_state.len() {
+                if !(self.admits(all, krate) || self.admits(bare, krate) || self.admits(blanket, krate)) {
+                    continue;
+                }
+                if !self.crate_linked(names, krate) {
+                    continue;
+                }
+                // Never skipped without a word: a crate the home admits whose tables are not asked
+                // would leave its impls out of the answer unseen.
+                let key = names.crate_key(krate).ok_or(TablesReadError::NoCrateKey { krate })?;
+                crates.push(key);
+                indexes.push(krate);
             }
-            // Never skipped without a word: a crate the home admits whose tables are not asked
-            // would leave its impls out of the answer unseen.
-            let key = names.crate_key(krate).ok_or(TablesReadError::NoCrateKey { krate })?;
-            crates.push(key);
-            indexes.push(krate);
         }
         let mut filed = 0usize;
         for (width, s) in shapes.iter().enumerate() {
@@ -1367,7 +1757,8 @@ impl BucketIndex {
             }
             // A trait rejection covers every width of a numeric survey. Only holders
             // that passed the first width's trait check need the remaining heads.
-            let narrow = width == 0 && shapes.len() > 1 && lib_trait.is_some();
+            // Under `uses_any_filter`, every crate in `crates` already passed the trait check.
+            let narrow = !uses_any_filter && width == 0 && shapes.len() > 1 && lib_trait.is_some();
             let remaining = RefCell::new(Vec::new_in(alloc));
             // Slots are local to a concrete shape. Its nth want is the same probe in
             // every holder, so only the first holder needs the stretch interner.
@@ -1378,7 +1769,7 @@ impl BucketIndex {
             let note = |holder: usize, slot: usize, read: ImplRead| {
                 let row = match read {
                     ImplRead::Filter { krate, probe, may_hold } => {
-                        if width != 0 && matches!(probe, Probe::Trait(_) | Probe::UnreadTrait) {
+                        if (uses_any_filter || width != 0) && matches!(probe, Probe::Trait(_) | Probe::UnreadTrait) {
                             return;
                         }
                         if narrow && may_hold && matches!(probe, Probe::Trait(_)) {
@@ -1416,9 +1807,16 @@ impl BucketIndex {
             // The first width has already filed and recorded the blanket, unread-at-any
             // and blind buckets. Every following width adds only its shaped buckets.
             let found = if width == 0 { found } else { found.only_at_shape() };
+            let mut last_at = 0usize;
             for row in found.recording(&note) {
                 let row = row.map_err(TablesReadError::Lookup)?;
-                let at = crates.iter().position(|c| row.impl_.is_of(*c)).ok_or(TablesReadError::Crate { impl_: row.impl_ })?;
+                let at = if crates.get(last_at).is_some_and(|c| row.impl_.is_of(*c)) {
+                    last_at
+                } else {
+                    let found_at = crates.iter().position(|c| row.impl_.is_of(*c)).ok_or(TablesReadError::Crate { impl_: row.impl_ })?;
+                    last_at = found_at;
+                    found_at
+                };
                 let filing = filing_of(names, &row)?;
                 ix.borrow_mut().take(names, indexes[at], filing);
                 filed += 1;
@@ -1439,9 +1837,13 @@ impl BucketIndex {
         reads.sort_unstable();
         reads.dedup();
         match ask {
-            Ask::Trait(t, shape) => self.indexed.trait_reads.insert((t, shape), reads),
-            Ask::Inherent(shape) => self.indexed.inherent_reads.insert(shape, reads),
-        };
+            Ask::Trait(t, shape) => {
+                self.indexed.trait_reads.insert((t, shape), asked::TraitReads { own: reads, uses_any_filter });
+            }
+            Ask::Inherent(shape) => {
+                self.indexed.inherent_reads.insert(shape, reads);
+            }
+        }
         Ok(filed)
     }
 }

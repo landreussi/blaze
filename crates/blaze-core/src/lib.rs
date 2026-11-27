@@ -39,6 +39,32 @@ pub mod atomic;
 pub mod boot;
 pub mod busy;
 pub mod chan;
+
+/// Implementation source bytes of linked process spawning, confinement entry, and the async
+/// read/wait driver stack reached by hermetic verification, hashed into content-addressed runner
+/// keys (AGENTS.md rule 69).
+pub const SPAWN_SOURCE: &[&[u8]] = &[
+    include_bytes!("process.rs"),
+    include_bytes!("process/linked.rs"),
+    include_bytes!("process/linked/channel.rs"),
+    include_bytes!("process/linked/run.rs"),
+    include_bytes!("process/spawn.rs"),
+    include_bytes!("process/spawn/streams.rs"),
+    include_bytes!("uring.rs"),
+    include_bytes!("uring/files.rs"),
+    include_bytes!("uring/flight.rs"),
+    include_bytes!("uring/ops.rs"),
+    include_bytes!("threads.rs"),
+    include_bytes!("threads/inline.rs"),
+    include_bytes!("threads/opening.rs"),
+    include_bytes!("wait.rs"),
+    include_bytes!("wait/ring.rs"),
+    include_bytes!("wait/direct.rs"),
+    include_bytes!("wait/retry.rs"),
+];
+/// Safe plain-old-data (`Pod`), `Zeroable`, `CheckedBitPattern`, and `TransparentWrapper`
+/// conversions (`blaze_own::pod`): Blaze's safe replacement for `core::mem::transmute`.
+pub use blaze_own::pod;
 // The records in flight: a per-key claim, its waiters, the cycle walk (parallel.md, end state).
 pub mod claim_table;
 pub mod claim_watch;
@@ -292,6 +318,8 @@ impl fmt::Display for FileName {
     }
 }
 
+impl blaze_own::Share for FileName {}
+
 impl FileName {
     /// The name as a path under `root`, the root of the driver that carries out its effects:
     /// how a driver writes a name for a person. A core prints its names as they are, relative
@@ -380,6 +408,8 @@ impl fmt::Display for DirName {
         }
     }
 }
+
+impl blaze_own::Share for DirName {}
 
 /// A [`FileName`] written as a path under a root ([`FileName::under`]).
 #[derive(Clone, Copy, Debug)]
@@ -1598,6 +1628,8 @@ pub struct Exit {
 /// or replace it by renaming another over it, never write its bytes in place or cut it).
 #[derive(Clone)]
 pub struct Mapping(std::sync::Arc<Held>);
+
+impl blaze_own::Share for Mapping {}
 
 /// Who keeps a [`Mapping`]'s bytes, dropped with its last clone.
 enum Held {

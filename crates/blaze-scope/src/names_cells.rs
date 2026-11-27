@@ -47,7 +47,7 @@ use core::cell::RefCell;
 use blaze_hash::{FixedState, Set, SetOpts};
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_ids::{Domain, Hasher};
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, Bump};
 use blaze_surface::{Binding, CrateRootHead, CrateRootView, DefKind, Globs, ItemKind, MacroShapes, Namespace, RefusedWhy, ScopeView};
 
 use crate::cell_key::{BindingKey, BindingKeys, CellKey, cell_key};
@@ -62,14 +62,36 @@ use crate::resolve::{CrateNames, aligned};
 /// and old reads miss.
 pub const KEY_DOMAIN: &str = "blaze v2 crate names cell key 1";
 /// The domain of a cell's digest. "1": a `Module` cell that held the module's textual macros
-/// and marks, now the `Textual` cell's.
-pub const DIGEST_DOMAIN: &str = "blaze v2 crate names cell digest 3";
+/// and marks, now the `Textual` cell's. "4": 128-bit cell digests in `TABLE_ROW` (32 B rows).
+pub const DIGEST_DOMAIN: &str = "blaze v2 crate names cell digest 4";
 
 static KEYS: Domain = Domain::new(KEY_DOMAIN);
 static DIGESTS: Domain = Domain::new(DIGEST_DOMAIN);
 
-/// One row of a cell table: the cell's key, then its digest.
-pub const TABLE_ROW: usize = 16 + 32;
+/// One row of a cell table: the cell's 16-byte key, then its 16-byte BLAKE3 digest prefix.
+pub const TABLE_ROW: usize = 16 + 16;
+
+/// Truncates a cell's 256-bit BLAKE3 digest to the 128-bit digest stored in a cell table row.
+#[inline]
+pub fn cell_digest(id: ContentId) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&id.0[..16]);
+    out
+}
+
+/// Widens a 128-bit cell-table digest back into the canonical 32-byte [`ContentId`] form
+/// (`[digest[0..16], 0..0]`) that [`seen_in`], [`seen_by_record`], and the engine compare.
+#[inline]
+pub fn expand_digest(digest: [u8; 16]) -> ContentId {
+    let mut out = [0u8; 32];
+    out[..16].copy_from_slice(&digest);
+    ContentId(out)
+}
+
+#[inline]
+fn norm_digest(id: ContentId) -> ContentId {
+    expand_digest(cell_digest(id))
+}
 
 /// One cell of a crate's names: see the module doc.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -111,6 +133,36 @@ pub enum NameCell {
     /// `incoherent_crates`). Absent: it may not (every crate but `core`, `alloc` and `std`), so
     /// an item added to a workspace crate never moves it.
     Incoherent { krate: [u8; 8] },
+    /// The crate's `#![panic_runtime]` flag and any `#[rustc_std_internal_symbol]` function items
+    /// (by key, name, and text): what `internal_symbol::record_search` reads of every crate in
+    /// the scope. Absent when the crate has neither (every normal workspace and registry crate),
+    /// so adding an ordinary private item to a dependency never wakes callers of internal symbols.
+    InternalSymbols { krate: [u8; 8] },
+    /// The crate's link facts: its `proc_macro` flag, its extern prelude crate roots, and every
+    /// `Origin::ExternCrate` binding target across its modules. What `front2::linked` reads of
+    /// each crate reached by the link closure, instead of recording both `Names` and `Items`
+    /// whole for every crate in the scope.
+    Links { krate: [u8; 8] },
+    /// The crate's impl rows, in record order ([`ItemsRecord::impl_at`]): what an `ImplBucket`
+    /// task and `NamesSource::each_impl_row` read of a crate's own items record. Absent when the
+    /// crate declares no impls, so adding a private `fn` or other non-impl item never wakes the
+    /// crate's `ImplBucket` task.
+    ImplRows { krate: [u8; 8] },
+    /// The crate's held file paths, in file-index order ([`ItemsRecord::file_surface`]'s `path`
+    /// and `shown`, without each file's `surface` digest): what `NamesSource::file_paths`,
+    /// `FileIs::NotHeld`, and `Heads` no-member / not-held checks read. Absent when the crate
+    /// holds no files, so adding an item to an existing file never wakes readers of file paths.
+    Files { krate: [u8; 8] },
+    /// The crate's leading `#![blaze::...]` syntax extension flags
+    /// (`blaze_file_items::detect_blaze_extensions` over the crate root file): what
+    /// `NamesSource::blaze_extensions` reads in body/head/symbol lowering. Absent when no
+    /// extension is enabled (normal Rust crates), so adding or editing items in any file never
+    /// wakes unrelated bodies or heads.
+    Extensions { krate: [u8; 8] },
+    /// The crate's cfg atoms, in record order ([`ItemsRecord::cfg_atoms`]): what `Decision::Absent`
+    /// and `NamesSource::cfg_atoms` depend on besides the item's own cfg predicates. Absent when
+    /// the crate has no cfg atoms, so adding or editing items in any file never moves it.
+    CfgAtoms { krate: [u8; 8] },
     /// A module's `macro_rules!` sequence and its `mod` lines' marks in it: what a textual
     /// macro lookup reads of the module, and no other walk; absent for a module the record does
     /// not hold a scope of.
@@ -148,6 +200,12 @@ impl NameCell {
             NameCell::Lang { krate } => h.update(&[12]).update(&krate),
             NameCell::Incoherent { krate } => h.update(&[13]).update(&krate),
             NameCell::Textual { module } => h.update(&[14]).id(&module.0),
+            NameCell::InternalSymbols { krate } => h.update(&[15]).update(&krate),
+            NameCell::Links { krate } => h.update(&[16]).update(&krate),
+            NameCell::ImplRows { krate } => h.update(&[17]).update(&krate),
+            NameCell::Files { krate } => h.update(&[18]).update(&krate),
+            NameCell::Extensions { krate } => h.update(&[19]).update(&krate),
+            NameCell::CfgAtoms { krate } => h.update(&[20]).update(&krate),
         };
         let mut key = [0; 16];
         key.copy_from_slice(&h.finish().0[..16]);
@@ -158,7 +216,16 @@ impl NameCell {
     pub fn crate_prefix(self) -> [u8; 8] {
         match self {
             NameCell::Binding { module, .. } | NameCell::Module { module } | NameCell::Textual { module } => module.crate_prefix(),
-            NameCell::Root { krate } | NameCell::Whole { krate, .. } | NameCell::Lang { krate } | NameCell::Incoherent { krate } => krate,
+            NameCell::Root { krate }
+            | NameCell::Whole { krate, .. }
+            | NameCell::Lang { krate }
+            | NameCell::Incoherent { krate }
+            | NameCell::InternalSymbols { krate }
+            | NameCell::Links { krate }
+            | NameCell::ImplRows { krate }
+            | NameCell::Files { krate }
+            | NameCell::Extensions { krate }
+            | NameCell::CfgAtoms { krate } => krate,
             NameCell::Variants { owner } | NameCell::Members { owner } => owner.crate_prefix(),
             NameCell::Item { key } => key.crate_prefix(),
             NameCell::Expansion { call } => call.crate_prefix(),
@@ -394,6 +461,159 @@ fn incoherent_digest(items: &ItemsRecord<'_>) -> Option<ContentId> {
     items.may_write_incoherent().then(|| Hasher::of(&DIGESTS).update(&[13]).finish())
 }
 
+/// What `InternalSymbols(krate)` holds: `None` (absent) when the crate's root file carries no
+/// `panic_runtime` and no function item carries `rustc_std_internal_symbol`; otherwise the digest
+/// of that flag and every such function's key, name, and text in key order.
+fn internal_symbols_digest<'a>(items: &ItemsRecord<'a>, read: ReadText<'_, 'a>) -> Result<Option<ContentId>, ItemsRecordError> {
+    let has_panic_runtime = match items.file_surface(0)? {
+        Some(file) => read(TextOf::File { index: 0, path: file.path }).is_some_and(|text| text.contains("panic_runtime")),
+        None => false,
+    };
+    let mut h = Hasher::of(&DIGESTS);
+    h.update(&[15, u8::from(has_panic_runtime)]);
+    let mut count = 0u64;
+    for i in 0..items.items() {
+        let Some(row) = items.item_at(i)? else { continue };
+        if row.kind != ItemKind::Function {
+            continue;
+        }
+        let Some(span) = row.text else { continue };
+        let text = items.slice(span, read)?;
+        if text.contains("rustc_std_internal_symbol") {
+            h.id(&row.key.0).std(&row.name).part(text.as_bytes());
+            count = count.saturating_add(1);
+        }
+    }
+    if !has_panic_runtime && count == 0 {
+        return Ok(None);
+    }
+    h.update(&count.to_le_bytes());
+    Ok(Some(h.finish()))
+}
+
+/// What `Links(krate)` holds: the crate's `proc_macro` flag, its extern prelude crate roots,
+/// and every `Origin::ExternCrate` binding target across its modules (in deterministic module
+/// and binding order). Covers everything `front2::source::Records::linked_logged` reads.
+fn links_digest(record: &NamesRecord<'_>, items: &ItemsRecord<'_>) -> Result<ContentId, ItemsRecordError> {
+    let mut h = Hasher::of(&DIGESTS);
+    h.update(&[16, u8::from(items.proc_macro())]);
+    let root = record.crate_root();
+    let extern_count = u64::try_from(root.externs().len()).unwrap_or(u64::MAX);
+    h.update(&extern_count.to_le_bytes());
+    for (_, dep_root) in root.externs() {
+        h.id(&dep_root.0);
+    }
+    let mut count = 0u64;
+    for m in 0..items.modules() {
+        let Some(row) = items.module_at(m)? else { break };
+        let Some(scope) = record.scope(row.key) else { continue };
+        for entry in scope.bindings() {
+            if matches!(entry.binding.origin, blaze_surface::Origin::ExternCrate) {
+                h.id(&entry.binding.def.key.0);
+                count = count.saturating_add(1);
+            }
+        }
+    }
+    h.update(&count.to_le_bytes());
+    Ok(h.finish())
+}
+
+/// What `ImplRows(krate)` holds: every impl row of the crate in record order (every field of
+/// [`crate::items_record::ImplRow`]); `None` for a crate that declares no impls.
+fn impl_rows_digest(items: &ItemsRecord<'_>) -> Result<Option<ContentId>, ItemsRecordError> {
+    if items.impls() == 0 {
+        return Ok(None);
+    }
+    let mut h = Hasher::of(&DIGESTS);
+    h.update(&[17]).update(&u64::try_from(items.impls()).unwrap_or(u64::MAX).to_le_bytes());
+    for i in 0..items.impls() {
+        let crate::items_record::ImplRow {
+            key,
+            module,
+            trait_path,
+            has_trait,
+            bare,
+            flags,
+            head,
+            self_path,
+            header_unread,
+            trait_unread,
+            refused_call,
+            trait_root,
+            self_root,
+        } = items.impl_at(i)?.ok_or(ItemsRecordError::Short { what: "the impl rows", at: i })?;
+        h.id(&key.0)
+            .id(&module.0)
+            .std(&trait_path)
+            .update(&[u8::from(has_trait), u8::from(bare), u8::from(header_unread), u8::from(trait_unread), u8::from(refused_call)])
+            .std(&flags)
+            .std(&head)
+            .std(&self_path);
+        match trait_root {
+            Some(k) => h.update(&[1]).id(&k.0),
+            None => h.update(&[0]),
+        };
+        match self_root {
+            Some(k) => h.update(&[1]).id(&k.0),
+            None => h.update(&[0]),
+        };
+    }
+    Ok(Some(h.finish()))
+}
+
+/// What `Files(krate)` holds: every file row's package path and shown path, in file-index order
+/// (leaving out each file's `surface` digest, which moves on every surface edit); `None` when the
+/// crate holds no files.
+fn files_digest(items: &ItemsRecord<'_>) -> Result<Option<ContentId>, ItemsRecordError> {
+    if items.files() == 0 {
+        return Ok(None);
+    }
+    let mut h = Hasher::of(&DIGESTS);
+    h.update(&[18]).update(&u64::try_from(items.files()).unwrap_or(u64::MAX).to_le_bytes());
+    for i in 0..items.files() {
+        let row = items
+            .file_surface(u32::try_from(i).unwrap_or(u32::MAX))?
+            .ok_or(ItemsRecordError::Short { what: "the file rows", at: i })?;
+        h.part(row.path.as_str().as_bytes()).part(row.shown.as_bytes());
+    }
+    Ok(Some(h.finish()))
+}
+
+/// What `Extensions(krate)` holds: the bitmask of `#![blaze::...]` syntax extensions enabled at
+/// the top of the crate's root file (`blaze_file_items::detect_blaze_extensions`); `None` (absent)
+/// when none are enabled.
+fn extensions_digest<'a>(items: &ItemsRecord<'a>, read: ReadText<'_, 'a>) -> Result<Option<ContentId>, ItemsRecordError> {
+    let bits = match items.file_surface(0)? {
+        Some(file) => read(TextOf::File { index: 0, path: file.path })
+            .map(blaze_file_items::detect_blaze_extensions)
+            .map_or(0, |ext| ext.bits()),
+        None => 0,
+    };
+    if bits == 0 {
+        return Ok(None);
+    }
+    Ok(Some(Hasher::of(&DIGESTS).update(&[19, bits]).finish()))
+}
+
+/// What `CfgAtoms(krate)` holds: every `(name, value)` cfg atom of the crate in record order
+/// ([`ItemsRecord::cfg_atoms`]); `None` (absent) when empty.
+fn cfg_atoms_digest(items: &ItemsRecord<'_>) -> Result<Option<ContentId>, ItemsRecordError> {
+    let atoms = items.cfg_atoms()?;
+    if atoms.is_empty() {
+        return Ok(None);
+    }
+    let mut h = Hasher::of(&DIGESTS);
+    h.update(&[20]).update(&u64::try_from(atoms.len()).unwrap_or(u64::MAX).to_le_bytes());
+    for &(name, value) in atoms {
+        h.part(name.as_bytes());
+        match value {
+            Some(v) => h.update(&[1]).part(v.as_bytes()),
+            None => h.update(&[0]),
+        };
+    }
+    Ok(Some(h.finish()))
+}
+
 /// The first 16 bytes of a key: what [`NameCell::Beginning`] is keyed by (`key_beginning`'s
 /// question).
 pub fn first_16(key: ItemKey) -> [u8; 16] {
@@ -464,7 +684,7 @@ pub fn beginning_digest(first: [u8; 16], lists: [&[ItemKey]; 3]) -> Option<Conte
             h.id(&key.0);
         }
     }
-    any.then(|| h.finish())
+    any.then(|| norm_digest(h.finish()))
 }
 
 /// The keys of the crate's item rows, module rows and variant rows, each in the record's order,
@@ -496,7 +716,7 @@ fn beginning_lists<'b>(items: &ItemsRecord<'_>, alloc: Alloc<'b>) -> Result<[AVe
 
 /// What `Whole(section)` holds: the digest of the section's bytes as the record holds them.
 pub fn whole_digest(section: Section, bytes: &[u8]) -> ContentId {
-    Hasher::of(&DIGESTS).update(&[8, section as u8]).part(bytes).finish()
+    norm_digest(Hasher::of(&DIGESTS).update(&[8, section as u8]).part(bytes).finish())
 }
 
 fn binding_digest(binding: Binding) -> ContentId {
@@ -654,11 +874,15 @@ pub const MAX_ROWS: usize = 1 << 24;
 /// The cell table of a crate just solved, from the two records written of it: what the crate's
 /// `CrateScope` record files beside them (blaze-cli names.rs). Item texts are read from the
 /// solve's own files and expansions; each of `wholes` is a [`NameCell::Whole`].
-pub fn crate_table<'a>(names: &CrateNames<'a>, names_record: &[u8], items_record: &[u8], wholes: &[(Section, &[u8])], alloc: Alloc<'a>) -> Result<AVec<'a, u8>, CellsError> {
-    let record = NamesRecord::open(Verified::check(aligned(names_record, alloc)).map_err(CellsError::Names)?);
-    let mut items = ItemsRecord::open(aligned(items_record, alloc), alloc).map_err(CellsError::Items)?;
-    items.use_solved_texts(names);
-    let read = |of: TextOf<'_>| -> Option<&'a str> {
+pub fn crate_table<'n, 'b>(names: &CrateNames<'n>, names_record: &[u8], items_record: &[u8], wholes: &[(Section, &[u8])], bump: Bump<'b>) -> Result<AVec<'b, u8>, CellsError>
+where
+    'n: 'b,
+{
+    let alloc = bump.alloc();
+    let record = NamesRecord::open(Verified::check(aligned(names_record, bump)).map_err(CellsError::Names)?);
+    let mut items = ItemsRecord::open(aligned(items_record, bump), alloc).map_err(CellsError::Items)?;
+    items.use_solved_texts(names, bump);
+    let read = |of: TextOf<'_>| -> Option<&'b str> {
         match of {
             TextOf::File { index, .. } => names.files.get(index as usize).map(|file| file.text),
             TextOf::Expansion { call } => names.expansions.get(&call).and_then(|expansion| expansion.made).map(|made| made.text),
@@ -672,10 +896,15 @@ pub fn crate_table<'a>(names: &CrateNames<'a>, names_record: &[u8], items_record
 /// every owner's members, every expansion); each of `wholes` is a [`NameCell::Whole`] over
 /// those bytes.
 pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, ReadText<'_, 'a>)>, wholes: &[(Section, &[u8])], alloc: Alloc<'b>) -> Result<AVec<'b, u8>, CellsError> {
-    let mut rows: AVec<'b, ([u8; 16], ContentId)> = AVec::new_in(alloc);
+    let est = wholes.len()
+        + record.modules().len() * 4
+        + record.enums().len()
+        + 1
+        + items.map_or(0, |(it, _)| it.items() * 3 + it.modules() * 2 + it.expansions() + it.owned_members() + it.variant_rows());
+    let mut rows: AVec<'b, ([u8; 16], [u8; 16])> = AVec::with_capacity_in(est, alloc);
     let krate = record.key().prefix();
     for (section, bytes) in wholes {
-        rows.push((NameCell::Whole { krate, section: *section }.key(), whole_digest(*section, bytes)));
+        rows.push((NameCell::Whole { krate, section: *section }.key(), cell_digest(whole_digest(*section, bytes))));
     }
     if let Some((items, read)) = items {
         let mut keys: AVec<'_, ItemKey> = AVec::with_capacity_in(items.items() + items.modules(), alloc);
@@ -683,7 +912,7 @@ pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, 
             if let Some(row) = items.item_at(i).map_err(CellsError::Items)? {
                 keys.push(row.key);
                 if let Some(digest) = members_digest(items, row.key, read).map_err(CellsError::Items)? {
-                    rows.push((NameCell::Members { owner: row.key }.key(), digest));
+                    rows.push((NameCell::Members { owner: row.key }.key(), cell_digest(digest)));
                 }
             }
         }
@@ -696,14 +925,14 @@ pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, 
         keys.dedup();
         for key in keys.iter() {
             if let Some(digest) = item_digest(items, *key, read).map_err(CellsError::Items)? {
-                rows.push((NameCell::Item { key: *key }.key(), digest));
+                rows.push((NameCell::Item { key: *key }.key(), cell_digest(digest)));
             }
         }
         let directory = directory_of(wholes)?;
         for i in 0..items.expansions() {
             if let Some(row) = items.expansion_at(i) {
                 if let Some(digest) = expansion_digest(items, directory.as_ref(), row.call)? {
-                    rows.push((NameCell::Expansion { call: row.call }.key(), digest));
+                    rows.push((NameCell::Expansion { call: row.call }.key(), cell_digest(digest)));
                 }
             }
         }
@@ -717,7 +946,7 @@ pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, 
             }
             last = Some(member);
             if let Some(digest) = member_of_digest(items, member).map_err(CellsError::Items)? {
-                rows.push((NameCell::MemberOf { member }.key(), digest));
+                rows.push((NameCell::MemberOf { member }.key(), cell_digest(digest)));
             }
         }
         // One `VariantOf` a variant key, over its run of the (sorted) variant table.
@@ -726,7 +955,7 @@ pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, 
             let Some((variant, ..)) = items.variant_at(i).map_err(CellsError::Items)? else { break };
             let (run, n) = variant_rows_of(items, variant).map_err(CellsError::Items)?;
             if let Some(digest) = variant_of_digest(&run[..n]) {
-                rows.push((NameCell::VariantOf { variant }.key(), digest));
+                rows.push((NameCell::VariantOf { variant }.key(), cell_digest(digest)));
             }
             // Past the whole run (a refused key may have more than the two rows read).
             i += 1;
@@ -746,36 +975,52 @@ pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, 
         firsts.dedup();
         for first in firsts.iter() {
             if let Some(digest) = beginning_digest(*first, [&lists[0][..], &lists[1][..], &lists[2][..]]) {
-                rows.push((NameCell::Beginning { first: *first }.key(), digest));
+                rows.push((NameCell::Beginning { first: *first }.key(), cell_digest(digest)));
             }
         }
         if let Some(digest) = lang_digest(items).map_err(CellsError::Items)? {
-            rows.push((NameCell::Lang { krate }.key(), digest));
+            rows.push((NameCell::Lang { krate }.key(), cell_digest(digest)));
         }
         if let Some(digest) = incoherent_digest(items) {
-            rows.push((NameCell::Incoherent { krate }.key(), digest));
+            rows.push((NameCell::Incoherent { krate }.key(), cell_digest(digest)));
+        }
+        if let Some(digest) = internal_symbols_digest(items, read).map_err(CellsError::Items)? {
+            rows.push((NameCell::InternalSymbols { krate }.key(), cell_digest(digest)));
+        }
+        rows.push((NameCell::Links { krate }.key(), cell_digest(links_digest(record, items).map_err(CellsError::Items)?)));
+        if let Some(digest) = impl_rows_digest(items).map_err(CellsError::Items)? {
+            rows.push((NameCell::ImplRows { krate }.key(), cell_digest(digest)));
+        }
+        if let Some(digest) = files_digest(items).map_err(CellsError::Items)? {
+            rows.push((NameCell::Files { krate }.key(), cell_digest(digest)));
+        }
+        if let Some(digest) = extensions_digest(items, read).map_err(CellsError::Items)? {
+            rows.push((NameCell::Extensions { krate }.key(), cell_digest(digest)));
+        }
+        if let Some(digest) = cfg_atoms_digest(items).map_err(CellsError::Items)? {
+            rows.push((NameCell::CfgAtoms { krate }.key(), cell_digest(digest)));
         }
     }
     for module in record.modules() {
         if let Some(digest) = module_digest(record, module) {
-            rows.push((NameCell::Module { module }.key(), digest));
+            rows.push((NameCell::Module { module }.key(), cell_digest(digest)));
         }
         if let Some(digest) = textual_cell_digest(record, module) {
-            rows.push((NameCell::Textual { module }.key(), digest));
+            rows.push((NameCell::Textual { module }.key(), cell_digest(digest)));
         }
         if let Some(view) = record.scope(module) {
             for entry in view.bindings() {
                 let cell = NameCell::Binding { module, name: cell_key(entry.ns, entry.name) };
-                rows.push((cell.key(), binding_digest(entry.binding)));
+                rows.push((cell.key(), cell_digest(binding_digest(entry.binding))));
             }
         }
     }
     for owner in record.enums() {
         if let Some(digest) = variants_digest(record, owner) {
-            rows.push((NameCell::Variants { owner }.key(), digest));
+            rows.push((NameCell::Variants { owner }.key(), cell_digest(digest)));
         }
     }
-    rows.push((NameCell::Root { krate: record.key().prefix() }.key(), root_digest(record)));
+    rows.push((NameCell::Root { krate: record.key().prefix() }.key(), cell_digest(root_digest(record))));
     if rows.len() > MAX_ROWS {
         return Err(CellsError::TooManyRows { rows: rows.len() });
     }
@@ -786,7 +1031,7 @@ pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, 
             return Err(CellsError::TwoUnderOneKey { key: *key });
         }
         bytes.extend_from_slice(key);
-        bytes.extend_from_slice(&digest.0);
+        bytes.extend_from_slice(digest);
     }
     Ok(bytes)
 }
@@ -804,9 +1049,9 @@ pub fn seen_in(table: &[u8], key: [u8; 16]) -> Result<Option<ContentId>, CellsEr
             core::cmp::Ordering::Less => lo = mid + 1,
             core::cmp::Ordering::Greater => hi = mid,
             core::cmp::Ordering::Equal => {
-                let mut digest = [0; 32];
+                let mut digest = [0; 16];
                 digest.copy_from_slice(&row[16..]);
-                return Ok(Some(ContentId(digest)));
+                return Ok(Some(expand_digest(digest)));
             }
         }
     }
@@ -1020,7 +1265,7 @@ impl<'l, N: Name, W: World<N>> World<N> for Logged<'l, W> {
 pub fn seen_by_record<'a>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, ReadText<'_, 'a>)>, wholes: &[(Section, &[u8])], cell: NameCell) -> Result<Option<ContentId>, CellsError> {
     let items_of = || items.map(|(items, _)| items).ok_or(CellsError::NoItemsRecord);
     let read_of = || items.map(|(_, read)| read).ok_or(CellsError::NoItemsRecord);
-    Ok(match cell {
+    let out = match cell {
         NameCell::Binding { module, name } => {
             let Some(view) = record.scope(module) else { return Ok(None) };
             let view: ScopeView<'_> = view;
@@ -1051,7 +1296,20 @@ pub fn seen_by_record<'a>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<
         NameCell::Lang { .. } => None,
         NameCell::Incoherent { krate } if krate == record.key().prefix() => incoherent_digest(items_of()?),
         NameCell::Incoherent { .. } => None,
-    })
+        NameCell::InternalSymbols { krate } if krate == record.key().prefix() => internal_symbols_digest(items_of()?, read_of()?).map_err(CellsError::Items)?,
+        NameCell::InternalSymbols { .. } => None,
+        NameCell::Links { krate } if krate == record.key().prefix() => Some(links_digest(record, items_of()?).map_err(CellsError::Items)?),
+        NameCell::Links { .. } => None,
+        NameCell::ImplRows { krate } if krate == record.key().prefix() => impl_rows_digest(items_of()?).map_err(CellsError::Items)?,
+        NameCell::ImplRows { .. } => None,
+        NameCell::Files { krate } if krate == record.key().prefix() => files_digest(items_of()?).map_err(CellsError::Items)?,
+        NameCell::Files { .. } => None,
+        NameCell::Extensions { krate } if krate == record.key().prefix() => extensions_digest(items_of()?, read_of()?).map_err(CellsError::Items)?,
+        NameCell::Extensions { .. } => None,
+        NameCell::CfgAtoms { krate } if krate == record.key().prefix() => cfg_atoms_digest(items_of()?).map_err(CellsError::Items)?,
+        NameCell::CfgAtoms { .. } => None,
+    };
+    Ok(out.map(norm_digest))
 }
 
 /// `Beginning(first)` read from the record by three binary searches, nothing allocated: the

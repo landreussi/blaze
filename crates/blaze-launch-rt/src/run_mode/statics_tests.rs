@@ -136,7 +136,7 @@ impl Memory for Sim {
         THUNKS + 16 * u64::from(slot.0)
     }
 
-    fn outside(&mut self, record: RecordId, symbol: Symbol, name: &str) -> Result<Outside, RunModeError> {
+    fn outside(&mut self, record: RecordId, symbol: Symbol, name: &str, _weak: bool) -> Result<Outside, RunModeError> {
         Err(RunModeError::Outside { record, symbol, name: super::CName::new(name), why: "the simulation binds no C names" })
     }
 
@@ -292,6 +292,7 @@ fn run_declaring(
     Seen { result, memory }
 }
 
+/// The invariant: statics, writable data, vtables, and thread-local descriptors are placed and initialized with valid addresses and function words before any record that names them.
 /// Steps 1 and 2: `S` (plain bytes) and `T` (its value `S`'s address, its own byte 8's, and
 /// `f`'s thunk) are placed before `f`, together; `f`'s load reads `S`'s word; each word of `T`
 /// holds what it names. Controls: `f` published with no `Data` is refused naming `S`; the same

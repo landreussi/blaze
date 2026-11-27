@@ -450,3 +450,95 @@ fn the_later_place_is_replayed_and_a_new_place_is_due() {
     assert_eq!((counts.replayed, counts.whole, counts.unplaced, counts.at, counts.status), (15, 24, 0, Some(20), Status::Used), "{counts}");
     assert!(counts.to_string().starts_with("journal: replayed 15 of 24 event ids (checkpoint at 20; floor: the ids appended since the last command)"), "{counts}");
 }
+
+/// Acquiring a helper place for the first time, or getting one from a new helper instance after a
+/// restart/reboot, marks a checkpoint due (`Due::NewPlace`) even when zero journal events fired,
+/// while a same-instance vouch with zero events writes no unnecessary checkpoint.
+#[test]
+fn a_new_helper_place_or_instance_is_due_even_with_zero_events() {
+    let frame = Frame::with_reserve(crate::engine_check::REQUEST_FRAME, bstd::mem::Tag::Other).expect("a test frame");
+    let sim = |journal, next| Cursor::Sim { journal, next };
+    let helper = |instance: u64, seq: u64| blaze_watch::since::Place { instance, seq }.encode();
+    let encoded = |cursor: Cursor, place: Option<[u8; crate::journal_sweep::HELPER_PLACE]>| {
+        let mut bytes = Vec::new_in(&frame);
+        Stored::encode_units([(CHECKOUT, "", cursor)].into_iter(), Some(7), &mut bytes);
+        if let Some(place) = place {
+            Stored::encode_helper(place, &mut bytes);
+        }
+        std::vec::Vec::from(&bytes[..])
+    };
+    let no_helper = encoded(sim(1, 10), None);
+    let no_helper_moved = encoded(sim(1, 11), None);
+    let first_helper = encoded(sim(1, 10), Some(helper(0xAA, 1)));
+    let same_instance = encoded(sim(1, 10), Some(helper(0xAA, 2)));
+    let same_instance_small_tick = encoded(sim(1, 10 + 5_000), Some(helper(0xAA, 3)));
+    let same_instance_large_tick = encoded(sim(1, 10 + HELPER_DUE_EVENTS), Some(helper(0xAA, 4)));
+    let restarted_helper = encoded(sim(1, 10), Some(helper(0xBB, 1)));
+    assert_eq!(due(whole(&no_helper), whole(&first_helper), DUE_EVENTS), Some(Due::NewPlace { units: 1 }), "first helper place triggers checkpoint");
+    assert_eq!(due(whole(&no_helper), whole(&no_helper_moved), DUE_EVENTS), Some(Due::Replayed { ids: 1 }), "without helper, 1 event still triggers checkpoint");
+    assert_eq!(due(whole(&first_helper), whole(&same_instance), DUE_EVENTS), None, "same helper instance with 0 events writes no checkpoint");
+    assert_eq!(due(whole(&first_helper), whole(&same_instance_small_tick), DUE_EVENTS), None, "same helper instance under HELPER_DUE_EVENTS writes no checkpoint");
+    assert_eq!(due(whole(&first_helper), whole(&same_instance_large_tick), DUE_EVENTS), Some(Due::Replayed { ids: HELPER_DUE_EVENTS }), "same helper instance at HELPER_DUE_EVENTS checkpoints");
+    assert_eq!(due(whole(&same_instance), whole(&restarted_helper), DUE_EVENTS), Some(Due::NewPlace { units: 1 }), "restarted helper instance triggers checkpoint");
+}
+
+/// Resetting `<answer_root>.journal` to `[answer]` skips `store.get` and returns `Status::Absent`,
+/// and `after_certificate` heals an existing stale `Ignored::OtherAnswer` checkpoint even when
+/// `due()` returns `None` (same helper instance, under `HELPER_DUE_EVENTS`).
+#[test]
+fn reset_sentinel_avoids_stale_checkpoint_read_and_heals_on_certificate() {
+    use blaze_cas::plain::Settings;
+    use bstd::io::{Io, Limits, SimWorld};
+    use bstd::mem::TASK_FRAME;
+    use bstd::test::BUDGET;
+
+    let io = Io::simulated(SimWorld::new(41, Limits::USUAL));
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
+    let home = crate::store::Home::of(&cx, &io.need_fs().expect("fs"), Some("/h")).expect("home");
+    let heap = blaze_own::testing::heap();
+    let frame = cx.frame();
+    let erased = blaze_own::Erased::new(frame);
+    let clock = io.need_clock().expect("clock");
+    let err = io.need_err().expect("stderr");
+    let lent = home.open_store(&Settings::default(), crate::store::Facts { boot: Some(1), nonce: 41 }, heap.alloc()).expect("store");
+    let mut store = CommandStore::new(&cx, &lent, false, 0, None, clock, &err, erased.handle()).expect("command store");
+
+    let sim = |journal, next| Cursor::Sim { journal, next };
+    let helper = |instance: u64, seq: u64| blaze_watch::since::Place { instance, seq }.encode();
+    let encoded = |cursor: Cursor, place: [u8; crate::journal_sweep::HELPER_PLACE]| {
+        let mut bytes = Vec::new_in(frame);
+        Stored::encode_units([(CHECKOUT, "", cursor)].into_iter(), Some(7), &mut bytes);
+        Stored::encode_helper(place, &mut bytes);
+        std::vec::Vec::from(&bytes[..])
+    };
+    let old_answer = answer_key(1);
+    let new_answer = answer_key(2);
+    let old_places = encoded(sim(1, 10), helper(0xAA, 1));
+    let new_places = encoded(sim(1, 20), helper(0xAA, 2));
+    let now_places = encoded(sim(1, 25), helper(0xAA, 3));
+
+    // Plant a legacy stale checkpoint extending `old_answer` under `answer.journal`, and put
+    // `new_answer` as the stored answer's sealed pointer record.
+    store.put(&cx, new_answer, b"new answer pointer").expect("put new answer pointer");
+    let (stale_key, stale_bytes) = encode(old_answer, whole(&old_places), frame);
+    store.put(&cx, stale_key, &stale_bytes).expect("put stale checkpoint");
+    store.pin(name("answer", frame).as_str(), &[stale_key]).expect("pin stale checkpoint");
+    lent.commit().expect("commit stale checkpoint");
+
+    // 1. Reading for `new_answer` sees `Ignored::OtherAnswer` and does 2 gets (root + checkpoint record).
+    let before_stale = lent.counts().gets;
+    let chosen = read(&cx, &mut store, "answer", new_answer, whole(&new_places), frame).expect("read stale");
+    assert_eq!(chosen.status, Status::Ignored(Ignored::OtherAnswer), "legacy stale checkpoint is reported ignored");
+    assert_eq!(lent.counts().gets, before_stale + 2, "stale checkpoint reads both root and checkpoint record");
+
+    // 2. `after_certificate` with `due == None` heals `<answer>.journal` to `[new_answer]`.
+    let wrote = after_certificate(&cx, &mut store, "answer", new_answer, &chosen, whole(&now_places), DUE_EVENTS, frame).expect("heal");
+    assert_eq!(wrote, None, "no new checkpoint record is written when under threshold");
+    lent.commit().expect("commit healed sentinel");
+
+    // 3. The next read sees `[new_answer]` sentinel and returns `Status::Absent` with only the 1 root read (no `store.get` of a checkpoint record).
+    let before = lent.counts().gets;
+    let next = read(&cx, &mut store, "answer", new_answer, whole(&new_places), frame).expect("read healed");
+    assert_eq!(next.status, Status::Absent, "healed sentinel reads as Absent, never Ignored");
+    assert_eq!(lent.counts().gets, before + 1, "sentinel reads only the root record and skips store.get");
+}

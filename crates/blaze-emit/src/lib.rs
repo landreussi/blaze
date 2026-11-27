@@ -177,10 +177,14 @@
 //! Anything outside the subset is [`EmitError::Unsupported`], naming the instruction: never a
 //! guess.
 
+#![cfg_attr(not(test), no_std)]
 #![feature(allocator_api)]
 // quad_run_tests.rs calls emitted `f128` functions and names the routines' `f128` signatures.
 #![cfg_attr(test, feature(f128))]
 
+
+extern crate alloc;
+use alloc::vec::Vec;
 use core::alloc::Allocator;
 use core::fmt;
 
@@ -208,7 +212,15 @@ mod scratch_tests;
 mod sota;
 pub mod table_gen;
 mod tier;
-pub use sota::{Sota, emit_sota_record_measured};
+pub use blaze_tier::Machine;
+pub use sota::{
+    CallMode, CompiledModuleFn, EmitProfile, InternalFastRole, ModuleFn, ScratchOrder, Sota,
+    SotaModuleOpts, SotaModuleOut, SotaRecordAbiOpts,
+    abi::{AbiFnInput, CallConvKind, ModuleAbiPlan, ZeroAbiOpts, ZeroAbiStats, plan_module_abi},
+    can_use_internal_fast_a64, compile_module_a64, emit_sota_record_for_machine,
+    emit_sota_record_for_machine_with_abi, emit_sota_record_measured,
+    emit_sota_record_with_profile,
+};
 pub use tier::Reference;
 pub use asm::AsmToken;
 
@@ -631,7 +643,7 @@ pub(crate) fn emit_reaching<A: Allocator>(
     // scalar on a copy first, in `Global` (the scratch the pass names for its own rows). Each
     // bound routine's reference row names a place the caller gave (`bound`), so `via` (one
     // entry per reference place) still covers every reference of the copy.
-    let heap = blaze_own::Erased::new(std::alloc::Global);
+    let heap = blaze_own::Erased::new(alloc::alloc::Global);
     let (legal, called) = routines::legalized(func, bound, heap.handle()).map_err(EmitError::Legalize)?;
     let func = match &legal {
         None => func,

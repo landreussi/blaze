@@ -1147,6 +1147,31 @@ fn a_cfg_predicate_is_read_from_its_tokens() {
     assert_eq!(eval("any(unix, unknown)").0, Err(CfgPredicateError::Atom(())));
 }
 
+#[test]
+fn a_cfg_predicate_unwraps_none_delim_groups_from_macro_captures() {
+    // `macro_rules!` `:expr` and `:meta` captures emit invisible `Delim::Invisible` groups around their
+    // substituted tokens (e.g. `async-compression`'s `#[cfg(all(feature = $algo_s))]`).
+    let cx = TestCx::new();
+    let def = rules("($s:expr, $m:meta) => { all(feature = $s, $m) };", 1);
+    let exp = call_fn(&def, "\"gzip\", unix", &cx);
+    assert!(
+        exp.tokens.tokens().iter().any(|t| matches!(t.kind, TokenKind::Open(Delim::Invisible))),
+        "expected invisible Delim::Invisible groups from :expr/:meta captures"
+    );
+    let out = cfg_predicate(&exp.tokens, blaze_own::testing::heap().alloc(), &mut |name, value| -> Result<bool, ()> {
+        Ok(matches!((name, value), ("feature", Some("gzip")) | ("unix", None)))
+    });
+    assert_eq!(out, Ok(true));
+
+    let attr_def = rules("($s:expr) => { #[cfg_attr(all(feature = $s), derive(Debug))] };", 1);
+    let attr_exp = call_fn(&attr_def, "\"gzip\"", &cx);
+    let metas = blaze_expand::cfg_attr_metas(&attr_exp.tokens, blaze_own::testing::heap().alloc(), &mut |name, value| -> Result<bool, ()> {
+        Ok(matches!((name, value), ("feature", Some("gzip"))))
+    })
+    .expect("cfg_attr with :expr capture parses");
+    assert_eq!(metas.len(), 1);
+}
+
 /// A predicate drawn from `tape` over the four atoms of [`TRI_ATOMS`], at most `depth` groups
 /// deep (`any`, `all`, `not`, each with a trailing comma sometimes).
 fn drawn_predicate(tape: &Tape, depth: u32) -> String {
@@ -1362,7 +1387,9 @@ fn the_closest_rule_is_named() {
     let cx = TestCx::new();
     let exp = call_fn(&rules("(a) => {}; (a b c) => {}", 1), "a b d", &cx);
     assert!(matches!(exp.diagnostics[..], [Diagnostic::NoRuleMatched { rules: 2, closest: Some(1), .. }]), "{:?}", exp.diagnostics);
-    let failed = blaze_expand::Failed::of(&exp, blaze_own::testing::heap().alloc()).expect("no rule matched is a failure");
+    let inline = blaze_own::Inline::<4096>::new();
+    let erased = blaze_own::Erased::new(&inline);
+    let failed = blaze_expand::Failed::of(&exp, erased.bump()).expect("no rule matched is a failure");
     let shown = std::format!("{failed}");
     assert!(shown.contains("rule 2 of 2"), "{shown}");
 }
@@ -1744,5 +1771,155 @@ fn an_include_s_read_list_entry_is_root_relative() {
             "{bad:?}: {:?}",
             refused.map(|_| ())
         );
+    }
+}
+
+/// An expression fragment with leading outer attributes (`#[cfg(windows)] "a".parse().unwrap()`,
+/// as in `vec![#[cfg(windows)] ...]`) keeps the outer attributes OUTSIDE any synthetic
+/// parentheses so `#[cfg(..)]` strips the whole element instead of leaving an empty `PAREN_EXPR`.
+#[test]
+fn expr_fragment_keeps_outer_attrs_outside_synthetic_parens() {
+    let cx = TestCx::new();
+    let def = rules("($($x:expr),+ $(,)?) => { [$($x),+] }", 1);
+    let exp = call_fn(
+        &def,
+        "#[cfg(unix)] \"a\".parse().unwrap(), #[cfg(windows)] \"b\".parse().unwrap(), #[allow(unused)] 1",
+        &cx,
+    );
+    let shown = show(&exp.tokens);
+    assert!(
+        shown.contains("# [ cfg ( windows ) ] ( \"b\" . parse ( ) . unwrap ( ) )"),
+        "outer #[cfg(windows)] must stay outside synthetic parens: {shown}"
+    );
+    assert!(
+        !shown.contains("( # [ cfg ( windows ) ]"),
+        "outer #[cfg(windows)] must not be wrapped inside synthetic parens: {shown}"
+    );
+    assert!(
+        shown.contains("# [ allow ( unused ) ] 1"),
+        "leaf body after outer attr needs no synthetic parens: {shown}"
+    );
+}
+
+/// Helper: expands `stringify!(input_stream)` and returns the unquoted string literal text.
+fn stringify_stream(input: &TokenStream<'_>, cx: &TestCx) -> String {
+    let mut sealed = input.clone();
+    sealed.seal(ContentId([9; 32]));
+    let exp = call_fn_tokens(&builtin(BuiltinFn::Stringify), &sealed, cx);
+    assert!(exp.diagnostics.is_empty(), "{:?}", exp.diagnostics);
+    assert_eq!(exp.tokens.len(), 1, "stringify! emits one string literal");
+    assert!(
+        matches!(exp.tokens.tokens()[0].kind, TokenKind::Literal { kind: LitKind::Str, .. }),
+        "expected Str literal, got {:?}",
+        exp.tokens.tokens()[0].kind
+    );
+    exp.tokens.text_at(0).to_owned()
+}
+
+/// Reproduces `cranelift-codegen-meta/src/pulley.rs:60` (`pulley_interpreter::for_each_op!(define)`):
+/// tokens coming from a `macro_rules!` RHS template never carry `Spacing::JointHidden`, so
+/// `stringify!($field_ty)` produces `"BinaryOperands < XReg >"` and `"UpperRegSet < XReg >"`.
+#[test]
+fn for_each_op_define_stringify_matches_rustc() {
+    let cx = TestCx::new();
+    let alloc = blaze_own::testing::heap().alloc();
+    let for_each_op = rules(
+        "($m:ident) => { $m! { \
+            xadd32 = Xadd32 { operands: BinaryOperands<XReg> }; \
+            xpush = Xpush { regs: UpperRegSet<XReg> }; \
+        } }",
+        1,
+    );
+    let define = rules(
+        "($( $snake:ident = $camel:ident { $( $field:ident : $field_ty:ty ),* }; )*) => { \
+            [ $( $( stringify!($field_ty) ),* ),* ] \
+        }",
+        2,
+    );
+
+    let step1 = call_fn(&for_each_op, "define", &cx);
+    assert!(step1.diagnostics.is_empty(), "{:?}", step1.diagnostics);
+    let calls1 = find_calls(&step1.tokens, alloc).expect("finds `define!` call");
+    assert_eq!(calls1.len(), 1);
+    let mut define_input = step1.tokens.copy_in(calls1[0].inner().to_usize(), alloc).expect("copies");
+    define_input.seal(ContentId([7; 32]));
+
+    let step2 = call_fn_tokens(&define, &define_input, &cx);
+    assert!(step2.diagnostics.is_empty(), "{:?}", step2.diagnostics);
+    let calls2 = find_calls(&step2.tokens, alloc).expect("finds `stringify!` calls");
+    assert_eq!(calls2.len(), 2);
+
+    let results: Vec<String> = calls2
+        .iter()
+        .map(|call| {
+            let arg = step2.tokens.copy_in(call.inner().to_usize(), alloc).expect("copies");
+            stringify_stream(&arg, &cx)
+        })
+        .collect();
+    assert_eq!(results, vec!["BinaryOperands < XReg >", "UpperRegSet < XReg >"]);
+    assert_eq!(results[0].strip_prefix("BinaryOperands <"), Some(" XReg >"));
+}
+
+/// Tokens from a `macro_rules!` RHS template (`TokenOrigin::Def`) drop `Spacing::JointHidden`
+/// (keeping only `Spacing::Joint` on glued punct) and `stringify!` spaces them as rustc does.
+#[test]
+fn macro_rules_rhs_stringify_spacing_matches_rustc() {
+    let cx = TestCx::new();
+    let cases = [
+        ("BinaryOperands<XReg>", "BinaryOperands < XReg >"),
+        ("UpperRegSet<XReg>", "UpperRegSet < XReg >"),
+        ("BinaryOperands<XReg, YReg>", "BinaryOperands < XReg, YReg >"),
+        ("foo::Bar<XReg>", "foo :: Bar < XReg >"),
+        ("$crate::f(1)", "$crate :: f(1)"),
+        ("let x = 1;", "let x = 1;"),
+        ("a.b.c()", "a.b.c()"),
+        ("#[allow(dead_code)] struct S { x: i32 }", "#[allow(dead_code)] struct S { x : i32 }"),
+        ("foo!(a, b)", "foo! (a, b)"),
+        ("1 ! 2", "1 ! 2"),
+        ("if ! ()", "if ! ()"),
+        ("(a)!", "(a)!"),
+        ("foo!=bar", "foo != bar"),
+        ("a[0]", "a [0]"),
+        ("1+2", "1 + 2"),
+        ("&'a mut XReg", "& 'a mut XReg"),
+        ("0..=10", "0 ..= 10"),
+        ("0..10", "0 .. 10"),
+        ("0...10", "0 ... 10"),
+    ];
+    for (rhs, expected) in cases {
+        let def = rules(&format!("() => {{ {rhs} }}"), 1);
+        let exp = call_fn(&def, "", &cx);
+        assert!(exp.diagnostics.is_empty(), "{rhs}: {:?}", exp.diagnostics);
+        let got = stringify_stream(&exp.tokens, &cx);
+        assert_eq!(got, expected, "macro_rules! RHS `{rhs}`");
+    }
+}
+
+/// Direct `stringify!(...)` and tokens forwarded from macro call input (`TokenOrigin::Input`,
+/// e.g. `id_tt!(...)`) preserve `Spacing::JointHidden` so adjacent source tokens stay unspaced.
+#[test]
+fn direct_and_input_forwarded_stringify_spacing_matches_rustc() {
+    let cx = TestCx::new();
+    let id_tt = rules("($($t:tt)*) => { $($t)* }", 1);
+    let cases = [
+        ("BinaryOperands<XReg>", "BinaryOperands<XReg>"),
+        ("foo::Bar<XReg>", "foo::Bar<XReg>"),
+        ("foo::<XReg>", "foo::<XReg>"),
+        ("a+b-c*d", "a+b-c*d"),
+        ("-1", "-1"),
+        ("&'a mut XReg", "&'a mut XReg"),
+        ("BinaryOperands   <   XReg   >", "BinaryOperands < XReg >"),
+        ("foo != bar", "foo != bar"),
+        ("foo!=bar", "foo!=bar"),
+        ("0..=10", "0..=10"),
+    ];
+    for (src, expected) in cases {
+        let direct = stringify_stream(&tokens(src), &cx);
+        assert_eq!(direct, expected, "direct stringify!({src})");
+
+        let forwarded = call_fn(&id_tt, src, &cx);
+        assert!(forwarded.diagnostics.is_empty(), "id_tt!({src}): {:?}", forwarded.diagnostics);
+        let got = stringify_stream(&forwarded.tokens, &cx);
+        assert_eq!(got, expected, "id_tt!({src}) -> stringify!");
     }
 }

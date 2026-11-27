@@ -900,6 +900,7 @@ mod dictionary_tests {
         Ok(())
     }
 
+    /// The invariant: rows-answer bytes are independent of worker completion arrival order.
     #[test]
     fn worker_order_preserves_answer_bytes() {
         blaze_sim::check(Config::cases(24), |tape| same_writes(tape, false));
@@ -1093,11 +1094,69 @@ impl fmt::Display for PublishError {
     }
 }
 
+impl<D: Driver, S: Sharing> StoreSink<'_, '_, '_, '_, D, S> {
+    /// Builds and stores the CAS reach index beside `owner`, reusing `cas_buf` to avoid repeated
+    /// per-page allocations and returning the created beside-index key so callers never recompute
+    /// `beside_key` a second time.
+    pub(crate) fn index_rows_into<A: core::alloc::Allocator>(
+        &mut self,
+        owner: Key,
+        records: &[Key],
+        scopes: &[(Name, Key)],
+        cas_buf: &mut Vec<blaze_cas::Key, A>,
+    ) -> Result<blaze_cas::Key, PublishError> {
+        use blaze_cas::plain::{INDEX_KEYS_MOST, beside_key};
+        use blaze_keyed::kind::ReservedTag;
+
+        // Fast path for a single-key page with no CrateScope expansions (e.g. a readers-only page):
+        // skip buffer copy/sort/dedup and file the 32-byte beside index directly.
+        if scopes.is_empty() && let [only] = records {
+            return self.lent.index_beside(blaze_cas::Key(owner.0), &[blaze_cas::Key(only.0)]).map_err(PublishError::Cas);
+        }
+        // CAS reach follows one index level. Include each expansion's key and its owner's
+        // side index so a later carried names row can be indexed again after compaction.
+        cas_buf.clear();
+        cas_buf.reserve(records.len());
+        cas_buf.extend(records.iter().map(|key| blaze_cas::Key(key.0)));
+        for &(_, record) in scopes {
+            let index = beside_key(blaze_cas::Key(record.0));
+            // put_all creates this optional local index only for a nonempty expansion set.
+            // Use `with_bytes` rather than `get` so uncommitted expansion indexes never pin the
+            // shared arena across commit.
+            let checked = self
+                .lent
+                .with_bytes(&index, |tag, namespace, bytes| {
+                    if namespace != blaze_cas::plain::Namespace::LOCAL || !ReservedTag::Index.is(tag) || bytes.len() % 32 != 0 || bytes.len() / 32 > INDEX_KEYS_MOST {
+                        return Err(PublishError::ExpansionIndex { record, index: Key(index.0), namespace: namespace.0, tag: tag.0, bytes: bytes.len() });
+                    }
+                    cas_buf.reserve(1 + bytes.len() / 32);
+                    cas_buf.push(index);
+                    for chunk in bytes.chunks_exact(32) {
+                        if let Ok(raw) = <[u8; 32]>::try_from(chunk) {
+                            cas_buf.push(blaze_cas::Key(ContentId(raw)));
+                        }
+                    }
+                    Ok(())
+                })
+                .map_err(PublishError::Cas)?;
+            if let Some(res) = checked {
+                res?;
+            }
+        }
+        cas_buf.sort_unstable();
+        cas_buf.dedup();
+        if cas_buf.len() > INDEX_KEYS_MOST {
+            return Err(PublishError::RowsReach { segment: owner, cap: INDEX_KEYS_MOST });
+        }
+        self.lent.index_beside(blaze_cas::Key(owner.0), cas_buf).map_err(PublishError::Cas)
+    }
+}
+
 impl<D: Driver, S: Sharing> AnswerSink for StoreSink<'_, '_, '_, '_, D, S> {
     type Error = PublishError;
 
     fn put(&mut self, key: Key, bytes: &[u8]) -> Result<(), PublishError> {
-        self.store.put(self.cx, key, bytes).map_err(PublishError::Command)
+        self.store.put_local(self.cx, key, bytes).map_err(PublishError::Command)
     }
 
     fn pin(&mut self, name: &str, keys: &[Key]) -> Result<(), PublishError> {
@@ -1105,36 +1164,9 @@ impl<D: Driver, S: Sharing> AnswerSink for StoreSink<'_, '_, '_, '_, D, S> {
     }
 
     fn index_rows(&mut self, owner: Key, records: &[Key], scopes: &[(Name, Key)], alloc: Alloc<'_>) -> Result<(), PublishError> {
-        use blaze_cas::plain::{INDEX_KEYS_MOST, beside_key};
-        use blaze_keyed::kind::ReservedTag;
-
-        // CAS reach follows one index level. Include each expansion's key and its owner's
-        // side index so a later carried names row can be indexed again after compaction.
-        let mut keys = blaze_own::BTreeSet::new_in(alloc);
-        let mut keep = |key| {
-            keys.insert(key);
-            if keys.len() > INDEX_KEYS_MOST {
-                return Err(PublishError::RowsReach { segment: owner, cap: INDEX_KEYS_MOST });
-            }
-            Ok(())
-        };
-        for key in records {
-            keep(*key)?;
-        }
-        for &(_, record) in scopes {
-            let index = beside_key(blaze_cas::Key(record.0));
-            // put_all creates this optional local index only for a nonempty expansion set.
-            let Some(held) = self.lent.get(&index).map_err(PublishError::Cas)? else { continue };
-            if held.namespace != blaze_cas::plain::Namespace::LOCAL || !ReservedTag::Index.is(held.tag) ||held.bytes.len() % 32 != 0 || held.bytes.len() / 32 > INDEX_KEYS_MOST {
-                return Err(PublishError::ExpansionIndex { record, index: Key(index.0), namespace: held.namespace.0, tag: held.tag.0, bytes: held.bytes.len() });
-            }
-            keep(Key(index.0))?;
-            for bytes in held.bytes.chunks_exact(32) {
-                keep(Key(ContentId(bytes.try_into().expect("a whole index key"))))?;
-            }
-        }
-        let keys = Vec::from_iter_in(keys.iter().copied(), alloc);
-        self.store.index_beside(self.cx, owner, &keys).map_err(PublishError::Command)
+        let mut cas_buf = Vec::with_capacity_in(records.len(), alloc);
+        let _ = self.index_rows_into(owner, records, scopes, &mut cas_buf)?;
+        Ok(())
     }
 
     fn pin_children(&mut self, names: &RootNames<'_>, segments: &[SegmentRef], lines: Key, alloc: Alloc<'_>) -> Result<(), PublishError> {

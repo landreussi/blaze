@@ -90,17 +90,17 @@ pub fn needs_drop<'g, E>(
 ) -> Result<bool, NeedsDropError<E>> {
     let malformed = |what: &'static str| move |_: CheckError| NeedsDropError::Malformed { what };
     let mut todo: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
-    let mut seen: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
+    let mut seen: crate::instance::PtyMap<(), Alloc<'_>> = crate::instance::PtyMap::new_in(scratch);
     let mut args: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
     todo.push(ty);
     while let Some(t) = todo.pop() {
-        if seen.contains(&t) {
+        if seen.get(t).is_some() {
             continue;
         }
         if seen.len() >= SEEN_CAP {
             return Err(NeedsDropError::TooManyTypes { cap: SEEN_CAP });
         }
-        seen.push(t);
+        seen.set(t, ());
         let node = ground_tys.view().node(t).map_err(malformed("a type past the ground table"))?;
         match node {
             // Nothing to drop: "any other type".
@@ -120,7 +120,7 @@ pub fn needs_drop<'g, E>(
             PNode::Foreign(_) => {}
             // A pattern type's values are its base's (an integer, `char` or raw pointer).
             PNode::Pat(base, _) => todo.push(base),
-            PNode::Tuple(l) => {
+            PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => {
                 todo.extend_from_slice(ground_tys.view().list(l).map_err(malformed("a tuple's list past the ground table"))?);
             }
             PNode::Slice(elem) => todo.push(elem),

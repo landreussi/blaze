@@ -76,6 +76,8 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::capabilities",
             "blaze::unreachable",
             "blaze::refinement",
+            "blaze::cost_contract",
+            "blaze::capability_in_sans_io",
             "blaze::todo",
             "blaze::undeclared_effect",
             "blaze::unfulfilled_effect",
@@ -127,6 +129,11 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::unmarked_noalloc",
             "blaze::unmarked_nonblocking",
             "blaze::mut_ref",
+            "blaze::magic_slice_len",
+            "blaze::bool_as_int",
+            "blaze::manual_slice_idioms",
+            "blaze::test_ambient_leak",
+            "blaze::mut_for_uniq_borrow",
             // Code written the way the edition wants it (docs/v2/plan/design/facts.md).
             "blaze::program_lifetime",
         ],
@@ -303,6 +310,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::workspace_unsafe",
             "blaze::raw_sync",
             "blaze::anon_tuple_return",
+            "blaze::parallel_vecs",
         ],
     ),
     // The cross-configuration reachability lints (docs/v2/plan/design/multiconfig-check.md), also in

@@ -23,6 +23,7 @@ use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::Front2;
 use blaze_ladder::front2::body::lower_fn;
 use blaze_ladder::front2::check::{BuildOrder, CheckFail, Records, check_body};
+use blaze_ladder::front2::consts::Consts;
 use blaze_ladder::front2::heads::{Store, Want};
 use blaze_ladder::front2::spell::Spelling;
 use blaze_ladder::refusal::SourceFile;
@@ -32,10 +33,13 @@ use blaze_scope::names::{self, Written};
 use blaze_surface::{Namespace, PathKind};
 
 const MAIN: &str = "extern crate alloc;
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::rc::Rc;
+use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
-fn main(cx: &Cx, io: Io) -> Result<(), Error> {
+fn main(cx: &Cx, out: Out) -> Result<(), Error> {
+    let _ = (cx, out);
     Ok(())
 }
 fn vec_len(v: Vec<u8>) -> usize { v.len() }
@@ -97,6 +101,71 @@ fn option_in_result(o: Option<u8>) -> Result<u8, E> { let x = o?; Ok(x) }
 fn range_inclusive_contains(a: u8, b: u8) -> bool { (a..=b).contains(&a) }
 fn range_inclusive_for() { for _i in 0..=3u8 {} }
 fn range_inclusive_wrong(a: u8, b: u8) -> u8 { a..=b }
+trait CloneBoxed {
+    fn clone_box(&self) -> Box<dyn CloneBoxed + Send + Sync>;
+}
+struct BoxHolder {
+    inner: Box<dyn CloneBoxed>,
+}
+fn box_dyn_method(h: &BoxHolder) -> Box<dyn CloneBoxed + Send + Sync> {
+    h.inner.clone_box()
+}
+struct NoDrop<T: ?Sized>(core::mem::ManuallyDrop<T>);
+impl<T: ?Sized> Deref for NoDrop<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+impl<T: ?Sized> DerefMut for NoDrop<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+}
+trait IterTrait<'a, T: 'a>: Iterator<Item = &'a T> {
+    fn clone_box(&self) -> Box<NoDrop<dyn IterTrait<'a, T> + 'a>>;
+}
+struct IterHolder<'a, T: 'a> {
+    inner: Box<NoDrop<dyn IterTrait<'a, T> + 'a>>,
+}
+fn box_nodrop_dyn_next<'a, T>(it: &mut IterHolder<'a, T>) -> Option<&'a T> {
+    it.inner.next()
+}
+fn box_nodrop_dyn_clone<'a, T>(it: &IterHolder<'a, T>) -> Box<NoDrop<dyn IterTrait<'a, T> + 'a>> {
+    it.inner.clone_box()
+}
+fn box_plain_dyn_iter_next<'a, T>(b: &mut Box<dyn IterTrait<'a, T> + 'a>) -> Option<&'a T> {
+    b.next()
+}
+fn box_plain_dyn_iter_clone<'a, T>(b: &Box<dyn IterTrait<'a, T> + 'a>) -> Box<NoDrop<dyn IterTrait<'a, T> + 'a>> {
+    b.clone_box()
+}
+fn box_nodrop_cloneboxed(b: &Box<NoDrop<dyn CloneBoxed>>) -> Box<dyn CloneBoxed + Send + Sync> {
+    b.clone_box()
+}
+trait SupAssoc {
+    type Item;
+    fn sup_next(&mut self) -> Option<Self::Item>;
+}
+trait SubAssoc<'a, T: 'a>: SupAssoc<Item = &'a T> {
+    fn sub_m(&self) -> u8;
+}
+fn box_sub_assoc_next<'a, T>(b: &mut Box<dyn SubAssoc<'a, T> + 'a>) -> Option<&'a T> {
+    b.sup_next()
+}
+fn box_sub_assoc_m<'a, T>(b: &Box<dyn SubAssoc<'a, T> + 'a>) -> u8 {
+    b.sub_m()
+}
+trait Service2<Req> {
+    type Resp;
+    type Err;
+}
+trait Transport2: Service2<u8, Resp = u16, Err = u32> + Send + Sync + 'static {}
+trait CloneTransport2: Transport2 + core::any::Any {
+    fn clone_box(&self) -> Box<dyn CloneTransport2 + Send + Sync>;
+}
+struct BoxTransport2 {
+    inner: Box<dyn CloneTransport2>,
+}
+fn box_transitive_super_proj_clone(t: &BoxTransport2) -> Box<dyn CloneTransport2 + Send + Sync> {
+    t.inner.clone_box()
+}
 ";
 
 /// The bodies that must check clean, each with what it proves. `vec_iter` and `try_same` come
@@ -137,6 +206,15 @@ const CLEAN: &[(&str, &str)] = &[
     ("takes", "`<[u8]>::len`"),
     ("range_inclusive_contains", "`a..=b` is `RangeInclusive::new(a, b)`: a lang fn of an inherent impl"),
     ("range_inclusive_for", "`for` over `0..=3u8`: `RangeInclusive::new`, then `IntoIterator::into_iter`"),
+    ("box_dyn_method", "`Box<dyn CloneBoxed>` calling `clone_box`"),
+    ("box_nodrop_dyn_next", "`Box<NoDrop<dyn IterTrait<'a, T>>>` calling `Iterator::next`"),
+    ("box_nodrop_dyn_clone", "`Box<NoDrop<dyn IterTrait<'a, T>>>` calling `IterTrait::clone_box`"),
+    ("box_plain_dyn_iter_next", "`Box<dyn IterTrait<'a, T>>` calling `Iterator::next`"),
+    ("box_plain_dyn_iter_clone", "`Box<dyn IterTrait<'a, T>>` calling `IterTrait::clone_box`"),
+    ("box_nodrop_cloneboxed", "`Box<NoDrop<dyn CloneBoxed>>` calling `CloneBoxed::clone_box`"),
+    ("box_sub_assoc_next", "`Box<dyn SubAssoc<'a, T>>` calling `SupAssoc::sup_next`"),
+    ("box_sub_assoc_m", "`Box<dyn SubAssoc<'a, T>>` calling `SubAssoc::sub_m`"),
+    ("box_transitive_super_proj_clone", "`Box<dyn CloneTransport2>` calling `clone_box` with transitive supertrait projections"),
     ("main", "the entry"),
 ];
 
@@ -162,7 +240,7 @@ fn deref_and_try_through_front2() {
     let user = UserCrate { name: "chks", dir: "/chks/", root: "/chks/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
         let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
@@ -175,10 +253,12 @@ fn deref_and_try_through_front2() {
             .map(|d| d.key)
             .unwrap_or_else(|| panic!("`{name}` from the crate root"))
     };
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut buckets = None;
-    let mut failed = Vec::new();
-    let mut report: Vec<String> = Vec::new();
+    let mut consts = Consts::default();
+    let test_alloc = blaze_own::testing::heap().alloc();
+    let mut failed = blaze_own::AVec::new_in(test_alloc);
+    let mut report = blaze_own::AVec::new_in(test_alloc);
     let cases = CLEAN.iter().map(|&(n, p)| (n, p, None)).chain(REFUSED.iter().map(|&(n, w)| (n, "must be refused", Some(w))));
     for (name, proves, want) in cases {
         if let Err(e) = store.ensure(&names, &mut front.keys, Want::Fn(lib(name))) {
@@ -197,7 +277,7 @@ fn deref_and_try_through_front2() {
         let view = body.lowered.view();
         let spell = Spelling::of(&view).expect("spelling");
         let scope = body.scope(&spell);
-        let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: None };
+        let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, prepared)) };
         match (check_body(&mut records, &body, &scope), want) {
             (Ok(_), None) => report.push(format!("{name}: clean")),
             (Err(CheckFail::Diags { diags, .. }), Some(w)) if format!("{diags:?}").starts_with(&format!("[({w},")) => {

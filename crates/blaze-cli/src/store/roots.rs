@@ -92,6 +92,14 @@ impl Class for Toolchain {
     const WHAT: &'static str = "the toolchain's code";
 }
 
+/// A test suite's kept incremental results, head, postings and state (test_cache.rs).
+#[derive(Debug)]
+pub(crate) enum TestSuite {}
+
+impl Class for TestSuite {
+    const WHAT: &'static str = "a test suite's kept results";
+}
+
 /// The proof that a root of class `C` names some keys from the next commit on: only the
 /// functions of this module and `PlainPlace::pin`/`pin_through` make one (rule 76).
 #[derive(Debug)]
@@ -136,6 +144,11 @@ impl RootName {
     /// long as the toolchain's records are.
     pub(crate) fn published_floor(set: &blaze_ids::ContentId) -> RootName {
         RootName::of(b"pubf.", &set.0)
+    }
+
+    /// A test suite's kept results root: `test.` and the 64 hex of the suite's id.
+    pub(crate) fn test_suite(suite: &blaze_ids::ContentId) -> RootName {
+        RootName::of(b"test.", &suite.0)
     }
 
     fn of(word: &[u8; 5], id: &[u8; 32]) -> RootName {
@@ -212,6 +225,16 @@ pub(crate) fn keep_program<D: Driver>(lent: &Lent<D, StoreAlloc>, today: &start_
     Ok((Rooted::new(at), kept))
 }
 
+/// Pins a test suite's kept incremental state (pointer, state record, head, postings, result
+/// records) under `test.<id>` for [`ROOT_LIFE_NS`].
+pub(crate) fn keep_test_suite<D: Driver>(lent: &Lent<D, StoreAlloc>, suite: &blaze_ids::ContentId, keys: &[CasKey]) -> Result<Rooted<TestSuite>, RootError> {
+    let root = RootName::test_suite(suite);
+    let store = |why| RootError::Store { class: TestSuite::WHAT, root, why };
+    let index = lent.index(keys).map_err(store)?;
+    let at = lent.root_through(root.as_str(), &[index], ROOT_LIFE_NS).map_err(store)?;
+    Ok(Rooted::new(at))
+}
+
 /// A toolchain root's life: twice a program's, and renewed by every command that reaches a
 /// record of its class (decided 2026-11-17).
 pub(crate) const TOOLCHAIN_LIFE_NS: u64 = 2 * ROOT_LIFE_NS;
@@ -233,6 +256,15 @@ pub(crate) const TOOLCHAIN_INDEXES_FOLD: usize = 64;
 /// root as they are, so reach keeps what they hold too (one level).
 pub(crate) fn keep_toolchain<D: Driver>(lent: &Lent<D, StoreAlloc>, toolchain: ToolchainId, made: &[CasKey], beside: &[CasKey]) -> Result<Option<Rooted<Toolchain>>, RootError> {
     let root = RootName::toolchain(toolchain);
+    // O(1) fast path on incremental edits where no new toolchain records were written: renew the
+    // existing `tool.<id>` root lease in the manifest without reading, copying, sorting, or
+    // re-probing every toolchain index record.
+    if made.is_empty() && beside.is_empty() {
+        return Ok(match lent.renew_root(root.as_str(), TOOLCHAIN_LIFE_NS) {
+            blaze_cas::plain::Renewed::Fresh(key) | blaze_cas::plain::Renewed::Extended(key) => Some(Rooted::new(key)),
+            blaze_cas::plain::Renewed::Missing => None,
+        });
+    }
     let store = |why| RootError::Store { class: Toolchain::WHAT, root, why };
     let not_indexed = |key| RootError::NotIndexed { class: Toolchain::WHAT, root, key };
     let mut indexes: std::vec::Vec<CasKey, StoreAlloc> = std::vec::Vec::new_in(*lent.alloc());

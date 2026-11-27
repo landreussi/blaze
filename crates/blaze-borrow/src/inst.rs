@@ -27,10 +27,10 @@
 use core::alloc::Allocator;
 
 use blaze_flow::Origin;
-use blaze_own::Vec;
+use blaze_own::{FixedVec, Vec};
 use blaze_typeck::region_facts::{ClauseView, ColView, Outlives, ParamsView};
 use blaze_typeck::regions::Region;
-use blaze_typeck::{ItemKey, Name, PTy};
+use blaze_typeck::{ItemKey, Mutbl, Name, PTy};
 
 use crate::types::{RegionTypes, SlotCount, SlotRange};
 use crate::{Bad, Refused, Reg};
@@ -56,14 +56,16 @@ pub enum ClauseIn<'c> {
     /// `T: Trait<A..>` as a head's clause column lays it (blaze-ladder heads_regions.rs): one
     /// `ExTrait(Trait, [T, A..])` node, the subject its FIRST argument, its column the trait's
     /// lifetime arguments then `T`'s slots then each `A`'s: the form of [`ImplHead::trait_ref`]
-    /// too. Tied as [`ClauseIn::Trait`] is, the subject read off the node (relate.rs `tie_of`).
-    TraitOf { trait_ref: Typed<'c> },
+    /// too. `binders` is `ClauseView::binders` (how many `for<..>` lifetimes at `binder: 0` the
+    /// clause itself quantifies). Tied as [`ClauseIn::Trait`] is, the subject read off the node
+    /// (relate.rs `tie_of`).
+    TraitOf { trait_ref: Typed<'c>, binders: u32 },
     /// `<T as Trait<A..>>::N == U` as a head's clause column lays it: one `ExProj { Trait, N,
     /// [T, A..], U }` node, its column EMPTY (a projection clause that writes a region is
-    /// refused by the caller by name). Related by relate.rs `proj_of`: nothing where `U` names
-    /// no region of the call (its parent `T: Trait<A..>` clause, laid apart, ties the rest);
-    /// else refused by name ([`NotSelected::WhereProjection`]).
-    ProjOf { proj: Typed<'c> },
+    /// refused by the caller by name). `binders` is `ClauseView::binders`. Related by relate.rs
+    /// `proj_of`: nothing where `U` names no region of the call (its parent `T: Trait<A..>`
+    /// clause, laid apart, ties the rest); else refused by name ([`NotSelected::WhereProjection`]).
+    ProjOf { proj: Typed<'c>, binders: u32 },
 }
 
 /// A fn item's signature as its head record lays it (D148 `SigRegions`, split by
@@ -152,13 +154,25 @@ pub enum Late {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnvId(u32);
 
+impl EnvId {
+    pub(crate) fn index(self) -> usize {
+        usize::try_from(self.0).unwrap_or(usize::MAX)
+    }
+}
+
 /// Where a side's region slots are.
 #[derive(Clone, Copy, Debug)]
 pub enum Slots<'c> {
     /// The caller's slots.
     Caller(SlotRange),
-    /// A declared column, its regions read through environment `env`.
+    /// A declared column (in `sig_types`), its regions read through environment `env`.
     Sig { col: &'c [Region], env: EnvId },
+    /// A caller-table type (in `types`, e.g. a closure's `FnPtr` signature), its regions read
+    /// through environment `env`.
+    CallerEnv { col: &'c [Region], env: EnvId },
+    /// A caller-table type (in `types`, e.g. an anonymous `async { .. }` block's `Future::Output`)
+    /// whose `len` slots are fresh existential origins bound at `Param(start..start + len)` in `env`.
+    CallerFresh { env: EnvId, start: u32, len: SlotCount },
 }
 
 impl<'c> Slots<'c> {
@@ -166,7 +180,8 @@ impl<'c> Slots<'c> {
     pub fn len(self) -> Option<SlotCount> {
         match self {
             Slots::Caller(r) => Some(r.count()),
-            Slots::Sig { col, .. } => SlotCount::of_len(col.len()),
+            Slots::Sig { col, .. } | Slots::CallerEnv { col, .. } => SlotCount::of_len(col.len()),
+            Slots::CallerFresh { len, .. } => Some(len),
         }
     }
 
@@ -180,6 +195,21 @@ impl<'c> Slots<'c> {
                 }
                 let (a, b) = col.split_at(n.len());
                 Some((Slots::Sig { col: a, env }, Slots::Sig { col: b, env }))
+            }
+            Slots::CallerEnv { col, env } => {
+                if n.len() > col.len() {
+                    return None;
+                }
+                let (a, b) = col.split_at(n.len());
+                Some((Slots::CallerEnv { col: a, env }, Slots::CallerEnv { col: b, env }))
+            }
+            Slots::CallerFresh { env, start, len } => {
+                if n.get() > len.get() {
+                    return None;
+                }
+                let mid = start.checked_add(n.get())?;
+                let rem = SlotCount::new(len.get() - n.get());
+                Some((Slots::CallerFresh { env, start, len: n }, Slots::CallerFresh { env, start: mid, len: rem }))
             }
         }
     }
@@ -210,26 +240,31 @@ pub enum Clause<'c> {
     /// proves it.
     Trait { subject: Side<'c>, trait_ref: Side<'c> },
     /// [`ClauseIn::TraitOf`]: the subject is `trait_ref`'s first argument.
-    TraitOf { trait_ref: Side<'c> },
+    TraitOf { trait_ref: Side<'c>, binders: u32 },
     /// [`ClauseIn::ProjOf`].
-    ProjOf { proj: Side<'c> },
+    ProjOf { proj: Side<'c>, binders: u32 },
 }
 
 #[derive(Clone, Copy, Debug)]
 enum Mode {
     /// A callee's or an impl's own numbering: `Param(i)` is `regs[i]`; `bindable` for an
-    /// impl's, whose parameters a header walk binds.
-    Item { bindable: bool },
+    /// impl's, whose parameters a header walk binds; `gat_base` is where a GAT's own
+    /// lifetimes (`Region::Late { binder: u32::MAX, var }`) start inside `regs`.
+    Item { bindable: bool, gat_base: u32 },
     /// The caller's numbering: `Param(i)` is the caller's own; `binder`'s variables are
     /// instantiated (`late`).
     Owner { binder: Option<u32> },
 }
 
-struct Env<'c, A: Allocator> {
+#[derive(Clone, Copy)]
+struct EnvMeta {
     mode: Mode,
-    regs: Vec<Option<Reg>, A>,
-    late: Vec<(u32, u32, Origin), A>,
-    types: Vec<Option<Side<'c>>, A>,
+    regs_start: u32,
+    regs_len: u32,
+    late_start: u32,
+    late_len: u32,
+    types_start: u32,
+    types_len: u32,
 }
 
 /// A region slot read through its environment.
@@ -250,63 +285,439 @@ pub(crate) enum TypeAt<'c> {
     Unbound { env: EnvId, param: u32 },
 }
 
+/// Contiguous inline-first buffer: zero heap allocation up to `N` items, spilling to a single
+/// `Vec<T, A>` only past `N`. Always exposes a contiguous slice for `env_types`, inputs, clauses.
+pub(crate) enum SmallBuf<T, const N: usize, A: Allocator> {
+    Inline { buf: FixedVec<T, N>, alloc: A },
+    Heap(Vec<T, A>),
+}
+
+impl<T, const N: usize, A: Allocator + Copy> SmallBuf<T, N, A> {
+    #[inline]
+    pub(crate) fn new_in(alloc: A) -> Self {
+        Self::Inline { buf: FixedVec::new(), alloc }
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Inline { buf, .. } => buf.len(),
+            Self::Heap(v) => v.len(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[T] {
+        match self {
+            Self::Inline { buf, .. } => buf.as_slice(),
+            Self::Heap(v) => v.as_slice(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
+        match self {
+            Self::Inline { buf, .. } => buf.as_mut_slice(),
+            Self::Heap(v) => v.as_mut_slice(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn clear(&mut self) {
+        match self {
+            Self::Inline { buf, .. } => buf.clear(),
+            Self::Heap(v) => v.clear(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn truncate(&mut self, len: usize) {
+        match self {
+            Self::Inline { buf, .. } => {
+                while buf.len() > len {
+                    let _ = buf.pop();
+                }
+            }
+            Self::Heap(v) => v.truncate(len),
+        }
+    }
+
+    #[cold]
+    fn spill(&mut self, extra: usize) {
+        let Self::Inline { buf, alloc } = self else { return };
+        let alloc = *alloc;
+        let cap = (N * 2).max(buf.len().saturating_add(extra));
+        let mut v = Vec::with_capacity_in(cap, alloc);
+        while !buf.is_empty() {
+            v.push(buf.remove_shift(0));
+        }
+        *self = Self::Heap(v);
+    }
+
+    #[inline]
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        match self {
+            Self::Inline { buf, .. } => {
+                if buf.len().saturating_add(additional) > N {
+                    self.spill(additional);
+                }
+            }
+            Self::Heap(v) => v.reserve(additional),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn push(&mut self, value: T) {
+        match self {
+            Self::Inline { buf, .. } => {
+                if let Err(full) = buf.push(value) {
+                    self.spill(1);
+                    if let Self::Heap(v) = self {
+                        v.push(full.value);
+                    }
+                }
+            }
+            Self::Heap(v) => v.push(value),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get<I: core::slice::SliceIndex<[T]>>(&self, index: I) -> Option<&I::Output> {
+        self.as_slice().get(index)
+    }
+
+    #[inline]
+    pub(crate) fn get_mut<I: core::slice::SliceIndex<[T]>>(&mut self, index: I) -> Option<&mut I::Output> {
+        self.as_mut_slice().get_mut(index)
+    }
+}
+
+impl<T: Copy, const N: usize, A: Allocator + Copy> SmallBuf<T, N, A> {
+    #[inline]
+    pub(crate) fn resize(&mut self, new_len: usize, value: T) {
+        let cur = self.len();
+        if new_len <= cur {
+            self.truncate(new_len);
+            return;
+        }
+        let add = new_len - cur;
+        self.reserve(add);
+        match self {
+            Self::Inline { buf, .. } => {
+                for _ in 0..add {
+                    let _ = buf.push(value);
+                }
+            }
+            Self::Heap(v) => v.resize(new_len, value),
+        }
+    }
+}
+
 /// The environments of one call: the callee's, and one per impl a normalization or a bound
 /// read (most a handful).
+///
+/// Flattened into four LIFO pools (`envs`, `regs`, `late`, `types`) so `truncate` and `clear`
+/// reclaim pool capacity without leaking per-`Env` `Vec` allocations into a bump frame.
+/// `types` stays inline up to 16 entries so typical calls never allocate on the heap for it.
 pub struct Envs<'c, A: Allocator> {
-    envs: Vec<Env<'c, A>, A>,
+    envs: Vec<EnvMeta, A>,
+    regs: Vec<Option<Reg>, A>,
+    late: Vec<(u32, u32, Origin), A>,
+    types: SmallBuf<Option<Side<'c>>, 16, A>,
+    owner: Option<EnvId>,
     alloc: A,
 }
 
-/// The most environments one call makes (rule 18).
-pub const MOST_ENVS: usize = 256;
+/// Lifetime-free storage pools of [`Envs`], moved in and out of [`crate::CallScratch`].
+pub(crate) struct EnvPools<A: Allocator> {
+    envs: Vec<EnvMeta, A>,
+    regs: Vec<Option<Reg>, A>,
+    late: Vec<(u32, u32, Origin), A>,
+}
 
-impl<'c, A: Allocator + Clone> Envs<'c, A> {
-    pub fn new_in(alloc: A) -> Envs<'c, A> {
-        Envs { envs: Vec::new_in(alloc.clone()), alloc }
+impl<A: Allocator + Copy> EnvPools<A> {
+    pub(crate) fn new_in(alloc: A) -> Self {
+        Self { envs: Vec::new_in(alloc), regs: Vec::new_in(alloc), late: Vec::new_in(alloc) }
     }
 
-    fn push(&mut self, mode: Mode, regs: Vec<Option<Reg>, A>, types: Vec<Option<Side<'c>>, A>) -> Option<EnvId> {
-        if self.envs.len() >= MOST_ENVS {
-            return None;
+    pub(crate) fn clear(&mut self) {
+        self.envs.clear();
+        self.regs.clear();
+        self.late.clear();
+    }
+}
+
+/// The most environments one call makes (rule 18; deeply chained iterator adaptors and
+/// Reth node-builder trait stacks open many nested impl/supertrait environments).
+pub const MOST_ENVS: usize = 65536;
+
+#[inline]
+fn range_of(start: u32, len: u32) -> core::ops::Range<usize> {
+    let lo = start as usize;
+    lo..lo + (len as usize)
+}
+
+impl<'c, A: Allocator + Copy> Envs<'c, A> {
+    pub fn new_in(alloc: A) -> Envs<'c, A> {
+        Envs {
+            envs: Vec::new_in(alloc),
+            regs: Vec::new_in(alloc),
+            late: Vec::new_in(alloc),
+            types: SmallBuf::new_in(alloc),
+            owner: None,
+            alloc,
         }
-        let id = EnvId(self.envs.len() as u32);
-        self.envs.push(Env { mode, regs, late: Vec::new_in(self.alloc.clone()), types });
-        Some(id)
+    }
+
+    pub(crate) fn from_pools(mut pools: EnvPools<A>, alloc: A) -> Envs<'c, A> {
+        pools.clear();
+        Envs { envs: pools.envs, regs: pools.regs, late: pools.late, types: SmallBuf::new_in(alloc), owner: None, alloc }
+    }
+
+    pub(crate) fn into_pools(self) -> EnvPools<A> {
+        EnvPools { envs: self.envs, regs: self.regs, late: self.late }
+    }
+
+    /// Clears every environment while retaining all pool capacities for reuse across calls.
+    pub fn clear(&mut self) {
+        self.envs.clear();
+        self.regs.clear();
+        self.late.clear();
+        self.types.clear();
+        self.owner = None;
+    }
+
+    pub(crate) fn alloc(&self) -> A {
+        self.alloc
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.envs.len()
+    }
+
+    pub(crate) fn env_regs(&self, env: EnvId) -> Option<&[Option<Reg>]> {
+        let meta = self.envs.get(env.index())?;
+        self.regs.get(range_of(meta.regs_start, meta.regs_len))
+    }
+
+    pub(crate) fn env_types(&self, env: EnvId) -> Option<&[Option<Side<'c>>]> {
+        let meta = self.envs.get(env.index())?;
+        self.types.get(range_of(meta.types_start, meta.types_len))
+    }
+
+    pub(crate) fn all_types_bound(&self, env: EnvId) -> bool {
+        self.env_types(env).is_some_and(|ts| ts.iter().all(Option::is_some))
+    }
+
+    pub(crate) fn all_impl_bound(&self, env: EnvId, lifetimes: u32) -> bool {
+        let Ok(n) = usize::try_from(lifetimes) else { return false };
+        let Some(rs) = self.env_regs(env) else { return false };
+        let Some(ts) = self.env_types(env) else { return false };
+        rs.get(..n).is_some_and(|prefix| prefix.iter().all(Option::is_some)) && ts.iter().all(Option::is_some)
+    }
+
+    pub(crate) fn truncate(&mut self, len: usize) {
+        if let Some(first_dropped) = self.envs.get(len) {
+            self.regs.truncate(first_dropped.regs_start as usize);
+            self.late.truncate(first_dropped.late_start as usize);
+            self.types.truncate(first_dropped.types_start as usize);
+        }
+        if self.owner.is_some_and(|id| (id.0 as usize) >= len) {
+            self.owner = None;
+        }
+        self.envs.truncate(len);
     }
 
     /// A fresh environment for an impl of `lifetimes` lifetime and `types` type parameters,
     /// every one unbound.
     pub(crate) fn impl_env(&mut self, lifetimes: u32, types: u32) -> Option<EnvId> {
-        let regs = Vec::from_elem_in(None, lifetimes as usize, self.alloc.clone());
-        let tys = Vec::from_elem_in(None, types as usize, self.alloc.clone());
-        self.push(Mode::Item { bindable: true }, regs, tys)
+        self.impl_env_gat(lifetimes, 0, types)
+    }
+
+    /// A fresh environment for an impl of `impl_lifetimes` + `gat_lifetimes` lifetime parameters
+    /// and `types` type parameters: `Region::Late { binder: u32::MAX, var }` reads `regs[impl_lifetimes + var]`.
+    pub(crate) fn impl_env_gat(&mut self, impl_lifetimes: u32, gat_lifetimes: u32, types: u32) -> Option<EnvId> {
+        if self.envs.len() >= MOST_ENVS {
+            return None;
+        }
+        let total = impl_lifetimes.checked_add(gat_lifetimes)?;
+        let id = EnvId(u32::try_from(self.envs.len()).ok()?);
+        let regs_start = u32::try_from(self.regs.len()).ok()?;
+        let late_start = u32::try_from(self.late.len()).ok()?;
+        let types_start = u32::try_from(self.types.len()).ok()?;
+        let regs_end = regs_start.checked_add(total)?;
+        let types_end = types_start.checked_add(types)?;
+        self.regs.resize(regs_end as usize, None);
+        self.types.resize(types_end as usize, None);
+        self.envs.push(EnvMeta {
+            mode: Mode::Item { bindable: true, gat_base: impl_lifetimes },
+            regs_start,
+            regs_len: total,
+            late_start,
+            late_len: 0,
+            types_start,
+            types_len: types,
+        });
+        Some(id)
     }
 
     /// An environment in the caller's numbering (a bound of the caller's read for a tie).
+    /// Cached per call since `Mode::Owner { binder: None }` is immutable and empty.
     pub(crate) fn owner_env(&mut self) -> Option<EnvId> {
-        let regs = Vec::new_in(self.alloc.clone());
-        let tys = Vec::new_in(self.alloc.clone());
-        self.push(Mode::Owner { binder: None }, regs, tys)
+        if let Some(id) = self.owner {
+            return Some(id);
+        }
+        if self.envs.len() >= MOST_ENVS {
+            return None;
+        }
+        let id = EnvId(u32::try_from(self.envs.len()).ok()?);
+        let regs_start = u32::try_from(self.regs.len()).ok()?;
+        let late_start = u32::try_from(self.late.len()).ok()?;
+        let types_start = u32::try_from(self.types.len()).ok()?;
+        self.envs.push(EnvMeta {
+            mode: Mode::Owner { binder: None },
+            regs_start,
+            regs_len: 0,
+            late_start,
+            late_len: 0,
+            types_start,
+            types_len: 0,
+        });
+        self.owner = Some(id);
+        Some(id)
     }
 
-    fn env(&self, e: EnvId) -> Result<&Env<'c, A>, Bad> {
-        self.envs.get(e.0 as usize).ok_or(Bad::StepBound)
+    /// Clones `base` with its clause-level `for<..>` binder (`binder: 0`, variables `0..binders`)
+    /// Skolemized to fresh origins produced by `make`. Inner binders (`binder >= 1`, e.g. `fn(..)`
+    /// or `dyn`) remain `Reg::Bound`.
+    pub(crate) fn skolemize_clause(&mut self, base: EnvId, binders: u32, mut make: impl FnMut() -> Origin) -> Option<EnvId> {
+        if binders == 0 {
+            return Some(base);
+        }
+        if self.envs.len() >= MOST_ENVS {
+            return None;
+        }
+        let src = *self.envs.get(usize::try_from(base.0).ok()?)?;
+        let mode = match src.mode {
+            Mode::Item { bindable, gat_base } => Mode::Item { bindable, gat_base },
+            Mode::Owner { binder } => Mode::Owner { binder: binder.or(Some(0)) },
+        };
+        let id = EnvId(u32::try_from(self.envs.len()).ok()?);
+        let regs_start = u32::try_from(self.regs.len()).ok()?;
+        let late_start = u32::try_from(self.late.len()).ok()?;
+        let types_start = u32::try_from(self.types.len()).ok()?;
+        let _ = regs_start.checked_add(src.regs_len)?;
+        let _ = types_start.checked_add(src.types_len)?;
+        let _ = late_start.checked_add(src.late_len)?.checked_add(binders)?;
+
+        let src_regs = range_of(src.regs_start, src.regs_len);
+        self.regs.reserve(src.regs_len as usize);
+        for i in src_regs {
+            let v = self.regs[i];
+            self.regs.push(v);
+        }
+
+        let src_types = range_of(src.types_start, src.types_len);
+        self.types.reserve(src.types_len as usize);
+        for i in src_types {
+            let v = self.types.as_slice()[i];
+            self.types.push(v);
+        }
+
+        let src_late = range_of(src.late_start, src.late_len);
+        self.late.reserve((src.late_len as usize) + (binders as usize));
+        for i in src_late {
+            let entry = self.late[i];
+            if entry.0 != 0 {
+                self.late.push(entry);
+            }
+        }
+        for var in 0..binders {
+            self.late.push((0, var, make()));
+        }
+        let late_len = u32::try_from(self.late.len() - (late_start as usize)).ok()?;
+        self.envs.push(EnvMeta {
+            mode,
+            regs_start,
+            regs_len: src.regs_len,
+            late_start,
+            late_len,
+            types_start,
+            types_len: src.types_len,
+        });
+        Some(id)
+    }
+
+    /// Copies any type or region bindings newly made in a cloned environment `from` (e.g. a
+    /// higher-ranked `skolemize_clause` clone) back into `None` slots of its source environment
+    /// `to`, so an impl parameter constrained by a higher-ranked projection where-clause (such as
+    /// `impl<P, R> World for Program<'_, P> where P: Fn(&Cx, Io) -> R`) stays bound for the
+    /// remaining clauses and associated-type values of the impl.
+    pub(crate) fn propagate_bindings(&mut self, from: EnvId, to: EnvId) {
+        if from == to {
+            return;
+        }
+        let (Ok(src), Ok(dst)) = (self.meta(from), self.meta(to)) else {
+            return;
+        };
+        let n_types = src.types_len.min(dst.types_len) as usize;
+        for i in 0..n_types {
+            let s_idx = (src.types_start as usize) + i;
+            let d_idx = (dst.types_start as usize) + i;
+            if let Some(Some(bound)) = self.types.get(s_idx).copied()
+                && let Some(slot @ None) = self.types.get_mut(d_idx)
+            {
+                *slot = Some(bound);
+            }
+        }
+        let n_regs = src.regs_len.min(dst.regs_len) as usize;
+        for i in 0..n_regs {
+            let s_idx = (src.regs_start as usize) + i;
+            let d_idx = (dst.regs_start as usize) + i;
+            if let Some(Some(bound)) = self.regs.get(s_idx).copied()
+                && let Some(slot @ None) = self.regs.get_mut(d_idx)
+            {
+                *slot = Some(bound);
+            }
+        }
+    }
+
+    fn meta(&self, e: EnvId) -> Result<EnvMeta, Bad> {
+        self.envs.get(e.0 as usize).copied().ok_or(Bad::StepBound)
     }
 
     /// Region `r` of a column read in `env`.
     pub(crate) fn reg(&self, e: EnvId, r: Region) -> Result<RegAt, Bad> {
-        let env = self.env(e)?;
+        let env = self.meta(e)?;
+        let regs = self.regs.get(range_of(env.regs_start, env.regs_len)).ok_or(Bad::StepBound)?;
+        let late = self.late.get(range_of(env.late_start, env.late_len)).ok_or(Bad::StepBound)?;
         Ok(match (env.mode, r) {
             (_, Region::Static) => RegAt::Known(Reg::Static),
-            (Mode::Item { .. }, Region::Param(i)) => match env.regs.get(i as usize) {
+            (Mode::Item { .. }, Region::Param(i)) => match regs.get(i as usize) {
                 Some(Some(reg)) => RegAt::Known(*reg),
                 Some(None) => RegAt::Unbound { env: e, param: i },
                 None => return Err(Bad::LifetimePast { index: i }),
             },
-            (Mode::Item { .. }, Region::Late { binder, var }) => RegAt::Known(Reg::Bound { binder, var }),
+            (Mode::Item { gat_base, .. }, Region::Late { binder: u32::MAX, var }) => {
+                let Some(idx) = gat_base.checked_add(var) else {
+                    return Err(Bad::LifetimePast { index: u32::MAX });
+                };
+                match regs.get(idx as usize) {
+                    Some(Some(reg)) => RegAt::Known(*reg),
+                    Some(None) => RegAt::Unbound { env: e, param: idx },
+                    None => return Err(Bad::LifetimePast { index: idx }),
+                }
+            }
+            (Mode::Item { .. }, Region::Late { binder, var }) => {
+                if let Some(&(_, _, o)) = late.iter().find(|&&(x, v, _)| x == binder && v == var) {
+                    RegAt::Known(Reg::Origin(o))
+                } else {
+                    RegAt::Known(Reg::Bound { binder, var })
+                }
+            }
             (Mode::Owner { .. }, Region::Param(i)) => RegAt::Known(Reg::Owner(Region::Param(i))),
             (Mode::Owner { binder: Some(b) }, Region::Late { binder, var }) if binder == b => {
-                match env.late.iter().find(|&&(x, v, _)| x == binder && v == var) {
+                match late.iter().find(|&&(x, v, _)| x == binder && v == var) {
                     Some(&(_, _, o)) => RegAt::Known(Reg::Origin(o)),
                     None => return Err(Bad::LateUnmade { binder, var }),
                 }
@@ -317,10 +728,11 @@ impl<'c, A: Allocator + Clone> Envs<'c, A> {
 
     /// Type parameter `t` read in `env`.
     pub(crate) fn type_of(&self, e: EnvId, t: u32) -> Result<TypeAt<'c>, Bad> {
-        let env = self.env(e)?;
+        let env = self.meta(e)?;
+        let types = self.types.get(range_of(env.types_start, env.types_len)).ok_or(Bad::StepBound)?;
         Ok(match env.mode {
             Mode::Owner { .. } => TypeAt::Rigid,
-            Mode::Item { bindable } => match env.types.get(t as usize) {
+            Mode::Item { bindable, .. } => match types.get(t as usize) {
                 Some(Some(side)) => TypeAt::Bound(*side),
                 Some(None) if bindable => TypeAt::Unbound { env: e, param: t },
                 _ => return Err(Bad::TypeArg { index: t }),
@@ -329,8 +741,12 @@ impl<'c, A: Allocator + Clone> Envs<'c, A> {
     }
 
     pub(crate) fn bind_reg(&mut self, e: EnvId, param: u32, to: Reg) -> Result<(), Bad> {
-        let env = self.envs.get_mut(e.0 as usize).ok_or(Bad::StepBound)?;
-        match env.regs.get_mut(param as usize) {
+        let env = self.meta(e)?;
+        if param >= env.regs_len {
+            return Err(Bad::LifetimePast { index: param });
+        }
+        let idx = (env.regs_start as usize) + (param as usize);
+        match self.regs.get_mut(idx) {
             Some(slot @ None) => {
                 *slot = Some(to);
                 Ok(())
@@ -341,8 +757,12 @@ impl<'c, A: Allocator + Clone> Envs<'c, A> {
     }
 
     pub(crate) fn bind_type(&mut self, e: EnvId, param: u32, to: Side<'c>) -> Result<(), Bad> {
-        let env = self.envs.get_mut(e.0 as usize).ok_or(Bad::StepBound)?;
-        match env.types.get_mut(param as usize) {
+        let env = self.meta(e)?;
+        if param >= env.types_len {
+            return Err(Bad::TypeArg { index: param });
+        }
+        let idx = (env.types_start as usize) + (param as usize);
+        match self.types.get_mut(idx) {
             Some(slot @ None) => {
                 *slot = Some(to);
                 Ok(())
@@ -371,18 +791,68 @@ enum Lifetimes<'c> {
     Early(u32),
 }
 
-/// `callee`'s signature at this call: early-bound regions from `generics`' slots, late-bound and
-/// the instantiated binder's fresh (`fresh`, called once per region in `Param` order, then per
-/// binder variable in column order), its clauses instantiated. Normalization is done as the
-/// relation meets an alias (relate.rs `normalize`), with the same environments.
-pub fn instantiate<'c, A: Allocator + Clone>(
+/// Push/clear/reserve sink shared by `Vec` (`instantiate_into`) and `SmallBuf` (`call_in`).
+pub(crate) trait PushBuf<T> {
+    fn clear_buf(&mut self);
+    fn reserve_buf(&mut self, additional: usize);
+    fn push_buf(&mut self, value: T);
+}
+
+impl<T, A: Allocator> PushBuf<T> for Vec<T, A> {
+    #[inline]
+    fn clear_buf(&mut self) {
+        self.clear();
+    }
+    #[inline]
+    fn reserve_buf(&mut self, additional: usize) {
+        self.reserve(additional);
+    }
+    #[inline]
+    fn push_buf(&mut self, value: T) {
+        self.push(value);
+    }
+}
+
+impl<T, const N: usize, A: Allocator + Copy> PushBuf<T> for SmallBuf<T, N, A> {
+    #[inline]
+    fn clear_buf(&mut self) {
+        self.clear();
+    }
+    #[inline]
+    fn reserve_buf(&mut self, additional: usize) {
+        self.reserve(additional);
+    }
+    #[inline]
+    fn push_buf(&mut self, value: T) {
+        self.push(value);
+    }
+}
+
+/// Instantiates `callee` into reusable `envs`, `inputs_out`, and `clauses_out` buffers (clearing
+/// them first so their capacities are reused across calls), returning the instantiated output.
+pub fn instantiate_into<'c, A: Allocator + Copy>(
     callee: Callee<'c>,
     generics: GenericArgs<'_>,
     fresh: &mut impl FnMut(Late) -> Origin,
-    alloc: A,
-) -> Result<Inst<'c, A>, Refused> {
+    envs: &mut Envs<'c, A>,
+    inputs_out: &mut Vec<Side<'c>, A>,
+    clauses_out: &mut Vec<Clause<'c>, A>,
+) -> Result<Side<'c>, Refused> {
+    instantiate_into_buf(callee, generics, fresh, envs, inputs_out, clauses_out)
+}
+
+pub(crate) fn instantiate_into_buf<'c, A: Allocator + Copy>(
+    callee: Callee<'c>,
+    generics: GenericArgs<'_>,
+    fresh: &mut impl FnMut(Late) -> Origin,
+    envs: &mut Envs<'c, A>,
+    inputs_out: &mut impl PushBuf<Side<'c>>,
+    clauses_out: &mut impl PushBuf<Clause<'c>>,
+) -> Result<Side<'c>, Refused> {
     let item = callee.item();
-    let mut envs: Envs<'c, A> = Envs::new_in(alloc.clone());
+    envs.clear();
+    inputs_out.clear_buf();
+    clauses_out.clear_buf();
     let (inputs, output, clauses_in, lifetimes): (&'c [Typed<'c>], Typed<'c>, &'c [ClauseIn<'c>], Option<Lifetimes<'c>>) = match callee {
         Callee::Fn(sig) | Callee::Method { sig, .. } | Callee::Operator { sig, .. } => {
             (sig.inputs, sig.output, sig.clauses, Some(Lifetimes::Params(sig.params)))
@@ -397,7 +867,11 @@ pub fn instantiate<'c, A: Allocator + Clone>(
                 Lifetimes::Params(p) => p.count(),
                 Lifetimes::Early(n) => n,
             };
-            let mut regs: Vec<Option<Reg>, A> = Vec::with_capacity_in(count as usize, alloc.clone());
+            let regs_start = u32::try_from(envs.regs.len()).map_err(|_| malformed(output.ty, Bad::StepBound))?;
+            let late_start = u32::try_from(envs.late.len()).map_err(|_| malformed(output.ty, Bad::StepBound))?;
+            let types_start = u32::try_from(envs.types.len()).map_err(|_| malformed(output.ty, Bad::StepBound))?;
+            let types_len = u32::try_from(generics.types.len()).map_err(|_| malformed(output.ty, Bad::StepBound))?;
+            envs.regs.reserve(count as usize);
             let mut early = 0u32;
             for i in 0..count {
                 let late = match l {
@@ -405,49 +879,69 @@ pub fn instantiate<'c, A: Allocator + Clone>(
                     Lifetimes::Early(_) => false,
                 };
                 if late {
-                    regs.push(Some(Reg::Origin(fresh(Late::Param(i)))));
+                    envs.regs.push(Some(Reg::Origin(fresh(Late::Param(i)))));
                 } else {
                     let slot = generics.lifetimes.nth(early).ok_or(malformed(output.ty, Bad::LifetimeArgs { want: early + 1, got: generics.lifetimes.count().get() }))?;
-                    regs.push(Some(Reg::Slot(slot)));
+                    envs.regs.push(Some(Reg::Slot(slot)));
                     early += 1;
                 }
             }
             if early != generics.lifetimes.count().get() {
                 return Err(malformed(output.ty, Bad::LifetimeArgs { want: early, got: generics.lifetimes.count().get() }));
             }
-            let mut types: Vec<Option<Side<'c>>, A> = Vec::with_capacity_in(generics.types.len(), alloc.clone());
+            envs.types.reserve(generics.types.len());
             for a in generics.types {
-                types.push(Some(Side::caller(*a)));
+                envs.types.push(Some(Side::caller(*a)));
             }
-            envs.push(Mode::Item { bindable: false }, regs, types).ok_or(malformed(output.ty, Bad::StepBound))?
+            let id = EnvId(u32::try_from(envs.envs.len()).map_err(|_| malformed(output.ty, Bad::StepBound))?);
+            envs.envs.push(EnvMeta {
+                mode: Mode::Item { bindable: false, gat_base: count },
+                regs_start,
+                regs_len: count,
+                late_start,
+                late_len: 0,
+                types_start,
+                types_len,
+            });
+            id
         }
         None => {
             let binder = match callee {
                 Callee::Closure { binder, .. } | Callee::Value { binder, .. } => binder,
                 _ => return Err(malformed(output.ty, Bad::NotOfKind)),
             };
-            let regs = Vec::new_in(alloc.clone());
-            let types = Vec::new_in(alloc.clone());
-            let e = envs.push(Mode::Owner { binder: Some(binder) }, regs, types).ok_or(malformed(output.ty, Bad::StepBound))?;
+            let regs_start = u32::try_from(envs.regs.len()).map_err(|_| malformed(output.ty, Bad::StepBound))?;
+            let late_start = u32::try_from(envs.late.len()).map_err(|_| malformed(output.ty, Bad::StepBound))?;
+            let types_start = u32::try_from(envs.types.len()).map_err(|_| malformed(output.ty, Bad::StepBound))?;
             // The binder's variables, fresh once each, in column order (inputs, then output).
-            let env = envs.envs.get_mut(e.0 as usize).ok_or(malformed(output.ty, Bad::StepBound))?;
             for t in inputs.iter().chain(core::iter::once(&output)) {
                 for r in t.col {
                     if let Region::Late { binder: b, var } = *r
                         && b == binder
-                        && !env.late.iter().any(|&(x, v, _)| x == b && v == var)
+                        && !envs.late[late_start as usize..].iter().any(|&(x, v, _)| x == b && v == var)
                     {
-                        env.late.push((b, var, fresh(Late::Bound { binder: b, var })));
+                        envs.late.push((b, var, fresh(Late::Bound { binder: b, var })));
                     }
                 }
             }
-            e
+            let late_len = u32::try_from(envs.late.len() - (late_start as usize)).map_err(|_| malformed(output.ty, Bad::StepBound))?;
+            let id = EnvId(u32::try_from(envs.envs.len()).map_err(|_| malformed(output.ty, Bad::StepBound))?);
+            envs.envs.push(EnvMeta {
+                mode: Mode::Owner { binder: Some(binder) },
+                regs_start,
+                regs_len: 0,
+                late_start,
+                late_len,
+                types_start,
+                types_len: 0,
+            });
+            id
         }
     };
     let sig_side = |t: Typed<'c>| Side { ty: t.ty, slots: Slots::Sig { col: t.col, env: e0 } };
-    let mut ins: Vec<Side<'c>, A> = Vec::with_capacity_in(inputs.len(), alloc.clone());
+    inputs_out.reserve_buf(inputs.len());
     for t in inputs {
-        ins.push(sig_side(*t));
+        inputs_out.push_buf(sig_side(*t));
     }
     let known = |envs: &Envs<'c, A>, r: Region| -> Result<Reg, Refused> {
         match envs.reg(e0, r).map_err(|w| malformed(output.ty, w))? {
@@ -455,32 +949,49 @@ pub fn instantiate<'c, A: Allocator + Clone>(
             RegAt::Unbound { param, .. } => Err(malformed(output.ty, Bad::Unconstrained { index: param })),
         }
     };
-    let mut clauses: Vec<Clause<'c>, A> = Vec::new_in(alloc);
     if let Some(Lifetimes::Params(p)) = lifetimes {
         for &(long, short) in p.outlives() {
-            clauses.push(Clause::Outlives { long: known(&envs, long)?, short: known(&envs, short)?, at: output.ty });
+            clauses_out.push_buf(Clause::Outlives { long: known(envs, long)?, short: known(envs, short)?, at: output.ty });
         }
     }
     for c in clauses_in {
-        clauses.push(match *c {
-            ClauseIn::TypeOutlives { subject, region } => Clause::TypeOutlives { subject: sig_side(subject), region: known(&envs, region)? },
-            ClauseIn::RegionOutlives { long, short } => Clause::Outlives { long: known(&envs, long)?, short: known(&envs, short)?, at: output.ty },
+        clauses_out.push_buf(match *c {
+            ClauseIn::TypeOutlives { subject, region } => Clause::TypeOutlives { subject: sig_side(subject), region: known(envs, region)? },
+            ClauseIn::RegionOutlives { long, short } => Clause::Outlives { long: known(envs, long)?, short: known(envs, short)?, at: output.ty },
             ClauseIn::Trait { subject, trait_ref } => Clause::Trait { subject: sig_side(subject), trait_ref: sig_side(trait_ref) },
-            ClauseIn::TraitOf { trait_ref } => Clause::TraitOf { trait_ref: sig_side(trait_ref) },
-            ClauseIn::ProjOf { proj } => Clause::ProjOf { proj: sig_side(proj) },
+            ClauseIn::TraitOf { trait_ref, binders } => Clause::TraitOf { trait_ref: sig_side(trait_ref), binders },
+            ClauseIn::ProjOf { proj, binders } => Clause::ProjOf { proj: sig_side(proj), binders },
         });
     }
-    Ok(Inst { item, inputs: ins, output: sig_side(output), clauses, envs })
+    Ok(sig_side(output))
 }
 
-/// A fn's signature column (laid over `fn(inputs..) -> output`, D148) split into its inputs and
-/// output, each with its own slots.
-pub fn split_fn_col<'c, A: Allocator>(
+/// `callee`'s signature at this call: early-bound regions from `generics`' slots, late-bound and
+/// the instantiated binder's fresh (`fresh`, called once per region in `Param` order, then per
+/// binder variable in column order), its clauses instantiated. Normalization is done as the
+/// relation meets an alias (relate.rs `normalize`), with the same environments.
+pub fn instantiate<'c, A: Allocator + Copy>(
+    callee: Callee<'c>,
+    generics: GenericArgs<'_>,
+    fresh: &mut impl FnMut(Late) -> Origin,
+    alloc: A,
+) -> Result<Inst<'c, A>, Refused> {
+    let item = callee.item();
+    let mut envs: Envs<'c, A> = Envs::new_in(alloc);
+    let mut inputs: Vec<Side<'c>, A> = Vec::new_in(alloc);
+    let mut clauses: Vec<Clause<'c>, A> = Vec::new_in(alloc);
+    let output = instantiate_into(callee, generics, fresh, &mut envs, &mut inputs, &mut clauses)?;
+    Ok(Inst { item, inputs, output, clauses, envs })
+}
+
+/// [`split_fn_col`], writing the inputs into a reusable `inputs_out` buffer (cleared first).
+pub fn split_fn_col_into<'c, A: Allocator>(
     types: &dyn RegionTypes,
     item: ItemKey,
     col: ColView<'c>,
-    alloc: A,
-) -> Result<(Vec<Typed<'c>, A>, Typed<'c>), Refused> {
+    inputs_out: &mut Vec<Typed<'c>, A>,
+) -> Result<Typed<'c>, Refused> {
+    inputs_out.clear();
     let root = col.ty();
     let kids = types.kids(root).map_err(|unknown| Refused::Count { item, unknown })?;
     let n = kids.len();
@@ -494,11 +1005,23 @@ pub fn split_fn_col<'c, A: Allocator>(
         let slots = col.child(k).ok_or(Refused::Malformed { item, node: root, what: Bad::NotOfKind })?;
         Ok(Typed { ty, col: slots })
     };
-    let mut inputs: Vec<Typed<'c>, A> = Vec::with_capacity_in((n - 1) as usize, alloc);
+    inputs_out.reserve((n - 1) as usize);
     for k in 0..n - 1 {
-        inputs.push(typed(k)?);
+        inputs_out.push(typed(k)?);
     }
-    let output = typed(n - 1)?;
+    typed(n - 1)
+}
+
+/// A fn's signature column (laid over `fn(inputs..) -> output`, D148) split into its inputs and
+/// output, each with its own slots.
+pub fn split_fn_col<'c, A: Allocator>(
+    types: &dyn RegionTypes,
+    item: ItemKey,
+    col: ColView<'c>,
+    alloc: A,
+) -> Result<(Vec<Typed<'c>, A>, Typed<'c>), Refused> {
+    let mut inputs: Vec<Typed<'c>, A> = Vec::new_in(alloc);
+    let output = split_fn_col_into(types, item, col, &mut inputs)?;
     Ok((inputs, output))
 }
 
@@ -619,6 +1142,15 @@ pub enum Keyed {
     Unknown,
 }
 
+/// The outer constructor shape of a trait impl's `Self` type (used to match projections on
+/// the caller's own enclosing trait impl `Self`, e.g. `Zip<A, B>::Item` or `(&T0, &T1)::Item`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelfShape {
+    Adt(ItemKey),
+    Ref(Mutbl),
+    Tuple(u32),
+}
+
 /// The asked alias's or bound's arguments `[Self, trait args..]` at the call, as the walk reads
 /// them (relate.rs `Keyer`): what a selection row is keyed against.
 pub trait AskArgs {
@@ -626,6 +1158,10 @@ pub trait AskArgs {
     fn count(&self) -> Option<u32>;
     /// The `k`-th argument against `ty`, a type of the CALLER's table (a row's argument).
     fn compare(&self, k: u32, ty: PTy) -> Keyed;
+    /// If argument 0 (`Self`) resolves to an `Adt`, `Ref`, or `Tuple`, its outer shape.
+    fn self_shape(&self) -> Option<SelfShape> {
+        None
+    }
 }
 
 /// An ask with no arguments to key by: every comparison [`Keyed::Unknown`].
@@ -638,6 +1174,27 @@ impl AskArgs for Unkeyed {
     fn compare(&self, _: u32, _: PTy) -> Keyed {
         Keyed::Unknown
     }
+}
+
+/// Normalization target of a trait fn's RPITIT opaque (`Opaque(op_key, ..)`) at a concrete
+/// call site (RFC 3425).
+#[derive(Clone, Copy, Debug)]
+pub enum RpititTarget<'s> {
+    /// The selected impl inherits the trait's provided fn (`rpitit::Twin`): identical captured
+    /// lifetimes and type arguments, with `Opaque(twin, ..)` replacing `Opaque(op_key, ..)`.
+    Twin { twin: ItemKey },
+    /// The selected impl overrides the fn with `impl_fn`: bind `impl_fn`'s environment from
+    /// `head`, `impl_col` vs `trait_col` inputs, and take the return subtree at `op_key`'s place
+    /// inside `impl_col`'s output.
+    ImplFn {
+        trait_: ItemKey,
+        head: ImplHead<'s>,
+        trait_types: u32,
+        impl_fn: ItemKey,
+        impl_params: ParamsView<'s>,
+        impl_col: ColView<'s>,
+        trait_col: ColView<'s>,
+    },
 }
 
 /// The answer to an [`Ask`].
@@ -679,6 +1236,79 @@ pub trait Selected {
     /// facts (blaze-flow-lower `Facts::trait_relates_nothing`).
     fn relates_nothing(&self, trait_: ItemKey) -> bool {
         let _ = trait_;
+        false
+    }
+    /// Whether `trait_` is an `auto trait` (`Send`, `Sync`, `Unpin`, `Freeze`, etc.). When
+    /// `blaze-typeck` proved `T: AutoTrait` structurally or from an opaque/generic bound (never a
+    /// manual `impl` with extra `where` clauses, which returns `Selection::Impl`), the proof
+    /// relates no region.
+    fn is_auto_trait(&self, trait_: ItemKey) -> bool {
+        let _ = trait_;
+        false
+    }
+    /// Whether `<T as trait_>::name` is a compiler-builtin associated type whose normalized value
+    /// always carries zero lifetimes (`DiscriminantKind::Discriminant`, `Pointee::Metadata`).
+    fn is_zero_slot_builtin_assoc(&self, trait_: ItemKey, name: Name) -> bool {
+        let _ = (trait_, name);
+        false
+    }
+    /// Whether `trait_` is one of the `Fn` / `FnMut` / `FnOnce` language traits.
+    fn is_fn_trait(&self, trait_: ItemKey) -> bool {
+        let _ = trait_;
+        false
+    }
+    /// Whether `trait_` is `core::future::Future`.
+    fn is_future_trait(&self, trait_: ItemKey) -> bool {
+        let _ = trait_;
+        false
+    }
+    /// Whether `trait_` is `core::future::IntoFuture`.
+    fn is_into_future_trait(&self, trait_: ItemKey) -> bool {
+        let _ = trait_;
+        false
+    }
+    /// Whether `trait_` is `core::any::TryAsDynCompatible` (`#[lang = "try_as_dyn"]`):
+    /// compiler-builtin (`#[rustc_deny_explicit_impl]`) for `dyn Trait<'b, ..> + 'a`, tying
+    /// the trait's lifetime parameter `'a` invariantly to the object's lifetime.
+    fn is_try_as_dyn_trait(&self, trait_: ItemKey) -> bool {
+        let _ = trait_;
+        false
+    }
+    /// The signature column and where-clauses of a `FnDef` item (a fn, method, or tuple
+    /// constructor), for proving builtin `Fn` / `FnMut` / `FnOnce` bounds and `Output`.
+    fn fn_def_sig(&self, item: ItemKey) -> Result<(ParamsView<'_>, ColView<'_>, ImplWhere<'_>), NotSelected> {
+        let _ = item;
+        Err(NotSelected::Builtin)
+    }
+    /// The declared supertrait and associated-type bound clauses of `trait_` (`regions.clauses(trait_)`),
+    /// along with `trait_`'s declared lifetime parameter count (`ParamsView::count()`).
+    fn trait_clauses(&self, trait_: ItemKey) -> Option<(u32, &[ClauseView<'_>])> {
+        let _ = trait_;
+        None
+    }
+    /// The declared item-bound clauses of associated type `trait_::name` (filed under
+    /// `AssocTyDef::item`), along with its total lifetime parameter count (trait + GAT lifetimes).
+    fn assoc_clauses(&self, trait_: ItemKey, name: Name) -> Option<(u32, &[ClauseView<'_>])> {
+        let _ = (trait_, name);
+        None
+    }
+    /// The declared bound clauses of an opaque type `opaque` (`regions.clauses(opaque)`),
+    /// along with its defining item's lifetime parameter count (`regions.lifetime_params(opaque).count()`).
+    fn opaque_clauses(&self, opaque: ItemKey) -> Option<(u32, &[ClauseView<'_>])> {
+        let _ = opaque;
+        None
+    }
+    /// If `opaque` is an RPITIT opaque of a trait fn whose impl was selected at this call
+    /// (`args` = `[Self, trait_args.., fn_args..]`), returns its concrete normalization target.
+    fn rpitit_target(&self, opaque: ItemKey, args: &dyn AskArgs) -> Option<RpititTarget<'_>> {
+        let _ = (opaque, args);
+        None
+    }
+    /// Whether `opaque` is the trait-fn RPITIT opaque corresponding to the synthetic RPITIT
+    /// associated type `(trait_, name)` (written as `Opaque` in the trait signature and as
+    /// `Alias { trait_, name, .. }` in typeck).
+    fn is_rpitit_alias(&self, opaque: ItemKey, trait_: ItemKey, name: Name) -> bool {
+        let _ = (opaque, trait_, name);
         false
     }
 }

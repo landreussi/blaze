@@ -187,22 +187,53 @@ pub(crate) fn outline_from<A: core::alloc::Allocator + Copy>(name: Name, key: Ke
     };
     let mut made = Record::new_in(name, alloc);
     made.out = view.out;
-    made.parts.extend(view.parts());
-    for path in view.paths() {
-        let at = made.path_bytes.len() as u32;
-        made.path_bytes.extend_from_slice(path.path);
-        made.paths.push((path.name, at, made.path_bytes.len() as u32, path.module));
+    let parts = view.parts();
+    if parts.len() > 0 {
+        made.parts.reserve_exact(parts.len());
+        made.parts.extend(parts);
     }
-    for finding in view.findings() {
-        let at = made.messages.len();
-        made.messages.extend_from_slice(finding.message);
-        made.findings.push((finding.rule, finding.start, finding.end, at, made.messages.len()));
+    let path_count = view.paths().size_hint().0;
+    if path_count > 0 {
+        made.paths.reserve_exact(path_count);
+        let mut path_bytes = 0usize;
+        for path in view.paths() {
+            path_bytes += path.path.len();
+        }
+        made.path_bytes.reserve_exact(path_bytes);
+        for path in view.paths() {
+            let at = u32::try_from(made.path_bytes.len()).unwrap_or(u32::MAX);
+            made.path_bytes.extend_from_slice(path.path);
+            let end = u32::try_from(made.path_bytes.len()).unwrap_or(u32::MAX);
+            made.paths.push((path.name, at, end, path.module));
+        }
     }
-    made.reads.extend(view.reads());
-    made.payload.extend_from_slice(view.payload);
+    let finding_count = view.finding_count();
+    if finding_count > 0 {
+        made.findings.reserve_exact(finding_count);
+        let mut msg_bytes = 0usize;
+        for finding in view.findings() {
+            msg_bytes += finding.message.len();
+        }
+        made.messages.reserve_exact(msg_bytes);
+        for finding in view.findings() {
+            let at = made.messages.len();
+            made.messages.extend_from_slice(finding.message);
+            made.findings.push((finding.rule, finding.start, finding.end, at, made.messages.len()));
+        }
+    }
+    let reads = view.reads();
+    if reads.len() > 0 {
+        made.reads.reserve_exact(reads.len());
+        made.reads.extend(reads);
+    }
+    if !view.payload.is_empty() {
+        made.payload.reserve_exact(view.payload.len());
+        made.payload.extend_from_slice(view.payload);
+    }
     Ok(made)
 }
 
+#[cfg(test)]
 const PUTS_DIGEST: &str = "blaze-cli engine records put 1";
 
 /// One stage's records as the profile prints them: "records (Names): N put, B bytes; held after
@@ -216,6 +247,9 @@ pub(crate) struct RecordLine {
     /// still holds in its heap or frames (results not yet released), and every byte the store
     /// holds copied in its heap (its arena), whichever stage put it.
     pub(crate) held: u64,
+    /// Payload bytes of this stage's own results still held in its heap or frames after the merge
+    /// (excluding the store's shared arena under `Visibility::InArena`).
+    pub(crate) results_held: u64,
     /// Copies of a record's bytes made into this process's memory on the way to the store or
     /// back from it (a joined record, the store's arena), and their bytes.
     pub(crate) copies: u64,
@@ -273,7 +307,8 @@ pub(crate) struct Ledger {
     /// (each one, its bytes in 16-byte blocks: blaze-cas plain/lent.rs `copy_in`): the stage's
     /// line counts its tasks' records' copies, so these are taken from it at the merge.
     extra_copies: [(u64, u64); STAGES],
-    digest: blaze_ids::Hasher,
+    #[cfg(test)]
+    digest: [u64; 4],
     /// The process's memory at each stage's end (engine_memory.rs): the profile's alone, never
     /// in the digest (rule 25).
     pub(crate) memory: crate::engine_memory::Memory,
@@ -307,7 +342,8 @@ impl Ledger {
             seen: crate::store::StoreKept::default(),
             seen_read: crate::engine_records::ReadCounts::default(),
             extra_copies: [(0, 0); STAGES],
-            digest: blaze_ids::Hasher::new(PUTS_DIGEST),
+            #[cfg(test)]
+            digest: [0u64; 4],
             memory: crate::engine_memory::Memory::new(),
         }
     }
@@ -324,9 +360,17 @@ impl Ledger {
     }
 
     /// An extra record of `stage`'s task put under `key` after its owner ([`put_all`]), the
-    /// store's answer `put`: in the digest in put order, written or not; counted when written.
+    /// store's answer `put`: recorded for the order-independent test digest, written or not;
+    /// counted when written.
     pub(crate) fn put_extra(&mut self, stage: Stage, key: Key, bytes: &[u8], put: blaze_keyed::store::Put) {
-        self.digest.update(&key.0.0).update(&(bytes.len() as u64).to_le_bytes()).update(bytes);
+        #[cfg(test)]
+        {
+            let mut h = blaze_ids::Hasher::new(PUTS_DIGEST);
+            h.update(&key.0.0).update(&(bytes.len() as u64).to_le_bytes()).update(bytes);
+            self.fold_digest(h.finish());
+        }
+        #[cfg(not(test))]
+        let _ = key;
         if put == blaze_keyed::store::Put::Written {
             let line = &mut self.extras[stage.index()];
             line.puts += 1;
@@ -357,10 +401,17 @@ impl Ledger {
         blaze_meter::add(blaze_meter::Count::StorePuts, 1);
         blaze_meter::add(blaze_meter::Count::StorePutBytes, len as u64);
         self.results[stage.index()] += payload as u64;
-        self.digest.update(&key.0.0).update(&(len as u64).to_le_bytes());
-        for part in parts {
-            self.digest.update(part);
+        #[cfg(test)]
+        {
+            let mut h = blaze_ids::Hasher::new(PUTS_DIGEST);
+            h.update(&key.0.0).update(&(len as u64).to_le_bytes());
+            for part in parts {
+                h.update(part);
+            }
+            self.fold_digest(h.finish());
         }
+        #[cfg(not(test))]
+        let _ = key;
     }
 
     /// `payload` bytes of a result of `stage` freed after its put.
@@ -377,14 +428,28 @@ impl Ledger {
         let (extra, extra_bytes) = core::mem::take(&mut self.extra_copies[stage.index()]);
         line.copies += store.copies.saturating_sub(self.seen.copies).saturating_sub(extra);
         line.copy_bytes += store.copy_bytes.saturating_sub(self.seen.copy_bytes).saturating_sub(extra_bytes);
-        line.held = self.results[stage.index()] + store.held_bytes;
+        let results_held = self.results[stage.index()];
+        line.results_held = results_held;
+        line.held = results_held + store.held_bytes;
         self.seen = store;
         self.memory.merged(stage);
     }
 
-    /// The digest of every record put so far (key, length, bytes, in put order).
+    #[cfg(test)]
+    fn fold_digest(&mut self, id: ContentId) {
+        for (slot, chunk) in self.digest.iter_mut().zip(id.0.as_chunks::<8>().0) {
+            *slot = slot.wrapping_add(u64::from_le_bytes(*chunk));
+        }
+    }
+
+    /// The order-independent digest of every record put so far (commutative wrapping sum of per-put hashes).
+    #[cfg(test)]
     pub(crate) fn digest(&self) -> ContentId {
-        self.digest.finish()
+        let mut h = blaze_ids::Hasher::new(PUTS_DIGEST);
+        for word in self.digest {
+            h.update(&word.to_le_bytes());
+        }
+        h.finish()
     }
 
     /// One line a stage that put a record, for the profile.

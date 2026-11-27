@@ -135,15 +135,15 @@ impl fmt::Display for ConstAtRefusal {
 
 /// The needs of one instance, each with its ground arguments (types of the build's ground
 /// table), once each, in the order met.
-pub struct Needs<A: Allocator + Clone> {
+pub struct Needs<A: Allocator + Copy> {
     /// The need and its arguments' range in `args`.
     rows: Vec<(ConstNeed, u32, u32), A>,
     args: Vec<PTy, A>,
 }
 
-impl<A: Allocator + Clone> Needs<A> {
+impl<A: Allocator + Copy> Needs<A> {
     pub fn new_in(alloc: A) -> Needs<A> {
-        Needs { rows: Vec::new_in(alloc.clone()), args: Vec::new_in(alloc) }
+        Needs { rows: Vec::new_in(alloc), args: Vec::new_in(alloc) }
     }
 
     pub fn clear(&mut self) {
@@ -185,7 +185,7 @@ impl<A: Allocator + Clone> Needs<A> {
 /// generics has no row: its one value is the program's own (`FrontEnd::const_record`), made
 /// when the program was.
 #[allow(clippy::too_many_arguments)]
-pub fn needs_of<A: Allocator + Clone>(
+pub fn needs_of<A: Allocator + Copy>(
     view: &BodyView<'_>,
     done: &Checked<'_>,
     args: &[PTy],
@@ -207,7 +207,7 @@ pub fn needs_of<A: Allocator + Clone>(
         };
         grounded.clear();
         for &t in types.list(list).map_err(|_| malformed("a constant path's arguments past the record's types"))? {
-            grounded.push(blaze_build::ground(types, t, args, ground, scratch, facts)?);
+            grounded.push(blaze_build::ground_own(types, t, args, view, ground, scratch, facts)?);
         }
         out.push(ConstNeed::Item(item), &grounded)?;
     }
@@ -223,7 +223,7 @@ pub fn needs_of<A: Allocator + Clone>(
         };
         grounded.clear();
         for &t in types.list(list).map_err(|_| malformed("a constant pattern's arguments past the record's types"))? {
-            grounded.push(blaze_build::ground(types, t, args, ground, scratch, facts)?);
+            grounded.push(blaze_build::ground_own(types, t, args, view, ground, scratch, facts)?);
         }
         out.push(ConstNeed::Item(item), &grounded)?;
     }
@@ -235,12 +235,17 @@ pub fn needs_of<A: Allocator + Clone>(
     for (&e, &key) in done.default_fields.column::<0>().iter().zip(done.default_fields.column::<2>().iter()) {
         if last != Some(e) {
             let t = *done.expr_ty.get(e.0 as usize).ok_or(malformed("a struct expression with defaults past the record's types"))?;
-            let g = blaze_build::ground(types, t, args, ground, scratch, facts)?;
-            let PNode::Adt(_, list) = ground.view().node(g).map_err(|_| malformed("a grounded type past the ground table"))? else {
-                return Err(malformed("a struct expression with defaults of a type that is not an ADT"));
-            };
-            grounded.clear();
-            grounded.extend_from_slice(ground.view().list(list).map_err(|_| malformed("an ADT's arguments past the ground table"))?);
+            let g = blaze_build::ground_own(types, t, args, view, ground, scratch, facts)?;
+            match ground.view().node(g).map_err(|_| malformed("a grounded type past the ground table"))? {
+                PNode::Adt(_, list) => {
+                    grounded.clear();
+                    grounded.extend_from_slice(ground.view().list(list).map_err(|_| malformed("an ADT's arguments past the ground table"))?);
+                }
+                PNode::Record(..) => {
+                    grounded.clear();
+                }
+                _ => return Err(malformed("a struct expression with defaults of a type that is not an ADT or record")),
+            }
             last = Some(e);
         }
         out.push(ConstNeed::Item(key), &grounded)?;
@@ -264,7 +269,7 @@ pub fn needs_of<A: Allocator + Clone>(
 /// verifier, which pulls a read list's `Const` rows here (`verify_instance`), asks the same
 /// table: one answer per constant, never the program's record at the build and this table's at
 /// the check (rule 30).
-pub fn plain_needs_of<A: Allocator + Clone>(done: &Checked<'_>, out: &mut Needs<A>) -> Result<(), BuildError> {
+pub fn plain_needs_of<A: Allocator + Copy>(done: &Checked<'_>, out: &mut Needs<A>) -> Result<(), BuildError> {
     let at_args = done.const_args.column::<0>();
     for (e, d) in done.expr_defs.column::<0>().iter().zip(done.expr_defs.column::<1>().iter()) {
         if let &Def::Const(item) = d
@@ -287,14 +292,14 @@ pub fn plain_needs_of<A: Allocator + Clone>(done: &Checked<'_>, out: &mut Needs<
 /// The values of one build's needs, by need and ground arguments (types of the build's ground
 /// table, interned: equal types have one id): filled by [`pull`] before each instance's walk,
 /// read by the builder's `Adts` during it.
-pub struct ConstTable<A: Allocator + Clone> {
+pub struct ConstTable<A: Allocator + Copy> {
     rows: SortedMap<(u8, u128, u32), Vec<(Vec<PTy, A>, DataRecord<Global>), A>, A>,
     alloc: A,
 }
 
-impl<A: Allocator + Clone> ConstTable<A> {
+impl<A: Allocator + Copy> ConstTable<A> {
     pub fn new_in(alloc: A) -> ConstTable<A> {
-        ConstTable { rows: SortedMap::new_in(alloc.clone()), alloc }
+        ConstTable { rows: SortedMap::new_in(alloc), alloc }
     }
 
     /// The value of `need` at `args`, if pulled.
@@ -303,24 +308,38 @@ impl<A: Allocator + Clone> ConstTable<A> {
     }
 
     fn insert(&mut self, need: ConstNeed, args: &[PTy], record: DataRecord<Global>) {
-        let alloc = self.alloc.clone();
-        let at = self.rows.get_or_insert_with(&need.order(), |&k| (k, Vec::new_in(alloc.clone())));
+        let alloc = self.alloc;
+        let at = self.rows.get_or_insert_with(&need.order(), |&k| (k, Vec::new_in(alloc)));
         let mut kept = Vec::new_in(alloc);
         kept.extend_from_slice(args);
         at.push((kept, record));
     }
 }
 
+/// Build-side facts for laying out closure and coroutine types met during constant evaluation
+/// (`Box::new` at a closure or async block reads `<T as SizedTypeProperties>::LAYOUT`).
+#[derive(Clone, Copy)]
+pub struct BuildFacts<'a> {
+    pub closures: &'a crate::run::ClosureTable,
+    pub(crate) coroutines: Option<&'a super::coroutines::Coroutines>,
+}
+
+impl<'a> BuildFacts<'a> {
+    pub(crate) fn new(closures: &'a crate::run::ClosureTable, coroutines: &'a super::coroutines::Coroutines) -> BuildFacts<'a> {
+        BuildFacts { closures, coroutines: Some(coroutines) }
+    }
+}
+
 /// Asks the front end for each of `needs` (arguments of `from`, the build's ground table) not
 /// in `table` yet, and files each answer. The first need refused is the instance's refusal.
-/// `closures`: the build's closure facts, which a closure type among the arguments is laid
-/// out from ([`FrontEnd::const_at`]).
-pub fn pull<P: FrontEnd, A: Allocator + Clone>(program: &mut P, needs: &Needs<A>, from: PTys<'_>, table: &mut ConstTable<A>, closures: &crate::run::ClosureTable) -> Result<(), ConstAtRefusal> {
+/// `facts`: the build's closure and coroutine facts, which closure or coroutine types among the
+/// arguments are laid out from ([`FrontEnd::const_at`]).
+pub fn pull<P: FrontEnd, A: Allocator + Copy>(program: &mut P, needs: &Needs<A>, from: PTys<'_>, table: &mut ConstTable<A>, facts: BuildFacts<'_>) -> Result<(), ConstAtRefusal> {
     for (need, args) in needs.iter() {
         if table.get(need, args).is_some() {
             continue;
         }
-        let record = program.const_at(need, from, args, closures).map_err(|why| ConstAtRefusal { need, why })?;
+        let record = program.const_at(need, from, args, facts).map_err(|why| ConstAtRefusal { need, why })?;
         table.insert(need, args, record);
     }
     Ok(())
@@ -417,6 +436,12 @@ pub fn copy_ground(from: PTys<'_>, args: &[PTy], into: &mut PortableTys<'_>, scr
             if !reached[at] {
                 continue;
             }
+            let raw_node = from.node(PTy(u32::try_from(at).map_err(|_| CopyFail::Malformed)?)).map_err(|_| CopyFail::Malformed)?;
+            if let PNode::Record(s, _) = raw_node
+                && let Some(names) = from.record_names(s)
+            {
+                into.register_record_schema(s, names).map_err(|_| CopyFail::Full)?;
+            }
             let mut map_list = |l: List, list: &mut Vec<PTy, Alloc<'_>>| -> Result<List, CopyFail> {
                 list.clear();
                 for t in from.list(l).map_err(|_| CopyFail::Malformed)? {
@@ -425,7 +450,7 @@ pub fn copy_ground(from: PTys<'_>, args: &[PTy], into: &mut PortableTys<'_>, scr
                 into.intern_list(list).map_err(|_| CopyFail::Full)
             };
             let m = |t: PTy| mapped.get(t.0 as usize).copied().ok_or(CopyFail::Malformed);
-            let node = match from.node(PTy(at as u32)).map_err(|_| CopyFail::Malformed)? {
+            let node = match raw_node {
                 PNode::Param(_) | PNode::ConstParam(_) => return Err(CopyFail::NotGround { what: "a generic parameter" }),
                 PNode::Alias { .. } => return Err(CopyFail::NotGround { what: "a projection" }),
                 PNode::Opaque(..) => return Err(CopyFail::NotGround { what: "an `impl Trait` type" }),
@@ -433,6 +458,8 @@ pub fn copy_ground(from: PTys<'_>, args: &[PTy], into: &mut PortableTys<'_>, scr
                 PNode::ConstValue { ty, bits } => PNode::ConstValue { ty: m(ty)?, bits },
                 n @ (PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Float(_) | PNode::Str | PNode::Never) => n,
                 PNode::Tuple(l) => PNode::Tuple(map_list(l, &mut list)?),
+                PNode::Record(s, l) => PNode::Record(s, map_list(l, &mut list)?),
+                PNode::Union(l) => PNode::Union(map_list(l, &mut list)?),
                 PNode::Ref(mu, t) => PNode::Ref(mu, m(t)?),
                 PNode::Ptr(mu, t) => PNode::Ptr(mu, m(t)?),
                 PNode::Array(t, n) => PNode::Array(m(t)?, m(n)?),

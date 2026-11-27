@@ -74,6 +74,21 @@ pub trait RegionFacts {
     fn impl_assoc(&self, impl_: ItemKey, name: crate::ids::Name) -> Result<ColView<'_>, RegionsUnread> { let _ = name; Err(RegionsUnread { item: impl_, why: UnreadWhy::NoHead }) }
 }
 
+/// Borrowed read of a head's region columns and the [`crate::regions::Arity`] table they were laid
+/// by, for trait-solver higher-ranked (`for<'a>`) and `'static` region checks.
+pub trait HeadRegionRead {
+    fn arity(&self) -> &dyn crate::regions::Arity;
+    fn impl_header(&self) -> Option<(ColView<'_>, Option<ColView<'_>>)>;
+    fn clause_count(&self) -> usize;
+    fn clause(&self, idx: usize) -> Option<(u32, u32, ColView<'_>)>;
+}
+
+impl core::fmt::Debug for dyn HeadRegionRead + '_ {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HeadRegionRead").field("clauses", &self.clause_count()).finish()
+    }
+}
+
 /// A fn's signature regions, borrowed: its lifetime parameters, the column laid over
 /// `FnPtr(inputs.., output)`, and an async fn's written output.
 #[derive(Clone, Copy, Debug)]
@@ -287,12 +302,24 @@ pub struct ClauseView<'a> {
     pub nth: u32,
     pub binders: u32,
     pub col: ColView<'a>,
+    /// For a `TypeOutlives` clause (`T: 'r`), the right-hand region `'r` in the item's numbering;
+    /// `None` for trait/projection clauses.
+    pub outlives: Option<Region>,
 }
 
 impl<'a> ClauseView<'a> {
     /// The view of `clause`.
     pub fn of<A: Allocator + 'a>(clause: &'a ClauseRegions<A>) -> ClauseView<'a> {
-        ClauseView { nth: clause.nth, binders: clause.binders, col: ColView::of(&clause.col) }
+        ClauseView { nth: clause.nth, binders: clause.binders, col: ColView::of(&clause.col), outlives: None }
+    }
+
+    /// The view of `clause`, pairing any matching `Outlives::Type` entry from `outlives`.
+    pub fn of_in<A: Allocator + 'a>(clause: &'a ClauseRegions<A>, outlives: &[Outlives]) -> ClauseView<'a> {
+        let rhs = outlives.iter().find_map(|o| match *o {
+            Outlives::Type { clause: c, region } if c == clause.nth => Some(region),
+            _ => None,
+        });
+        ClauseView { nth: clause.nth, binders: clause.binders, col: ColView::of(&clause.col), outlives: rhs }
     }
 }
 

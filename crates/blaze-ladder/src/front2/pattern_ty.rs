@@ -34,8 +34,17 @@ fn refused(what: String, r: Range) -> Why {
 
 impl<'n, H: Heads, S: NamesSource<'n>> Builder<'_, H, S> {
     /// The type the unexpanded type macro `t` of a signature's `v` stands for, written in
-    /// `env.module`: its text expanded and lowered, then read as a type.
-    pub(super) fn macro_ty(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, r: Range) -> Result<PTy, Why> {
+    /// `env.module`: its text expanded and lowered, then read as a type (and its region slots
+    /// laid onto `sink`, if given).
+    pub(super) fn macro_ty(
+        &self,
+        tys: &mut PortableTys<'_>,
+        env: &Env<'_>,
+        v: &View<'_>,
+        t: lf::TypeId,
+        r: Range,
+        sink: Option<&mut super::types::RegionSink<'_>>,
+    ) -> Result<PTy, Why> {
         let text = v.text_at(v.type_range(t)?)?;
         let x = super::type_expand::expand_type_text(self.resolver.names, env.module, text, self.marks, r, tys.alloc())?;
         // A fn's return type with a macro in it is expanded whole by `heads.rs` `fn_head`
@@ -51,7 +60,16 @@ impl<'n, H: Heads, S: NamesSource<'n>> Builder<'_, H, S> {
         // The expansion is a text of its own, read at `env.module`: the item's marks are not
         // its tokens' (front2 item_site.rs).
         let own = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks: None };
-        own.ty(tys, &Env { anon: &[], ..*env }, &x.view(), x.root)
+        let own_env = Env { anon: &[], ..*env };
+        match sink {
+            Some(s) => {
+                let mark = s.mark_expansion();
+                let res = own.ty_regions(tys, &own_env, &x.view(), x.root, s);
+                s.remap_expansion_ranges(mark, r);
+                res
+            }
+            None => own.ty(tys, &own_env, &x.view(), x.root),
+        }
     }
 
     /// The pattern type over `base` (already built) with the pattern `pat` of `v`.
@@ -59,6 +77,7 @@ impl<'n, H: Heads, S: NamesSource<'n>> Builder<'_, H, S> {
         let written = match pat {
             lf::TyPat::NotNull => String::from("_ is !null"),
             lf::TyPat::Of(p) => format!("_ is {}", v.text_at(v.pat_range(p)?)?),
+            lf::TyPat::In(c) => format!("_ is in {}", v.text_at(v.const_range(c)?)?),
         };
         let text = parse_pattern_type(&written, r).map_err(|e| refused(format!("{e:?}"), r))?;
         let names = self.resolver.names;

@@ -52,8 +52,8 @@ impl fmt::Display for NotItsCfg {
 /// The graph's bytes. Each unit's cfg set is not written: it is its platform's atoms (the two
 /// platforms are written once), its features and its kind's flags, remade on decode; a unit
 /// whose cfg is other than that is [`NotItsCfg`].
-pub fn encode<'a>(graph: &UnitGraph<'a>, target: &TargetDesc<'a>, host: &TargetDesc<'a>, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, NotItsCfg> {
-    let mut w = Writer(Vec::new_in(alloc));
+pub fn encode<'g, 'r>(graph: &UnitGraph<'g>, target: &TargetDesc<'g>, host: &TargetDesc<'g>, alloc: Alloc<'r>) -> Result<AVec<'r, u8>, NotItsCfg> {
+    let mut w = Writer(Vec::with_capacity_in(graph.units.len().saturating_mul(256).max(1024), alloc));
     w.0.extend_from_slice(MAGIC);
     w.u8(match graph.resolver {
         Resolver::V1 => 1,
@@ -68,9 +68,11 @@ pub fn encode<'a>(graph: &UnitGraph<'a>, target: &TargetDesc<'a>, host: &TargetD
         }
     }
     w.u32(graph.units.len() as u32);
+    let target_sorted = target.cfg.windows(2).all(|p| p[0] <= p[1]);
+    let host_sorted = host.cfg.windows(2).all(|p| p[0] <= p[1]);
     for (at, unit) in graph.units.iter().enumerate() {
-        let desc = if unit.for_host { host } else { target };
-        if !cfg_is(unit, desc, alloc) {
+        let (desc, desc_sorted) = if unit.for_host { (host, host_sorted) } else { (target, target_sorted) };
+        if !cfg_is(unit, desc, desc_sorted) {
             return Err(NotItsCfg { unit: UnitId(at as u32) });
         }
         w.u32(unit.package.0);
@@ -168,9 +170,77 @@ fn is_test(kind: &UnitKind<'_>) -> bool {
     crate::extra::has_test_cfg(kind)
 }
 
-/// Whether `unit`'s cfg is the set [`crate::resolve::unit_cfg`] makes on `desc`.
-fn cfg_is<'a>(unit: &Unit<'a>, desc: &TargetDesc<'a>, alloc: Alloc<'a>) -> bool {
-    unit.cfg == unit_cfg(desc, &unit.features, is_test(&unit.kind), crate::resolve::ignores_profile_panic(&unit.kind), unit.kind == UnitKind::ProcMacro, alloc)
+/// Whether `unit`'s cfg is the exact sorted, deduplicated set [`crate::resolve::unit_cfg`] makes
+/// on `desc`, verified in-place with zero heap allocations.
+fn cfg_is<'a>(unit: &Unit<'a>, desc: &TargetDesc<'a>, desc_sorted: bool) -> bool {
+    // `unit_cfg` always produces strictly sorted, deduplicated atoms.
+    if !unit.cfg.windows(2).all(|pair| pair[0] < pair[1]) {
+        return false;
+    }
+    let test = is_test(&unit.kind);
+    let unwinds = crate::resolve::ignores_profile_panic(&unit.kind);
+    let proc_macro = unit.kind == UnitKind::ProcMacro;
+    let has_unit_atom = |name: &str, value: Option<&str>| {
+        unit.cfg
+            .binary_search_by(|atom| atom.name.as_str().cmp(name).then_with(|| atom.value.as_deref().cmp(&value)))
+            .is_ok()
+    };
+    let has_desc_atom = |atom: &CfgAtom<'_>| {
+        if desc_sorted {
+            desc.cfg.binary_search(atom).is_ok()
+        } else {
+            desc.cfg.iter().any(|candidate| candidate == atom)
+        }
+    };
+    // 1. Every atom `unit_cfg` emits must be present in `unit.cfg`.
+    for atom in desc.cfg.iter() {
+        if unwinds && atom.name.as_str() == crate::resolve::PANIC_KEY {
+            continue;
+        }
+        if !has_unit_atom(atom.name.as_str(), atom.value.as_deref()) {
+            return false;
+        }
+    }
+    if unwinds && !has_unit_atom(crate::resolve::PANIC_KEY, Some("unwind")) {
+        return false;
+    }
+    for feature in unit.features.iter() {
+        if !has_unit_atom("feature", Some(feature.as_str())) {
+            return false;
+        }
+    }
+    if !has_unit_atom("debug_assertions", None) {
+        return false;
+    }
+    if test && !has_unit_atom("test", None) {
+        return false;
+    }
+    if proc_macro && !has_unit_atom("proc_macro", None) {
+        return false;
+    }
+    // 2. Every atom present in `unit.cfg` must be justified by one of the sources above.
+    let features_sorted = unit.features.windows(2).all(|pair| pair[0] <= pair[1]);
+    for atom in unit.cfg.iter() {
+        let name = atom.name.as_str();
+        let val = atom.value.as_deref();
+        let expected = (name == "debug_assertions" && val.is_none())
+            || (test && name == "test" && val.is_none())
+            || (proc_macro && name == "proc_macro" && val.is_none())
+            || (unwinds && name == crate::resolve::PANIC_KEY && val == Some("unwind"))
+            || (name == "feature"
+                && val.is_some_and(|f| {
+                    if features_sorted {
+                        unit.features.binary_search_by(|feat| feat.as_str().cmp(f)).is_ok()
+                    } else {
+                        unit.features.iter().any(|feat| feat.as_str() == f)
+                    }
+                }))
+            || (!(unwinds && name == crate::resolve::PANIC_KEY) && has_desc_atom(atom));
+        if !expected {
+            return false;
+        }
+    }
+    true
 }
 
 /// Bytes that are not a unit graph's record: where, and what is wrong there.
@@ -331,6 +401,188 @@ pub fn decode<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Result<Decoded<'a>, RecordR
         return r.refuse("bytes after the record");
     }
     Ok(Decoded { graph: UnitGraph { units, resolver, meta, left_out }, target, host })
+}
+
+/// Borrowed target kind returned by [`scan_units`] with zero string or cfg allocations.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScannedKind<'b> {
+    Lib,
+    ProcMacro,
+    Bin(&'b str),
+    BuildScript,
+    Test { bin: Option<&'b str> },
+    IntegrationTest { name: &'b str, harness: bool, test: bool, required_features_met: bool },
+    Example { name: &'b str, harness: bool, test: bool, required_features_met: bool },
+    Bench { name: &'b str, harness: bool, test: bool, required_features_met: bool },
+}
+
+impl ScannedKind<'_> {
+    /// Whether this unit kind carries `#[cfg(test)]`, matching `extra::has_test_cfg`.
+    pub const fn has_test_cfg(&self) -> bool {
+        match *self {
+            ScannedKind::Test { .. } => true,
+            ScannedKind::IntegrationTest { harness, .. } | ScannedKind::Bench { harness, .. } => harness,
+            ScannedKind::Lib | ScannedKind::ProcMacro | ScannedKind::Bin(_) | ScannedKind::BuildScript | ScannedKind::Example { .. } => false,
+        }
+    }
+}
+
+/// Lightweight zero-copy view of one unit decoded by [`scan_units`], carrying every field needed
+/// for binary/test target selection and `MemberUnitIndex` resolution without allocating `unit_cfg`,
+/// `deps`, `meta`, `left_out`, or per-unit strings.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ScannedUnit<'b> {
+    pub index: usize,
+    pub name: &'b str,
+    pub version: &'b str,
+    pub kind: ScannedKind<'b>,
+    pub for_host: bool,
+    pub edition: PackageEdition,
+    pub crate_name: &'b str,
+    pub root: &'b str,
+    pub has_test_cfg: bool,
+    pub has_build_script: bool,
+}
+
+/// Zero-copy, zero-excess-alloc scan of a `BUG4` unit-graph record: validates the entire record
+/// (magic, version, platforms, unit indices, UTF-8, metadata order, left-out order, trailing
+/// bytes) identically to [`decode`], while borrowing every string directly from `bytes` and
+/// skipping `unit_cfg`, `deps`, `meta`, and `left_out` allocations.
+pub fn scan_units<'b, 'a>(bytes: &'b [u8], alloc: Alloc<'a>) -> Result<AVec<'a, ScannedUnit<'b>>, RecordRefused> {
+    let mut r = Reader { bytes, at: 0, alloc };
+    if r.take(4)? != MAGIC {
+        return Err(RecordRefused { at: 0, why: "another magic (an older form, or not a record)" });
+    }
+    match r.u8()? {
+        1..=3 => {}
+        _ => return r.refuse("no such resolver"),
+    }
+    let target_has_test = r.skip_platform()?;
+    let host_has_test = r.skip_platform()?;
+    let n = r.count()?;
+    let mut units = Vec::with_capacity_in(n, alloc);
+    let mut req_scratch: AVec<'a, &'b str> = Vec::new_in(alloc);
+    let mut feat_scratch: AVec<'a, &'b str> = Vec::new_in(alloc);
+    for index in 0..n {
+        let _package = r.u32()?;
+        let name = r.str_ref()?;
+        let version = r.str_ref()?;
+        req_scratch.clear();
+        let kind_tag = r.u8()?;
+        let mut extra_info: Option<(u8, &'b str, bool, bool)> = None;
+        let simple_kind = match kind_tag {
+            0 => Some(ScannedKind::Lib),
+            1 => Some(ScannedKind::ProcMacro),
+            2 => Some(ScannedKind::Bin(r.str_ref()?)),
+            3 => Some(ScannedKind::BuildScript),
+            4 => Some(ScannedKind::Test { bin: None }),
+            5 => Some(ScannedKind::Test { bin: Some(r.str_ref()?) }),
+            tag @ 6..=8 => {
+                let target_name = r.str_ref()?;
+                let flags = r.u8()?;
+                if flags > 3 {
+                    return r.refuse("unknown target flags");
+                }
+                let nr = r.count()?;
+                req_scratch.reserve(nr);
+                for _ in 0..nr {
+                    req_scratch.push(r.str_ref()?);
+                }
+                extra_info = Some((tag, target_name, flags & 1 != 0, flags & 2 != 0));
+                None
+            }
+            _ => return r.refuse("no such unit kind"),
+        };
+        let flags = r.u8()?;
+        if flags > 1 {
+            return r.refuse("unknown unit flags");
+        }
+        let for_host = flags & 1 != 0;
+        let edition = r.edition_ref()?;
+        let crate_name = r.str_ref()?;
+        let root = r.str_ref()?;
+        let nf = r.count()?;
+        let required_features_met = if req_scratch.is_empty() {
+            for _ in 0..nf {
+                let _ = r.str_ref()?;
+            }
+            true
+        } else {
+            feat_scratch.clear();
+            feat_scratch.reserve(nf);
+            for _ in 0..nf {
+                feat_scratch.push(r.str_ref()?);
+            }
+            req_scratch.iter().all(|f| feat_scratch.binary_search(f).is_ok())
+        };
+        let kind = match (simple_kind, extra_info) {
+            (Some(k), _) => k,
+            (None, Some((6, target_name, harness, test))) => ScannedKind::IntegrationTest { name: target_name, harness, test, required_features_met },
+            (None, Some((7, target_name, harness, test))) => ScannedKind::Example { name: target_name, harness, test, required_features_met },
+            (None, Some((_, target_name, harness, test))) => ScannedKind::Bench { name: target_name, harness, test, required_features_met },
+            (None, None) => return r.refuse("no such unit kind"),
+        };
+        let has_test_cfg = (if for_host { host_has_test } else { target_has_test }) || kind.has_test_cfg();
+        let nd = r.count()?;
+        for _ in 0..nd {
+            let _ = r.str_ref()?;
+            let _ = r.unit(n)?;
+        }
+        let has_build_script = match r.u32()? {
+            u32::MAX => false,
+            id if usize::try_from(id).is_ok_and(|u| u < n) => true,
+            _ => return r.refuse("a build script past the last unit"),
+        };
+        match r.u8()? {
+            0 => {}
+            1 => {
+                let _ = r.str_ref()?;
+            }
+            _ => return r.refuse("a links tag"),
+        }
+        units.push(ScannedUnit { index, name, version, kind, for_host, edition, crate_name, root, has_test_cfg, has_build_script });
+    }
+    let nm = r.count()?;
+    let mut last_meta: Option<LockId> = None;
+    for _ in 0..nm {
+        let id = LockId(r.u32()?);
+        if last_meta.is_some_and(|last| last >= id) {
+            return r.refuse("package metadata not strictly by id");
+        }
+        last_meta = Some(id);
+        for _ in 0..8 {
+            let _ = r.str_ref()?;
+        }
+    }
+    let nl = r.count()?;
+    let mut last_left: Option<(LockId, LeftOutKind, &'b str)> = None;
+    for _ in 0..nl {
+        let package = LockId(r.u32()?);
+        let _package_name = r.str_ref()?;
+        let kind = match r.u8()? {
+            0 => LeftOutKind::Bin,
+            1 => LeftOutKind::Test,
+            2 => LeftOutKind::Example,
+            3 => LeftOutKind::Bench,
+            _ => return r.refuse("no such left-out target kind"),
+        };
+        let name = r.str_ref()?;
+        let no = r.count()?;
+        if no == 0 {
+            return r.refuse("a target left out with no feature off");
+        }
+        for _ in 0..no {
+            let _ = r.str_ref()?;
+        }
+        if last_left.is_some_and(|last| last >= (package, kind, name)) {
+            return r.refuse("left-out targets not strictly by (package, kind, name)");
+        }
+        last_left = Some((package, kind, name));
+    }
+    if r.at != bytes.len() {
+        return r.refuse("bytes after the record");
+    }
+    Ok(units)
 }
 
 /// The digest of what a request's unit graph read: the record's source.
@@ -504,13 +756,67 @@ impl<'b, 'a> Reader<'b, 'a> {
         }
     }
 
-    fn text(&mut self) -> Result<Text<'a>, RecordRefused> {
-        let n = self.u32()? as usize;
+    fn str_ref(&mut self) -> Result<&'b str, RecordRefused> {
+        let n = usize::try_from(self.u32()?).map_err(|_| RecordRefused { at: self.at, why: "a string length past usize" })?;
         let at = self.at;
         let bytes = self.take(n)?;
         match core::str::from_utf8(bytes) {
-            Ok(s) => Ok(String::from_str_in(s, self.alloc)),
+            Ok(s) => Ok(s),
             Err(_) => Err(RecordRefused { at, why: "text that is not UTF-8" }),
+        }
+    }
+
+    fn text(&mut self) -> Result<Text<'a>, RecordRefused> {
+        let s = self.str_ref()?;
+        Ok(String::from_str_in(s, self.alloc))
+    }
+
+    /// Validates a platform section without allocating strings, returning whether the platform's
+    /// cfg atoms already include bare `test`.
+    fn skip_platform(&mut self) -> Result<bool, RecordRefused> {
+        let _triple = self.str_ref()?;
+        let n = self.count()?;
+        let mut last: Option<(&'b str, Option<&'b str>)> = None;
+        let mut has_test = false;
+        for _ in 0..n {
+            let name = self.str_ref()?;
+            let value = match self.u8()? {
+                0 => None,
+                1 => Some(self.str_ref()?),
+                _ => return self.refuse("a cfg atom's value tag"),
+            };
+            if last.is_some_and(|prev| prev >= (name, value)) {
+                return self.refuse("a platform's atoms out of order");
+            }
+            last = Some((name, value));
+            if name == "test" && value.is_none() {
+                has_test = true;
+            }
+        }
+        Ok(has_test)
+    }
+
+    fn edition_ref(&mut self) -> Result<PackageEdition, RecordRefused> {
+        let at = self.at;
+        match self.u8()? {
+            0 => {
+                let syntax = match self.u16()? {
+                    2015 => Edition::Edition2015,
+                    2018 => Edition::Edition2018,
+                    2021 => Edition::Edition2021,
+                    2024 => Edition::Edition2024,
+                    _ => return Err(RecordRefused { at, why: "no such Rust edition" }),
+                };
+                Ok(PackageEdition { syntax, blaze: None })
+            }
+            1 => {
+                let written = self.str_ref()?;
+                match PackageEdition::of_manifest(written) {
+                    Ok(edition) if edition.blaze.is_some() => Ok(edition),
+                    _ => Err(RecordRefused { at, why: "no such blaze edition" }),
+                }
+            }
+            _ => Err(RecordRefused { at, why: "an edition's tag" }),
         }
     }
 
@@ -566,5 +872,140 @@ impl<'b, 'a> Reader<'b, 'a> {
             }
             _ => Err(RecordRefused { at, why: "an edition's tag" }),
         }
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use blaze_manifest::lock::LockId;
+    use blaze_own::{String, Vec};
+    use edition::{Edition, PackageEdition};
+
+    use super::{ScannedKind, decode, encode, scan_units};
+    use crate::resolve::unit_cfg;
+    use crate::{CfgAtom, ExtraUnit, Resolver, TargetDesc, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
+
+    #[test]
+    fn scan_units_matches_decode_and_refuses_corrupt_records() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let s = |v: &str| String::from_str_in(v, alloc);
+        let target = TargetDesc {
+            triple: s("aarch64-apple-darwin"),
+            cfg: {
+                let mut c = Vec::new_in(alloc);
+                c.push(CfgAtom { name: s("target_arch"), value: Some(s("aarch64")) });
+                c.push(CfgAtom { name: s("unix"), value: None });
+                c
+            },
+        };
+        let host = TargetDesc { triple: s("aarch64-apple-darwin"), cfg: Vec::new_in(alloc) };
+        let ed = PackageEdition { syntax: Edition::Edition2024, blaze: None };
+
+        let make_unit = |kind, name: &str, crate_name: &str, root: &str, for_host: bool, feats: &[&str], build_script: Option<UnitId>| {
+            let mut features = Vec::new_in(alloc);
+            for &f in feats {
+                features.push(s(f));
+            }
+            let desc = if for_host { &host } else { &target };
+            let cfg = unit_cfg(
+                desc,
+                &features,
+                crate::extra::has_test_cfg(&kind),
+                crate::resolve::ignores_profile_panic(&kind),
+                kind == UnitKind::ProcMacro,
+                alloc,
+            );
+            Unit {
+                package: LockId(0),
+                name: s(name),
+                version: s("0.1.0"),
+                kind,
+                for_host,
+                edition: ed,
+                crate_name: s(crate_name),
+                root: s(root),
+                features,
+                cfg,
+                deps: Vec::new_in(alloc),
+                build_script,
+                links: None,
+            }
+        };
+
+        let mut units = Vec::new_in(alloc);
+        units.push(make_unit(UnitKind::BuildScript, "app", "build_script_build", "build.rs", true, &[], None));
+        units.push(make_unit(UnitKind::Lib, "app", "app", "src/lib.rs", false, &["alpha"], Some(UnitId(0))));
+        units.push(make_unit(UnitKind::Bin(s("cli")), "app", "cli", "src/main.rs", false, &["alpha"], Some(UnitId(0))));
+        units.push(make_unit(UnitKind::Test { bin: None }, "app", "app", "src/lib.rs", false, &["alpha"], Some(UnitId(0))));
+        units.push(make_unit(
+            UnitKind::IntegrationTest(ExtraUnit {
+                name: s("it_ok"),
+                harness: true,
+                test: true,
+                required_features: {
+                    let mut r = Vec::new_in(alloc);
+                    r.push(s("alpha"));
+                    r
+                },
+            }),
+            "app",
+            "it_ok",
+            "tests/it_ok.rs",
+            false,
+            &["alpha", "beta"],
+            None,
+        ));
+        units.push(make_unit(
+            UnitKind::IntegrationTest(ExtraUnit {
+                name: s("it_missing"),
+                harness: false,
+                test: true,
+                required_features: {
+                    let mut r = Vec::new_in(alloc);
+                    r.push(s("gamma"));
+                    r
+                },
+            }),
+            "app",
+            "it_missing",
+            "tests/it_missing.rs",
+            false,
+            &["alpha"],
+            None,
+        ));
+        // Add a dependency edge on unit 1 -> unit 0 to exercise dep skipping.
+        units[1].deps.push(UnitDep { name: s("bs"), unit: UnitId(0) });
+
+        let graph = UnitGraph { units, resolver: Resolver::V3, meta: Vec::new_in(alloc), left_out: Vec::new_in(alloc) };
+        let encoded = encode(&graph, &target, &host, alloc).expect("encode unit graph");
+        let full = decode(encoded.as_slice(), alloc).expect("full decode");
+        let scanned = scan_units(encoded.as_slice(), alloc).expect("scan_units");
+
+        assert_eq!(scanned.len(), full.graph.units.len());
+        for (sc, u) in scanned.iter().zip(full.graph.units.iter()) {
+            assert_eq!(sc.name, u.name.as_str());
+            assert_eq!(sc.version, u.version.as_str());
+            assert_eq!(sc.crate_name, u.crate_name.as_str());
+            assert_eq!(sc.root, u.root.as_str());
+            assert_eq!(sc.for_host, u.for_host);
+            assert_eq!(sc.edition, u.edition);
+            assert_eq!(sc.has_build_script, u.build_script.is_some());
+            assert_eq!(sc.has_test_cfg, u.cfg.iter().any(|c| c.name == "test" && c.value.is_none()));
+        }
+        assert_eq!(
+            scanned[4].kind,
+            ScannedKind::IntegrationTest { name: "it_ok", harness: true, test: true, required_features_met: true }
+        );
+        assert_eq!(
+            scanned[5].kind,
+            ScannedKind::IntegrationTest { name: "it_missing", harness: false, test: true, required_features_met: false }
+        );
+
+        // Corrupt magic and truncated payload must be refused identically.
+        let mut bad_magic = Vec::new_in(alloc);
+        bad_magic.extend_from_slice(encoded.as_slice());
+        bad_magic[0] = b'X';
+        assert!(scan_units(bad_magic.as_slice(), alloc).is_err());
+        assert!(scan_units(&encoded[..encoded.len() - 1], alloc).is_err());
     }
 }

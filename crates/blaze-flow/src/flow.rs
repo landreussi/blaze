@@ -108,10 +108,13 @@ pub struct PlaceRow {
     /// slice"), where the same projection of an array `[T; N]` is. Its own fact, never read
     /// from [`Self::of_drop_type`] (lane B12 item 6).
     pub of_slice: bool,
+    /// A `Proj::Deref` of a shared reference (`&T`) or raw pointer (`*const T` / `*mut T`):
+    /// a loan behind this deref does not lock prefixes above it (rustc `places_conflict`:
+    /// supporting prefixes stop at a shared-ref or raw-ptr deref).
+    pub of_shared_ref: bool,
 }
 
-/// What a place made by [`FlowBuilder::project_in`] is marked as: one fact per row, the
-/// reason a move out of it is refused (moves.rs `move_out`).
+/// What a place made by [`FlowBuilder::project_in`] is marked as: one fact per row.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PlaceMark {
     None,
@@ -119,6 +122,8 @@ pub enum PlaceMark {
     DropField,
     /// [`PlaceRow::of_slice`].
     SliceElement,
+    /// [`PlaceRow::of_shared_ref`].
+    SharedDeref,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -268,6 +273,9 @@ pub struct Flow<A: Allocator> {
     pub placeholder: Vec<bool, A>,
     /// `(local, origin)`: the local's type mentions the origin. Sorted.
     pub local_origins: Vec<(Local, Origin), A>,
+    /// Subset of `local_origins` whose positions do NOT run a destructor on `StmtKind::Drop`
+    /// (RFC 1327 / dropck: e.g. `&'a mut U` inside `Result<&'a mut U, E>`). Sorted.
+    pub local_no_drop_origins: Vec<(Local, Origin), A>,
     /// Known `from: into` between placeholders (the signature's bounds).
     pub known: Vec<(Origin, Origin), A>,
     /// Each local's own place: `Place(l)` for the locals the builder was made with, a later row
@@ -352,22 +360,55 @@ impl<A: Allocator> Flow<A> {
         }
     }
 
-    /// Returns the `idx`-th successor statement of `s`, or `None`.
+    /// Calls `f` on each successor block of block `b`.
     #[inline]
-    pub(crate) fn nth_succ(&self, s: Stmt, idx: u32) -> Option<Stmt> {
-        match self.stmt(s).kind {
-            StmtKind::Goto(b) => (idx == 0).then(|| Stmt(self.blocks[b.index()].start)),
+    pub(crate) fn for_each_block_succ(&self, b: Block, mut f: impl FnMut(Block)) {
+        let range = self.blocks[b.index()];
+        if range.end <= range.start {
+            return;
+        }
+        match self.stmt(Stmt(range.end - 1)).kind {
+            StmtKind::Goto(t) => f(t),
+            StmtKind::Switch { targets, .. } => {
+                for &t in &self.succ[targets.start as usize..targets.end as usize] {
+                    f(t);
+                }
+            }
+            StmtKind::Suspend { resume, cancel } => {
+                f(resume);
+                f(cancel);
+            }
+            StmtKind::Return | StmtKind::Unreachable => {}
+            _ => {
+                if let Some(&t) = self.stmt_block.get(range.end as usize) {
+                    f(t);
+                }
+            }
+        }
+    }
+
+    /// Returns the `idx`-th successor block of block `b`, or `None`.
+    #[inline]
+    pub(crate) fn nth_block_succ(&self, b: Block, idx: u32) -> Option<Block> {
+        let range = self.blocks[b.index()];
+        if range.end <= range.start {
+            return None;
+        }
+        match self.stmt(Stmt(range.end - 1)).kind {
+            StmtKind::Goto(t) => (idx == 0).then_some(t),
             StmtKind::Switch { targets, .. } => {
                 let i = targets.start + idx;
-                (i < targets.end).then(|| Stmt(self.blocks[self.succ[i as usize].index()].start))
+                (i < targets.end).then(|| self.succ[i as usize])
             }
             StmtKind::Suspend { resume, cancel } => match idx {
-                0 => Some(Stmt(self.blocks[resume.index()].start)),
-                1 => Some(Stmt(self.blocks[cancel.index()].start)),
+                0 => Some(resume),
+                1 => Some(cancel),
                 _ => None,
             },
             StmtKind::Return | StmtKind::Unreachable => None,
-            _ => (idx == 0).then(|| Stmt(s.0 + 1)),
+            _ => (idx == 0)
+                .then(|| self.stmt_block.get(range.end as usize).copied())
+                .flatten(),
         }
     }
 
@@ -496,7 +537,7 @@ impl<A: Allocator> Flow<A> {
 const NO_CHILD: u32 = u32::MAX;
 
 /// Builds a flow by hand: reserve blocks, then fill each in turn, ending it with a terminator.
-pub struct FlowBuilder<A: Allocator + Clone> {
+pub struct FlowBuilder<A: Allocator + Copy> {
     flow: Flow<A>,
     filled: Vec<bool, A>,
     /// Intrusive linked list of direct children per place (`NO_CHILD` = end).
@@ -508,14 +549,14 @@ pub struct FlowBuilder<A: Allocator + Clone> {
     error: Option<FlowError>,
 }
 
-impl<A: Allocator + Clone> FlowBuilder<A> {
+impl<A: Allocator + Copy> FlowBuilder<A> {
     /// A body of `locals` locals, of which `1..=args` are arguments (`Local(0)` returns).
     pub fn new_in(locals: u32, args: u32, alloc: A) -> FlowBuilder<A> {
         let cap = locals as usize;
-        let mut places = Vec::with_capacity_in(cap, alloc.clone());
-        let mut local_places = Vec::with_capacity_in(cap, alloc.clone());
-        let mut first_child = Vec::with_capacity_in(cap, alloc.clone());
-        let mut next_sibling = Vec::with_capacity_in(cap, alloc.clone());
+        let mut places = Vec::with_capacity_in(cap, alloc);
+        let mut local_places = Vec::with_capacity_in(cap, alloc);
+        let mut first_child = Vec::with_capacity_in(cap, alloc);
+        let mut next_sibling = Vec::with_capacity_in(cap, alloc);
         for l in 0..locals {
             local_places.push(Place(l));
             places.push(PlaceRow {
@@ -525,6 +566,7 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
                 depth: 0,
                 of_drop_type: false,
                 of_slice: false,
+                of_shared_ref: false,
             });
             first_child.push(NO_CHILD);
             next_sibling.push(NO_CHILD);
@@ -534,17 +576,18 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
                 locals,
                 args,
                 places,
-                stmts: Vec::new_in(alloc.clone()),
-                blocks: Vec::new_in(alloc.clone()),
-                stmt_block: Vec::new_in(alloc.clone()),
-                operands: Vec::new_in(alloc.clone()),
-                succ: Vec::new_in(alloc.clone()),
-                loans: Vec::new_in(alloc.clone()),
-                subsets: Vec::new_in(alloc.clone()),
+                stmts: Vec::new_in(alloc),
+                blocks: Vec::new_in(alloc),
+                stmt_block: Vec::new_in(alloc),
+                operands: Vec::new_in(alloc),
+                succ: Vec::new_in(alloc),
+                loans: Vec::new_in(alloc),
+                subsets: Vec::new_in(alloc),
                 origins: 0,
-                placeholder: Vec::new_in(alloc.clone()),
-                local_origins: Vec::new_in(alloc.clone()),
-                known: Vec::new_in(alloc.clone()),
+                placeholder: Vec::new_in(alloc),
+                local_origins: Vec::new_in(alloc),
+                local_no_drop_origins: Vec::new_in(alloc),
+                known: Vec::new_in(alloc),
                 local_places,
             },
             filled: Vec::new_in(alloc),
@@ -570,7 +613,7 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
     pub fn add_local(&mut self) -> Local {
         let l = Local(self.flow.locals);
         self.flow.locals += 1;
-        self.flow.places.push(PlaceRow { local: l, parent: None, proj: None, depth: 0, of_drop_type: false, of_slice: false });
+        self.flow.places.push(PlaceRow { local: l, parent: None, proj: None, depth: 0, of_drop_type: false, of_slice: false, of_shared_ref: false });
         self.first_child.push(NO_CHILD);
         self.next_sibling.push(NO_CHILD);
         self.flow.local_places.push(Place(self.flow.places.len() as u32 - 1));
@@ -607,6 +650,7 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
             depth: up.depth + 1,
             of_drop_type: mark == PlaceMark::DropField,
             of_slice: mark == PlaceMark::SliceElement,
+            of_shared_ref: mark == PlaceMark::SharedDeref,
         });
         self.first_child.push(NO_CHILD);
         self.next_sibling.push(self.first_child[p_idx]);
@@ -620,7 +664,7 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
         Origin(self.flow.origins - 1)
     }
 
-    /// The type of `local` mentions `origin`.
+    /// The type of `local` mentions `origin`, which is drop-live at `StmtKind::Drop`.
     pub fn mentions(&mut self, local: u32, origin: Origin) {
         let row = (Local(local), origin);
         if let Some(&last) = self.flow.local_origins.last() {
@@ -632,6 +676,13 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
             }
         }
         self.flow.local_origins.push(row);
+    }
+
+    /// The type of `local` mentions `origin`, but dropping `local` cannot touch `origin`
+    /// (trivial-drop position such as `&mut U` inside `Result<&mut U, E>`).
+    pub fn mentions_no_drop(&mut self, local: u32, origin: Origin) {
+        self.mentions(local, origin);
+        self.flow.local_no_drop_origins.push((Local(local), origin));
     }
 
     /// The signature says `from: into` between two placeholders.
@@ -763,6 +814,10 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
         if self.local_origins_dirty {
             self.flow.local_origins.sort_unstable();
             self.flow.local_origins.dedup();
+        }
+        if !self.flow.local_no_drop_origins.is_empty() {
+            self.flow.local_no_drop_origins.sort_unstable();
+            self.flow.local_no_drop_origins.dedup();
         }
         Ok(self.flow)
     }

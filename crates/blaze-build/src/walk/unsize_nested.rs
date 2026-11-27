@@ -76,7 +76,7 @@ fn offset_by((p, off): (Value, i32), by: u32) -> Result<(Value, i32), BuildError
     Ok((p, off))
 }
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Adjustment `n` of `e`, an unsizing of the value on top (a thin or wide pointer, or a
     /// struct holding one, any depth): the target value is built in a fresh temporary: the
     /// other fields moved to their offsets in the target, then the pointer's two words.
@@ -260,7 +260,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             };
             let (types, last_ty) = (adt.types, last.ty);
             let full = || malformed("a struct's arguments past the ground table");
-            let mut args: blaze_own::Vec<PTy, A> = blaze_own::Vec::new_in(self.alloc.clone());
+            let mut args: blaze_own::Vec<PTy, A> = blaze_own::Vec::new_in(self.alloc);
             args.extend_from_slice(self.ground.view().list(lf).map_err(|_| full())?);
             let tf = ground(types, last_ty, &args, self.ground, self.scratch, self.adts.facts())?;
             args.clear();
@@ -289,10 +289,12 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             (PNode::Dynamic(_), PNode::Dynamic(_), Some(vt)) => {
                 let (pf, pt) = (self.principal(e, from)?, self.principal(e, to)?);
                 match (pf, pt) {
-                    (_, None) => return Err(refused(e, None, "an unsizing to a trait object of auto traits alone (no principal trait)")),
+                    // Upcasting any trait object to an auto-trait-only object (`dyn Send + Sync`)
+                    // keeps the same vtable pointer: every vtable begins with `[drop, size, align]`.
+                    (_, None) => vt,
                     (Some((a, _)), Some((b, _))) if a == b => vt,
                     (Some((a, _)), Some((b, _))) => {
-                        let shape = crate::vtable::Shape::of(a, |t| self.adts.object_trait(t), self.alloc.clone())
+                        let shape = crate::vtable::Shape::of(a, |t| self.adts.object_trait(t), self.scratch)
                             .map_err(|error| BuildError::Vtable { at: Some(e), error })?;
                         match shape.upcast(b) {
                             Some(crate::vtable::Upcast::Prefix) => vt,
@@ -309,9 +311,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             }
             (PNode::Dynamic(_), _, _) | (_, _, Some(_)) => return Err(malformed("an unsizing of a trait object to other than a trait object")),
             (_, PNode::Dynamic(_), None) => {
-                let Some((principal, args)) = self.principal(e, to)? else {
-                    return Err(refused(e, None, "an unsizing to a trait object of auto traits alone (no principal trait)"));
-                };
+                let (principal, args) = self.principal(e, to)?.unwrap_or((crate::vtable::AUTO_ONLY_PRINCIPAL, blaze_typeck::List::EMPTY));
                 self.vtable_addr(crate::vtable::VtableRef { concrete: from, principal, args })?
             }
             _ => return Err(refused(e, None, "an unsizing whose pointer's pointee changes to other than a slice or a trait object")),

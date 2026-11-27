@@ -94,7 +94,7 @@ fn heads_in(edition_name: &str, text: &'static str, asks: &[Ask]) -> Vec<Result<
     let crates = inputs.crates();
     // The test's one heap handle, named once.
     let g = Alloc::global();
-    let names = inputs.resolve(&crates, g).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
     let mut front = Front2::new(&names, &frame, &sources, g).unwrap_or_else(|e| panic!("front2: {e}"));
@@ -482,8 +482,8 @@ fn main() {}
 ";
     let got = heads_in("2024", TEXT, &[Ask::Free("get"), Ask::Free("get2")]);
     assert_eq!(laid(&got[0], "get").col, [P0, P0], "`<Wrap<'a> as Tr>::A` lays `Wrap<'a>`'s slot, then the output's `'a`");
-    assert!(got[1].is_err(), "TWIN: a qualified path through a trait with a lifetime stays refused by name: {:?}", got[1]);
-    println!("front2_region_rules: a_qualified_projection_lays_its_arguments_slots: get [P0, P0]; get2 refused");
+    assert_eq!(laid(&got[1], "get2").col, [P0, P0, P0], "`<Wrap<'a> as Tr2<'a>>::A` lays `Wrap<'a>`'s slot, `Tr2<'a>`'s lifetime slot, then the output's `'a`");
+    println!("front2_region_rules: a_qualified_projection_lays_its_arguments_slots: get [P0, P0]; get2 [P0, P0, P0]");
 }
 
 /// An `async fn`'s future captures every lifetime in scope (the Reference, "Async

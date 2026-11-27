@@ -29,10 +29,12 @@ use blaze_engine::{STAGES, Stage};
 use blaze_own::FixedString;
 use bstd::clock::Clock;
 use bstd::fs::{Dir, ReadWrite};
+use bstd::host::Host;
 use bstd::out::Out;
 use bstd::path::Path;
 use bstd::procs::{By, Requests};
-use bstd::{Cx, Io};
+use bstd::sync::CachePadded;
+use bstd::Cx;
 
 use crate::engine_memory::AtEnd;
 
@@ -118,29 +120,65 @@ impl Asking<'_> {
     pub(crate) const NONE: Asking<'static> = Asking { requests: None, every: None, plant: Plant::None };
 }
 
-/// One stage's counts.
+/// One stage's counts. Hot per-task atomics (`started`, `done`, `cpu_ns`, `refused`, `known`)
+/// are isolated onto separate 128-byte cache lines ([`CachePadded`], rule 86) so 128 workers
+/// starting and ending tasks never false-share with each other or with adjacent stages.
 #[derive(Default)]
 struct Counts {
-    known: AtomicU64,
-    started: AtomicU64,
-    done: AtomicU64,
+    known: CachePadded<AtomicU64>,
+    started: CachePadded<AtomicU64>,
+    done: CachePadded<AtomicU64>,
     /// Starts refused by a stop.
-    refused: AtomicU64,
-    /// Its tasks' time summed, and its phases' wall summed (ns).
-    cpu_ns: AtomicU64,
+    refused: CachePadded<AtomicU64>,
+    /// Its tasks' time summed (ns).
+    cpu_ns: CachePadded<AtomicU64>,
+    /// Its phases' wall summed (ns), and when its running phase began plus 1 (0: none runs).
     wall_ns: AtomicU64,
-    /// When its running phase began, plus 1 (0: none runs).
     phase_from: AtomicU64,
 }
 
-/// A running task.
+/// A running task or live sub-activity. 128-byte aligned so `[Lock<Option<Slot>>; SLOTS]`
+/// isolates every worker's slot lock onto its own cache line (rule 86).
+#[repr(align(128))]
 #[derive(Clone, Copy)]
 struct Slot {
-    stage: Stage,
+    stage: Option<Stage>,
+    kind: blaze_screen::WorkKind,
     label: Label,
     from_ns: u64,
     /// Its frame's bytes used when it began (a worker's frame is not read from another thread).
     frame: u64,
+}
+
+/// Default [`blaze_screen::WorkKind`] for an engine [`Stage`].
+const fn default_work_kind(stage: Stage) -> blaze_screen::WorkKind {
+    match stage {
+        Stage::Scripts => blaze_screen::WorkKind::BuildScript,
+        Stage::Units | Stage::Outlines | Stage::Names | Stage::Heads | Stage::Bodies | Stage::Lints => {
+            blaze_screen::WorkKind::Blaze
+        }
+    }
+}
+
+/// Concise lowercase name for a Blaze checking stage in the live TUI hint.
+const fn stage_hint_name(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Units => "units",
+        Stage::Scripts => "scripts",
+        Stage::Outlines => "outlines",
+        Stage::Names => "names",
+        Stage::Heads => "heads",
+        Stage::Bodies => "bodies",
+        Stage::Lints => "lints",
+    }
+}
+
+/// Snapshot of active tasks grouped by [`blaze_screen::WorkKind`], slowest-first per group.
+struct Grouped {
+    top: [[Option<Slot>; blaze_screen::MAX_GROUP_ITEMS]; blaze_screen::WORK_KINDS],
+    counts: [u32; blaze_screen::WORK_KINDS],
+    active: u32,
+    blaze_stages: u8,
 }
 
 /// Who writes the stopped status: the first to claim it.
@@ -167,9 +205,13 @@ pub(crate) struct Board<'r> {
     /// What each checked body left past its task and what it took in its scratch, summed and
     /// at its most (engine_bodies.rs `BodyMemLive`, lane BD3): the `bodies memory:` line.
     pub(crate) bodies_mem: crate::engine_bodies::BodyMemLive,
+    /// Whether a live watcher (`--status-every`, TTY TUI sink, or direct status test) is observing
+    /// individual running-task slots. When `false`, `show*`/`start`/`Drop` skip `cursor` and
+    /// `slots` locking completely (zero lock acquisitions on the hot path).
+    slots_active: CachePadded<AtomicBool>,
     slots: [Lock<Option<Slot>>; SLOTS],
-    cursor: AtomicUsize,
-    unslotted: AtomicU64,
+    cursor: CachePadded<AtomicUsize>,
+    unslotted: CachePadded<AtomicU64>,
     /// The stage whose phase began last, plus 1 (0: none yet).
     stage: AtomicU8,
     claimed: AtomicU8,
@@ -184,6 +226,21 @@ pub(crate) struct Running<'b> {
     stage: Stage,
     slot: Option<usize>,
     from_ns: u64,
+}
+
+/// A live sub-activity on the board (such as a Wasmtime proc-macro expansion running inside a
+/// `Names` or `Bodies` task): frees its slot on drop without altering stage task counts.
+pub(crate) struct ActivityGuard<'b> {
+    board: &'b Board<'b>,
+    slot: Option<usize>,
+}
+
+impl Drop for ActivityGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.and_then(|at| self.board.slots.get(at)) {
+            *slot.lock() = None;
+        }
+    }
 }
 
 /// A phase begun: what [`Board::phase_ended`] tops up from.
@@ -207,13 +264,24 @@ impl<'r> Board<'r> {
             at_end: Lock::new("engine.status.at_end", [AtEnd::default(); STAGES]),
             phase_mem: Lock::new("engine.status.phase_mem", [crate::engine_phase_mem::StageMem::default(); STAGES]),
             bodies_mem: crate::engine_bodies::BodyMemLive::new(),
+            slots_active: CachePadded::new(AtomicBool::new(true)),
             slots: [const { Lock::new("engine.status.slot", None) }; SLOTS],
-            cursor: AtomicUsize::new(0),
-            unslotted: AtomicU64::new(0),
+            cursor: CachePadded::new(AtomicUsize::new(0)),
+            unslotted: CachePadded::new(AtomicU64::new(0)),
             stage: AtomicU8::new(0),
             claimed: AtomicU8::new(0),
             over: AtomicBool::new(false),
         }
+    }
+
+    /// Sets whether live task slots are tracked on `show*`/`start` calls, returning the prior value.
+    pub(crate) fn set_watched(&self, active: bool) -> bool {
+        self.slots_active.swap(active, Ordering::AcqRel)
+    }
+
+    /// Whether live task slots are currently being tracked.
+    pub(crate) fn is_watched(&self) -> bool {
+        self.slots_active.load(Ordering::Relaxed)
     }
 
     /// Now on `clock`, in ns since the command began.
@@ -284,33 +352,126 @@ impl<'r> Board<'r> {
             self.refused(stage, 1);
             return None;
         }
-        Some(self.show(stage, label(), frame, now))
+        Some(self.show_lazy(stage, label, frame, now))
     }
 
     /// `tasks` of `stage` not begun, refused by a stop.
     pub(crate) fn refused(&self, stage: Stage, tasks: u64) {
-        self.counts[stage.index()].refused.fetch_add(tasks, Ordering::AcqRel);
+        if let Some(counts) = self.counts.get(stage.index()) {
+            counts.refused.fetch_add(tasks, Ordering::AcqRel);
+        }
+    }
+
+    /// Fast path when no watcher observes live slots: records the start in the stage's padded
+    /// counter without touching `cursor`, `unslotted`, or any slot mutex.
+    #[inline]
+    fn show_unslotted(&self, stage: Stage, now: u64) -> Running<'_> {
+        if let Some(counts) = self.counts.get(stage.index()) {
+            counts.started.fetch_add(1, Ordering::AcqRel);
+        }
+        Running { board: self, stage, slot: None, from_ns: now }
+    }
+
+    /// A task of `stage` starts now, deferring `label` construction so unwatched runs skip both
+    /// formatting and slot locking.
+    pub(crate) fn show_lazy(&self, stage: Stage, label: impl FnOnce() -> Label, frame: u64, now: u64) -> Running<'_> {
+        if !self.slots_active.load(Ordering::Relaxed) {
+            return self.show_unslotted(stage, now);
+        }
+        self.show(stage, label(), frame, now)
     }
 
     /// A task of `stage` starts now and runs whatever is asked (a stage whose tasks are begun
     /// all at once: its stop is the driver's, after them).
     pub(crate) fn show(&self, stage: Stage, label: Label, frame: u64, now: u64) -> Running<'_> {
-        self.counts[stage.index()].started.fetch_add(1, Ordering::AcqRel);
-        let first = self.cursor.fetch_add(1, Ordering::Relaxed);
-        let mut slot = None;
-        for step in 0..SLOTS {
-            let at = (first + step) % SLOTS;
-            let mut held = self.slots[at].lock();
-            if held.is_none() {
-                *held = Some(Slot { stage, label, from_ns: now, frame });
-                slot = Some(at);
-                break;
-            }
+        self.show_kind(stage, default_work_kind(stage), label, frame, now)
+    }
+
+    /// A task of `stage` with explicit [`blaze_screen::WorkKind`] attribution starts now.
+    pub(crate) fn show_kind(
+        &self,
+        stage: Stage,
+        kind: blaze_screen::WorkKind,
+        label: Label,
+        frame: u64,
+        now: u64,
+    ) -> Running<'_> {
+        if !self.slots_active.load(Ordering::Relaxed) {
+            return self.show_unslotted(stage, now);
         }
+        if let Some(counts) = self.counts.get(stage.index()) {
+            counts.started.fetch_add(1, Ordering::AcqRel);
+        }
+        let slot = self.claim_slot(Slot { stage: Some(stage), kind, label, from_ns: now, frame });
         if slot.is_none() {
             self.unslotted.fetch_add(1, Ordering::AcqRel);
         }
         Running { board: self, stage, slot, from_ns: now }
+    }
+
+    /// A live sub-activity (e.g. Wasmtime proc-macro expansion) starts now: shown in the live TUI
+    /// and status dumps without modifying stage task counters.
+    pub(crate) fn show_activity(
+        &self,
+        kind: blaze_screen::WorkKind,
+        label: Label,
+        now: u64,
+    ) -> ActivityGuard<'_> {
+        let slot = if self.slots_active.load(Ordering::Relaxed) {
+            self.claim_slot(Slot { stage: None, kind, label, from_ns: now, frame: 0 })
+        } else {
+            None
+        };
+        ActivityGuard { board: self, slot }
+    }
+
+    fn claim_slot(&self, entry: Slot) -> Option<usize> {
+        let first = self.cursor.fetch_add(1, Ordering::Relaxed);
+        for step in 0..SLOTS {
+            let at = (first + step) % SLOTS;
+            let Some(slot) = self.slots.get(at) else { continue };
+            let mut held = slot.lock();
+            if held.is_none() {
+                *held = Some(entry);
+                return Some(at);
+            }
+        }
+        None
+    }
+
+    /// Active tasks grouped by [`blaze_screen::WorkKind`], slowest-first (up to
+    /// [`blaze_screen::MAX_GROUP_ITEMS`] per category), plus active Blaze stage bitmask.
+    fn grouped(&self) -> Grouped {
+        let mut top: [[Option<Slot>; blaze_screen::MAX_GROUP_ITEMS]; blaze_screen::WORK_KINDS] =
+            [[None; blaze_screen::MAX_GROUP_ITEMS]; blaze_screen::WORK_KINDS];
+        let mut counts = [0u32; blaze_screen::WORK_KINDS];
+        let mut active = u32::try_from(self.unslotted.load(Ordering::Acquire)).unwrap_or(u32::MAX);
+        let mut blaze_stages = 0u8;
+        for slot in self.slots.iter() {
+            let Some(one) = *slot.lock() else { continue };
+            active = active.saturating_add(1);
+            let k = one.kind.index();
+            if let Some(count) = counts.get_mut(k) {
+                *count = count.saturating_add(1);
+            }
+            if one.kind == blaze_screen::WorkKind::Blaze
+                && let Some(stage) = one.stage
+            {
+                let bit = u8::try_from(stage.index()).unwrap_or(7);
+                if bit < 8 {
+                    blaze_stages |= 1u8 << bit;
+                }
+            }
+            if let Some(row) = top.get_mut(k)
+                && let Some(at) = row.iter().position(|existing| existing.is_none_or(|e| one.from_ns < e.from_ns))
+            {
+                row.copy_within(at..blaze_screen::MAX_GROUP_ITEMS - 1, at + 1);
+                if let Some(cell) = row.get_mut(at) {
+                    *cell = Some(one);
+                }
+            }
+        }
+        Grouped { top, counts, active, blaze_stages }
     }
 
     /// Each running task, the longest first (ties by slot), at most [`LONGEST`]; and how many
@@ -338,21 +499,22 @@ impl Running<'_> {
     /// The task ended now.
     pub(crate) fn end(self, now: u64) {
         let board = self.board;
-        let counts = &board.counts[self.stage.index()];
-        counts.cpu_ns.fetch_add(now.saturating_sub(self.from_ns), Ordering::AcqRel);
-        let done = counts.done.fetch_add(1, Ordering::AcqRel) + 1;
-        match board.plant {
-            Plant::StopAfter { stage, done: at, by } if stage == self.stage && done == at => board.own.ask_stop(by),
-            Plant::StatusAfter { stage, done: at, by } if stage == self.stage && done == at => board.own.ask_status(by),
-            _ => {}
+        if let Some(counts) = board.counts.get(self.stage.index()) {
+            counts.cpu_ns.fetch_add(now.saturating_sub(self.from_ns), Ordering::AcqRel);
+            let done = counts.done.fetch_add(1, Ordering::AcqRel) + 1;
+            match board.plant {
+                Plant::StopAfter { stage, done: at, by } if stage == self.stage && done == at => board.own.ask_stop(by),
+                Plant::StatusAfter { stage, done: at, by } if stage == self.stage && done == at => board.own.ask_status(by),
+                _ => {}
+            }
         }
     }
 }
 
 impl Drop for Running<'_> {
     fn drop(&mut self) {
-        if let Some(at) = self.slot {
-            *self.board.slots[at].lock() = None;
+        if let Some(slot) = self.slot.and_then(|at| self.board.slots.get(at)) {
+            *slot.lock() = None;
         }
     }
 }
@@ -434,7 +596,10 @@ pub(crate) fn write_status(board: &Board<'_>, heading: Heading, now: u64, into: 
     let (longest, count) = board.longest();
     write!(into, "running: {count} task(s)")?;
     for one in longest.iter().flatten() {
-        write!(into, " · `{}` ({:?}) {} s, frame {} bytes", one.label.as_str(), one.stage, Secs(now.saturating_sub(one.from_ns)), one.frame)?;
+        match one.stage {
+            Some(stage) => write!(into, " · `{}` ({stage:?}) {} s, frame {} bytes", one.label.as_str(), Secs(now.saturating_sub(one.from_ns)), one.frame)?,
+            None => write!(into, " · `{}` ({}) {} s", one.label.as_str(), one.kind.label("blaze"), Secs(now.saturating_sub(one.from_ns)))?,
+        }
     }
     writeln!(into)?;
     if let Heading::Stopped { stuck: true, .. } = heading {
@@ -470,6 +635,36 @@ pub(crate) fn line(board: &Board<'_>, now: u64, into: &mut impl fmt::Write) -> f
     if let Some(stage) = most {
         let kept = u64::try_from(phase_mem[stage.index()].kept_on_heap.max(0)).unwrap_or(0);
         write!(into, " · kept past its phases: {stage:?} {} GB", Gb(kept))?;
+    }
+    let grouped = board.grouped();
+    // Explicitly attribute slow external work (`build.rs`, `fetch`, `proc-macro`) on periodic
+    // plain log lines so scripted / piped runs separate external script time from Blaze time.
+    for kind in [blaze_screen::WorkKind::BuildScript, blaze_screen::WorkKind::Fetch, blaze_screen::WorkKind::ProcMacro] {
+        let k = kind.index();
+        let total = grouped.counts.get(k).copied().unwrap_or(0);
+        if total == 0 {
+            continue;
+        }
+        match kind {
+            blaze_screen::WorkKind::BuildScript => write!(into, " · build.rs [external]: ")?,
+            blaze_screen::WorkKind::Fetch => write!(into, " · fetch: ")?,
+            blaze_screen::WorkKind::ProcMacro => write!(into, " · proc-macro: ")?,
+            blaze_screen::WorkKind::Blaze => {}
+        }
+        let mut shown = 0u32;
+        if let Some(row) = grouped.top.get(k) {
+            for one in row.iter().flatten() {
+                if shown > 0 {
+                    write!(into, ", ")?;
+                }
+                write!(into, "{} {} s", one.label.as_str(), now.saturating_sub(one.from_ns) / 1_000_000_000)?;
+                shown += 1;
+            }
+        }
+        let extra = total.saturating_sub(shown);
+        if extra > 0 {
+            write!(into, " +{extra}")?;
+        }
     }
     let (longest, _) = board.longest();
     if let Some(one) = longest[0] {
@@ -560,15 +755,179 @@ pub(crate) fn put(cx: &Cx, root: &Dir<ReadWrite>, err: &Out, text: &[u8]) -> Res
     Ok(())
 }
 
-/// `work` with the watcher beside it when a signal can ask or a line is due; the watcher ends
-/// and is joined on every path, an unwind too. A stop the workers do not reach in
-/// [`STOP_BOUND`] is written from here and ends the process (`Exit::StopStalled`). A plant
-/// starts no watcher: its requests are the driver's at its scheduling points, so a planted run
-/// stays one deterministic thread on one worker.
-pub(crate) fn watched<R>(io: &Io, root: &Dir<ReadWrite>, err: &Out, clock: &Clock, board: &Board<'_>, every: Option<Duration>, work: impl FnOnce() -> R) -> Result<R, StatusError> {
-    if board.asked.is_none() && every.is_none() {
+/// Publish the board's live grouped activity (`build.rs`, `fetch`, `proc-macro`, Blaze checking)
+/// and aggregate progress counts to `live`.
+pub(crate) fn report_live(board: &Board<'_>, now: u64, live: &(dyn blaze_screen::Watch + Sync)) {
+    let mut done_sum = 0u64;
+    let mut known_sum = 0u64;
+    for counts in board.counts.iter() {
+        let done = counts.done.load(Ordering::Acquire);
+        let known = counts.known.load(Ordering::Acquire).max(done);
+        done_sum = done_sum.saturating_add(done);
+        known_sum = known_sum.saturating_add(known);
+    }
+    let grouped = board.grouped();
+    if known_sum == 0 && grouped.active == 0 && board.stage().is_none() {
+        return;
+    }
+    let progress = (known_sum > 0).then(|| {
+        let done = u32::try_from(done_sum).unwrap_or(u32::MAX);
+        let total = u32::try_from(known_sum).unwrap_or(u32::MAX);
+        (done, total)
+    });
+
+    // Build concise Blaze sub-stage hint (e.g. `names / bodies`).
+    let mut hint_buf = FixedString::<{ blaze_screen::HINT_BYTES }>::new();
+    let mut hint_parts = 0u8;
+    for stage in Stage::ALL {
+        let bit = u8::try_from(stage.index()).unwrap_or(7);
+        if bit < 8 && (grouped.blaze_stages & (1u8 << bit)) != 0 {
+            if hint_parts > 0 {
+                let _ = hint_buf.write_str(" / ");
+            }
+            let _ = hint_buf.write_str(stage_hint_name(stage));
+            hint_parts += 1;
+        }
+    }
+    let hint = (!hint_buf.as_str().is_empty()).then_some(hint_buf.as_str());
+
+    // Build per-category active item slices on the stack (zero heap allocation).
+    const EMPTY_ITEM: blaze_screen::ActiveItemRef<'static> =
+        blaze_screen::ActiveItemRef { label: "", elapsed_ms: 0 };
+    let mut item_storage = [[EMPTY_ITEM; blaze_screen::MAX_GROUP_ITEMS]; blaze_screen::WORK_KINDS];
+    let mut item_lens = [0usize; blaze_screen::WORK_KINDS];
+    for ((dst_row, dst_len), src_row) in item_storage.iter_mut().zip(item_lens.iter_mut()).zip(grouped.top.iter()) {
+        let mut len = 0usize;
+        for slot in src_row.iter().flatten() {
+            let label = slot.label.as_str();
+            if label.is_empty() {
+                continue;
+            }
+            if let Some(cell) = dst_row.get_mut(len) {
+                *cell = blaze_screen::ActiveItemRef {
+                    label,
+                    elapsed_ms: now.saturating_sub(slot.from_ns) / 1_000_000,
+                };
+                len += 1;
+            }
+        }
+        *dst_len = len;
+    }
+
+    let mut groups_buf = [blaze_screen::ActiveGroupRef {
+        kind: blaze_screen::WorkKind::Blaze,
+        items: &[],
+        extra: 0,
+    }; blaze_screen::WORK_KINDS];
+    let mut group_count = 0usize;
+    for (((kind, row), &len), &total) in blaze_screen::WorkKind::ALL
+        .into_iter()
+        .zip(item_storage.iter())
+        .zip(item_lens.iter())
+        .zip(grouped.counts.iter())
+    {
+        if len == 0 {
+            continue;
+        }
+        let Some(items) = row.get(..len) else { continue };
+        let Some(dst) = groups_buf.get_mut(group_count) else { break };
+        let extra = u16::try_from(total.saturating_sub(u32::try_from(len).unwrap_or(0))).unwrap_or(u16::MAX);
+        *dst = blaze_screen::ActiveGroupRef { kind, items, extra };
+        group_count += 1;
+    }
+
+    let groups = groups_buf.get(..group_count).unwrap_or(&[]);
+    live.see(blaze_screen::Step::Activity(blaze_screen::Activity {
+        verb: "checking",
+        progress,
+        active: grouped.active,
+        hint,
+        groups,
+    }));
+}
+
+/// Restores `Board::slots_active` on scope exit (including unwinds).
+struct SlotsActiveGuard<'b, 'r> {
+    board: &'b Board<'r>,
+    prev: bool,
+}
+
+impl<'b, 'r> SlotsActiveGuard<'b, 'r> {
+    fn new(board: &'b Board<'r>, active: bool) -> Self {
+        let prev = board.set_watched(active);
+        Self { board, prev }
+    }
+}
+
+impl Drop for SlotsActiveGuard<'_, '_> {
+    fn drop(&mut self) {
+        let _ = self.board.set_watched(self.prev);
+    }
+}
+
+/// `work` with the watcher beside it when a periodic line is due (`every.is_some()`) or a live
+/// progress sink is attached (`live.is_some()`); the watcher ends and is joined on every path, an
+/// unwind too. When neither is active, `work` runs directly with zero OS thread spawn, zero
+/// `WATCH_SCRATCH` mapping, and slot tracking disabled so hot `show*`/`Drop` paths acquire zero
+/// locks (fast certificate and ready-edit paths check `board.stopping()` at scheduling points,
+/// while long multi-phase drives wrap themselves in [`watch_signals`] when process signals are
+/// held). A plant starts no watcher: its requests are the driver's at its scheduling points, so a
+/// planted run stays one deterministic thread on one worker.
+#[expect(clippy::too_many_arguments, reason = "the watcher's edge: each argument one specific capability or sink")]
+pub(crate) fn watched<R>(
+    cx: &Cx,
+    host: Option<&Host>,
+    root: &Dir<ReadWrite>,
+    err: &Out,
+    clock: &Clock,
+    board: &Board<'_>,
+    every: Option<Duration>,
+    live: Option<&(dyn blaze_screen::Watch + Sync)>,
+    work: impl FnOnce() -> R,
+) -> Result<R, StatusError> {
+    if every.is_none() && live.is_none() {
+        let _guard = SlotsActiveGuard::new(board, false);
         return Ok(work());
     }
+    let _guard = SlotsActiveGuard::new(board, true);
+    run_watched(cx, host, root, err, clock, board, every, live, work)
+}
+
+/// Watches held process signals (`SIGINFO`/`SIGUSR1` mid-phase and [`STOP_BOUND`] on stuck
+/// workers) during a long multi-phase drive when [`watched`] did not already spawn a watcher for
+/// `every` or `live`. Disables per-task slot locking while no live TTY/periodic watcher is
+/// attached so workers never contend on slot mutexes. No watcher thread is spawned when
+/// `board.asked` is `None`.
+#[expect(clippy::too_many_arguments, reason = "the watcher's edge: each argument one specific capability")]
+pub(crate) fn watch_signals<R>(
+    cx: &Cx,
+    host: Option<&Host>,
+    root: &Dir<ReadWrite>,
+    err: &Out,
+    clock: &Clock,
+    board: &Board<'_>,
+    work: impl FnOnce() -> R,
+) -> Result<R, StatusError> {
+    let _guard = SlotsActiveGuard::new(board, false);
+    if board.asked.is_none() {
+        return Ok(work());
+    }
+    run_watched(cx, host, root, err, clock, board, None, None, work)
+}
+
+#[expect(clippy::too_many_arguments, reason = "the watcher's edge: each argument one specific capability or sink")]
+fn run_watched<R>(
+    cx: &Cx,
+    host: Option<&Host>,
+    root: &Dir<ReadWrite>,
+    err: &Out,
+    clock: &Clock,
+    board: &Board<'_>,
+    every: Option<Duration>,
+    live: Option<&(dyn blaze_screen::Watch + Sync)>,
+    work: impl FnOnce() -> R,
+) -> Result<R, StatusError> {
+    let spawner = cx.spawner();
     struct Over<'b, 'r>(&'b Board<'r>, &'b Signal);
     impl Drop for Over<'_, '_> {
         fn drop(&mut self) {
@@ -584,7 +943,7 @@ pub(crate) fn watched<R>(io: &Io, root: &Dir<ReadWrite>, err: &Out, clock: &Cloc
     let got = std::thread::scope(|scope| {
         std::thread::Builder::new()
             .spawn_scoped(scope, || {
-                let cx = match io.cx(Duration::MAX, WATCH_SCRATCH) {
+                let cx = match spawner.cx(Duration::MAX, WATCH_SCRATCH) {
                     Ok(cx) => cx,
                     Err(why) => {
                         *failed.lock() = Some(why);
@@ -595,8 +954,11 @@ pub(crate) fn watched<R>(io: &Io, root: &Dir<ReadWrite>, err: &Out, clock: &Cloc
                 let mut guard = parked.lock();
                 while !board.over.load(Ordering::Acquire) {
                     let now = board.now(clock);
+                    if let Some(sink) = live {
+                        report_live(board, now, sink);
+                    }
                     let act = watch.look(now, board.stopping(), board.take_status(), board.claimed.load(Ordering::Acquire) != 0);
-                    act_on(&cx, io, root, err, board, act, now);
+                    act_on(&cx, host, root, err, board, act, now);
                     // A bounded wait (rule 15, 18): the next look in a tick, or at the work's end.
                     let _span = cx.span("engine status: the next look");
                     woken.wait_for(&mut guard, TICK);
@@ -616,7 +978,7 @@ pub(crate) fn watched<R>(io: &Io, root: &Dir<ReadWrite>, err: &Out, clock: &Cloc
 
 /// One act's writes. A write that fails is said on stderr once and the check goes on (the
 /// status is a report; the check's own result is the command's).
-fn act_on(cx: &Cx, io: &Io, root: &Dir<ReadWrite>, err: &Out, board: &Board<'_>, act: Act, now: u64) {
+fn act_on(cx: &Cx, host: Option<&Host>, root: &Dir<ReadWrite>, err: &Out, board: &Board<'_>, act: Act, now: u64) {
     let mut text = FixedString::<TEXT>::new();
     let heading = match act {
         Act::Nothing => return,
@@ -643,11 +1005,11 @@ fn act_on(cx: &Cx, io: &Io, root: &Dir<ReadWrite>, err: &Out, board: &Board<'_>,
         let _ = err.write_all(cx, said.as_str().as_bytes());
     }
     if let Heading::Stopped { .. } = heading {
-        match io.need_host() {
-            Ok(host) => host.exit(blaze_core::exit::Exit::StopStalled.code()),
-            Err(missing) => {
+        match host {
+            Some(host) => host.exit(blaze_core::exit::Exit::StopStalled.code()),
+            None => {
                 let mut said = FixedString::<512>::new();
-                let _ = writeln!(said, "engine-check: stopped, and the process could not be ended: {missing}");
+                let _ = writeln!(said, "engine-check: stopped, and the process could not be ended: missing host capability");
                 let _ = err.write_all(cx, said.as_str().as_bytes());
             }
         }
@@ -676,5 +1038,112 @@ impl fmt::Display for Gb {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let tenths = self.0 / 100_000_000;
         write!(f, "{}.{}", tenths / 10, tenths % 10)
+    }
+}
+
+#[cfg(test)]
+mod board_fast_path_tests {
+    use super::*;
+
+    #[test]
+    fn board_counters_and_slots_are_128_byte_cache_padded() {
+        assert!(core::mem::align_of::<Counts>() >= 128, "stage Counts must be 128B aligned");
+        assert!(
+            core::mem::align_of::<Lock<Option<Slot>>>() >= 128,
+            "per-worker status slots must be 128B aligned"
+        );
+        assert!(core::mem::align_of::<Board<'static>>() >= 128, "Board must be 128B aligned");
+    }
+
+    #[test]
+    fn board_fast_path_skips_slot_locks_when_unwatched_and_preserves_counts() {
+        let board = Board::new(&Asking::NONE, Duration::ZERO);
+        assert!(board.is_watched(), "Board starts watched for direct status tests");
+
+        // Hold locks on the first 8 slots (including slot 0 where cursor starts): any slot lock
+        // acquisition by show*/start/Drop on this same thread would immediately deadlock.
+        let _held0 = board.slots.first().expect("slot 0").lock();
+        let _held1 = board.slots.get(1).expect("slot 1").lock();
+        let _held2 = board.slots.get(2).expect("slot 2").lock();
+        let _held3 = board.slots.get(3).expect("slot 3").lock();
+
+        {
+            let _unwatched = SlotsActiveGuard::new(&board, false);
+            assert!(!board.is_watched());
+
+            let r1 = board.show(Stage::Bodies, Label::of("body_a"), 128, 100);
+            assert!(r1.slot.is_none(), "unwatched show must not claim a slot");
+            r1.end(250);
+
+            let mut lazy_called = false;
+            let r2 = board.show_lazy(
+                Stage::Bodies,
+                || {
+                    lazy_called = true;
+                    Label::of("body_b")
+                },
+                256,
+                300,
+            );
+            assert!(!lazy_called, "unwatched show_lazy must skip building Label");
+            assert!(r2.slot.is_none(), "unwatched show_lazy must not claim a slot");
+            r2.end(500);
+
+            let mut start_called = false;
+            let r3 = board
+                .start(
+                    Stage::Bodies,
+                    || {
+                        start_called = true;
+                        Label::of("body_c")
+                    },
+                    512,
+                    600,
+                )
+                .expect("not stopped");
+            assert!(!start_called, "unwatched start must skip building Label");
+            assert!(r3.slot.is_none(), "unwatched start must not claim a slot");
+            r3.end(900);
+
+            let r4 = board.show_kind(Stage::Bodies, blaze_screen::WorkKind::Blaze, Label::of("body_d"), 0, 1000);
+            assert!(r4.slot.is_none(), "unwatched show_kind must not claim a slot");
+            r4.end(1050);
+
+            let activity = board.show_activity(blaze_screen::WorkKind::ProcMacro, Label::of("derive"), 1100);
+            assert!(activity.slot.is_none(), "unwatched show_activity must not claim a slot");
+            drop(activity);
+        }
+
+        drop(_held3);
+        drop(_held2);
+        drop(_held1);
+        drop(_held0);
+
+        assert!(board.is_watched(), "SlotsActiveGuard restores prior watched state");
+        assert_eq!(board.cursor.load(Ordering::Relaxed), 0, "unwatched path must not touch shared cursor");
+        assert_eq!(board.unslotted.load(Ordering::Relaxed), 0, "unwatched path must not increment unslotted");
+
+        let counts = board.counts.get(Stage::Bodies.index()).expect("Bodies counts");
+        assert_eq!(counts.started.load(Ordering::Acquire), 4);
+        assert_eq!(counts.done.load(Ordering::Acquire), 4);
+        assert_eq!(counts.cpu_ns.load(Ordering::Acquire), 150 + 200 + 300 + 50);
+
+        // Control: when watched is active, show_lazy evaluates the label and claims + releases a slot.
+        let mut called = false;
+        let active = board.show_lazy(
+            Stage::Bodies,
+            || {
+                called = true;
+                Label::of("watched_body")
+            },
+            64,
+            2000,
+        );
+        assert!(called, "watched show_lazy must evaluate label");
+        let slot_idx = active.slot.expect("watched show_lazy must claim a slot");
+        assert_eq!(board.cursor.load(Ordering::Relaxed), 1);
+        assert!(board.slots.get(slot_idx).expect("slot").lock().is_some());
+        active.end(2100);
+        assert!(board.slots.get(slot_idx).expect("slot").lock().is_none(), "Drop frees claimed slot");
     }
 }

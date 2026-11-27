@@ -158,6 +158,10 @@ impl Printer<'_, '_> {
                 self.seq(&[Text("&"), N(r.node()), Text(mt), N(e.node())]);
             }
             TyKind::FnPtr(sig, h) => {
+                if let Some(effs) = h.declared_effects() {
+                    self.push(Text(effs.canonical_label()));
+                    self.push(Text(" "));
+                }
                 let len = self.tys.list_len(sig);
                 let out = len.saturating_sub(1);
                 if let Some(o) = self.tys.list_get(sig, out) {
@@ -183,6 +187,16 @@ impl Printer<'_, '_> {
                 self.push(Text(if len == 1 { ",)" } else { ")" }));
                 self.list(l, 0, len, ", ");
                 self.push(Text("("));
+            }
+            TyKind::Record(_, l) => {
+                let len = self.tys.list_len(l);
+                self.push(Text("}"));
+                self.list(l, 0, len, ", ");
+                self.push(Text("{"));
+            }
+            TyKind::Union(l) => {
+                let len = self.tys.list_len(l);
+                self.list(l, 0, len, " | ");
             }
             // Rigid aliases print as the others: rigidness is the solver's knowledge.
             TyKind::Alias { kind, rigid: _, def, args } => {

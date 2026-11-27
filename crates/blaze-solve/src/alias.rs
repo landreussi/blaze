@@ -528,6 +528,32 @@ fn push_alias_bounds<T: Tys, F: Facts>(
     Err(Stop::Error(SolveError::Limit(Limit::Walk)))
 }
 
+/// Whether rigid alias `t` (`AliasKind::Projection | AliasKind::Opaque`) directly declares
+/// positive trait `trait_` among its own item bounds (e.g. `trait Built { type Value<'a>: Sized; }`
+/// proves `<B as Built>::Value<'a>: Sized` for `<Placed<B> as Pointee>::Metadata == ()`).
+pub(crate) fn alias_has_item_bound_trait<T: Tys, F: Facts>(
+    cx: &mut Cx<'_, '_, T, F>,
+    t: Ty,
+    k: AliasKind,
+    d: Def,
+    largs: List,
+    wanted_trait: Def,
+) -> Result<bool, Stop> {
+    let n = bound_count(cx, k, d)?;
+    for i in 0..n {
+        let (p, portable) = bound_pred(cx, k, d, i)?;
+        let Pred::Trait { trait_, polarity: Polarity::Positive, .. } = p else { continue };
+        if trait_ != wanted_trait {
+            continue;
+        }
+        let p = cx.import_alias_bound(d, i, portable, p, largs)?;
+        if pred_self(cx, p).is_some_and(|s| same_alias(cx, s, t)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// The alias bounds of a trait goal whose self type `g.self_ty` is a rigid alias
 /// (assembly/mod.rs `assemble_alias_bound_candidates`).
 pub fn assemble_alias_bounds<T: Tys, F: Facts>(
@@ -869,9 +895,10 @@ fn reveal_one<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, t: Ty) -> Result<Ty, 
 /// children then related pairwise by [`eq_revealing`]); a childless kind is its own head.
 fn same_head(a: TyKind, b: TyKind) -> bool {
     match (a, b) {
-        (TyKind::Tuple(x), TyKind::Tuple(y)) | (TyKind::Dynamic(x, _), TyKind::Dynamic(y, _)) | (TyKind::Pat(_, x), TyKind::Pat(_, y)) => {
+        (TyKind::Tuple(x), TyKind::Tuple(y)) | (TyKind::Union(x), TyKind::Union(y)) | (TyKind::Dynamic(x, _), TyKind::Dynamic(y, _)) | (TyKind::Pat(_, x), TyKind::Pat(_, y)) => {
             x.len == y.len
         }
+        (TyKind::Record(s1, x), TyKind::Record(s2, y)) => s1 == s2 && x.len == y.len,
         (TyKind::Ref(_, _, m), TyKind::Ref(_, _, n)) | (TyKind::RawPtr(_, m), TyKind::RawPtr(_, n)) => m == n,
         (TyKind::Array(..), TyKind::Array(..)) | (TyKind::Slice(_), TyKind::Slice(_)) => true,
         (TyKind::Adt(d, x), TyKind::Adt(e, y))
@@ -1004,9 +1031,10 @@ fn step_impl<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, stage
         if !cx.eq_lists(gtr, itr)? {
             return Ok(Step::No);
         }
-        for &wc in h.where_clauses {
+        for (i, &wc) in h.where_clauses.iter().enumerate() {
             let p = cx.import_pred(h.portable, wc, iargs)?;
-            cx.add(GoalSource::ImplWhereBound, p);
+            let bound = h.where_clause_bounds.get(i).copied().unwrap_or(0);
+            cx.add_bound(GoalSource::ImplWhereBound, p, bound);
         }
         // The impl's arguments, kept for stage 1 as one term.
         cand.b = cx.mk(TyKind::Tuple(iargs))?;

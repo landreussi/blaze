@@ -7,11 +7,12 @@
 //! block (a `cleanup` block) drops it and ends in `resume`. The split takes such bodies:
 //!
 //! - **Cleanup blocks.** An `invoke`'s landing block and every block reached from it is a
-//!   cleanup block. It is copied into whichever output holds it like any block; a kept value
-//!   used there is loaded from the state exactly as on a cancel path (the landing blocks are
-//!   counted where the suspends' cancel blocks are: a value live into one is kept). A cleanup
-//!   path may not suspend, as a cancel path may not: refused by name, "a suspension in a
-//!   cleanup path".
+//!   cleanup block. It is copied into whichever output holds it like any block; a value live
+//!   across a suspension into one is loaded from the state as on a cancel path (the `invoke`'s
+//!   unwind edge carries the backward liveness walk to the suspend's resume or cancel block),
+//!   while a value defined on the same side of every suspension still dominates the landing
+//!   block directly. A cleanup path may not suspend, as a cancel path may not: refused by
+//!   name, "a suspension in a cleanup path".
 //! - **Poisoning.** Every `resume` is preceded by a store of [`PANICKED`] at the tag, so a
 //!   state whose poll unwound is `Panicked`: the split's `drop` at `Panicked` returns at once
 //!   (the cleanup already dropped what was live), and `poll` at `Panicked` goes to
@@ -29,7 +30,8 @@
 //! builder refuses too: a caught unwind goes on in ordinary code, which nothing here has
 //! been shown to split right).
 
-use std::alloc::Allocator;
+use alloc::vec::Vec;
+use alloc::alloc::Allocator;
 
 use super::{CoroutineError, DIRECT, Emit, PANICKED, Plant, REMADE, Shape, Split, filled, split_planted_with};
 use crate::{Block, Op, Ty, View, func::BlockKind, func::NONE};
@@ -81,13 +83,13 @@ pub(super) struct Unwinds<A: Allocator> {
 /// Reads the body's `invoke`s: their landing blocks, and per normal block its `invoke`. An
 /// invoke's value is defined at the head of its normal block, so `defined_in` (per
 /// instruction, the block its value is defined in) names that block for it.
-pub(super) fn unwinds<A: Allocator + Clone>(
+pub(super) fn unwinds<A: Allocator + Copy>(
     view: &View<'_>,
     defined_in: &mut [u32],
     alloc: &A,
 ) -> Result<Unwinds<A>, CoroutineError> {
     let blocks = view.blocks();
-    let mut landings = Vec::new_in(alloc.clone());
+    let mut landings = Vec::new_in(*alloc);
     let mut invoked = filled(blocks, NONE, alloc);
     for b in 0..blocks {
         let at = view.terminator(Block(b as u32));
@@ -147,7 +149,7 @@ pub(super) fn no_suspend_in_cleanup(view: &View<'_>, cleanup: &[bool]) -> Result
     Ok(())
 }
 
-impl<A: Allocator + Clone> Emit<'_, '_, A> {
+impl<S: Allocator + Copy, A: Allocator> Emit<'_, '_, S, A> {
     /// Stores the body's `invoke` value `invoke` to its field, if it has one, at the head of
     /// the invoke's normal block (the current one). The stored word names the body's value
     /// and is fixed up once every block is copied: the normal block may come before the

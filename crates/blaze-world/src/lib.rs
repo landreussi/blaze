@@ -30,9 +30,8 @@
 //! [`Toolchain::open`] over a `Shelf`, a [`Tree`] for the checkout).
 
 #![no_std]
-#![feature(allocator_api)]
 
-#[cfg(feature = "std")]
+#[cfg(any(test, feature = "std"))]
 extern crate std;
 
 #[cfg(feature = "std")]
@@ -60,7 +59,7 @@ use core::fmt;
 use blaze_fetch::PackView;
 use blaze_id::{ContentId, CrateItemKey};
 use blaze_manifest::lock::{Lock, LockId};
-use blaze_own::{AString, AVec, Alloc, Box};
+use blaze_own::{AString, AVec, Alloc, Bump};
 use blaze_scope::crate_env::{CrateEnv, MemberDirError};
 use blaze_scope::graph::Sysroot;
 use blaze_scope::resolve::{CrateInput, Names, NamesError, SourceTexts, resolve_crates};
@@ -71,7 +70,7 @@ use blaze_unit_graph::sources::Records;
 
 #[cfg(feature = "std")]
 pub use checkout::Checkout;
-pub use list::{Listed, Side, crate_list, needs, open_list, world};
+pub use list::{Listed, ScriptWorld, Side, crate_list, needs, open_list, open_list_light, script_world, world, world_from_list};
 pub use script::{ScriptRecords, ScriptRecordsError, joined, script_subject};
 #[cfg(feature = "std")]
 pub use stored_files::StoredFiles;
@@ -84,18 +83,33 @@ pub trait Tree {
     fn file(&self, path: &str) -> Option<&[u8]>;
 }
 
-impl Tree for PackView<'_> {
-    fn file(&self, path: &str) -> Option<&[u8]> {
-        self.find(path).map(|f| f.bytes)
-    }
+/// Whether a checkout path package is a workspace member or an external path package (from
+/// `[patch.*]` or a path dependency outside `workspace.members`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PathKind {
+    Member,
+    External,
+}
+
+/// One path package in the checkout (tree 0): its lock entry, directory (relative to the
+/// checkout root), and whether it is a workspace member or an external path dependency.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CheckoutPath<'w> {
+    pub id: LockId,
+    pub dir: &'w str,
+    pub kind: PathKind,
 }
 
 /// Where a package's files are.
 #[derive(Clone, Copy)]
 pub enum Place<'w> {
-    /// In the checkout (tree 0), under this directory (relative to the checkout's root, no
-    /// trailing `/`; `""` for the root).
+    /// A workspace member in the checkout (tree 0), under this directory (relative to the
+    /// checkout's root, no trailing `/`; `""` for the root).
     Checkout { dir: &'w str },
+    /// A non-member path package in the checkout (tree 0), e.g. from `[patch.*]` or a path
+    /// dependency outside `workspace.members`: files are read from tree 0 under `dir`, and it
+    /// is treated as a dependency rather than a workspace member.
+    Path { dir: &'w str },
     /// In a record of the fetch store, under this directory of it (`""` for a crate; a git
     /// package's directory in its commit).
     Pack { view: PackView<'w>, dir: &'w str },
@@ -110,23 +124,24 @@ pub trait Packages<'w> {
 /// (`StoreSources::files`), a path package from the directory the caller's layout found it in.
 pub struct Fetched<'s, 'l, 'w, R: Records<'w>> {
     pub store: &'s mut StoreSources<'l, 'w, 'w, R>,
-    /// Each path package's directory in the checkout, by lock id.
-    pub paths: &'s [(LockId, &'w str)],
+    /// Each path package in the checkout, by lock id.
+    pub paths: &'s [CheckoutPath<'w>],
     pub lock: &'l Lock<'w>,
-    pub alloc: Alloc<'w>,
+    pub alloc: Bump<'w>,
 }
 
 impl<'w, R: Records<'w>> Packages<'w> for Fetched<'_, '_, 'w, R> {
     fn place(&mut self, package: LockId) -> Result<Place<'w>, WorldError<'w>> {
         let p = self.lock.package(package);
         if matches!(p.source, blaze_manifest::lock::LockSource::Path) {
-            return match self.paths.iter().find(|(id, _)| *id == package) {
-                Some((_, dir)) => Ok(Place::Checkout { dir }),
-                None => Err(WorldError::PathNotPlaced { package: keep(&p.name, self.alloc) }),
+            return match self.paths.iter().find(|entry| entry.id == package) {
+                Some(CheckoutPath { dir, kind: PathKind::Member, .. }) => Ok(Place::Checkout { dir }),
+                Some(CheckoutPath { dir, kind: PathKind::External, .. }) => Ok(Place::Path { dir }),
+                None => Err(WorldError::PathNotPlaced { package: self.alloc.alloc_str(&p.name) }),
             };
         }
         let (view, dir) = self.store.files(package).map_err(WorldError::Source)?;
-        Ok(Place::Pack { view, dir: keep(&dir, self.alloc) })
+        Ok(Place::Pack { view, dir: self.alloc.alloc_str(&dir) })
     }
 }
 
@@ -160,6 +175,9 @@ pub struct Crate<'w> {
     pub units: u32,
     pub script: Script,
     pub proc_macro: bool,
+    /// Whether this crate belongs to a workspace member (`Place::Checkout`), as opposed to an
+    /// external path package (`Place::Path`), fetched package, or toolchain crate.
+    pub member: bool,
     /// The package's name and version, as the lock writes them (the toolchain's crate's for its).
     pub package: &'w str,
     pub version: &'w str,
@@ -200,7 +218,7 @@ impl<'w> World<'w> {
     }
 
     /// Every crate's names, resolved together.
-    pub fn resolve<P: Par>(&self, inputs: &[CrateInput<'w>], par: &P, alloc: Alloc<'w>) -> Result<Names<'w>, NamesError<'w>> {
+    pub fn resolve<P: Par>(&self, inputs: &[CrateInput<'w>], par: &P, alloc: Bump<'w>) -> Result<Names<'w>, NamesError<'w>> {
         resolve_crates(inputs, self.sysroot, &self.texts, par, alloc)
     }
 
@@ -325,6 +343,8 @@ pub struct Texts<'w> {
     /// Each crate's environment, by crate index ([`SourceTexts::crate_env`]): what its `env!`
     /// reads, `CARGO_MANIFEST_DIR` the root it sees (D96).
     envs: AVec<'w, CrateEnv<'w>>,
+    /// World arena for decompressing compressed `BLZFPK04` pack files on read.
+    bump: Bump<'w>,
 }
 
 impl<'w> Texts<'w> {
@@ -356,7 +376,7 @@ impl<'w> SourceTexts<'w> for Texts<'w> {
         }
         let bytes = match tree {
             0 => self.checkout.file(inner)?,
-            n => self.packs.get(n - 1)?.find(inner)?.bytes,
+            n => self.packs.get(n - 1)?.read_slice(inner, self.bump).ok()??,
         };
         core::str::from_utf8(bytes).ok()
     }
@@ -450,16 +470,6 @@ impl fmt::Display for WorldError<'_> {
     }
 }
 
-/// `text` copied into `alloc` for as long as it lives.
-fn keep<'w>(text: &str, alloc: Alloc<'w>) -> &'w str {
-    Box::leak(AString::from_str_in(text, alloc).into_boxed_str())
-}
-
-/// `values` copied into `alloc` for as long as it lives.
-fn keep_slice<'w, T: Copy>(values: &[T], alloc: Alloc<'w>) -> &'w [T] {
-    AVec::from_slice_in(values, alloc).leak()
-}
-
 /// `a` then `b`, joined by one `/` (none when either is empty).
 fn join<'w>(a: &str, b: &str, alloc: Alloc<'w>) -> AString<'w> {
     let mut out = AString::with_capacity_in(a.len() + b.len() + 1, alloc);
@@ -483,10 +493,11 @@ fn correct_pack<'w>(
     unit: &'w blaze_unit_graph::Unit<'w>,
     corrected: &mut AVec<'w, (u32, &'w str, &'w str)>,
     used: &mut AVec<'w, Corrected<'w>>,
-    alloc: Alloc<'w>,
+    bump: Bump<'w>,
 ) -> Result<(), WorldError<'w>> {
+    let alloc = bump.alloc();
     let path_of = |file: &str| -> AString<'w> {
-        let mut path = AString::with_capacity_in(dir.len() + file.len() + 1, alloc.clone());
+        let mut path = AString::with_capacity_in(dir.len() + file.len() + 1, alloc);
         if !dir.is_empty() {
             path.push_str(dir);
             path.push_str("/");
@@ -495,23 +506,23 @@ fn correct_pack<'w>(
         path
     };
     let files = row
-        .correct_crate(&unit.version, |file| view.find(&path_of(file)).map(|f| f.bytes), blaze_lex::Cpu::BASELINE, alloc.clone())
+        .correct_crate(&unit.version, |file| view.read_slice(&path_of(file), bump).ok().flatten(), blaze_lex::Cpu::BASELINE, alloc)
         .map_err(|why| {
-            let mut words = AString::new_in(alloc.clone());
+            let mut words = AString::new_in(alloc);
             let _ = fmt::write(&mut Words(&mut words), format_args!("{why}"));
-            WorldError::Correction { package: &unit.name, version: &unit.version, why: keep(&words, alloc.clone()) }
+            WorldError::Correction { package: &unit.name, version: &unit.version, why: bump.alloc_str(&words) }
         })?;
     let mut predicates = 0;
     for (file, fixed) in files.iter() {
         predicates += fixed.replaced.len();
-        corrected.push((tree, keep(&path_of(file), alloc.clone()), keep(fixed.text.as_str(), alloc.clone())));
+        corrected.push((tree, bump.alloc_str(&path_of(file)), bump.alloc_str(fixed.text.as_str())));
     }
     used.push(Corrected {
         package: &unit.name,
         version: &unit.version,
         files: files.len(),
         predicates,
-        decision: keep(&row.decision, alloc.clone()),
+        decision: bump.alloc_str(&row.decision),
     });
     Ok(())
 }

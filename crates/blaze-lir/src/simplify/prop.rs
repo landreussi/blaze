@@ -29,10 +29,11 @@ use blaze_own::Vec;
 
 use super::{
     SimplifyError,
-    dce::{Edit, NONE, filled, incoming, rebuild, reachable},
+    dce::{Edit, Incoming, NONE, filled, incoming, rebuild, reachable},
+    value_info::{ValFact, ValueInfo, eval_icmp_facts, scalar_int_width, width_mask},
 };
 use crate::{
-    Block, Flags, Func, Op, Ty, View,
+    Block, Flags, Func, IntCond, Op, Ty, View,
     arith::{binary, compare, convert, iconst_value, overflow, unary, wide_value},
     verify,
 };
@@ -67,26 +68,26 @@ enum Fact {
 
 /// The function `view` with its copies and constants propagated and its integer operations
 /// on constants folded, in `alloc`, verified.
-pub fn propagate<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
+pub fn propagate<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
     propagate_planted(view, Plant::None, alloc)
 }
 
 /// [`propagate`] with `plant` (a test's control; ignored outside tests).
-pub fn propagate_planted<A: Allocator + Clone>(view: View<'_>, plant: Plant, alloc: A) -> Result<Func<A>, SimplifyError> {
+pub fn propagate_planted<A: Allocator + Copy>(view: View<'_>, plant: Plant, alloc: A) -> Result<Func<A>, SimplifyError> {
     if view.blocks() == 0 {
         return Err(SimplifyError::Refused { inst: 0, what: "a function with no blocks" });
     }
     let len = view.len();
-    let no_jumps = filled(len, NONE, &alloc);
-    let reached = reachable(&view, &no_jumps, &alloc);
-    let into = incoming(&view, &reached, &no_jumps, &alloc);
+    let mut jump = filled(len, NONE, &alloc);
+    let reached = reachable(&view, &jump, &alloc);
+    let into = incoming(&view, &reached, &jump, &alloc);
 
     // Single pass over reached blocks: build CSR def-use edges for values that can ever gain a
     // fact, record each eligible block parameter's block, and seed the worklist.
     let mut param_block = filled(len, NONE, &alloc);
     let mut use_counts = filled(len + 1, 0u32, &alloc);
-    let mut raw_edges: Vec<(u32, u32), A> = Vec::new_in(alloc.clone());
-    let mut call_indirects: Vec<u32, A> = Vec::new_in(alloc.clone());
+    let mut raw_edges: Vec<(u32, u32), A> = Vec::new_in(alloc);
+    let mut call_indirects: Vec<u32, A> = Vec::new_in(alloc);
     let mut queue = Queue::new(len, &alloc);
     let mut in_work = filled(len, false, &alloc);
 
@@ -95,7 +96,7 @@ pub fn propagate_planted<A: Allocator + Clone>(view: View<'_>, plant: Plant, all
         let params = view.params(block);
         if into.targets_only[b] {
             let edges = into.edges_into(b);
-            for (k, param) in params.clone().enumerate() {
+            for (k, param) in (params.start..params.end).enumerate() {
                 param_block[param] = b as u32;
                 let p = param as u32;
                 for &args in edges {
@@ -142,7 +143,7 @@ pub fn propagate_planted<A: Allocator + Clone>(view: View<'_>, plant: Plant, all
     let mut facts = Facts {
         view,
         plant: cfg!(test) && plant == Plant::FoldSubAsAdd,
-        stands: Vec::with_capacity_in(len, alloc.clone()),
+        stands: Vec::with_capacity_in(len, alloc),
         known: filled(len, Known::No, &alloc),
     };
     for value in 0..len as u32 {
@@ -154,51 +155,62 @@ pub fn propagate_planted<A: Allocator + Clone>(view: View<'_>, plant: Plant, all
     // its undecided users must be woken.
     let mut stand_head = filled(len, NONE, &alloc);
     let mut stand_next = filled(len, NONE, &alloc);
-    let mut relay_stack: Vec<u32, A> = Vec::new_in(alloc.clone());
+    let mut relay_stack: Vec<u32, A> = Vec::new_in(alloc);
 
     let mut any_stands = false;
     let mut any_folded = false;
+    let mut any_jump = false;
 
-    while let Some(v_u32) = queue.pop(&mut in_work) {
-        let v = v_u32 as usize;
-        if facts.decided(v) {
-            continue;
-        }
-        let b = param_block[v];
-        let fact = if b != NONE {
-            let k = v - view.block_starts[b as usize] as usize;
-            facts.param(v, k, into.edges_into(b as usize))
-        } else {
-            facts.inst(v)
-        };
-        if !facts.take(v, fact) {
-            continue;
-        }
-        if facts.stands[v] != v_u32 {
-            any_stands = true;
-            let root = facts.stands[v] as usize;
-            stand_next[v] = stand_head[root];
-            stand_head[root] = v_u32;
-        } else if matches!(facts.known[v], Known::Int(_))
-            && !matches!(view.op(v), Op::Param | Op::Iconst | Op::IconstWide)
-        {
-            any_folded = true;
-        }
-        relay_stack.push(v_u32);
-        while let Some(u) = relay_stack.pop() {
-            let us = u as usize;
-            for &user in &use_list[use_start[us] as usize..use_start[us + 1] as usize] {
-                if !facts.decided(user as usize) {
-                    queue.push(user, &mut in_work);
-                }
-            }
-            let mut child = stand_head[us];
-            while child != NONE {
-                relay_stack.push(child);
-                child = stand_next[child as usize];
-            }
-        }
+    drain_worklist(
+        &view,
+        &into,
+        &param_block,
+        &use_start,
+        &use_list,
+        &mut facts,
+        &mut queue,
+        &mut in_work,
+        &mut stand_head,
+        &mut stand_next,
+        &mut relay_stack,
+        &mut any_stands,
+        &mut any_folded,
+    );
+
+    if fold_value_info_facts(
+        &view,
+        &reached,
+        &mut facts,
+        &use_start,
+        &use_list,
+        &stand_head,
+        &stand_next,
+        &mut relay_stack,
+        &mut queue,
+        &mut in_work,
+        &mut any_folded,
+        &mut jump,
+        &mut any_jump,
+        alloc,
+    ) {
+        drain_worklist(
+            &view,
+            &into,
+            &param_block,
+            &use_start,
+            &use_list,
+            &mut facts,
+            &mut queue,
+            &mut in_work,
+            &mut stand_head,
+            &mut stand_next,
+            &mut relay_stack,
+            &mut any_stands,
+            &mut any_folded,
+        );
     }
+
+    collapse_const_terminators(&view, &reached, &facts, &mut jump, &mut any_jump);
 
     let mut devirt = filled(len, NONE, &alloc);
     let mut any_devirt = false;
@@ -211,12 +223,12 @@ pub fn propagate_planted<A: Allocator + Clone>(view: View<'_>, plant: Plant, all
         }
     }
 
-    if !any_stands && !any_folded && !any_devirt {
-        verify(view).map_err(SimplifyError::Verify)?;
+    if !any_stands && !any_folded && !any_devirt && !any_jump {
+        crate::verify::verify_in(view, alloc).map_err(SimplifyError::Verify)?;
         return Ok(view.to_func_in(alloc));
     }
 
-    let mut stands = Vec::with_capacity_in(len, alloc.clone());
+    let mut stands = Vec::with_capacity_in(len, alloc);
     let mut constant = filled(len, None, &alloc);
     for value in 0..len {
         stands.push(facts.resolve(value as u32));
@@ -229,9 +241,10 @@ pub fn propagate_planted<A: Allocator + Clone>(view: View<'_>, plant: Plant, all
         inst_kept: filled(len, true, &alloc),
         stands,
         constant,
-        jump: no_jumps,
+        jump,
         devirt,
         merge_next: filled(view.blocks(), NONE, &alloc),
+        fma_fuse: filled(len, None, &alloc),
     };
     rebuild(view, &edit, alloc)
 }
@@ -245,7 +258,7 @@ struct Queue<A: Allocator> {
     count: usize,
 }
 
-impl<A: Allocator + Clone> Queue<A> {
+impl<A: Allocator + Copy> Queue<A> {
     fn new(len: usize, alloc: &A) -> Self {
         Self { buf: filled(len.max(1), 0u32, alloc), head: 0, tail: 0, count: 0 }
     }
@@ -652,4 +665,389 @@ impl<A: Allocator> Facts<'_, A> {
         }
         Fact::None
     }
+}
+
+// ---------------------------------------------------------------------------
+// Worklist helpers and ValueInfo-backed constant folding
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn to_idx(v: u32) -> usize {
+    usize::try_from(v).unwrap_or(usize::MAX)
+}
+
+#[inline]
+fn to_u32(v: usize) -> u32 {
+    u32::try_from(v).unwrap_or(u32::MAX)
+}
+
+#[inline]
+fn at<T: Copy>(slice: &[T], i: usize, default: T) -> T {
+    slice.get(i).copied().unwrap_or(default)
+}
+
+#[inline]
+fn set_at<T>(slice: &mut [T], i: usize, val: T) {
+    if let Some(slot) = slice.get_mut(i) {
+        *slot = val;
+    }
+}
+
+fn wake_users<A: Allocator + Copy>(
+    root: u32,
+    facts: &Facts<'_, A>,
+    use_start: &[u32],
+    use_list: &[u32],
+    stand_head: &[u32],
+    stand_next: &[u32],
+    relay_stack: &mut Vec<u32, A>,
+    queue: &mut Queue<A>,
+    in_work: &mut [bool],
+) {
+    relay_stack.push(root);
+    while let Some(u) = relay_stack.pop() {
+        let us = to_idx(u);
+        let start = to_idx(at(use_start, us, 0));
+        let end = to_idx(at(use_start, us + 1, 0));
+        if let Some(users) = use_list.get(start..end) {
+            for &user in users {
+                if !facts.decided(to_idx(user)) {
+                    queue.push(user, in_work);
+                }
+            }
+        }
+        let mut child = at(stand_head, us, NONE);
+        while child != NONE {
+            relay_stack.push(child);
+            child = at(stand_next, to_idx(child), NONE);
+        }
+    }
+}
+
+fn drain_worklist<A: Allocator + Copy>(
+    view: &View<'_>,
+    into: &Incoming<A>,
+    param_block: &[u32],
+    use_start: &[u32],
+    use_list: &[u32],
+    facts: &mut Facts<'_, A>,
+    queue: &mut Queue<A>,
+    in_work: &mut [bool],
+    stand_head: &mut [u32],
+    stand_next: &mut [u32],
+    relay_stack: &mut Vec<u32, A>,
+    any_stands: &mut bool,
+    any_folded: &mut bool,
+) {
+    while let Some(v_u32) = queue.pop(in_work) {
+        let v = to_idx(v_u32);
+        if facts.decided(v) {
+            continue;
+        }
+        let b = at(param_block, v, NONE);
+        let fact = if b != NONE {
+            let k = v.saturating_sub(to_idx(at(view.block_starts, to_idx(b), 0)));
+            facts.param(v, k, into.edges_into(to_idx(b)))
+        } else {
+            facts.inst(v)
+        };
+        if !facts.take(v, fact) {
+            continue;
+        }
+        let stands_v = at(&facts.stands, v, v_u32);
+        if stands_v != v_u32 {
+            *any_stands = true;
+            let root = to_idx(stands_v);
+            set_at(stand_next, v, at(stand_head, root, NONE));
+            set_at(stand_head, root, v_u32);
+        } else if matches!(at(&facts.known, v, Known::No), Known::Int(_))
+            && !matches!(view.op(v), Op::Param | Op::Iconst | Op::IconstWide)
+        {
+            *any_folded = true;
+        }
+        wake_users(v_u32, facts, use_start, use_list, stand_head, stand_next, relay_stack, queue, in_work);
+    }
+}
+
+/// Pure, side-effect-free, non-trapping scalar integer operations that [`ValueInfo`] may fold
+/// to an exact constant when flagless. Excludes `Iconst`, `IconstWide`, `Param`, `Uninit`, and
+/// potentially trapping ops (`Udiv`, `Sdiv`, `Urem`, `Srem`).
+#[inline]
+fn is_pure_scalar_int_foldable(op: Op) -> bool {
+    matches!(
+        op,
+        Op::Trunc
+            | Op::Zext
+            | Op::Sext
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Not
+            | Op::Shl
+            | Op::Lshr
+            | Op::Ashr
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Select
+            | Op::Umin
+            | Op::Umax
+            | Op::Smin
+            | Op::Smax
+            | Op::Clz
+            | Op::Ctz
+            | Op::Popcnt
+            | Op::Bswap
+            | Op::Bitrev
+    )
+}
+
+/// Returns the exact constant proved by `f` for a scalar integer of bit width `width`,
+/// rejecting contradictory/empty lattice states and out-of-width values.
+#[inline]
+fn exact_const_fact(f: ValFact, width: u32) -> Option<u128> {
+    if width == 0 {
+        return None;
+    }
+    let m = width_mask(width);
+    if (f.bits.zeros & f.bits.ones) == 0
+        && f.range.lo == f.range.hi
+        && f.range.lo <= m
+        && f.contains(f.range.lo)
+    {
+        Some(f.range.lo)
+    } else {
+        None
+    }
+}
+
+/// Target ordinal for an `Op::Switch` or `Op::Br` terminator at `inst` when its
+/// scrutinee/condition is proved equal to `value`.
+fn terminator_target_for_const(view: &View<'_>, inst: usize, value: u128) -> Option<u32> {
+    match view.op(inst) {
+        Op::Br => Some(if value != 0 { 0 } else { 1 }),
+        Op::Switch => {
+            let mut o = view.operands(inst);
+            let scrutinee = o.value();
+            let width = scalar_int_width(Ty(at(view.tys, to_idx(scrutinee.0), 0)), view.head.ptr_bits);
+            if width == 0 {
+                return None;
+            }
+            o.target();
+            let found = o.cases(scrutinee).position(|(words, _)| wide_value(words, width) == value);
+            let chosen = match found {
+                Some(case) => u32::try_from(case).ok()?.checked_add(1)?,
+                None => 0,
+            };
+            if chosen == NONE { None } else { Some(chosen) }
+        }
+        _ => None,
+    }
+}
+
+/// Collapses an `Op::Switch` or `Op::Br` terminator in `block` to an unconditional jump when
+/// its scrutinee/condition is proved constant by `facts` or block-local `vi`.
+fn try_collapse_terminator<A: Allocator>(
+    view: &View<'_>,
+    block: Block,
+    inst: usize,
+    facts: &Facts<'_, A>,
+    vi: Option<&ValueInfo<A>>,
+    jump: &mut [u32],
+    any_jump: &mut bool,
+) {
+    if at(jump, inst, NONE) != NONE {
+        return;
+    }
+    let op = view.op(inst);
+    if !matches!(op, Op::Switch | Op::Br) {
+        return;
+    }
+    let raw = view.operands(inst).value().0;
+    let resolved = facts.resolve(raw);
+    let width = scalar_int_width(Ty(at(view.tys, to_idx(resolved), 0)), view.head.ptr_bits);
+    if width == 0 {
+        return;
+    }
+    let const_val = if let Some((c, _)) = facts.int(resolved) {
+        Some(c)
+    } else if let Some(vi) = vi {
+        let m = width_mask(width);
+        let f = vi.fact_at(block, to_idx(raw));
+        let combined = if resolved != raw { f.refine(vi.fact_at(block, to_idx(resolved)), m) } else { f };
+        exact_const_fact(combined, width)
+    } else {
+        None
+    };
+    if let Some(c) = const_val
+        && let Some(chosen) = terminator_target_for_const(view, inst, c)
+    {
+        set_at(jump, inst, chosen);
+        *any_jump = true;
+    }
+}
+
+/// Collapses any reached `Op::Switch` or `Op::Br` terminator whose scrutinee/condition is
+/// proved constant in `facts` (including block parameters folded to a single constant).
+fn collapse_const_terminators<A: Allocator>(
+    view: &View<'_>,
+    reached: &[bool],
+    facts: &Facts<'_, A>,
+    jump: &mut [u32],
+    any_jump: &mut bool,
+) {
+    for b in (0..view.blocks()).filter(|&b| at(reached, b, false)) {
+        let block = Block(to_u32(b));
+        let term = view.terminator(block);
+        try_collapse_terminator(view, block, term, facts, None, jump, any_jump);
+    }
+}
+
+/// Folds undecided flagless scalar-integer `Op::Icmp` and pure scalar-integer instructions
+/// proved constant by the unified [`ValueInfo`] analysis (known bits, unsigned ranges, and
+/// dominator-scoped branch / XOR-range refinements), waking users of any folded instruction,
+/// and collapses `Op::Switch`/`Op::Br` terminators whose scrutinee/condition is proved
+/// constant in its block.
+fn fold_value_info_facts<A: Allocator + Copy>(
+    view: &View<'_>,
+    reached: &[bool],
+    facts: &mut Facts<'_, A>,
+    use_start: &[u32],
+    use_list: &[u32],
+    stand_head: &[u32],
+    stand_next: &[u32],
+    relay_stack: &mut Vec<u32, A>,
+    queue: &mut Queue<A>,
+    in_work: &mut [bool],
+    any_folded: &mut bool,
+    jump: &mut [u32],
+    any_jump: &mut bool,
+    alloc: A,
+) -> bool {
+    let mut has_candidate = false;
+    'scan: for b in (0..view.blocks()).filter(|&b| at(reached, b, false)) {
+        let block = Block(to_u32(b));
+        let params = view.params(block);
+        for inst in params.end..view.block(block).end {
+            let op = view.op(inst);
+            if op == Op::Icmp && view.flags(inst) == Flags::NONE && !facts.decided(inst) {
+                let mut o = view.operands(inst);
+                let _cond = o.int_cond();
+                let lhs = o.value().0;
+                if scalar_int_width(Ty(at(view.tys, to_idx(lhs), 0)), view.head.ptr_bits) > 0 {
+                    has_candidate = true;
+                    break 'scan;
+                }
+            } else if is_pure_scalar_int_foldable(op)
+                && view.flags(inst) == Flags::NONE
+                && !facts.decided(inst)
+                && scalar_int_width(Ty(at(view.tys, inst, 0)), view.head.ptr_bits) > 0
+            {
+                has_candidate = true;
+                break 'scan;
+            } else if matches!(op, Op::Switch | Op::Br) {
+                let scrutinee = view.operands(inst).value().0;
+                let rs = facts.resolve(scrutinee);
+                if facts.int(rs).is_none()
+                    && scalar_int_width(Ty(at(view.tys, to_idx(rs), 0)), view.head.ptr_bits) > 0
+                {
+                    has_candidate = true;
+                    break 'scan;
+                }
+            }
+        }
+    }
+    if !has_candidate {
+        return false;
+    }
+
+    let vi = ValueInfo::analyze(*view, alloc);
+    let mut changed = false;
+    for b in (0..view.blocks()).filter(|&b| at(reached, b, false)) {
+        let block = Block(to_u32(b));
+        let params = view.params(block);
+        for inst in params.end..view.block(block).end {
+            let op = view.op(inst);
+            if op == Op::Icmp {
+                if view.flags(inst) != Flags::NONE || facts.decided(inst) {
+                    continue;
+                }
+                let mut o = view.operands(inst);
+                let cond = o.int_cond();
+                let lhs = o.value().0;
+                let rhs = o.value().0;
+                let width = scalar_int_width(Ty(at(view.tys, to_idx(lhs), 0)), view.head.ptr_bits);
+                if width == 0
+                    || width != scalar_int_width(Ty(at(view.tys, to_idx(rhs), 0)), view.head.ptr_bits)
+                {
+                    continue;
+                }
+                let rl = facts.resolve(lhs);
+                let rr = facts.resolve(rhs);
+                let folded = if rl == rr && to_idx(rl) < view.len() && view.op(to_idx(rl)) != Op::Uninit {
+                    Some(matches!(
+                        cond,
+                        IntCond::Eq | IntCond::Ule | IntCond::Uge | IntCond::Sle | IntCond::Sge
+                    ))
+                } else {
+                    let m = width_mask(width);
+                    let operand_fact = |raw: u32, resolved: u32| -> ValFact {
+                        if let Some((c, _)) = facts.int(resolved) {
+                            ValFact::constant(c, m)
+                        } else {
+                            let f = vi.fact_at(block, to_idx(raw));
+                            if resolved != raw { f.refine(vi.fact_at(block, to_idx(resolved)), m) } else { f }
+                        }
+                    };
+                    eval_icmp_facts(cond, width, operand_fact(lhs, rl), operand_fact(rhs, rr))
+                };
+                if let Some(val) = folded
+                    && facts.take(inst, Fact::Known(Known::Int(u128::from(val))))
+                {
+                    *any_folded = true;
+                    changed = true;
+                    wake_users(
+                        to_u32(inst),
+                        facts,
+                        use_start,
+                        use_list,
+                        stand_head,
+                        stand_next,
+                        relay_stack,
+                        queue,
+                        in_work,
+                    );
+                }
+            } else if is_pure_scalar_int_foldable(op) {
+                if view.flags(inst) != Flags::NONE || facts.decided(inst) {
+                    continue;
+                }
+                let width = scalar_int_width(Ty(at(view.tys, inst, 0)), view.head.ptr_bits);
+                if width == 0 {
+                    continue;
+                }
+                let f = vi.fact_at(block, inst);
+                if let Some(c) = exact_const_fact(f, width)
+                    && facts.take(inst, Fact::Known(Known::Int(c)))
+                {
+                    *any_folded = true;
+                    changed = true;
+                    wake_users(
+                        to_u32(inst),
+                        facts,
+                        use_start,
+                        use_list,
+                        stand_head,
+                        stand_next,
+                        relay_stack,
+                        queue,
+                        in_work,
+                    );
+                }
+            } else if matches!(op, Op::Switch | Op::Br) {
+                try_collapse_terminator(view, block, inst, facts, Some(&vi), jump, any_jump);
+            }
+        }
+    }
+    changed
 }

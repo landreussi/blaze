@@ -280,22 +280,26 @@ macro_rules! narrow {
         // `x as u128` of a `u128` source is the value itself: the table's one body for all.
         #[allow(clippy::unnecessary_cast)]
         impl Cast<$s, $t> {
+            /// Range-checked conversion returning `Err(wide)` without constructing [`Narrowed`].
+            #[inline(always)]
+            const fn try_cast(x: $s) -> Result<$t, u128> {
+                let wide = x as u128;
+                if wide <= <$t>::MAX as u128 { Ok(x as $t) } else { Err(wide) }
+            }
+
             /// The same value, or a [`Narrowed`] naming it.
             #[inline(always)]
             pub const fn narrow(x: $s) -> Result<$t, Narrowed> {
-                // An unsigned value is never under the target's minimum; the target's maximum
-                // is positive, so its `u128` is exact.
-                if x as u128 <= <$t>::MAX as u128 {
-                    Ok(x as $t)
-                } else {
-                    Err(Narrowed { value: Value::Unsigned(x as u128), from: stringify!($s), to: stringify!($t) })
+                match Self::try_cast(x) {
+                    Ok(it) => Ok(it),
+                    Err(wide) => Err(Narrowed { value: Value::Unsigned(wide), from: stringify!($s), to: stringify!($t) }),
                 }
             }
 
             /// The value clamped to the target's range.
             #[inline(always)]
             pub const fn saturate(x: $s) -> $t {
-                match Self::narrow(x) {
+                match Self::try_cast(x) {
                     Ok(it) => it,
                     Err(_) => <$t>::MAX,
                 }
@@ -307,24 +311,27 @@ macro_rules! narrow {
         // `x as i128` of an `i128` source is the value itself: the table's one body for all.
         #[allow(clippy::unnecessary_cast)]
         impl Cast<$s, $t> {
+            /// Range-checked conversion returning `Err(wide)` without constructing [`Narrowed`].
+            #[inline(always)]
+            const fn try_cast(x: $s) -> Result<$t, i128> {
+                let wide = x as i128;
+                let fits = if wide < 0 { wide >= <$t>::MIN as i128 } else { wide as u128 <= <$t>::MAX as u128 };
+                if fits { Ok(x as $t) } else { Err(wide) }
+            }
+
             /// The same value, or a [`Narrowed`] naming it.
             #[inline(always)]
             pub const fn narrow(x: $s) -> Result<$t, Narrowed> {
-                let wide = x as i128;
-                // The target's minimum is 0 or negative and its maximum positive, so both are
-                // exact in `i128` and `u128`.
-                let fits = if wide < 0 { wide >= <$t>::MIN as i128 } else { wide as u128 <= <$t>::MAX as u128 };
-                if fits {
-                    Ok(x as $t)
-                } else {
-                    Err(Narrowed { value: Value::Signed(wide), from: stringify!($s), to: stringify!($t) })
+                match Self::try_cast(x) {
+                    Ok(it) => Ok(it),
+                    Err(wide) => Err(Narrowed { value: Value::Signed(wide), from: stringify!($s), to: stringify!($t) }),
                 }
             }
 
             /// The value clamped to the target's range.
             #[inline(always)]
             pub const fn saturate(x: $s) -> $t {
-                match Self::narrow(x) {
+                match Self::try_cast(x) {
                     Ok(it) => it,
                     Err(_) if x < 0 => <$t>::MIN,
                     Err(_) => <$t>::MAX,
@@ -340,7 +347,7 @@ macro_rules! narrow {
             #[inline(always)]
             #[track_caller]
             pub const fn narrow_or_stop(x: $s) -> $t {
-                match Self::narrow(x) {
+                match Self::try_cast(x) {
                     Ok(it) => it,
                     Err(_) => panic!(concat!(
                         "blaze_int: narrow_or_stop: a ",
@@ -390,6 +397,50 @@ macro_rules! truncate {
 
 table!(impls);
 
+/// A `usize` statically proved strictly less than `N` (checked once at construction,
+/// Rule 74 `verify-once` and Rule 76 `correct-by-construction`).
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Idx<const N: usize>(usize);
+
+impl<const N: usize> Idx<N> {
+    /// Construct an `Idx<N>` if `value < N`.
+    #[inline(always)]
+    #[must_use]
+    pub const fn new(value: usize) -> Option<Self> {
+        if value < N { Some(Self(value)) } else { None }
+    }
+
+    /// Construct an `Idx<N>` from `value & (N - 1)`. Compile-time asserts that `N` is a
+    /// non-zero power of two.
+    #[inline(always)]
+    #[must_use]
+    pub const fn from_masked(value: usize) -> Self {
+        let mask = const {
+            assert!(N.is_power_of_two(), "Idx::from_masked requires a non-zero power-of-two N");
+            N - 1
+        };
+        Self(value & mask)
+    }
+
+    /// Construct an `Idx<N>` from any `u8`. Compile-time asserts that `256 <= N`.
+    #[inline(always)]
+    #[must_use]
+    pub const fn from_u8(value: u8) -> Self {
+        const {
+            assert!(256 <= N, "Idx::from_u8 requires N >= 256");
+        }
+        Self(Cast::<u8, usize>::widen(value))
+    }
+
+    /// The proven in-bounds `usize` value (`< N`).
+    #[inline(always)]
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
 // Time as a number: `Nanos`, `Deadline` and the handed-in `Clock` (the module's doc).
 pub mod time;
 
@@ -397,3 +448,35 @@ pub use time::{Clock, Deadline, Nanos};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod idx_tests {
+    use super::Idx;
+
+    #[test]
+    fn idx_new_checks_bounds() {
+        assert_eq!(Idx::<0>::new(0), None);
+        assert_eq!(Idx::<4>::new(0).map(Idx::get), Some(0));
+        assert_eq!(Idx::<4>::new(3).map(Idx::get), Some(3));
+        assert_eq!(Idx::<4>::new(4), None);
+        assert_eq!(Idx::<4>::new(usize::MAX), None);
+    }
+
+    #[test]
+    fn idx_from_masked_wraps_to_power_of_two() {
+        assert_eq!(Idx::<1>::from_masked(0).get(), 0);
+        assert_eq!(Idx::<1>::from_masked(99).get(), 0);
+        assert_eq!(Idx::<16>::from_masked(0).get(), 0);
+        assert_eq!(Idx::<16>::from_masked(15).get(), 15);
+        assert_eq!(Idx::<16>::from_masked(16).get(), 0);
+        assert_eq!(Idx::<16>::from_masked(usize::MAX).get(), 15);
+    }
+
+    #[test]
+    fn idx_from_u8_covers_all_bytes() {
+        for b in 0u8..=u8::MAX {
+            assert_eq!(Idx::<256>::from_u8(b).get(), usize::from(b));
+            assert_eq!(Idx::<512>::from_u8(b).get(), usize::from(b));
+        }
+    }
+}

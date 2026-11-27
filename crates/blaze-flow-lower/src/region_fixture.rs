@@ -114,6 +114,7 @@ struct ImplDecl {
     self_ty: PTy,
     self_slots: vec::Vec<Region>,
     trait_ref: Option<(ItemKey, vec::Vec<PTy>, vec::Vec<Region>)>,
+    clauses: vec::Vec<(u32, u32, PTy, vec::Vec<Region>)>,
 }
 
 /// The heads of one test, declared over the world's types; laid by [`Decls::lay`]. Also the
@@ -197,7 +198,18 @@ impl Decls {
             self_ty: head.self_ty,
             self_slots: head.self_slots.to_vec(),
             trait_ref: head.trait_ref.map(|(t, args, slots)| (t, args.to_vec(), slots.to_vec())),
+            clauses: vec::Vec::new(),
         });
+    }
+
+    /// Where-clause `nth` of impl `item` (`binders` its own `for<..>` binds), its column `slots`
+    /// over `ty` (subject-first `ExTrait` / `ExProj` in the world's table, numbered in the impl's
+    /// lifetimes).
+    pub(crate) fn impl_clause(&mut self, item: ItemKey, nth: u32, binders: u32, ty: PTy, slots: &[Region]) {
+        let Some(imp) = self.impls.iter_mut().find(|i| i.item == item) else {
+            panic!("{item:?} has no declared impl head");
+        };
+        imp.clauses.push((nth, binders, ty, slots.to_vec()));
     }
 
     /// Field `field` of `variant` of ADT `adt`: its declared type `ty` and the column over it,
@@ -319,6 +331,10 @@ impl Decls {
                 self.col(into, tr, &col, i.item)
             });
             head.impl_header = Some((self_col, trait_col));
+            for (nth, binders, ty, slots) in &i.clauses {
+                let t = import(from, *ty, into);
+                head.clauses.push(ClauseRegions { nth: *nth, binders: *binders, col: self.col(into, t, slots, i.item) });
+            }
             heads.push(leak(i.item, head));
         }
         // An opaque type with a declared clause or bound: one head per opaque, in its fn's
@@ -393,7 +409,7 @@ impl Arity for Decls {
 /// both live as long as the views handed out (`RegionFacts::clauses` returns a slice of views).
 fn leak(item: ItemKey, head: HeadRegions<Alloc<'static>>) -> (ItemKey, &'static HeadRegions<Alloc<'static>>, &'static [ClauseView<'static>]) {
     let head: &'static HeadRegions<Alloc<'static>> = Box::leak(Box::new(head));
-    let views: vec::Vec<ClauseView<'static>> = head.clauses.iter().map(ClauseView::of).collect();
+    let views: vec::Vec<ClauseView<'static>> = head.clauses.iter().map(|c| ClauseView::of_in(c, &head.outlives)).collect();
     (item, head, Box::leak(views.into_boxed_slice()))
 }
 
@@ -416,6 +432,8 @@ fn import(from: PTys<'_>, t: PTy, into: &mut PortableTys<'_>) -> PTy {
         | PNode::ExAuto(_)
         | PNode::Foreign(_) => node,
         PNode::Tuple(l) => PNode::Tuple(import_list(from, l, into)),
+        PNode::Record(s, l) => PNode::Record(s, import_list(from, l, into)),
+        PNode::Union(l) => PNode::Union(import_list(from, l, into)),
         PNode::Ref(m, c) => PNode::Ref(m, import(from, c, into)),
         PNode::Ptr(m, c) => PNode::Ptr(m, import(from, c, into)),
         PNode::Array(elem, len) => {
@@ -562,6 +580,30 @@ impl<F: Facts> Facts for WithRegions<'_, F> {
     fn call_bounds(&self, item: ItemKey) -> Option<CallBounds<'_>> {
         self.base.call_bounds(item)
     }
+    fn is_fn_trait(&self, trait_: ItemKey) -> bool {
+        self.base.is_fn_trait(trait_)
+    }
+    fn is_future_trait(&self, trait_: ItemKey) -> bool {
+        self.base.is_future_trait(trait_)
+    }
+    fn is_into_future_trait(&self, trait_: ItemKey) -> bool {
+        self.base.is_into_future_trait(trait_)
+    }
+    fn is_try_as_dyn_trait(&self, trait_: ItemKey) -> bool {
+        self.base.is_try_as_dyn_trait(trait_)
+    }
+    fn deref_impl(&self, adt: ItemKey) -> Option<ItemKey> {
+        self.base.deref_impl(adt)
+    }
+    fn is_zero_slot_builtin_assoc(&self, trait_: ItemKey, name: Name) -> bool {
+        self.base.is_zero_slot_builtin_assoc(trait_, name)
+    }
+    fn drop_lifetimes(&self, adt: ItemKey) -> Option<&[bool]> {
+        self.base.drop_lifetimes(adt)
+    }
+    fn alias_copy(&self, alias: PTy) -> bool {
+        self.base.alias_copy(alias)
+    }
     fn ties(&self, item: ItemKey) -> Option<Ties<'_>> {
         self.base.ties(item)
     }
@@ -579,6 +621,12 @@ impl<F: Facts> Facts for WithRegions<'_, F> {
     }
     fn copy_args(&self, adt: ItemKey) -> Option<&[bool]> {
         self.base.copy_args(adt)
+    }
+    fn drop_args(&self, adt: ItemKey) -> Option<&[bool]> {
+        self.base.drop_args(adt)
+    }
+    fn inst_needs_drop(&self, ty: PTy) -> Option<bool> {
+        self.base.inst_needs_drop(ty)
     }
     fn field_count(&self, adt: ItemKey, variant: u32) -> Option<u32> {
         self.base.field_count(adt, variant)
@@ -619,6 +667,7 @@ pub(crate) struct Run {
     pub(crate) lines: vec::Vec<String>,
     pub(crate) stats: Stats,
     pub(crate) flow: String,
+    pub(crate) coarse: Option<Refusal>,
 }
 
 /// `view` checked by the real type checker, which must find it clean.
@@ -660,7 +709,7 @@ pub(crate) fn lower<F: Facts>(fx: &Fx, view: &BodyView<'_>, c: &mut Checked<'sta
     for f in rec.borrows.iter() {
         lines.push(format!("borrow {f:?}"));
     }
-    Ok(Run { lines, stats: lowered.stats, flow })
+    Ok(Run { lines, stats: lowered.stats, flow, coarse: lowered.coarse })
 }
 
 /// `view` checked, lowered under `facts` and `decls`' heads, and its flow checked ([`lower`]).

@@ -401,8 +401,35 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
                 Pred::HostEffect { trait_, args: self.map_list(args, &mut f)?, constness }
             }
             Pred::ConstHolds { cond, args } => Pred::ConstHolds { cond, args: self.map_list(args, &mut f)? },
-            Pred::Projection { alias, term } => Pred::Projection { alias: f(self, alias)?, term: f(self, term)? },
-            Pred::NormalizesTo { alias, term } => Pred::NormalizesTo { alias: f(self, alias)?, term: f(self, term)? },
+            Pred::ForFields { container, trait_, args_after_self } => Pred::ForFields {
+                container: f(self, container)?,
+                trait_,
+                args_after_self: self.map_list(args_after_self, &mut f)?,
+            },
+            // `alias` in `Projection` / `NormalizesTo` is an `AliasTerm` (def + args), not a
+            // replaceable type position (rustc_next_trait_solver `ReplaceProjectionWith` folds
+            // only the alias's arguments and `term`, never replacing the outer alias head with
+            // a non-alias type).
+            Pred::Projection { alias, term } => {
+                let alias = match self.kind(alias) {
+                    TyKind::Alias(r, k, d, l) => {
+                        let nl = self.map_list(l, &mut f)?;
+                        if nl == l { alias } else { self.mk(TyKind::Alias(r, k, d, nl))? }
+                    }
+                    _ => f(self, alias)?,
+                };
+                Pred::Projection { alias, term: f(self, term)? }
+            }
+            Pred::NormalizesTo { alias, term } => {
+                let alias = match self.kind(alias) {
+                    TyKind::Alias(r, k, d, l) => {
+                        let nl = self.map_list(l, &mut f)?;
+                        if nl == l { alias } else { self.mk(TyKind::Alias(r, k, d, nl))? }
+                    }
+                    _ => f(self, alias)?,
+                };
+                Pred::NormalizesTo { alias, term: f(self, term)? }
+            }
             Pred::TypeOutlives { ty, region } => Pred::TypeOutlives { ty: f(self, ty)?, region: f(self, region)? },
             Pred::RegionOutlives { a, b } => Pred::RegionOutlives { a: f(self, a)?, b: f(self, b)? },
             Pred::WellFormed(t) => Pred::WellFormed(f(self, t)?),
@@ -483,6 +510,11 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
             Pred::ConstHolds { cond, args: a } => {
                 Pred::ConstHolds { cond, args: fold::import_list_at(self.tys, self.scratch, p, a, inst, at)? }
             }
+            Pred::ForFields { container, trait_, args_after_self } => Pred::ForFields {
+                container: fold::import_at(self.tys, self.scratch, p, container, inst, at)?,
+                trait_,
+                args_after_self: fold::import_list_at(self.tys, self.scratch, p, args_after_self, inst, at)?,
+            },
             Pred::WellFormed(t) => Pred::WellFormed(fold::import_at(self.tys, self.scratch, p, t, inst, at)?),
             Pred::ConstEvaluatable(t) => {
                 Pred::ConstEvaluatable(fold::import_at(self.tys, self.scratch, p, t, inst, at)?)
@@ -582,6 +614,11 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
     /// where-clause's index, a field's (why_no.rs).
     pub fn add_from(&mut self, source: GoalSource, pred: Pred, reach: Reach) {
         self.added.push(Added { source, pred, bound: 0, via_only: false, reach });
+    }
+
+    /// [`Cx::add_from`] under `bound` higher-ranked bound variables (`for<'a, ..>`).
+    pub fn add_bound_from(&mut self, source: GoalSource, pred: Pred, bound: u32, reach: Reach) {
+        self.added.push(Added { source, pred, bound, via_only: false, reach });
     }
 
     /// Adds a nested goal under `bound` bound variables.

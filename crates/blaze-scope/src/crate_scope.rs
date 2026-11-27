@@ -22,13 +22,13 @@ use blaze_format::FormatError;
 use blaze_hash::HashMap;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_ids::producer::{Expander, ProducerId};
-use blaze_own::{AVec, Alloc, Box};
+use blaze_own::{AVec, Alloc, BVec, Bump};
 use blaze_surface::{BuildError, Edition, GlobEdge, Namespace, RecordBytes, ScopeBuilder, Unresolved, Visibility};
 
 use crate::asked::{Asked, Question, ReadListError, Stale};
 use crate::graph::{CrateGraph, CrateId, GraphCrate, GraphDep, Sysroot};
 use crate::prepares::Prepares;
-use crate::resolve::{Built, CrateInput, CrateNames, NamesError, SourceTexts, resolve_one};
+use crate::resolve::{Built, CrateInput, CrateNames, NamesError, ResolveOpts, SourceTexts, resolve_one_with};
 use crate::scope_record::{DepRecord, Module, Parts, Reaches, ScopeOf, VariantsOf, Verified};
 use crate::task::{First, MacroBody, MacroSrc, Par, Variant};
 
@@ -151,16 +151,16 @@ pub(crate) enum Form {
 
 /// The record `bytes` (16-aligned, living as long as `alloc`'s values) as a dependency read in
 /// `form`.
-pub(crate) fn hand<'a>(form: Form, bytes: &'a [u8], alloc: Alloc<'a>) -> Result<Dep<'a>, RecordRead> {
+pub(crate) fn hand<'a>(form: Form, bytes: &'a [u8], alloc: Bump<'a>) -> Result<Dep<'a>, RecordRead> {
     Ok(match form {
-        Form::InPlace => Dep::InPlace(Box::leak(Box::new_in(DepRecord::open(Verified::check(bytes)?), alloc))),
-        Form::Heap => Dep::Record(Box::leak(Box::new_in(read_record(bytes, alloc)?, alloc))),
+        Form::InPlace => Dep::InPlace(alloc.alloc_val(DepRecord::open(Verified::check(bytes)?))),
+        Form::Heap => Dep::Record(alloc.alloc_val(read_record(bytes, alloc.alloc())?)),
     })
 }
 
 /// Each of `deps` as [`hand`] reads it, in order.
-fn handed<'a>(form: Form, deps: &[&'a [u8]], alloc: Alloc<'a>) -> Result<AVec<'a, Dep<'a>>, CrateScopeError<'a>> {
-    let mut out = AVec::with_capacity_in(deps.len(), alloc);
+fn handed<'a>(form: Form, deps: &[&'a [u8]], alloc: Bump<'a>) -> Result<AVec<'a, Dep<'a>>, CrateScopeError<'a>> {
+    let mut out = AVec::with_capacity_in(deps.len(), alloc.alloc());
     for (at, bytes) in deps.iter().enumerate() {
         out.push(hand(form, bytes, alloc).map_err(|error| CrateScopeError::Record { at, error })?);
     }
@@ -374,7 +374,8 @@ pub fn why_reported<'a>(why: Unresolved, inner: &[u8], module: ItemKey, name: &s
     }
     // Only on a failure's report: the inner record checked whole, one module row found, its
     // bindings scanned in place (no decode).
-    let bound = crate::scope_record::inner_binds(crate::resolve::aligned(inner, alloc), module, name)?;
+    let aligned = crate::resolve::AlignedBuf::copy_from(inner, alloc);
+    let bound = crate::scope_record::inner_binds(aligned.as_slice(), module, name)?;
     Ok(if bound { Unresolved::Private } else { why })
 }
 
@@ -449,8 +450,16 @@ pub struct Records<'b> {
 
 /// The two records of `names`, the crates of `built` answering for the items of other crates
 /// its scopes name. `leak_private` is the planted bug of the privacy test: every binding is
-/// written `pub`.
-pub(crate) fn write_records<'a, 'b>(names: &CrateNames<'a>, built: &Built<'_, 'a>, leak_private: bool, alloc: Alloc<'b>) -> Result<Records<'b>, BuildError> {
+/// written `pub`. When `write_inner` is `false`, `inner` is returned empty without serializing
+/// unwalked modules or private module halves (used by the driver, which discards `inner` and
+/// persists Section 2 `names_record` directly); `exports` is byte-identical either way.
+pub(crate) fn write_records_opt<'a, 'b>(
+    names: &CrateNames<'a>,
+    built: &Built<'_, 'a>,
+    leak_private: bool,
+    write_inner: bool,
+    alloc: Alloc<'b>,
+) -> Result<Records<'b>, BuildError> {
     let own = names.key.prefix();
     let mut def_site = AVec::new_in(alloc);
     for m in names.tables.macros.values() {
@@ -464,53 +473,57 @@ pub(crate) fn write_records<'a, 'b>(names: &CrateNames<'a>, built: &Built<'_, 'a
     def_site.sort_unstable();
     def_site.dedup();
     let outside = Outside { def_site };
-    // Each module's scope split: what `outside` keeps, and the rest.
-    let mut split: HashMap<ItemKey, (ScopeBuilder<'b, &str>, ScopeBuilder<'_, &str>), Alloc<'b>> = HashMap::new_in(alloc);
-    for (m, done) in names.done.iter() {
-        let mut inner = done.scope.clone();
-        if leak_private {
-            for e in inner.bindings.iter_mut() {
-                e.binding.vis = Visibility::Public;
-            }
-        }
-        let mut exports = ScopeBuilder::new_in(*m, alloc);
-        let mut keep = AVec::with_capacity_in(inner.bindings.len(), alloc);
-        for e in inner.bindings.iter() {
-            keep.push(outside.sees(e.binding.vis) || may_shadow(names, built, &inner.globs, &outside, e.ns, e.name));
-        }
-        let mut at = 0;
-        inner.bindings.retain(|e| {
-            at += 1;
-            if keep[at - 1] {
-                exports.bindings.push(*e);
-            }
-            !keep[at - 1]
-        });
-        inner.globs.retain(|g| {
-            if outside.sees(g.vis) {
-                exports.globs.push(*g);
-            }
-            !outside.sees(g.vis)
-        });
-        inner.traits.retain(|t| {
-            if outside.sees(t.vis) {
-                exports.traits.push(*t);
-            }
-            !outside.sees(t.vis)
-        });
-        exports.macro_exports.extend(inner.macro_exports.drain(..));
-        split.insert(*m, (exports, inner));
-    }
-    // The modules a dependent can walk into, and every item key their kept names name.
-    let mut walked: HashMap<ItemKey, (), Alloc<'b>> = HashMap::new_in(alloc);
+    // Split ONLY the modules a dependent can actually walk into (BFS from `names.root` and
+    // `outside.def_site`), allocating in `alloc` (the scratch frame). When `write_inner` is
+    // `false`, private halves and unwalked modules are skipped completely.
+    let mut split: HashMap<ItemKey, (ScopeBuilder<'b, &'a str>, Option<ScopeBuilder<'b, &'a str>>), Alloc<'b>> = HashMap::new_in(alloc);
     let mut named: HashMap<ItemKey, (), Alloc<'b>> = HashMap::new_in(alloc);
     let mut work = AVec::new_in(alloc);
     work.push(names.root);
     work.extend_from_slice(&outside.def_site);
     while let Some(m) = work.pop() {
-        let Some((exports, _)) = split.get(&m) else { continue };
-        if walked.insert(m, ()).is_some() {
+        if split.contains_key(&m) {
             continue;
+        }
+        let Some(done) = names.done.get(&m) else { continue };
+        let src = &done.scope;
+        let mut exports = ScopeBuilder::new_in(m, alloc);
+        let mut inner = if write_inner { Some(ScopeBuilder::new_in(m, alloc)) } else { None };
+        for &entry in src.bindings.iter() {
+            let mut entry = entry;
+            if leak_private {
+                entry.binding.vis = Visibility::Public;
+            }
+            let keep = outside.sees(entry.binding.vis)
+                || may_shadow(names, built, &src.globs, &outside, entry.ns, entry.name);
+            if keep {
+                exports.bindings.push(entry);
+            } else if let Some(inner) = inner.as_mut() {
+                inner.bindings.push(entry);
+            }
+        }
+        for &g in src.globs.iter() {
+            if outside.sees(g.vis) {
+                exports.globs.push(g);
+            } else if let Some(inner) = inner.as_mut() {
+                inner.globs.push(g);
+            }
+        }
+        for &t in src.traits.iter() {
+            if outside.sees(t.vis) {
+                exports.traits.push(t);
+            } else if let Some(inner) = inner.as_mut() {
+                inner.traits.push(t);
+            }
+        }
+        exports.macro_exports.extend_from_slice(&src.macro_exports);
+        if let Some(inner) = inner.as_mut() {
+            inner.textual.extend_from_slice(&src.textual);
+            inner.marks.extend_from_slice(&src.marks);
+            inner.errors.reserve(src.errors.len());
+            for err in src.errors.iter() {
+                inner.errors.push(clone_scope_error_in(err, alloc));
+            }
         }
         let keys = exports
             .bindings
@@ -521,10 +534,11 @@ pub(crate) fn write_records<'a, 'b>(names: &CrateNames<'a>, built: &Built<'_, 'a
             .chain(exports.macro_exports.iter().map(|t| t.def));
         for key in keys {
             named.insert(key, ());
-            if key.0.0[..8] == own && split.contains_key(&key) && !walked.contains_key(&key) {
+            if key.0.0[..8] == own && names.done.contains_key(&key) && !split.contains_key(&key) {
                 work.push(key);
             }
         }
+        split.insert(m, (exports, inner));
     }
     // A `#[macro_export]` macro is a binding of the root for other crates (its own crate does
     // not see it by path), and a dependent reads its definition by key.
@@ -533,56 +547,104 @@ pub(crate) fn write_records<'a, 'b>(names: &CrateNames<'a>, built: &Built<'_, 'a
             named.insert(*def, ());
         }
     }
-    let mut modules = AVec::from_iter_in(names.done.keys().copied(), alloc);
-    modules.sort_unstable();
-    // Every other crate a part's scopes name an item of, and what that crate reaches.
-    let mut reach = [AVec::new_in(alloc), AVec::new_in(alloc)];
-    let add = |part: Part, key: ItemKey, reach: &mut [AVec<'b, CrateItemKey>; 2]| {
+    let add_reach = |key: ItemKey, out: &mut AVec<'b, CrateItemKey>| {
         if key.0.0[..8] == own {
             return;
         }
         if let Some(dep) = built.of(key) {
-            reach[part as usize].push(dep.key());
-            reach[part as usize].extend(dep.reaches().iter());
+            out.push(dep.key());
+            out.extend(dep.reaches().iter());
         }
     };
-    let mut exports_scopes = AVec::new_in(alloc);
-    let mut inner_scopes = AVec::new_in(alloc);
-    for m in modules.iter() {
-        let (exports, inner) = &split[m];
-        // An unwalked module's whole scope is the crate's own.
-        let to = if walked.contains_key(m) { Part::Exports } else { Part::Inner };
-        for e in exports.bindings.iter() {
-            add(to, e.binding.def.key, &mut reach);
-        }
-        for g in exports.globs.iter() {
-            add(to, g.source.key, &mut reach);
-        }
-        for e in inner.bindings.iter() {
-            add(Part::Inner, e.binding.def.key, &mut reach);
-        }
-        for g in inner.globs.iter() {
-            add(Part::Inner, g.source.key, &mut reach);
-        }
-        if to == Part::Exports {
+    if !write_inner {
+        let mut modules = AVec::from_iter_in(split.keys().copied(), alloc);
+        modules.sort_unstable();
+        let mut exports_reach = AVec::new_in(alloc);
+        let mut exports_scopes = AVec::with_capacity_in(modules.len(), alloc);
+        for m in modules.iter() {
+            let Some((exports, _)) = split.get(m) else { continue };
+            for e in exports.bindings.iter() {
+                add_reach(e.binding.def.key, &mut exports_reach);
+            }
+            for g in exports.globs.iter() {
+                add_reach(g.source.key, &mut exports_reach);
+            }
             exports_scopes.push(Some(exports.write(alloc)?));
-            inner_scopes.push(Some(inner.write(alloc)?));
-        } else {
+        }
+        let exports = write_part(names, &modules, &exports_scopes, &exports_reach, &|k| named.contains_key(k), alloc)?;
+        return Ok(Records { exports, inner: RecordBytes::new_in(alloc) });
+    }
+    let mut modules = AVec::from_iter_in(names.done.keys().copied(), alloc);
+    modules.sort_unstable();
+    // Every other crate a part's scopes name an item of, and what that crate reaches.
+    let mut exports_reach = AVec::new_in(alloc);
+    let mut inner_reach = AVec::new_in(alloc);
+    let mut exports_scopes = AVec::with_capacity_in(modules.len(), alloc);
+    let mut inner_scopes = AVec::with_capacity_in(modules.len(), alloc);
+    for m in modules.iter() {
+        if let Some((exports, inner)) = split.get(m) {
+            for e in exports.bindings.iter() {
+                add_reach(e.binding.def.key, &mut exports_reach);
+            }
+            for g in exports.globs.iter() {
+                add_reach(g.source.key, &mut exports_reach);
+            }
+            if let Some(inner) = inner.as_ref() {
+                for e in inner.bindings.iter() {
+                    add_reach(e.binding.def.key, &mut inner_reach);
+                }
+                for g in inner.globs.iter() {
+                    add_reach(g.source.key, &mut inner_reach);
+                }
+                inner_scopes.push(Some(inner.write(alloc)?));
+            } else {
+                inner_scopes.push(None);
+            }
+            exports_scopes.push(Some(exports.write(alloc)?));
+        } else if let Some(done) = names.done.get(m) {
+            // An unwalked module's whole scope is the crate's own.
+            let scope = &done.scope;
+            for e in scope.bindings.iter() {
+                add_reach(e.binding.def.key, &mut inner_reach);
+            }
+            for g in scope.globs.iter() {
+                add_reach(g.source.key, &mut inner_reach);
+            }
             exports_scopes.push(None);
-            inner_scopes.push(Some(names.done[m].scope.write(alloc)?));
+            inner_scopes.push(Some(scope.write(alloc)?));
         }
     }
-    let [exports_reach, inner_reach] = reach;
     let exports = write_part(names, &modules, &exports_scopes, &exports_reach, &|k| named.contains_key(k), alloc)?;
     let inner = write_part(names, &modules, &inner_scopes, &inner_reach, &|k| !named.contains_key(k), alloc)?;
     Ok(Records { exports, inner })
 }
 
-/// Which of the two records a name goes to.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Part {
-    Exports = 0,
-    Inner = 1,
+#[cfg(test)]
+pub(crate) fn write_records<'a, 'b>(names: &CrateNames<'a>, built: &Built<'_, 'a>, leak_private: bool, alloc: Alloc<'b>) -> Result<Records<'b>, BuildError> {
+    write_records_opt(names, built, leak_private, true, alloc)
+}
+
+fn clone_path_in<'b, N: Copy>(p: &blaze_surface::Path<'_, N>, alloc: Alloc<'b>) -> blaze_surface::Path<'b, N> {
+    blaze_surface::Path { kind: p.kind, segments: AVec::from_slice_in(&p.segments, alloc) }
+}
+
+fn clone_scope_error_in<'b, N: Copy>(
+    err: &blaze_surface::ScopeError<N, blaze_surface::Path<'_, N>>,
+    alloc: Alloc<'b>,
+) -> blaze_surface::ScopeError<N, blaze_surface::Path<'b, N>> {
+    use blaze_surface::ScopeError;
+    match *err {
+        ScopeError::Import { site, ref path, segment, why } => ScopeError::Import { site, path: clone_path_in(path, alloc), segment, why },
+        ScopeError::Macro { call, ref path, segment, why } => ScopeError::Macro { call, path: clone_path_in(path, alloc), segment, why },
+        ScopeError::ExternCrate { name } => ScopeError::ExternCrate { name },
+        ScopeError::RestrictedNotAncestor { ref path } => ScopeError::RestrictedNotAncestor { path: clone_path_in(path, alloc) },
+        ScopeError::Duplicate { ns, name, first, second } => ScopeError::Duplicate { ns, name, first, second },
+        ScopeError::WiderReexport { site, ns, name, def } => ScopeError::WiderReexport { site, ns, name, def },
+        ScopeError::Ambiguous { site, ns, name, kind, first, second } => ScopeError::Ambiguous { site, ns, name, kind, first, second },
+        ScopeError::Inconsistent { site, ns, name, early, last } => ScopeError::Inconsistent { site, ns, name, early, last },
+        ScopeError::RecursionLimit { call } => ScopeError::RecursionLimit { call },
+        ScopeError::Refused { call, name, why } => ScopeError::Refused { call, name, why },
+    }
 }
 
 /// One record: each of `modules` that has a scope's bytes in `scopes`, the crates it `reaches`,
@@ -635,7 +697,7 @@ pub fn resolve_crate<'a, S: SourceTexts<'a>, P: Par>(
     source: usize,
     par: &P,
     prepares: &'a Prepares<'a>,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 ) -> Result<CrateScope<'a>, CrateScopeError<'a>> {
     resolve_crate_with(input, deps, sysroot, sources, source, par, false, prepares, alloc)
 }
@@ -791,7 +853,7 @@ pub fn resolve_by_records<'a, S: SourceTexts<'a>, P: Par>(
     sources: &S,
     par: &P,
     ready: &Ready<'_>,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 ) -> Result<(AVec<'a, CrateScope<'a>>, usize), (usize, CrateScopeError<'a>)> {
     resolve_by_records_with(crates, sysroot, sources, par, ready, false, alloc)
 }
@@ -807,7 +869,7 @@ pub fn resolve_kept<'a, S: SourceTexts<'a>, P: Par>(
     par: &P,
     ready: &Ready<'_>,
     kept: &dyn Kept,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 ) -> Result<(AVec<'a, Solved<'a>>, usize), (usize, CrateScopeError<'a>)> {
     resolve_queue(crates, sysroot, sources, par, ready, false, Some(kept), Form::InPlace, alloc)
 }
@@ -850,7 +912,7 @@ pub(crate) fn resolve_by_records_with<'a, S: SourceTexts<'a>, P: Par>(
     par: &P,
     ready: &Ready<'_>,
     leak_private: bool,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 ) -> Result<(AVec<'a, CrateScope<'a>>, usize), (usize, CrateScopeError<'a>)> {
     resolve_by_records_in(crates, sysroot, sources, par, ready, leak_private, Form::InPlace, alloc)
 }
@@ -866,10 +928,10 @@ pub(crate) fn resolve_by_records_in<'a, S: SourceTexts<'a>, P: Par>(
     ready: &Ready<'_>,
     leak_private: bool,
     form: Form,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 ) -> Result<(AVec<'a, CrateScope<'a>>, usize), (usize, CrateScopeError<'a>)> {
     let (solved, needs) = resolve_queue(crates, sysroot, sources, par, ready, leak_private, None, form, alloc)?;
-    let mut all = AVec::with_capacity_in(solved.len(), alloc);
+    let mut all = AVec::with_capacity_in(solved.len(), alloc.alloc());
     for (at, s) in solved.into_iter().enumerate() {
         match s {
             Solved::Solved(scope) => all.push(scope),
@@ -891,8 +953,9 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
     leak_private: bool,
     kept: Option<&dyn Kept>,
     form: Form,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Result<(AVec<'a, Solved<'a>>, usize), (usize, CrateScopeError<'a>)> {
+    let alloc = bump.alloc();
     let graph = crate::resolve::graph_of(crates, sysroot, alloc).map_err(|e| (0, CrateScopeError::Names(e)))?;
     let n = crates.len();
     let mut pos: AVec<'a, usize> = AVec::from_iter_in(crates.iter().map(|_| usize::MAX), alloc);
@@ -937,7 +1000,7 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
         failed: None,
     });
     let woken = Condvar::new();
-    let prepares = Prepares::new_in(alloc);
+    let prepares = Prepares::new_in(bump);
     let rank_of = |at: usize| (ready.rank.map_or(0, |r| r[at]), pos[at]);
     let worker = |w: usize| {
         loop {
@@ -979,11 +1042,11 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
                     local.len() - 1
                 }
             };
-            let mut own_deps = AVec::with_capacity_in(input.deps.len(), alloc);
+            let mut own_deps = BVec::with_capacity_in(input.deps.len(), bump);
             for &(name, index) in input.deps {
                 own_deps.push((name, place(index, &mut local)));
             }
-            let own_deps: &'a [(&'a str, usize)] = AVec::leak(own_deps);
+            let own_deps: &'a [(&'a str, usize)] = own_deps.into_bump_slice();
             let mut mapped = [None; 4];
             for (slot, s) in mapped.iter_mut().zip(sysroot.all()) {
                 *slot = s.filter(|s| s.index() != at && pos[s.index()] < pos[at]).map(|s| place(s.index(), &mut local));
@@ -997,7 +1060,7 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
             let found = match kept.and_then(|k| k.find(at).map(|f| (k, f))) {
                 None => Ok(None),
                 Some((k, (record, inner, read))) => {
-                    let read = crate::resolve::aligned(read, alloc);
+                    let read = crate::resolve::aligned(read, bump);
                     match crate::asked::check(read, &now, alloc) {
                         Err(error) => Err(CrateScopeError::ReadList { krate: input.name, error }),
                         Ok(Some(why)) => {
@@ -1005,7 +1068,7 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
                             Ok(None)
                         }
                         Ok(None) => {
-                            let (r, i) = (crate::resolve::aligned(record, alloc), crate::resolve::aligned(inner, alloc));
+                            let (r, i) = (crate::resolve::aligned(record, bump), crate::resolve::aligned(inner, bump));
                             Ok(Some(Solved::Found { record: &r[..record.len()], inner: &i[..inner.len()] }))
                         }
                     }
@@ -1061,7 +1124,7 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
                         .unwrap_or_else(|e| panic!("the kept expansions of `{}` did not open: {e}", input.name)),
                     None => crate::expansions::KeptExpansions::none(alloc),
                 };
-                match resolve_crate_decoded(&local_input, &deps, local_sysroot, sources, at, par, leak_private, prepares, &kept_expansions, alloc) {
+                match resolve_crate_decoded(&local_input, &deps, local_sysroot, sources, at, par, leak_private, prepares, &kept_expansions, ResolveOpts::default(), bump) {
                     Ok(done) => {
                         if let Some((k, _)) = keeper {
                             par.stage(crate::task::Stage::ExpansionsRecord);
@@ -1123,8 +1186,8 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
                 let digest = ContentId::of(EXPORTS_DOMAIN, own);
                 par.stage(crate::task::Stage::Decode);
                 ready.hooks.decoding(at);
-                let bytes = crate::resolve::aligned(own, alloc);
-                let record = hand(form, bytes, alloc).map_err(|error| CrateScopeError::OwnRecord { krate: input.name, error })?;
+                let bytes = crate::resolve::aligned(own, bump);
+                let record = hand(form, bytes, bump).map_err(|error| CrateScopeError::OwnRecord { krate: input.name, error })?;
                 ready.hooks.decoded(at, bytes.len());
                 Ok((done, record, digest))
             });
@@ -1175,10 +1238,10 @@ pub(crate) fn resolve_crate_with<'a, S: SourceTexts<'a>, P: Par>(
     par: &P,
     leak_private: bool,
     prepares: &'a Prepares<'a>,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 ) -> Result<CrateScope<'a>, CrateScopeError<'a>> {
     let read = handed(Form::InPlace, deps, alloc)?;
-    resolve_crate_decoded(input, &read, sysroot, sources, source, par, leak_private, prepares, &crate::expansions::KeptExpansions::none(alloc), alloc)
+    resolve_crate_decoded(input, &read, sysroot, sources, source, par, leak_private, prepares, &crate::expansions::KeptExpansions::none(alloc.alloc()), ResolveOpts::default(), alloc)
 }
 
 /// [`resolve_crate`] given its dependencies' exports records already checked, each proof made
@@ -1194,19 +1257,39 @@ pub fn resolve_crate_verified<'a, S: SourceTexts<'a>, P: Par>(
     source: usize,
     par: &P,
     prepares: &'a Prepares<'a>,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 ) -> Result<CrateScope<'a>, CrateScopeError<'a>> {
-    let mut handed = AVec::with_capacity_in(deps.len(), alloc);
+    resolve_crate_verified_with(input, deps, sysroot, sources, source, par, prepares, ResolveOpts::default(), alloc)
+}
+
+/// [`resolve_crate_verified`] with explicit [`ResolveOpts`] (skipping dead `inner`
+/// serialization on the engine path, and enabling intra-crate parallel lowering, scope
+/// writing, and wave-batched macro expansion) and a stage-shared [`Prepares`] whose arena
+/// lifetime `'p` outlives this crate's frame `'a`.
+#[allow(clippy::too_many_arguments, reason = "the entry's arguments, each named")]
+pub fn resolve_crate_verified_with<'a, 'r, 'p: 'a, S: SourceTexts<'a>, P: Par>(
+    input: &CrateInput<'a>,
+    deps: &[Verified<'a>],
+    sysroot: Sysroot,
+    sources: &S,
+    source: usize,
+    par: &P,
+    prepares: &'r Prepares<'p>,
+    opts: ResolveOpts<'a>,
+    alloc: Bump<'a>,
+) -> Result<CrateScope<'a>, CrateScopeError<'a>> {
+    let a = alloc.alloc();
+    let mut handed = AVec::with_capacity_in(deps.len(), a);
     for proof in deps {
-        handed.push(Dep::InPlace(Box::leak(Box::new_in(DepRecord::open(*proof), alloc))));
+        handed.push(Dep::InPlace(alloc.alloc_val(DepRecord::open(*proof))));
     }
-    resolve_crate_decoded(input, &handed, sysroot, sources, source, par, false, prepares, &crate::expansions::KeptExpansions::none(alloc), alloc)
+    resolve_crate_decoded(input, &handed, sysroot, sources, source, par, false, prepares, &crate::expansions::KeptExpansions::none(a), opts, alloc)
 }
 
 /// [`resolve_crate_with`] given its dependencies' records already handed: the ready queue
 /// checks each record once for the whole call and gives every reader the same one.
 #[allow(clippy::too_many_arguments, reason = "the entry's arguments and the planted bug's switch")]
-fn resolve_crate_decoded<'a, S: SourceTexts<'a>, P: Par>(
+fn resolve_crate_decoded<'a, 'r, 'p: 'a, S: SourceTexts<'a>, P: Par>(
     input: &CrateInput<'a>,
     deps: &[Dep<'a>],
     sysroot: Sysroot,
@@ -1214,17 +1297,42 @@ fn resolve_crate_decoded<'a, S: SourceTexts<'a>, P: Par>(
     source: usize,
     par: &P,
     leak_private: bool,
-    prepares: &'a Prepares<'a>,
+    prepares: &'r Prepares<'p>,
     kept: &crate::expansions::KeptExpansions<'_, 'a>,
-    alloc: Alloc<'a>,
+    opts: ResolveOpts<'a>,
+    bump: Bump<'a>,
 ) -> Result<CrateScope<'a>, CrateScopeError<'a>> {
+    let alloc = bump.alloc();
+    let write_inner = opts.write_inner;
     let write = |names: CrateNames<'a>, built: &Built<'_, 'a>| -> Result<_, CrateScopeError<'a>> {
         par.stage(crate::task::Stage::Write);
-        let Records { exports, inner } = write_records(&names, built, leak_private, alloc).map_err(|error| CrateScopeError::Write { krate: input.name, error })?;
+        // Run `write_records_opt`'s ScopeBuilder splits and per-module scratch inside the idle
+        // `call_scratch` frame, copying ONLY the final record bytes into the crate frame
+        // (~110 MB saved on `core`, rule 11). When `!write_inner`, `inner` is skipped completely.
+        let mut written = None;
+        let mode = par.call_scratch(&mut |scratch_alloc| {
+            written = Some(write_records_opt(&names, built, leak_private, write_inner, scratch_alloc).map(|Records { exports, inner }| {
+                let mut out_exports = RecordBytes::with_capacity_in(exports.len(), alloc);
+                out_exports.extend_from_slice(&exports);
+                let out_inner = if write_inner {
+                    let mut out = RecordBytes::with_capacity_in(inner.len(), alloc);
+                    out.extend_from_slice(&inner);
+                    out
+                } else {
+                    RecordBytes::new_in(alloc)
+                };
+                Records { exports: out_exports, inner: out_inner }
+            }));
+        });
+        let Records { exports, inner } = match (mode, written) {
+            (crate::task::Scratch::Reset, Some(res)) => res,
+            _ => write_records_opt(&names, built, leak_private, write_inner, alloc),
+        }
+        .map_err(|error| CrateScopeError::Write { krate: input.name, error })?;
         Ok((names, exports, inner))
     };
-    let ((names, record, inner), asked) = with_names(input, deps, sysroot, sources, source, par, prepares, kept, alloc, write)?;
-    let names: &'a CrateNames<'a> = Box::leak(Box::new_in(names, alloc));
+    let ((names, record, inner), asked) = with_names(input, deps, sysroot, sources, source, par, prepares, kept, opts, bump, write)?;
+    let names: &'a CrateNames<'a> = bump.alloc_val(names);
     Ok(CrateScope { names, record, inner, asked })
 }
 
@@ -1244,10 +1352,11 @@ pub fn resolve_members<'a, S: SourceTexts<'a>, P: Par>(
     source: usize,
     par: &P,
     members: crate::cells::Members<'_>,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Result<crate::cells::Solved<'a>, CrateScopeError<'a>> {
-    let decoded = handed(Form::InPlace, deps, alloc)?;
-    let prepares = Prepares::new_in(alloc);
+    let alloc = bump.alloc();
+    let decoded = handed(Form::InPlace, deps, bump)?;
+    let prepares = Prepares::new_in(bump);
     let par = OfMembers { par, members };
     let kept = crate::expansions::KeptExpansions::none(alloc);
     let members_of = |mut names: CrateNames<'a>, _: &Built<'_, 'a>| {
@@ -1260,7 +1369,7 @@ pub fn resolve_members<'a, S: SourceTexts<'a>, P: Par>(
         core::mem::forget(names);
         Ok(crate::cells::Solved { groups, tree })
     };
-    let (solved, _) = with_names(input, &decoded, sysroot, sources, source, &par, prepares, &kept, alloc, members_of)?;
+    let (solved, _) = with_names(input, &decoded, sysroot, sources, source, &par, prepares, &kept, ResolveOpts::default(), bump, members_of)?;
     Ok(solved)
 }
 
@@ -1287,6 +1396,10 @@ impl<P: Par> Par for OfMembers<'_, P> {
         self.par.call_scratch(work)
     }
 
+    fn solve_scratch(&self, work: &mut dyn FnMut(blaze_own::Alloc<'_>)) -> crate::task::Scratch {
+        self.par.solve_scratch(work)
+    }
+
     fn expand_part(&self, part: crate::task::ExpandPart, macro_name: &str, size: usize) {
         self.par.expand_part(part, macro_name, size);
     }
@@ -1309,6 +1422,10 @@ impl<P: Par> Par for OfMembers<'_, P> {
 
     fn block_scopes(&self) -> crate::surface::BlockScopes {
         self.par.block_scopes()
+    }
+
+    fn track_by_place(&self) -> bool {
+        self.par.track_by_place()
     }
 }
 
@@ -1336,6 +1453,10 @@ impl<P: Par> Par for Strategy<'_, P> {
         self.par.call_scratch(work)
     }
 
+    fn solve_scratch(&self, work: &mut dyn FnMut(blaze_own::Alloc<'_>)) -> crate::task::Scratch {
+        self.par.solve_scratch(work)
+    }
+
     fn expand_part(&self, part: crate::task::ExpandPart, macro_name: &str, size: usize) {
         self.par.expand_part(part, macro_name, size);
     }
@@ -1350,6 +1471,10 @@ impl<P: Par> Par for Strategy<'_, P> {
 
     fn tree_record_read(&self, bytes: usize) {
         self.par.tree_record_read(bytes);
+    }
+
+    fn track_by_place(&self) -> bool {
+        self.par.track_by_place()
     }
 
     fn block_scopes(&self) -> crate::surface::BlockScopes {
@@ -1376,7 +1501,7 @@ pub fn block_scopes_differential<'a, S: SourceTexts<'a>, P: Par>(
     source: usize,
     par: &P,
     prepares: &'a Prepares<'a>,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 ) -> Result<crate::body_scope::BlockScopesVerdict<'a>, crate::body_scope::DifferentialError<'a>> {
     let modules = block_scopes_modules_side(input, deps, sysroot, sources, source, par, prepares, alloc, alloc)?;
     block_scopes_bodies_side(&modules, input, deps, sysroot, sources, source, par, prepares, alloc)
@@ -1395,16 +1520,17 @@ pub fn block_scopes_modules_side<'a, 'o, S: SourceTexts<'a>, P: Par>(
     source: usize,
     par: &P,
     prepares: &'a Prepares<'a>,
-    alloc: Alloc<'a>,
-    out: Alloc<'o>,
+    bump: Bump<'a>,
+    out: Bump<'o>,
 ) -> Result<crate::body_scope::ModulesSide<'o>, crate::body_scope::DifferentialError<'a>> {
     use crate::body_scope::{DifferentialError, ModulesSide};
     use crate::surface::BlockScopes;
 
-    let decoded = handed(Form::InPlace, deps, alloc).map_err(DifferentialError::Names)?;
+    let alloc = bump.alloc();
+    let decoded = handed(Form::InPlace, deps, bump).map_err(DifferentialError::Names)?;
     let kept = crate::expansions::KeptExpansions::none(alloc);
     let modules_par = Strategy { par, scopes: BlockScopes::Modules };
-    let (side, _) = with_names(input, &decoded, sysroot, sources, source, &modules_par, prepares, &kept, alloc, |names, _| Ok(ModulesSide::of(&names, alloc, out))).map_err(DifferentialError::Names)?;
+    let (side, _) = with_names(input, &decoded, sysroot, sources, source, &modules_par, prepares, &kept, ResolveOpts::default(), bump, |names, _| Ok(ModulesSide::of(&names, alloc, out))).map_err(DifferentialError::Names)?;
     side.map_err(|error| DifferentialError::Rows { krate: input.name, error })
 }
 
@@ -1422,14 +1548,15 @@ pub fn block_scopes_bodies_side<'a, 'o: 'a, S: SourceTexts<'a>, P: Par>(
     source: usize,
     par: &P,
     prepares: &'a Prepares<'a>,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Result<crate::body_scope::BlockScopesVerdict<'a>, crate::body_scope::DifferentialError<'a>> {
     use crate::body_scope::{BodyScope, BodyScopeRefusal, DifferentialError};
     use crate::surface::BlockScopes;
 
-    let decoded = handed(Form::InPlace, deps, alloc).map_err(DifferentialError::Names)?;
+    let alloc = bump.alloc();
+    let decoded = handed(Form::InPlace, deps, bump).map_err(DifferentialError::Names)?;
     let kept = crate::expansions::KeptExpansions::none(alloc);
-    let leak = |names: CrateNames<'a>| -> &'a CrateNames<'a> { Box::leak(Box::new_in(names, alloc)) };
+    let leak = |names: CrateNames<'a>| -> &'a CrateNames<'a> { bump.alloc_val(names) };
 
     let bodies_par = Strategy { par, scopes: BlockScopes::Bodies };
     let solve = |names: CrateNames<'a>, built: &Built<'_, 'a>| -> Result<_, CrateScopeError<'a>> {
@@ -1441,7 +1568,7 @@ pub fn block_scopes_bodies_side<'a, 'o: 'a, S: SourceTexts<'a>, P: Par>(
         // missing from the `Bodies` table because of the refusal (the verdict says how many).
         let mut refused_blocks: AVec<'a, ItemKey> = AVec::new_in(alloc);
         // The crate's tree record read once for every held body (rule 74, D189's floor).
-        let tree = crate::resolve::ReadTree::of(c, alloc).map_err(|error| CrateScopeError::Names(NamesError::TreeRecord { krate: input.name, error }))?;
+        let tree = crate::resolve::ReadTree::of(c, bump).map_err(|error| CrateScopeError::Names(NamesError::TreeRecord { krate: input.name, error }))?;
         // Each body's work (its cells over its chain and the modules it reads, cells/mod.rs
         // `load_body`; the read list's scope bytes) in the driver's scratch, reset after it: tempo's `core` outgrew its 4 GiB
         // frame with every body's work kept (21 Nov 05:33). No macro call is open here (the
@@ -1449,7 +1576,7 @@ pub fn block_scopes_bodies_side<'a, 'o: 'a, S: SourceTexts<'a>, P: Par>(
         // `solve_held_body_scratch`), so the scratch is never asked twice at once.
         let hook = |work: &mut dyn FnMut(Alloc<'_>)| par.call_scratch(work);
         for held in c.bodies.iter() {
-            match crate::body_scope::body_scope_scratch(&tree, &body_deps, input, source, *held, sources, prepares, &hook, alloc) {
+            match crate::body_scope::body_scope_scratch(&tree, &body_deps, input, source, *held, sources, prepares, &hook, bump) {
                 Ok(scope) => scopes.push(scope),
                 Err(refusal) => {
                     let nested = blaze_file_items::nested::scan(held.src.text, alloc);
@@ -1462,7 +1589,7 @@ pub fn block_scopes_bodies_side<'a, 'o: 'a, S: SourceTexts<'a>, P: Par>(
         refused_blocks.dedup();
         Ok((c, scopes, refused, refused_blocks))
     };
-    let ((bodies, scopes, refused, refused_blocks), _) = with_names(input, &decoded, sysroot, sources, source, &bodies_par, prepares, &kept, alloc, solve).map_err(DifferentialError::Names)?;
+    let ((bodies, scopes, refused, refused_blocks), _) = with_names(input, &decoded, sysroot, sources, source, &bodies_par, prepares, &kept, ResolveOpts::default(), bump, solve).map_err(DifferentialError::Names)?;
 
     let bodies_rows = crate::body_scope::bodies_impl_table(bodies, &scopes, alloc).map_err(|error| DifferentialError::Rows { krate: input.name, error })?;
     let diff = crate::body_scope::impl_diff(&modules.rows, &bodies_rows, alloc);
@@ -1486,22 +1613,24 @@ pub fn block_scopes_bodies_side<'a, 'o: 'a, S: SourceTexts<'a>, P: Par>(
     })
 }
 
-/// One crate's names (through [`resolve_one`]) against its dependencies' records, handed to
+/// One crate's names (through [`resolve_one_with`]) against its dependencies' records, handed to
 /// `then` with the dependencies as the solve read them; the answer is `then`'s, and every
 /// question the solve asked of the dependencies.
 #[allow(clippy::too_many_arguments, reason = "the entry's arguments, each named")]
-fn with_names<'a, S: SourceTexts<'a>, P: Par, R>(
+fn with_names<'a, 'r, 'p: 'a, S: SourceTexts<'a>, P: Par, R>(
     input: &CrateInput<'a>,
     deps: &[Dep<'a>],
     sysroot: Sysroot,
     sources: &S,
     source: usize,
     par: &P,
-    prepares: &'a Prepares<'a>,
+    prepares: &'r Prepares<'p>,
     kept: &crate::expansions::KeptExpansions<'_, 'a>,
-    alloc: Alloc<'a>,
+    opts: ResolveOpts<'a>,
+    bump: Bump<'a>,
     then: impl FnOnce(CrateNames<'a>, &Built<'_, 'a>) -> Result<R, CrateScopeError<'a>>,
 ) -> Result<(R, AVec<'a, Question<'a>>), CrateScopeError<'a>> {
+    let alloc = bump.alloc();
     let mut slots: AVec<'a, Option<Dep<'a>>> = AVec::with_capacity_in(deps.len() + 1, alloc);
     let mut by_prefix = HashMap::new_in(alloc);
     let mut graph_crates = AVec::with_capacity_in(deps.len() + 1, alloc);
@@ -1545,13 +1674,99 @@ fn with_names<'a, S: SourceTexts<'a>, P: Par, R>(
     slots.push(None);
     let graph = CrateGraph::new_in(graph_crates, sysroot, alloc).map_err(|e| CrateScopeError::Names(NamesError::Graph(e)))?;
     let id = CrateId(u32::try_from(deps.len()).map_err(|_| CrateScopeError::NoSuchDep { krate: input.name, name: input.name, index: deps.len() })?);
-    let asked = Asked::new_in(alloc);
+    let asked = Asked::new_in(bump);
     let built = Built { crates: &slots, by_prefix: &by_prefix, asked: Some(&asked) };
     // Each handed crate's facts decide what it reaches (`Need`) and the record's reach list.
     for d in slots.iter().flatten() {
         built.ask(|| Question::krate(*d, alloc));
     }
-    let names = resolve_one::<S, P>(&graph, input, id, source, &built, sources, par, First::Prefetch, prepares, kept, alloc).map_err(CrateScopeError::Names)?;
+    let names = resolve_one_with::<S, P>(&graph, input, id, source, &built, sources, par, First::Prefetch, prepares, kept, opts, bump).map_err(CrateScopeError::Names)?;
     let answer = then(names, &built)?;
     Ok((answer, asked.take()))
+}
+
+#[cfg(test)]
+mod skip_inner_tests {
+    use super::*;
+    use crate::task::Serial;
+    use blaze_mem::{Frame, Tag};
+    use blaze_own::Erased;
+    use blaze_unit_graph::{Implicit, Prelude, StdIs};
+
+    struct MapSources<'a>(&'a [(&'a str, &'a str)]);
+
+    impl<'a> SourceTexts<'a> for MapSources<'a> {
+        fn read(&self, _krate: usize, path: &str) -> Option<&'a str> {
+            self.0.iter().find(|(p, _)| *p == path).map(|(_, t)| *t)
+        }
+    }
+
+    #[test]
+    fn skipping_inner_writes_byte_identical_exports_and_empty_inner() {
+        let files: &[(&str, &str)] = &[
+            (
+                "/pkg/src/lib.rs",
+                "#![no_core]\npub mod pub_m;\nmod priv_m;\npub use pub_m::PubType;\npub fn top() { let _ = priv_m::secret(); }\n#[macro_export] macro_rules! exported { () => { pub struct FromMac; }; }\n",
+            ),
+            (
+                "/pkg/src/pub_m.rs",
+                "pub struct PubType;\nstruct HiddenInPub;\npub enum PubEnum { A, B }\n",
+            ),
+            (
+                "/pkg/src/priv_m.rs",
+                "pub(crate) fn secret() -> u32 { { struct InBlock; 1 } }\nstruct PrivateOnly;\n",
+            ),
+        ];
+        let sources = MapSources(files);
+        let input = CrateInput {
+            key: CrateItemKey(ContentId::of("blaze-scope skip_inner test", b"demo")),
+            name: "demo",
+            edition: Edition::E2021,
+            implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false },
+            root: "/pkg/src/lib.rs",
+            shown_from: "/pkg",
+            features: &[],
+            cfg: &[],
+            deps: &[],
+            script: None,
+        };
+        let frame_full = Frame::new(Tag::Nameres).expect("full frame");
+        let erased_full = Erased::new(&frame_full);
+        let bump_full = erased_full.bump();
+        let prepares_full = Prepares::new_in(bump_full);
+        let full = resolve_crate_verified_with(
+            &input,
+            &[],
+            Sysroot::default(),
+            &sources,
+            0,
+            &Serial,
+            prepares_full,
+            ResolveOpts { write_inner: true, ..ResolveOpts::default() },
+            bump_full,
+        )
+        .expect("resolve with inner");
+
+        let frame_skip = Frame::new(Tag::Nameres).expect("skip frame");
+        let erased_skip = Erased::new(&frame_skip);
+        let bump_skip = erased_skip.bump();
+        let prepares_skip = Prepares::new_in(bump_skip);
+        let skipped = resolve_crate_verified_with(
+            &input,
+            &[],
+            Sysroot::default(),
+            &sources,
+            0,
+            &Serial,
+            prepares_skip,
+            ResolveOpts { write_inner: false, ..ResolveOpts::default() },
+            bump_skip,
+        )
+        .expect("resolve without inner");
+
+        assert!(!full.inner.is_empty(), "write_inner = true must populate inner");
+        assert!(skipped.inner.is_empty(), "write_inner = false must skip inner");
+        assert_eq!(&*skipped.record, &*full.record, "exports record must be byte-identical");
+        assert!(skipped.names.tree_record.is_empty(), "dead tree_record must be skipped on default path");
+    }
 }

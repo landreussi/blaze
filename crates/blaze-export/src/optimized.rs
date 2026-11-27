@@ -30,11 +30,11 @@
 //!
 //! # Layout (D100 point 13)
 //!
-//! The order of functions: the profile's hot functions first, in its order (the hot region),
-//! then a depth-first walk from the entry over each record's words and relocations, so a caller
-//! sits just before its first callee, then what is left by symbol: the same rule as
-//! layout.rs. Equal records (equal code, relro part, targets, relocations, words and polls) are
-//! placed once. The loop map, positions, inline frames and read list are a run's and are not
+//! The order of functions uses the exact same 16 KB Apple Silicon 3-tier BOLT / Ext-TSP / C³
+//! packer as `layout.rs` ([`crate::layout::bolt_order_members`]): Hot, Warm, and Cold tail
+//! tiers with 16 KB-page-aware greedy call-chain merging and deterministic canonical symbol
+//! tie-breaking. Equal records (equal code, relro part, targets, relocations, words and polls)
+//! are placed once. The loop map, positions, inline frames and read list are a run's and are not
 //! read here.
 //!
 //! # Unwinding (D100 point 10)
@@ -53,10 +53,10 @@
 //! records) into this path, and the bytes it writes for them are equal to `export`'s (the test
 //! `optimized_equals_export_for_converted_records`).
 
-use blaze_code::a64::{ADRP, BLR, LDR64, NOP, add_lo12, adrp, bl, expect, ldr_lo12, read32, up, write32};
+use blaze_code::a64::{ADRP, BLR, LDR64, NOP, add_lo12, adrp, bl, expect, ldr_lo12, read32, write32};
 use blaze_code::image::ImageError;
 use blaze_code::place::PlaceError;
-use blaze_code::record::{CodeRecord, CodeView, OWN_CODE, OWN_RELRO, Space, Symbol, Target};
+use blaze_code::record::{CodeRecord, CodeView, OWN_CODE, OWN_RELRO, Space, Symbol, Target, Word};
 use blaze_code::unwind::{self, Row, Unwind};
 use blaze_ids::Hasher;
 use blaze_own::{AVec, Alloc, Vec};
@@ -65,15 +65,15 @@ use blaze_tier::record::{Declare, DeclaredKind, Declares, FormError, RecordView,
 use crate::eh_out::{eh_room_rows, eh_sections_rows};
 use crate::error::ExportError;
 use crate::export::{Exported, Panics};
-use crate::input::{Data, DataPlace, Entry, Panic, Platform, Profile, Tier};
-use crate::layout::{FixTo, Fixup, Import, Laid, Placed, Plan, check_data, find_data, pad_to};
+use crate::input::{Data, Entry, Panic, Platform, Profile, Tier, TlsRuntime};
+use crate::layout::{
+    FixTo, Fixup, Import, Laid, LayoutMember, Placed, Plan, TlsPlan, bolt_order_members, check_data, find_member, lay_out_const_and_data, pad_to,
+    rebase_target, target_home,
+};
 use crate::start::{main_of, start};
 use crate::{elf, macho};
 
 const FOLD_DOMAIN: &str = "blaze-export fold bzcode02 1";
-
-/// As layout.rs: `adrp` reaches ±4 GiB and a chained fixup's target is 36 bits.
-const IMAGE_LIMIT: u64 = 1 << 32;
 
 /// `b`/`bl`: bits 30..26 fixed, bit 31 the link.
 const B_OR_BL: (u32, u32) = (0x7C00_0000, 0x1400_0000);
@@ -111,6 +111,8 @@ pub struct ProgramIn02<'r> {
     pub panic: Panic,
     /// The program's `eh_personality` routine, one of `functions` (as `ProgramIn::personality`).
     pub personality: Option<Symbol>,
+    /// The program's thread-local runtime (`descriptor` and `ender`), as `ProgramIn::tls`.
+    pub tls: Option<TlsRuntime>,
     pub profile: Option<Profile<'r>>,
 }
 
@@ -120,6 +122,93 @@ pub struct Member02<'r> {
     pub symbol: Symbol,
     pub record: RecordView<'r>,
     pub tier: Option<Tier>,
+}
+
+impl LayoutMember for Member02<'_> {
+    fn symbol(&self) -> Symbol {
+        self.symbol
+    }
+    fn code(&self) -> &[u8] {
+        self.record.code()
+    }
+    fn relro(&self) -> &[u8] {
+        self.record.relro()
+    }
+    fn words(&self) -> usize {
+        self.record.words()
+    }
+    fn word(&self, i: usize) -> Word {
+        self.record.word(i)
+    }
+    fn target(&self, i: usize) -> Target {
+        self.record.target(i)
+    }
+    fn traps(&self) -> usize {
+        self.record.traps()
+    }
+    fn is_made_start(&self) -> bool {
+        self.tier.is_none()
+    }
+    fn for_each_direct_call(&self, mut f: impl FnMut(Symbol)) {
+        let r = self.record;
+        for k in 0..r.relocs() {
+            let reloc = r.reloc(k);
+            if reloc.in_relro || in_poll(&r, reloc.at) {
+                continue;
+            }
+            let is_call = match reloc.kind {
+                RelocKind::Branch26 => true,
+                RelocKind::GotPageOff12 => calls(r.code(), reloc.at),
+                _ => false,
+            };
+            if is_call
+                && let Some(t) = named(&r, reloc.target)
+                && t.space == Space::Func
+            {
+                f(t.symbol);
+            }
+        }
+    }
+    fn for_each_code_func_load(&self, mut f: impl FnMut(Symbol)) {
+        let r = self.record;
+        for k in 0..r.relocs() {
+            let reloc = r.reloc(k);
+            if reloc.in_relro || in_poll(&r, reloc.at) {
+                continue;
+            }
+            let is_load = match reloc.kind {
+                RelocKind::GotPageOff12 => !calls(r.code(), reloc.at),
+                RelocKind::Page21 => true,
+                _ => false,
+            };
+            if is_load
+                && let Some(t) = named(&r, reloc.target)
+                && t.space == Space::Func
+            {
+                f(t.symbol);
+            }
+        }
+    }
+    fn for_each_relro_func_ref(&self, mut f: impl FnMut(Symbol)) {
+        let r = self.record;
+        for w in 0..r.words() {
+            let word = r.word(w);
+            if let Some(t) = named(&r, word.target)
+                && t.space == Space::Func
+            {
+                f(t.symbol);
+            }
+        }
+        for k in 0..r.relocs() {
+            let reloc = r.reloc(k);
+            if reloc.kind == RelocKind::Abs64
+                && let Some(t) = named(&r, reloc.target)
+                && t.space == Space::Func
+            {
+                f(t.symbol);
+            }
+        }
+    }
 }
 
 /// `view` (a `bzcode01` record) in the `bzcode02` form, encoded into `out`: rebuilt as a
@@ -147,13 +236,17 @@ pub fn v1_to_v2<'a>(view: CodeView<'_>, by: &dyn Declares, out: &mut AVec<'a, u8
     }
     for k in 0..view.targets() {
         let target = view.target(k);
-        if target.space != Space::Outside {
+        if !target.space.is_outside() {
             continue;
         }
         let Some(name) = view.name(target.symbol) else {
             return Err(FormError::NameMissing { symbol: target.symbol });
         };
-        r.outside(name);
+        if target.space == Space::WeakOutside {
+            r.weak_outside(name);
+        } else {
+            r.outside(name);
+        }
     }
     let mut e = from_v1(r, alloc)?;
     declare(&mut e, by)?;
@@ -163,13 +256,18 @@ pub fn v1_to_v2<'a>(view: CodeView<'_>, by: &dyn Declares, out: &mut AVec<'a, u8
 }
 
 /// The start records' declarer: each fn they name is bound by this export (`main`,
-/// `lang_start`, a start piece), never followed by a walk; they name nothing else in the
-/// program, so any other target is refused by `declare`, by name.
+/// `lang_start`, `ender`, a start piece), and the synthesized TLS descriptor static is declared
+/// as `TlsDescriptor`; they name nothing else in the program, so any other target is refused by
+/// `declare`, by name.
 pub struct StartBound;
 
 impl Declares for StartBound {
     fn declared(&self, t: Target) -> Option<Declare<'_>> {
-        (t.space == Space::Func).then_some(Declare { kind: DeclaredKind::Bound, item: 0, name: &[] })
+        match t.space {
+            Space::Func => Some(Declare { kind: DeclaredKind::Bound, item: 0, name: &[] }),
+            Space::Static => Some(Declare { kind: DeclaredKind::TlsDescriptor, item: 0, name: &[] }),
+            Space::Vtable | Space::Tls | Space::Outside | Space::WeakOutside => None,
+        }
     }
 }
 
@@ -203,6 +301,9 @@ fn rows_of<'a>(members: &[Member02<'_>], alloc: Alloc<'a>) -> AVec<'a, Row> {
 /// Exports `program` for `platform` from its `bzcode02` records: the file's bytes replace `out`'s
 /// contents. The same input gives the same bytes on every machine.
 pub fn export_optimized<'a>(program: &ProgramIn02<'_>, platform: Platform, out: &mut AVec<'a, u8>, alloc: Alloc<'a>) -> Result<Exported, ExportError> {
+    if platform == Platform::Wasm64 {
+        return Err(ExportError::Wasm64RequiresWasmProgram);
+    }
     let has = |symbol: Symbol| program.functions.iter().any(|f| f.symbol == symbol);
     let main = main_of(program.entry);
     if !matches!(program.entry, Entry::Hosted { .. }) && !has(main) {
@@ -213,7 +314,12 @@ pub fn export_optimized<'a>(program: &ProgramIn02<'_>, platform: Platform, out: 
     {
         return Err(ExportError::NoEntry { symbol: lang_start });
     }
-    let start = start(program.entry, platform, alloc)?;
+    if let Some(tls) = program.tls
+        && !has(tls.ender)
+    {
+        return Err(ExportError::TlsEnderNotPlaced { ender: tls.ender });
+    }
+    let start = start(program.entry, program.tls, platform, alloc)?;
     let mut made: AVec<'a, (Symbol, AVec<'a, u8>)> = Vec::with_capacity_in(start.records.len(), alloc);
     for (symbol, view) in start.views() {
         let mut bytes: AVec<'a, u8> = Vec::new_in(alloc);
@@ -228,15 +334,16 @@ pub fn export_optimized<'a>(program: &ProgramIn02<'_>, platform: Platform, out: 
         let record = read(bytes).map_err(|error| ExportError::Record { symbol: *symbol, error })?;
         members.push(Member02 { symbol: *symbol, record, tier: None });
     }
-    let plan = match platform {
-        Platform::MacosArm64 => macho::plan(),
-        Platform::LinuxArm64 => elf::plan(),
+    let (plan, initial_root) = match platform {
+        Platform::MacosArm64 => (macho::plan(), 0u64),
+        Platform::LinuxArm64 => (elf::plan(), elf::TLS_ROOT_OFFSET | blaze_code::tls::ROOT_OWN),
         Platform::Wasm64 => return Err(ExportError::Wasm64RequiresWasmProgram),
     };
+    let tls_plan = program.tls.map(|t| TlsPlan { descriptor: t.descriptor, mod_init_fn: start.tls_init, initial_root });
     let rows = rows_of(&members, alloc);
     let unwinds = unwinds(&members, &rows, alloc)?;
     let room = eh_room_rows(&unwinds, program.personality, platform, alloc)?;
-    let laid = lay_out_records(&members, program.data, start.entry, program.profile, plan, room, alloc)?;
+    let laid = lay_out_records_with_tls(&members, program.data, start.entry, program.profile, plan, room, tls_plan, alloc)?;
     let eh = eh_sections_rows(&laid, &unwinds, program.personality, platform, alloc)?;
     let panics = match program.panic {
         Panic::Unwind => Panics::Unwind { functions: eh.functions },
@@ -277,11 +384,6 @@ pub fn export_optimized<'a>(program: &ProgramIn02<'_>, platform: Platform, out: 
     })
 }
 
-/// Finds `symbol` in `members` through `by_symbol` (member indices sorted by symbol).
-fn find(members: &[Member02<'_>], by_symbol: &[u32], symbol: Symbol) -> Option<usize> {
-    by_symbol.binary_search_by(|&i| members[i as usize].symbol.cmp(&symbol)).ok().map(|k| by_symbol[k] as usize)
-}
-
 /// The function a word or relocation names, if it names one: not the record's own code or relro.
 fn named(r: &RecordView<'_>, target: u32) -> Option<Target> {
     match target {
@@ -302,56 +404,6 @@ fn in_poll(r: &RecordView<'_>, at: u32) -> bool {
         }
     }
     lo > 0 && at < r.poll(lo - 1).at + 8
-}
-
-/// The placement order: profile first, then a depth-first walk from the entry, then the rest by
-/// symbol. A work list, no recursion.
-fn order<'a>(members: &[Member02<'_>], by_symbol: &[u32], entry: usize, profile: Option<Profile<'_>>, alloc: Alloc<'a>) -> AVec<'a, u32> {
-    let n = members.len();
-    let mut placed: AVec<'_, bool> = Vec::from_elem_in(false, n, alloc);
-    let mut walked: AVec<'_, bool> = Vec::from_elem_in(false, n, alloc);
-    let mut order: AVec<'a, u32> = Vec::with_capacity_in(n, alloc);
-    let hot = profile.map_or(&[][..], |p| p.hot);
-    for &symbol in hot {
-        if let Some(i) = find(members, by_symbol, symbol)
-            && !placed[i]
-        {
-            placed[i] = true;
-            order.push(i as u32);
-        }
-    }
-    let mut stack: AVec<'_, u32> = Vec::new_in(alloc);
-    let from_profile = hot.iter().filter_map(|&symbol| find(members, by_symbol, symbol));
-    let roots = core::iter::once(entry).chain(from_profile).chain(by_symbol.iter().map(|&i| i as usize));
-    for root in roots {
-        stack.push(root as u32);
-        while let Some(i) = stack.pop() {
-            let i = i as usize;
-            if walked[i] {
-                continue;
-            }
-            walked[i] = true;
-            if !placed[i] {
-                placed[i] = true;
-                order.push(i as u32);
-            }
-            let r = members[i].record;
-            // Words first, so they pop after the relocations; relocations in reverse, so the
-            // first call in the code is walked first.
-            let words = (0..r.words()).rev().map(|w| r.word(w).target);
-            let relocs = (0..r.relocs()).rev().filter(|&k| !in_poll(&r, r.reloc(k).at) || r.reloc(k).in_relro).map(|k| r.reloc(k).target);
-            for target in words.chain(relocs) {
-                if let Some(t) = named(&r, target)
-                    && t.space == Space::Func
-                    && let Some(j) = find(members, by_symbol, t.symbol)
-                    && !walked[j]
-                {
-                    stack.push(j as u32);
-                }
-            }
-        }
-    }
-    order
 }
 
 /// Whether two records lay out to the same bytes wherever they are placed.
@@ -397,6 +449,7 @@ fn branch(inst: u32, pc: u64, to: u64, symbol: Symbol) -> Result<u32, ExportErro
 /// and the start's), in any order; `entry` is the one the loader enters; `tail` bytes are kept
 /// after the code (the stubs included) for the unwind tables (eh_out.rs `eh_room_rows`), as
 /// layout.rs's `lay_out` keeps them.
+#[allow(clippy::too_many_arguments)]
 pub fn lay_out_records<'a, 'r>(
     members: &[Member02<'r>],
     data: &[Data<'r>],
@@ -404,6 +457,21 @@ pub fn lay_out_records<'a, 'r>(
     profile: Option<Profile<'_>>,
     plan: Plan,
     tail: u64,
+    alloc: Alloc<'a>,
+) -> Result<Laid<'a, 'r>, ExportError> {
+    lay_out_records_with_tls(members, data, entry, profile, plan, tail, None, alloc)
+}
+
+/// [`lay_out_records`] with an optional Rust thread-local runtime plan ([`TlsPlan`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lay_out_records_with_tls<'a, 'r>(
+    members: &[Member02<'r>],
+    data: &[Data<'r>],
+    entry: Symbol,
+    profile: Option<Profile<'_>>,
+    plan: Plan,
+    tail: u64,
+    tls_plan: Option<TlsPlan>,
     alloc: Alloc<'a>,
 ) -> Result<Laid<'a, 'r>, ExportError> {
     let n = members.len();
@@ -418,11 +486,11 @@ pub fn lay_out_records<'a, 'r>(
             return Err(ExportError::TwoRecords { symbol: members[pair[0] as usize].symbol });
         }
     }
-    let by_target = check_data(data, page, alloc)?;
-    let Some(entry_member) = find(members, &by_symbol, entry) else {
+    let by_target = check_data(data, tls_plan.map(|t| t.descriptor), page, alloc)?;
+    let Some(entry_member) = find_member(members, &by_symbol, entry) else {
         return Err(ExportError::NoEntry { symbol: entry });
     };
-    let order = order(members, &by_symbol, entry_member, profile, alloc);
+    let order = bolt_order_members(members, &by_symbol, entry_member, profile, page, alloc);
 
     // Folding: each position's representative is the first position with an equal record.
     let mut digests: AVec<'_, ([u8; 32], u32)> = Vec::with_capacity_in(n, alloc);
@@ -467,7 +535,7 @@ pub fn lay_out_records<'a, 'r>(
     }
 
     // Every target a placed record USES (a poll's page is not used: see the module's
-    // documentation): thread-locals refused, C names gathered.
+    // documentation): C names gathered, thread-locals checked for runtime and datum.
     let mut imports: AVec<'a, Import<'r>> = Vec::new_in(alloc);
     for (pos, &i) in order.iter().enumerate() {
         if rep[pos] as usize != pos {
@@ -480,19 +548,46 @@ pub fn lay_out_records<'a, 'r>(
         for target in words.chain(relocs) {
             let Some(t) = named(&r, target) else { continue };
             match t.space {
-                Space::Tls => return Err(ExportError::ThreadLocal { from: m.symbol }),
-                Space::Outside => {
+                Space::Tls => {
+                    if tls_plan.is_none() {
+                        return Err(ExportError::NoTlsRuntime { target: t });
+                    }
+                    let found = by_target
+                        .binary_search_by(|&idx| {
+                            usize::try_from(idx)
+                                .ok()
+                                .and_then(|u| data.get(u))
+                                .map_or(core::cmp::Ordering::Greater, |d| d.target.cmp(&t))
+                        })
+                        .is_ok();
+                    if !found {
+                        return Err(ExportError::OutOfReach { from: m.symbol, target: t });
+                    }
+                }
+                Space::Outside | Space::WeakOutside => {
                     let Some(name) = r.name(t.symbol) else {
                         return Err(ExportError::OutsideNameMissing { from: m.symbol, target: t });
                     };
-                    imports.push(Import { symbol: t.symbol, name });
+                    imports.push(Import { symbol: t.symbol, name, weak: t.space == Space::WeakOutside });
                 }
                 Space::Func | Space::Static | Space::Vtable => {}
             }
         }
     }
-    imports.sort_unstable_by(|a, b| a.symbol.cmp(&b.symbol));
-    imports.dedup_by(|a, b| a.symbol == b.symbol);
+    for &d in by_target.iter() {
+        let Some(datum) = data.get(usize::try_from(d).unwrap_or(usize::MAX)) else {
+            continue;
+        };
+        for w in datum.words {
+            if let Some(t) = w.target
+                && t.space.is_outside()
+                && let Some(&(_, name)) = datum.outside.iter().find(|&&(sym, _)| sym == t.symbol)
+            {
+                imports.push(Import { symbol: t.symbol, name, weak: t.space == Space::WeakOutside });
+            }
+        }
+    }
+    crate::layout::dedup_imports(&mut imports);
     let import_of = |symbol: Symbol| imports.binary_search_by(|it| it.symbol.cmp(&symbol)).ok();
 
     // The stubs: one per C name some `b`/`bl` reaches, after the code, in import order.
@@ -508,7 +603,7 @@ pub fn lay_out_records<'a, 'r>(
                 continue;
             }
             if let Some(t) = named(&r, reloc.target)
-                && t.space == Space::Outside
+                && t.space.is_outside()
                 && let Some(index) = import_of(t.symbol)
             {
                 stub_at[index] = 0;
@@ -527,69 +622,8 @@ pub fn lay_out_records<'a, 'r>(
     }
     let text_end = plan.text_at + text.len() as u64;
 
-    // The const region: the writer's head, the GOT, relro parts, read-only data.
-    let const_at = up(text_end + tail, page);
-    let mut konst: AVec<'a, u8> = Vec::new_in(alloc);
-    konst.resize(plan.const_head as usize, 0);
-    pad_to(&mut konst, const_at, 8);
-    let got_at = const_at + konst.len() as u64;
-    konst.resize(konst.len() + 8 * imports.len(), 0);
-    let mut relro_at: AVec<'_, u64> = Vec::from_elem_in(0, n, alloc);
-    for (pos, &i) in order.iter().enumerate() {
-        let r = rep[pos] as usize;
-        if r != pos {
-            relro_at[i as usize] = relro_at[order[r] as usize];
-            continue;
-        }
-        let relro = members[i as usize].record.relro();
-        if relro.is_empty() {
-            continue;
-        }
-        pad_to(&mut konst, const_at, 16);
-        relro_at[i as usize] = const_at + konst.len() as u64;
-        konst.extend_from_slice(relro);
-    }
-    let mut data_home: AVec<'_, u64> = Vec::from_elem_in(0, data.len(), alloc);
-    for &d in by_target.iter() {
-        let datum = &data[d as usize];
-        if datum.place == DataPlace::ReadOnly {
-            pad_to(&mut konst, const_at, u64::from(datum.align));
-            data_home[d as usize] = const_at + konst.len() as u64;
-            konst.extend_from_slice(datum.bytes);
-        }
-    }
-    // The data region: writable data, then zeroed data with no file bytes.
-    let data_at = up(const_at + konst.len() as u64, page);
-    let mut bytes: AVec<'a, u8> = Vec::new_in(alloc);
-    for &d in by_target.iter() {
-        let datum = &data[d as usize];
-        if datum.place == DataPlace::Writable {
-            pad_to(&mut bytes, data_at, u64::from(datum.align));
-            data_home[d as usize] = data_at + bytes.len() as u64;
-            bytes.extend_from_slice(datum.bytes);
-        }
-    }
-    let zero_at = up(data_at + bytes.len() as u64, 16);
-    let mut zero_end = zero_at;
-    for &d in by_target.iter() {
-        let datum = &data[d as usize];
-        if let DataPlace::Zeroed { len } = datum.place {
-            zero_end = up(zero_end, u64::from(datum.align));
-            data_home[d as usize] = zero_end;
-            zero_end += len;
-        }
-    }
-    let end = up(zero_end, page);
-    if end > IMAGE_LIMIT {
-        return Err(ExportError::TooLarge { what: "adrp's 4 GiB and a chained fixup's 36-bit target", len: end });
-    }
-    let home_of = |t: Target| -> Option<u64> {
-        match t.space {
-            Space::Func => find(members, &by_symbol, t.symbol).map(|i| home[i]),
-            Space::Static | Space::Vtable => find_data(data, &by_target, t).map(|d| data_home[d]),
-            Space::Tls | Space::Outside => None,
-        }
-    };
+    let mut regions = lay_out_const_and_data(members, &order, &rep, data, &by_target, imports.len(), tls_plan, text_end, plan, tail, alloc)?;
+    let got_at = regions.got_at;
     let word_of = |symbol: Symbol| -> u64 {
         match import_of(symbol) {
             Some(index) => got_at + 8 * index as u64,
@@ -603,7 +637,7 @@ pub fn lay_out_records<'a, 'r>(
         if at == NO_STUB {
             continue;
         }
-        let word = got_at + 8 * k as u64;
+        let word = regions.got_at + 8 * k as u64;
         let x = at - plan.text_at;
         let stub = imports[k].symbol;
         write32(&mut text, x, adrp(STUB_ADRP_X16, at, word, stub)?);
@@ -614,15 +648,8 @@ pub fn lay_out_records<'a, 'r>(
     // record, then the data's; sorted by offset at the end.
     let mut fixups: AVec<'a, Fixup> = Vec::new_in(alloc);
     for k in 0..imports.len() {
-        fixups.push(Fixup { at: got_at + 8 * k as u64, to: FixTo::Bind { import: k as u32 } });
+        fixups.push(Fixup { at: regions.got_at + 8 * k as u64, to: FixTo::Bind { import: k as u32 } });
     }
-    let rebase = |from: Symbol, at: u64, target: i64| -> Result<FixTo, ExportError> {
-        // `<=`: a pointer one past a region's last byte (a slice's end) is an address too.
-        match target >= 0 && (target as u64) <= end {
-            true => Ok(FixTo::Rebase { target: target as u64 }),
-            false => Err(ExportError::WordOutside { from, at }),
-        }
-    };
 
     // Complete every placed record's relocations and polls.
     for (pos, &i) in order.iter().enumerate() {
@@ -632,21 +659,23 @@ pub fn lay_out_records<'a, 'r>(
         let m = &members[i as usize];
         let (r, symbol) = (m.record, m.symbol);
         let at_home = home[i as usize];
-        let own_relro = relro_at[i as usize];
+        let own_relro = regions.relro_at[i as usize];
         // The address an address relocation names, its addend added.
-        let address = |reloc: Reloc| -> Result<u64, ExportError> {
+        let address = |reloc: Reloc, regions: &crate::layout::ConstAndData<'_>| -> Result<u64, ExportError> {
             let base = match reloc.target {
                 OWN_CODE => at_home,
                 OWN_RELRO => own_relro,
                 index => {
                     let t = r.target(index as usize);
                     match t.space {
-                        Space::Tls => return Err(ExportError::ThreadLocal { from: symbol }),
-                        Space::Outside => return Err(ExportError::AddressOfOutside { from: symbol, target: t, at: reloc.at }),
-                        Space::Func | Space::Static | Space::Vtable => match home_of(t) {
-                            Some(to) => to,
-                            None => return Err(ExportError::OutOfReach { from: symbol, target: t }),
-                        },
+                        Space::Tls => return Err(ExportError::TlsAddress { from: symbol, at: reloc.at }),
+                        Space::Outside | Space::WeakOutside => return Err(ExportError::AddressOfOutside { from: symbol, target: t, at: reloc.at }),
+                        Space::Func | Space::Static | Space::Vtable => {
+                            match target_home(members, &by_symbol, &home, data, &by_target, &regions.data_home, regions.tls_desc, t) {
+                                Some(to) => to,
+                                None => return Err(ExportError::OutOfReach { from: symbol, target: t }),
+                            }
+                        }
                     }
                 }
             };
@@ -656,14 +685,26 @@ pub fn lay_out_records<'a, 'r>(
             let reloc = r.reloc(k);
             if reloc.kind == RelocKind::Abs64 {
                 let at = own_relro + u64::from(reloc.at);
-                let to = match named(&r, reloc.target) {
-                    Some(t) if t.space == Space::Outside => match import_of(t.symbol) {
-                        Some(import) => FixTo::Bind { import: import as u32 },
-                        None => unreachable!("every outside target a placed record uses was gathered above"),
-                    },
-                    _ => rebase(symbol, at, address(reloc)? as i64)?,
-                };
-                fixups.push(Fixup { at, to });
+                match named(&r, reloc.target) {
+                    Some(t) if t.space == Space::Tls => {
+                        let Some(index) = regions.tls_index_of(t.symbol) else {
+                            return Err(ExportError::OutOfReach { from: symbol, target: t });
+                        };
+                        let value = u64::from(index).wrapping_add_signed(reloc.addend);
+                        regions.write_const_word(symbol, at, value)?;
+                    }
+                    Some(t) if t.space.is_outside() => {
+                        let to = match import_of(t.symbol) {
+                            Some(import) => FixTo::Bind { import: import as u32 },
+                            None => unreachable!("every outside target a placed record uses was gathered above"),
+                        };
+                        fixups.push(Fixup { at, to });
+                    }
+                    _ => {
+                        let to = rebase_target(symbol, at, address(reloc, &regions)? as i64, regions.end)?;
+                        fixups.push(Fixup { at, to });
+                    }
+                }
                 continue;
             }
             if in_poll(&r, reloc.at) {
@@ -676,27 +717,26 @@ pub fn lay_out_records<'a, 'r>(
                     let inst = expect(&text, x, B_OR_BL, symbol, "b or bl")?;
                     let to = match named(&r, reloc.target) {
                         None if reloc.target == OWN_RELRO => return Err(ExportError::CallOfData { from: symbol, at: reloc.at }),
-                        None => address(reloc)?,
+                        None => address(reloc, &regions)?,
                         Some(t) => match t.space {
-                            Space::Func => address(reloc)?,
-                            Space::Outside => match import_of(t.symbol) {
+                            Space::Func => address(reloc, &regions)?,
+                            Space::Outside | Space::WeakOutside => match import_of(t.symbol) {
                                 Some(index) if stub_at[index] != NO_STUB => stub_at[index],
                                 _ => unreachable!("every outside target a b/bl reaches was given a stub above"),
                             },
-                            Space::Static | Space::Vtable => return Err(ExportError::CallOfData { from: symbol, at: reloc.at }),
-                            Space::Tls => return Err(ExportError::ThreadLocal { from: symbol }),
+                            Space::Static | Space::Vtable | Space::Tls => return Err(ExportError::CallOfData { from: symbol, at: reloc.at }),
                         },
                     };
                     write32(&mut text, x, branch(inst, pc, to, symbol)?);
                 }
                 RelocKind::Page21 => {
                     let inst = expect(&text, x, ADRP, symbol, "adrp")?;
-                    let to = address(reloc)?;
+                    let to = address(reloc, &regions)?;
                     write32(&mut text, x, adrp(inst, pc, to, symbol)?);
                 }
                 RelocKind::PageOff12 { scale } => {
                     let inst = read32(&text, x);
-                    let to = address(reloc)?;
+                    let to = address(reloc, &regions)?;
                     write32(&mut text, x, page_offset(inst, scale, to, u64::from(reloc.at), symbol).map_err(ExportError::Place)?);
                 }
                 RelocKind::GotPage21 => {
@@ -704,19 +744,30 @@ pub fn lay_out_records<'a, 'r>(
                     // The seal refused an import-word kind on the record's own code or relro.
                     let t = r.target(reloc.target as usize);
                     let to = match t.space {
-                        Space::Outside => word_of(t.symbol),
-                        Space::Tls => return Err(ExportError::ThreadLocal { from: symbol }),
-                        Space::Func if call_triple(&r, k) => {
-                            if home_of(t).is_none() {
+                        Space::Outside | Space::WeakOutside => word_of(t.symbol),
+                        Space::Tls => {
+                            let Some(index) = regions.tls_index_of(t.symbol) else {
                                 return Err(ExportError::OutOfReach { from: symbol, target: t });
+                            };
+                            regions.tls_indices_at + 8 * u64::from(index)
+                        }
+                        Space::Func if call_triple(&r, k) => {
+                            let Some(to) = target_home(members, &by_symbol, &home, data, &by_target, &regions.data_home, regions.tls_desc, t) else {
+                                return Err(ExportError::OutOfReach { from: symbol, target: t });
+                            };
+                            if bl(pc + 8, to, symbol).is_ok() {
+                                write32(&mut text, x, NOP);
+                            } else {
+                                write32(&mut text, x, adrp(inst, pc, to, symbol)?);
                             }
-                            write32(&mut text, x, NOP);
                             continue;
                         }
-                        Space::Func | Space::Static | Space::Vtable => match home_of(t) {
-                            Some(to) => to,
-                            None => return Err(ExportError::OutOfReach { from: symbol, target: t }),
-                        },
+                        Space::Func | Space::Static | Space::Vtable => {
+                            match target_home(members, &by_symbol, &home, data, &by_target, &regions.data_home, regions.tls_desc, t) {
+                                Some(to) => to,
+                                None => return Err(ExportError::OutOfReach { from: symbol, target: t }),
+                            }
+                        }
                     };
                     write32(&mut text, x, adrp(inst, pc, to, symbol)?);
                 }
@@ -725,17 +776,32 @@ pub fn lay_out_records<'a, 'r>(
                     let t = r.target(reloc.target as usize);
                     let call = calls(r.code(), reloc.at);
                     match t.space {
-                        Space::Outside => write32(&mut text, x, ldr_lo12(inst, word_of(t.symbol))),
-                        Space::Tls => return Err(ExportError::ThreadLocal { from: symbol }),
+                        Space::Outside | Space::WeakOutside => write32(&mut text, x, ldr_lo12(inst, word_of(t.symbol))),
+                        Space::Tls => {
+                            if call {
+                                return Err(ExportError::CallOfData { from: symbol, at: reloc.at });
+                            }
+                            let Some(index) = regions.tls_index_of(t.symbol) else {
+                                return Err(ExportError::OutOfReach { from: symbol, target: t });
+                            };
+                            let word = regions.tls_indices_at + 8 * u64::from(index);
+                            write32(&mut text, x, ldr_lo12(inst, word));
+                        }
                         Space::Func | Space::Static | Space::Vtable => {
-                            let Some(to) = home_of(t) else {
+                            let Some(to) = target_home(members, &by_symbol, &home, data, &by_target, &regions.data_home, regions.tls_desc, t) else {
                                 return Err(ExportError::OutOfReach { from: symbol, target: t });
                             };
                             match (call, t.space) {
                                 (true, Space::Func) => {
                                     expect(&text, x + 4, BLR, symbol, "blr")?;
-                                    write32(&mut text, x, NOP);
-                                    write32(&mut text, x + 4, bl(pc + 4, to, symbol)?);
+                                    if let Ok(branch) = bl(pc + 4, to, symbol) {
+                                        write32(&mut text, x, NOP);
+                                        write32(&mut text, x + 4, branch);
+                                    } else {
+                                        // Target is past `bl`'s ±128 MiB reach; `GotPage21` kept
+                                        // `adrp`, so convert `ldr` to `add_lo12` and keep `blr`.
+                                        write32(&mut text, x, add_lo12(inst, to));
+                                    }
                                 }
                                 (true, _) => return Err(ExportError::CallOfData { from: symbol, at: reloc.at }),
                                 (false, _) => write32(&mut text, x, add_lo12(inst, to)),
@@ -762,77 +828,5 @@ pub fn lay_out_records<'a, 'r>(
         }
     }
 
-    for (pos, &i) in order.iter().enumerate() {
-        if rep[pos] as usize != pos {
-            continue;
-        }
-        let m = &members[i as usize];
-        let r = m.record;
-        for w in 0..r.words() {
-            let word = r.word(w);
-            let at = relro_at[i as usize] + u64::from(word.at);
-            let to = match word.target {
-                OWN_CODE => rebase(m.symbol, at, home[i as usize] as i64 + word.addend)?,
-                OWN_RELRO => rebase(m.symbol, at, relro_at[i as usize] as i64 + word.addend)?,
-                index => {
-                    let t = r.target(index as usize);
-                    match t.space {
-                        Space::Tls => return Err(ExportError::ThreadLocal { from: m.symbol }),
-                        Space::Outside if word.addend != 0 => return Err(ExportError::OutsideAddend { from: m.symbol, target: t }),
-                        Space::Outside => match import_of(t.symbol) {
-                            Some(import) => FixTo::Bind { import: import as u32 },
-                            None => unreachable!("every outside target a placed record uses was gathered above"),
-                        },
-                        Space::Func | Space::Static | Space::Vtable => match home_of(t) {
-                            Some(to) => rebase(m.symbol, at, to as i64 + word.addend)?,
-                            None => return Err(ExportError::OutOfReach { from: m.symbol, target: t }),
-                        },
-                    }
-                }
-            };
-            fixups.push(Fixup { at, to });
-        }
-    }
-    for &d in by_target.iter() {
-        let datum = &data[d as usize];
-        let base = data_home[d as usize];
-        for w in datum.words {
-            let at = base + u64::from(w.at);
-            let to = match w.target {
-                None => rebase(datum.target.symbol, at, base as i64 + w.addend)?,
-                Some(t) => match (t.space, import_of(t.symbol)) {
-                    (Space::Outside, Some(import)) if w.addend == 0 => FixTo::Bind { import: import as u32 },
-                    (Space::Func | Space::Static | Space::Vtable, _) => match home_of(t) {
-                        Some(to) => rebase(datum.target.symbol, at, to as i64 + w.addend)?,
-                        None => return Err(ExportError::DataOutOfReach { from: datum.target, target: t }),
-                    },
-                    _ => return Err(ExportError::DataOutOfReach { from: datum.target, target: t }),
-                },
-            };
-            fixups.push(Fixup { at, to });
-        }
-    }
-    fixups.sort_unstable_by_key(|f| f.at);
-
-    let entry_at = home[entry_member];
-    drop(rep);
-    drop(relro_at);
-    Ok(Laid {
-        page,
-        text_at: plan.text_at,
-        text,
-        const_at,
-        konst,
-        got_at,
-        data_at,
-        data: bytes,
-        zero_at,
-        zero_len: zero_end - zero_at,
-        end,
-        imports,
-        fixups,
-        entry: entry_at,
-        placed,
-        tables_room: tail,
-    })
+    regions.finish(members, &by_symbol, &order, &rep, &home, data, &by_target, entry_member, plan, tail, text, imports, fixups, placed)
 }

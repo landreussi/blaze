@@ -36,8 +36,8 @@
 use blaze_own::Vec;
 use core::alloc::Allocator;
 
-use crate::bits::{self, Bits};
-use crate::flow::{Bound, Flow, Local, Operand, Place, Stmt, StmtKind, Value};
+use crate::bits::{self, BlockBits};
+use crate::flow::{Block, Bound, Flow, Local, Operand, Place, Stmt, StmtKind, Value};
 use crate::moves::{Inits, for_each_operand, inits};
 use crate::record::Plant;
 
@@ -68,18 +68,38 @@ pub(crate) enum SavedPlant {
     NoBorrows,
 }
 
+/// Maximum number of saved locals for which [`saved_plan`] builds a quadratic storage-conflict
+/// bit matrix (4096 locals -> 2 MiB max); larger bodies fall back to empty conflicts (no overlap).
+const MAX_CONFLICT_LOCALS: usize = 4096;
+
+/// Saved locals together with their pairwise storage-conflict bit matrix (row `i`, bit `j` set
+/// iff saved locals `locals[i]` and `locals[j]` may be storage-live simultaneously at some point
+/// in the flow). An empty `conflicts` slice when `locals` is non-empty means the body exceeded
+/// [`MAX_CONFLICT_LOCALS`] and callers must not overlap its saved locals.
+pub struct SavedPlan<A: Allocator> {
+    pub saved: Saved<A>,
+    pub locals: Vec<Local, A>,
+    pub conflicts: Vec<u64, A>,
+}
+
 /// The saved locals of `flow`, the union over its `Suspend` statements.
-pub fn saved<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Result<Saved<A>, Bound> {
-    saved_with(flow, true, alloc)
+pub fn saved<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<Saved<A>, Bound> {
+    saved_with(flow, true, false, alloc).map(|p| p.saved)
+}
+
+/// The saved locals of `flow` plus their pairwise storage-conflict matrix for overlapping
+/// coroutine state layout.
+pub fn saved_plan<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<SavedPlan<A>, Bound> {
+    saved_with(flow, true, true, alloc)
 }
 
 #[cfg(test)]
-pub(crate) fn saved_planted<A: Allocator + Clone>(
+pub(crate) fn saved_planted<A: Allocator + Copy>(
     flow: &Flow<A>,
     plant: SavedPlant,
     alloc: A,
 ) -> Result<Saved<A>, Bound> {
-    saved_with(flow, plant != SavedPlant::NoBorrows, alloc)
+    saved_with(flow, plant != SavedPlant::NoBorrows, false, alloc).map(|p| p.saved)
 }
 
 fn zeroed<A: Allocator>(words: usize, alloc: A) -> Vec<u64, A> {
@@ -88,38 +108,44 @@ fn zeroed<A: Allocator>(words: usize, alloc: A) -> Vec<u64, A> {
     v
 }
 
-fn saved_with<A: Allocator + Clone>(flow: &Flow<A>, borrows: bool, alloc: A) -> Result<Saved<A>, Bound> {
-    let locals = flow.locals as usize;
+fn saved_with<A: Allocator + Copy>(flow: &Flow<A>, borrows: bool, want_conflicts: bool, alloc: A) -> Result<SavedPlan<A>, Bound> {
+    let locals = usize::try_from(flow.locals).unwrap_or(usize::MAX);
     let words = locals.div_ceil(64);
-    let mut out = zeroed(words, alloc.clone());
+    let mut out = zeroed(words, alloc);
     let suspends =
-        flow.stmts.iter().filter(|row| matches!(row.kind, StmtKind::Suspend { .. })).count() as u32;
+        u32::try_from(flow.stmts.iter().filter(|row| matches!(row.kind, StmtKind::Suspend { .. })).count()).unwrap_or(u32::MAX);
     if suspends == 0 {
-        return Ok(Saved { bits: out, suspends });
+        return Ok(SavedPlan {
+            saved: Saved { bits: out, suspends },
+            locals: Vec::new_in(alloc),
+            conflicts: Vec::new_in(alloc),
+        });
     }
-    let limit = flow.blocks.len() as u64 * locals as u64 + 1;
+    let blocks_u64 = u64::try_from(flow.blocks.len()).unwrap_or(u64::MAX);
+    let limit = blocks_u64.saturating_mul(u64::from(flow.locals)).saturating_add(1);
 
     // Maybe storage-live on entry: the arguments, and every local no storage statement names.
-    let mut named = zeroed(words, alloc.clone());
+    let mut named = zeroed(words, alloc);
     for row in flow.stmts.iter() {
         if let StmtKind::StorageLive(l) | StmtKind::StorageDead(l) = row.kind {
             bits::put(&mut named, l.index(), true);
         }
     }
-    let mut entry = zeroed(words, alloc.clone());
+    let mut entry = zeroed(words, alloc);
+    let args = usize::try_from(flow.args).unwrap_or(usize::MAX);
     for l in 1..locals {
-        if l <= flow.args as usize || !bits::test(&named, l) {
+        if l <= args || !bits::test(&named, l) {
             bits::put(&mut entry, l, true);
         }
     }
-    let storage = forward(flow, &entry, storage_step, limit, "maybe storage-live passes", alloc.clone())?;
-    let none = zeroed(words, alloc.clone());
-    let borrowed = forward(flow, &none, borrow_step, limit, "maybe borrowed passes", alloc.clone())?;
-    let init = inits(flow, Plant::None, alloc.clone())?;
-    let live = live_by_use(flow, &init, limit, alloc.clone())?;
+    let storage = forward(flow, &entry, storage_step, limit, "maybe storage-live passes", alloc)?;
+    let none = zeroed(words, alloc);
+    let borrowed = forward(flow, &none, borrow_step, limit, "maybe borrowed passes", alloc)?;
+    let init = inits(flow, Plant::None, alloc)?;
+    let live = live_by_use(flow, &init, limit, alloc)?;
 
-    let mut st = zeroed(words, alloc.clone());
-    let mut bo = zeroed(words, alloc.clone());
+    let mut st = zeroed(words, alloc);
+    let mut bo = zeroed(words, alloc);
     let mut keep = zeroed(words, alloc);
     for (s, row) in flow.stmts.iter().enumerate() {
         let StmtKind::Suspend { resume, cancel } = row.kind else {
@@ -127,16 +153,17 @@ fn saved_with<A: Allocator + Clone>(flow: &Flow<A>, borrows: bool, alloc: A) -> 
         };
         // A `Suspend` is its block's terminator: the statements before it in the block are
         // `range.start..s`.
-        let b = flow.stmt_block[s].index();
-        let range = flow.blocks[b];
+        let b = flow.stmt_block[s];
+        let range = flow.blocks[b.index()];
         st.copy_from_slice(storage.row(b));
         bo.copy_from_slice(borrowed.row(b));
-        for t in range.start..s as u32 {
+        let s_u32 = u32::try_from(s).unwrap_or(u32::MAX);
+        for t in range.start..s_u32 {
             storage_step(flow, Stmt(t), &mut st);
             borrow_step(flow, Stmt(t), &mut bo);
         }
-        keep.copy_from_slice(live.row(resume.index()));
-        bits::union_into(&mut keep, live.row(cancel.index()));
+        keep.copy_from_slice(live.row(resume));
+        bits::union_into(&mut keep, live.row(cancel));
         if borrows {
             bits::union_into(&mut keep, &bo);
         }
@@ -146,7 +173,125 @@ fn saved_with<A: Allocator + Clone>(flow: &Flow<A>, borrows: bool, alloc: A) -> 
     if locals > 0 {
         bits::put(&mut out, 0, false);
     }
-    Ok(Saved { bits: out, suspends })
+    let saved = Saved { bits: out, suspends };
+    if !want_conflicts {
+        return Ok(SavedPlan { saved, locals: Vec::new_in(alloc), conflicts: Vec::new_in(alloc) });
+    }
+    let mut saved_locals = Vec::new_in(alloc);
+    for l in (flow.args + 1)..flow.locals {
+        let local = Local(l);
+        if saved.is_saved(local) {
+            saved_locals.push(local);
+        }
+    }
+    let conflicts = compute_conflicts(flow, &storage, &saved_locals, alloc);
+    Ok(SavedPlan { saved, locals: saved_locals, conflicts })
+}
+
+fn each_bit(words: &[u64], mut f: impl FnMut(usize)) {
+    for (w, &word) in words.iter().enumerate() {
+        let mut rest = word;
+        while rest != 0 {
+            f(w * 64 + rest.trailing_zeros() as usize);
+            rest &= rest - 1;
+        }
+    }
+}
+
+/// Pairwise storage-conflict bit matrix over `saved_locals`: row `i` holds bit `j` when some
+/// point of `flow` has both `saved_locals[i]` and `saved_locals[j]` maybe storage-live (or
+/// accesses one while the other is storage-live).
+fn compute_conflicts<A: Allocator + Copy>(
+    flow: &Flow<A>,
+    storage: &BlockBits<A>,
+    saved_locals: &[Local],
+    alloc: A,
+) -> Vec<u64, A> {
+    let n = saved_locals.len();
+    if n == 0 || n > MAX_CONFLICT_LOCALS {
+        return Vec::new_in(alloc);
+    }
+    let locals = usize::try_from(flow.locals).unwrap_or(usize::MAX);
+    let mut ordinal: Vec<u32, A> = Vec::with_capacity_in(locals, alloc);
+    ordinal.resize(locals, u32::MAX);
+    for (i, &local) in saved_locals.iter().enumerate() {
+        if local.index() < locals {
+            ordinal[local.index()] = i as u32;
+        }
+    }
+    let rw = n.div_ceil(64);
+    let mut matrix = zeroed(n * rw, alloc);
+    let mut cur = zeroed(rw, alloc);
+    let mark_live = |local: Local, ordinal: &[u32], cur: &mut [u64], matrix: &mut [u64]| {
+        let ord = ordinal.get(local.index()).copied().unwrap_or(u32::MAX);
+        if ord == u32::MAX {
+            return;
+        }
+        let i = ord as usize;
+        let (word, bit) = (i / 64, 1u64 << (i % 64));
+        if cur[word] & bit != 0 {
+            return;
+        }
+        cur[word] |= bit;
+        let row = i * rw;
+        for w in 0..rw {
+            matrix[row + w] |= cur[w];
+        }
+        each_bit(cur, |j| matrix[j * rw + word] |= bit);
+    };
+    for b in 0..flow.blocks.len() {
+        cur.fill(0);
+        let blk = Block(b as u32);
+        let st_row = storage.row(blk);
+        for (i, &local) in saved_locals.iter().enumerate() {
+            if bits::test(st_row, local.index()) {
+                cur[i / 64] |= 1u64 << (i % 64);
+            }
+        }
+        each_bit(&cur, |i| {
+            let row = i * rw;
+            for w in 0..rw {
+                matrix[row + w] |= cur[w];
+            }
+        });
+        let range = flow.blocks[b];
+        for s in range.start..range.end {
+            match flow.stmt(Stmt(s)).kind {
+                StmtKind::StorageLive(l) => mark_live(l, &ordinal, &mut cur, &mut matrix),
+                StmtKind::StorageDead(l) => {
+                    let ord = ordinal.get(l.index()).copied().unwrap_or(u32::MAX);
+                    if ord != u32::MAX {
+                        let i = ord as usize;
+                        cur[i / 64] &= !(1u64 << (i % 64));
+                    }
+                }
+                StmtKind::Assign { dest, value } => {
+                    mark_live(flow.place(dest).local, &ordinal, &mut cur, &mut matrix);
+                    for_each_operand(flow, value, |o| {
+                        if let Operand::Copy(p) | Operand::Move(p) = o {
+                            mark_live(flow.place(p).local, &ordinal, &mut cur, &mut matrix);
+                        }
+                    });
+                    if let Value::Borrow { place, .. } = value {
+                        mark_live(flow.place(place).local, &ordinal, &mut cur, &mut matrix);
+                    }
+                }
+                StmtKind::Call { args, dest } => {
+                    mark_live(flow.place(dest).local, &ordinal, &mut cur, &mut matrix);
+                    for o in flow.ops(args) {
+                        if let Operand::Copy(p) | Operand::Move(p) = *o {
+                            mark_live(flow.place(p).local, &ordinal, &mut cur, &mut matrix);
+                        }
+                    }
+                }
+                StmtKind::Drop(p) => mark_live(flow.place(p).local, &ordinal, &mut cur, &mut matrix),
+                StmtKind::Activate(l) => mark_live(flow.place(flow.loan(l).place).local, &ordinal, &mut cur, &mut matrix),
+                StmtKind::Switch { on, .. } => mark_live(flow.place(on).local, &ordinal, &mut cur, &mut matrix),
+                _ => {}
+            }
+        }
+    }
+    matrix
 }
 
 fn storage_step<A: Allocator>(flow: &Flow<A>, s: Stmt, row: &mut [u64]) {
@@ -168,20 +313,20 @@ fn borrow_step<A: Allocator>(flow: &Flow<A>, s: Stmt, row: &mut [u64]) {
 }
 
 /// A forward union problem at block grain: row `b` is the state on entry to block `b`.
-fn forward<A: Allocator + Clone>(
+fn forward<A: Allocator + Copy>(
     flow: &Flow<A>,
     entry: &[u64],
     step: fn(&Flow<A>, Stmt, &mut [u64]),
     limit: u64,
     what: &'static str,
     alloc: A,
-) -> Result<Bits<A>, Bound> {
+) -> Result<BlockBits<A>, Bound> {
     let blocks = flow.blocks.len();
-    let mut rows = Bits::new_in(blocks, flow.locals as usize, alloc.clone());
+    let mut rows = BlockBits::new_in(flow, usize::try_from(flow.locals).unwrap_or(usize::MAX), alloc);
     if blocks == 0 {
         return Ok(rows);
     }
-    rows.row_mut(0).copy_from_slice(entry);
+    rows.row_mut(Block(0)).copy_from_slice(entry);
     let mut cur = zeroed(rows.words(), alloc);
     let mut passes = 0u64;
     loop {
@@ -191,17 +336,18 @@ fn forward<A: Allocator + Clone>(
         }
         let mut changed = false;
         for b in 0..blocks {
+            let blk = Block(b as u32);
             let range = flow.blocks[b];
             // `FlowBuilder::finish` refuses a block without its terminator: every block has a row.
             if range.end <= range.start {
                 continue;
             }
-            cur.copy_from_slice(rows.row(b));
+            cur.copy_from_slice(rows.row(blk));
             for s in range.start..range.end {
                 step(flow, Stmt(s), &mut cur);
             }
             flow.for_each_succ(Stmt(range.end - 1), |t| {
-                let to = flow.stmt_block[t.index()].index();
+                let to = flow.stmt_block[t.index()];
                 changed |= bits::union_into(rows.row_mut(to), &cur);
             });
         }
@@ -266,14 +412,14 @@ fn live_step<A: Allocator>(flow: &Flow<A>, init: &Inits<A>, s: Stmt, row: &mut [
 }
 
 /// Live by use on entry to each block, backward, passes in reverse block order.
-fn live_by_use<A: Allocator + Clone>(
+fn live_by_use<A: Allocator + Copy>(
     flow: &Flow<A>,
     init: &Inits<A>,
     limit: u64,
     alloc: A,
-) -> Result<Bits<A>, Bound> {
+) -> Result<BlockBits<A>, Bound> {
     let blocks = flow.blocks.len();
-    let mut rows = Bits::new_in(blocks, flow.locals as usize, alloc.clone());
+    let mut rows = BlockBits::new_in(flow, usize::try_from(flow.locals).unwrap_or(usize::MAX), alloc);
     let mut cur = zeroed(rows.words(), alloc);
     let mut passes = 0u64;
     loop {
@@ -283,6 +429,7 @@ fn live_by_use<A: Allocator + Clone>(
         }
         let mut changed = false;
         for b in (0..blocks).rev() {
+            let blk = Block(b as u32);
             let range = flow.blocks[b];
             // `FlowBuilder::finish` refuses a block without its terminator: every block has a row.
             if range.end <= range.start {
@@ -290,13 +437,13 @@ fn live_by_use<A: Allocator + Clone>(
             }
             cur.fill(0);
             flow.for_each_succ(Stmt(range.end - 1), |t| {
-                let from = flow.stmt_block[t.index()].index();
+                let from = flow.stmt_block[t.index()];
                 bits::union_into(&mut cur, rows.row(from));
             });
             for s in (range.start..range.end).rev() {
                 live_step(flow, init, Stmt(s), &mut cur);
             }
-            changed |= bits::union_into(rows.row_mut(b), &cur);
+            changed |= bits::union_into(rows.row_mut(blk), &cur);
         }
         if !changed {
             return Ok(rows);

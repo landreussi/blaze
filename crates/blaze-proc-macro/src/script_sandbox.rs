@@ -51,8 +51,10 @@ use dep_mount::DepViews;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScriptRoot {
     /// `None`: a dependency; `Some(dir)`: a member at `dir`, checked by `SeenRoot::member`.
-    member: Option<String>,
+    member: Option<Arc<str>>,
 }
+
+impl blaze_own::Share for ScriptRoot {}
 
 impl ScriptRoot {
     /// A dependency's (registry, git, toolchain) script: it sees `/package`.
@@ -64,7 +66,7 @@ impl ScriptRoot {
     /// `dir` that is not a plain path under it is refused by name.
     pub fn member(dir: &str) -> Result<ScriptRoot, MemberDirError<'_>> {
         SeenRoot::member(dir)?;
-        Ok(ScriptRoot { member: Some(dir.to_owned()) })
+        Ok(ScriptRoot { member: Some(Arc::from(dir)) })
     }
 
     pub fn seen(&self) -> SeenRoot<'_> {
@@ -85,7 +87,9 @@ pub(crate) const STDERR_TAIL: usize = 64 << 10;
 /// resolved the root too, a relative `.`, and so asked the process for its folder twice per read
 /// (tempo's edit: `getcwd` 3.25% of the command's CPU, the reads a third of its opens).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RealRoot(PathBuf);
+pub struct RealRoot(Arc<Path>);
+
+impl blaze_own::Share for RealRoot {}
 
 /// Why a served checkout's root has no [`RealRoot`].
 #[derive(Debug)]
@@ -107,12 +111,16 @@ impl std::fmt::Display for RootUnresolved {
 }
 
 impl RealRoot {
+    fn from_path(path: impl AsRef<Path>) -> RealRoot {
+        RealRoot(Arc::from(path.as_ref()))
+    }
+
     /// `absolute` with every link resolved: the one `realpath` of a served tree's root.
     pub fn resolve(absolute: &Path) -> Result<RealRoot, RootUnresolved> {
         if !absolute.is_absolute() {
             return Err(RootUnresolved::Relative(absolute.to_owned()));
         }
-        std::fs::canonicalize(absolute).map(RealRoot).map_err(|error| RootUnresolved::Io { path: absolute.to_owned(), error })
+        std::fs::canonicalize(absolute).map(RealRoot::from_path).map_err(|error| RootUnresolved::Io { path: absolute.to_owned(), error })
     }
 
     /// `rel`, relative to the folder the process was started in (`.` for it), with every link
@@ -122,9 +130,9 @@ impl RealRoot {
     /// 75). `Err` names the path and the OS's error.
     pub fn of_start(rel: &Path, plant: impl blaze_own::planted::Planted<StartPlant>) -> Result<RealRoot, RootUnresolved> {
         if plant.has(StartPlant::LeftRelative) {
-            return Ok(RealRoot(rel.to_owned()));
+            return Ok(RealRoot::from_path(rel));
         }
-        std::fs::canonicalize(rel).map(RealRoot).map_err(|error| RootUnresolved::Io { path: rel.to_owned(), error })
+        std::fs::canonicalize(rel).map(RealRoot::from_path).map_err(|error| RootUnresolved::Io { path: rel.to_owned(), error })
     }
 
     pub fn path(&self) -> &Path {
@@ -173,11 +181,14 @@ impl blaze_own::planted::Plants for TreePlant {}
 pub enum Tree {
     /// A folder on disk, read-only (a workspace member's checkout), at its resolved root.
     Dir(RealRoot),
-    /// Files read out of a package's record: (path from the root, bytes), sorted by path.
+    /// Files read out of a package's record: (path from the root, bytes), sorted by path,
+    /// together with any unpopulated git submodules (`(path, commit_oid)`) inside the package.
     /// `git`: the commit when the record is a fetched git source's, whose `git` answers it
     /// gives (D54); `None` for a crate.
-    Mem { files: Arc<Vec<(String, Vec<u8>)>>, git: Option<git::Oid> },
+    Mem { files: Arc<Vec<(String, Vec<u8>)>>, submodules: Arc<[(String, [u8; 20])]>, git: Option<git::Oid> },
 }
+
+impl blaze_own::Share for Tree {}
 
 /// A file or a folder of the tree.
 enum Node<'t> {
@@ -189,6 +200,7 @@ enum Node<'t> {
 enum TreeFault {
     Outside(PathBuf),
     Special(PathBuf),
+    Submodule { path: PathBuf, submodule: PathBuf, commit: [u8; 20] },
     Io { path: PathBuf, op: &'static str, error: std::io::Error },
 }
 
@@ -197,6 +209,13 @@ impl std::fmt::Display for TreeFault {
         match self {
             Self::Outside(path) => write!(f, "`{}` is a link out of the served tree", path.display()),
             Self::Special(path) => write!(f, "`{}` in the served tree is neither a regular file nor a directory", path.display()),
+            Self::Submodule { path, submodule, commit } => {
+                write!(f, "`{}` is inside unpopulated git submodule `{}` at commit ", path.display(), submodule.display())?;
+                for byte in commit {
+                    write!(f, "{byte:02x}")?;
+                }
+                Ok(())
+            }
             Self::Io { path, op, error } => write!(f, "cannot {op} `{}` in the served tree: {error}", path.display()),
         }
     }
@@ -317,10 +336,41 @@ impl Tree {
         }
     }
 
+    /// Returns `true` when every component from the tree root to `rel` exists and is not a
+    /// symlink (always `true` for in-memory trees). A direct path's content/stat/listing can
+    /// only move when the checkout journal reports a change to `rel` or one of its ancestors.
+    pub fn is_direct(&self, rel: &str) -> bool {
+        match self {
+            Tree::Mem { .. } => true,
+            Tree::Dir(root) => {
+                if rel.is_empty() {
+                    return true;
+                }
+                if rel.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
+                    return false;
+                }
+                match disk_node(root, rel, blaze_own::planted::NoPlant) {
+                    Ok(Some((real, _))) => real == root.path().join(rel),
+                    _ => false,
+                }
+            }
+        }
+    }
+
     /// The bytes of the file `rel` of the tree; `None` when it is absent, a folder or a link
     /// out of the tree.
     pub fn file(&self, rel: &str) -> Option<Vec<u8>> {
         self.file_bytes(rel).ok().flatten().map(Cow::into_owned)
+    }
+
+    fn submodule_covering(&self, rel: &str) -> Option<(&str, [u8; 20])> {
+        let Tree::Mem { submodules, .. } = self else { return None };
+        for (sub, commit) in submodules.iter() {
+            if rel == sub.as_str() || (rel.len() > sub.len() && rel.starts_with(sub.as_str()) && rel.as_bytes().get(sub.len()) == Some(&b'/')) {
+                return Some((sub.as_str(), *commit));
+            }
+        }
+        None
     }
 
     fn file_bytes(&self, rel: &str) -> Result<Option<Cow<'_, [u8]>>, TreeFault> {
@@ -332,12 +382,17 @@ impl Tree {
                 }
                 std::fs::read(path).map(|bytes| Some(Cow::Owned(bytes))).map_err(|error| TreeFault::Io { path: PathBuf::from(rel), op: "read", error })
             }
-            Tree::Mem { files, .. } => Ok(files.binary_search_by(|(path, _)| path.as_str().cmp(rel)).ok().map(|at| Cow::Borrowed(files[at].1.as_slice()))),
+            Tree::Mem { files, .. } => {
+                if let Some((submodule, commit)) = self.submodule_covering(rel) {
+                    return Err(TreeFault::Submodule { path: PathBuf::from(rel), submodule: PathBuf::from(submodule), commit });
+                }
+                Ok(files.binary_search_by(|(path, _)| path.as_str().cmp(rel)).ok().map(|at| Cow::Borrowed(files[at].1.as_slice())))
+            }
         }
     }
 
     /// What `rel` is: its bytes or its entries; `None` when absent. `Err`: a link out of the
-    /// tree.
+    /// tree, or a path inside an unpopulated git submodule.
     fn node(&self, rel: &str) -> Result<Option<Node<'_>>, TreeFault> {
         match self {
             Tree::Dir(root) => {
@@ -365,7 +420,10 @@ impl Tree {
                 let bytes = std::fs::read(&real).map_err(|error| fault("read", error))?;
                 Ok(Some(Node::File(Cow::Owned(bytes))))
             }
-            Tree::Mem { files, .. } => {
+            Tree::Mem { files, submodules, .. } => {
+                if let Some((submodule, commit)) = self.submodule_covering(rel) {
+                    return Err(TreeFault::Submodule { path: PathBuf::from(rel), submodule: PathBuf::from(submodule), commit });
+                }
                 if let Ok(at) = files.binary_search_by(|(path, _)| path.as_str().cmp(rel)) {
                     return Ok(Some(Node::File(Cow::Borrowed(&files[at].1))));
                 }
@@ -382,8 +440,15 @@ impl Tree {
                         entries.push((name.as_bytes().to_vec(), filetype));
                     }
                 }
+                for (sub, _) in submodules.iter() {
+                    if let Some(below) = sub.strip_prefix(prefix.as_str()) {
+                        let name = below.split_once('/').map_or(below, |(name, _)| name);
+                        entries.push((name.as_bytes().to_vec(), Filetype::Directory));
+                    }
+                }
                 // Full paths sort "a.txt" before "a/f"; the served names sort "a" first.
                 entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                entries.dedup_by(|a, b| a.0 == b.0);
                 Ok((!entries.is_empty() || rel.is_empty()).then_some(Node::Folder(entries)))
             }
         }
@@ -414,6 +479,11 @@ pub struct Script {
     /// is not read. `None` (the default until the checker answers the real probes' ladder):
     /// the table answers.
     pub probes: Option<crate::script_probes::ScriptProbes>,
+    /// The C compiler probe answerer and content-addressed cache (`probe_clang.rs`): `Ready`
+    /// answers `cc-probe` spawns hermetically and records `cc-probe\n<answerer>\n<clang>\n<key>`;
+    /// `Unavailable(why)` refuses any script that actually issues a C probe without blocking
+    /// unrelated scripts on hosts without a clang pin or unpacked shelf.
+    pub c_probes: Option<crate::probe_clang::CProbeSetting>,
     /// The deterministic sandbox's executor, chosen once per command by its setting; `None`:
     /// the sandbox is off (D92, D94), and a spawn that needs it is refused by name.
     pub spawner: Option<Arc<dyn blaze_spawn::Executor + Send + Sync>>,
@@ -841,7 +911,7 @@ impl ScriptSandbox {
                     if !self.c_held.contains_key(&digest) {
                         self.c_held_bytes += bytes.len() as u64;
                         if self.c_held_bytes > limit {
-                            over = Some(name.clone());
+                            over = Some(name.as_str());
                             break;
                         }
                         self.c_held.insert(digest, bytes.clone());
@@ -851,9 +921,10 @@ impl ScriptSandbox {
             }
         }
         if let Some(name) = over {
-            return Err(self.refuse(Refusal::OutDir(format!(
+            let msg = format!(
                 "deferred C requests whose OUT_DIR inputs, kept as each request saw them, pass {limit} bytes (at {name})"
-            ))));
+            );
+            return Err(self.refuse(Refusal::OutDir(msg)));
         }
         let state = match self.c_states.last() {
             Some(last) if *last == entries => self.c_states.len() - 1,
@@ -940,7 +1011,8 @@ impl ScriptSandbox {
         let opened = at.checked_sub(ROOT_FD + 1).and_then(|at| self.opened.get(at as usize)).and_then(Option::as_ref);
         match opened {
             Some(Opened::Ro { entries: Some(_), folder, .. }) => {
-                let mut joined = folder.clone();
+                let mut joined = Vec::with_capacity(folder.len() + 1 + path.len());
+                joined.extend_from_slice(folder);
                 joined.push(b'/');
                 joined.extend_from_slice(path);
                 Ok(joined)
@@ -1165,8 +1237,9 @@ impl ScriptSandbox {
         };
         let found = self.look_up(program)?;
         if !found {
-            let host = self.script.host.clone();
-            self.record(crate::spawn_route::absent_subject(&host, program), Some(crate::spawn_route::absent_digest(&host, program)));
+            let subject = crate::spawn_route::absent_subject(&self.script.host, program);
+            let digest = crate::spawn_route::absent_digest(&self.script.host, program);
+            self.record(subject, Some(digest));
         }
         Ok(found)
     }
@@ -1186,13 +1259,20 @@ impl ScriptSandbox {
         let owned = || args.to_vec();
         let name = program.rsplit('/').next().unwrap_or(program);
         let found = self.look_up(program)?;
-        let routed = crate::spawn_route::route(name, &args_text, self.script.c_mode, found, self.script.spawner.is_some());
+        let routed = crate::spawn_route::route_with_stdin(
+            program,
+            &args_text,
+            !spawned.stdin.is_empty(),
+            self.script.c_mode,
+            found,
+            self.script.spawner.is_some(),
+        );
         let (code, stdout, stderr): (i32, Vec<u8>, Vec<u8>) = match routed {
             crate::spawn_route::Route::NotFound => {
                 return Err(self.refuse(Refusal::Spawn(SpawnRefusal::NotFoundUnasked { program: program.clone(), args: owned() })));
             }
             crate::spawn_route::Route::Rustc if self.script.probes.is_some() => {
-                let probes = self.script.probes.clone().expect("the arm's guard: the checker is on");
+                let probes = self.script.probes.as_ref().map(blaze_own::Share::share).expect("the arm's guard: the checker is on");
                 self.checked_probe(&probes, &args_text, &spawned, args)?
             }
             crate::spawn_route::Route::Rustc => match probe_ask::classify(&args_text, Alloc::global()) {
@@ -1202,22 +1282,33 @@ impl ScriptSandbox {
                 // not handed to the script host yet; refused by name, never guessed.
                 Ok(Ask::Print { .. }) => return Err(self.refuse(Refusal::Spawn(SpawnRefusal::RustcArgs { args: owned() }))),
                 Ok(Ask::Compile(compile)) => {
-                    let cwd = spawned.cwd.clone().unwrap_or_else(|| self.script.cwd());
-                    let bytes = match compile.input {
-                        Snippet::Stdin => Some(spawned.stdin.clone()),
-                        Snippet::File(path) => self.snippet_file(&cwd, path)?,
+                    let script_cwd;
+                    let cwd = match spawned.cwd.as_deref() {
+                        Some(cwd) => cwd,
+                        None => {
+                            script_cwd = self.script.cwd();
+                            &script_cwd
+                        }
+                    };
+                    let owned_bytes;
+                    let bytes: Option<&[u8]> = match compile.input {
+                        Snippet::Stdin => Some(spawned.stdin.as_slice()),
+                        Snippet::File(path) => {
+                            owned_bytes = self.snippet_file(cwd, path)?;
+                            owned_bytes.as_deref()
+                        }
                     };
                     let Some(bytes) = bytes else {
                         return Err(self.refuse(Refusal::Spawn(SpawnRefusal::RustcArgs { args: owned() })));
                     };
                     // probe_ask.rs: no output file is written; every probe of tempo's reads
                     // only the status.
-                    let answered = probe_ask::answer(&compile, &self.script.host, &bytes, &Table { rows: &self.script.table });
+                    let answered = probe_ask::answer(&compile, &self.script.host, bytes, &Table { rows: &self.script.table });
                     match answered.verdict {
                         Verdict::Accepted(_) => (0, Vec::new(), Vec::new()),
-                        Verdict::Rejected(rejection) => (1, Vec::new(), rejection.stderr(&compile, &bytes, Alloc::global()).as_bytes().to_vec()),
+                        Verdict::Rejected(rejection) => (1, Vec::new(), rejection.stderr(&compile, bytes, Alloc::global()).as_bytes().to_vec()),
                         Verdict::Unanswered(_) => {
-                            let snippet = String::from_utf8_lossy(&bytes).into_owned();
+                            let snippet = String::from_utf8_lossy(bytes).into_owned();
                             let (key, target) = (answered.key, answered.target.to_owned());
                             return Err(self.refuse(Refusal::Spawn(SpawnRefusal::CannotAnswerYet { key, args: owned(), snippet, target })));
                         }
@@ -1264,30 +1355,7 @@ impl ScriptSandbox {
                 }
             }
             crate::spawn_route::Route::Fact(fact) => return self.spawn_fact(&fact, program, args, &spawned),
-            crate::spawn_route::Route::Deferred => {
-                // Its inputs the script made are captured now, by content: the script may
-                // remove or rewrite them before the request runs (outputs.rs, THE C INPUTS).
-                let state = self.snap_out()?;
-                // Its relative paths made the guest paths they meant in the spawn's folder
-                // (c_tasks.rs `rooted`): the request runs later, elsewhere.
-                let script_cwd = self.script.cwd();
-                let cwd = match spawned.cwd.as_deref() {
-                    None => script_cwd,
-                    Some(cwd) if cwd.starts_with('/') => cwd.to_owned(),
-                    Some(cwd) => format!("{script_cwd}/{cwd}"),
-                };
-                let argv: Vec<&str> = spawned.argv.iter().map(String::as_str).collect();
-                let mut text = String::new();
-                blaze_build_script::c_tasks::rooted(&argv, &cwd, &mut text).expect("script_sandbox: writing to a String does not fail");
-                // A process tree runs later with the folder and environment it was spawned
-                // with (outputs.rs `CTree`): `configure` reads CC, CFLAGS and the rest.
-                if blaze_build_script::c_tasks::is_tree(program) {
-                    let env = crate::spawn_route::child_env(&self.script.env, &spawned);
-                    self.c_trees.push((self.c_requests.len() as u32, cwd.clone(), env));
-                }
-                self.c_requests.push((text, state));
-                (0, Vec::new(), Vec::new())
-            }
+            crate::spawn_route::Route::Deferred => return self.spawn_deferred(program, &spawned),
             crate::spawn_route::Route::Executor => return self.spawn_executor(program, args, &spawned),
             crate::spawn_route::Route::Refused => {
                 let why = self.script.spawn_setting.no_sandbox();
@@ -1295,6 +1363,34 @@ impl ScriptSandbox {
             }
         };
         self.set_reply(code, &stdout, &stderr);
+        Ok(())
+    }
+
+    /// Records a deferred C/native compile request (`CMode::Deferred`) and replies exit 0 with
+    /// empty streams. Shared by `Route::Deferred` and oversized-probe fallthrough.
+    pub(crate) fn spawn_deferred(&mut self, program: &str, spawned: &crate::spawn_route::Decoded) -> Result<(), Stop> {
+        // Its inputs the script made are captured now, by content: the script may remove or
+        // rewrite them before the request runs (outputs.rs, THE C INPUTS).
+        let state = self.snap_out()?;
+        // Its relative paths made the guest paths they meant in the spawn's folder
+        // (c_tasks.rs `rooted`): the request runs later, elsewhere.
+        let script_cwd = self.script.cwd();
+        let cwd = match spawned.cwd.as_deref() {
+            None => script_cwd,
+            Some(cwd) if cwd.starts_with('/') => cwd.to_owned(),
+            Some(cwd) => format!("{script_cwd}/{cwd}"),
+        };
+        let argv: Vec<&str> = spawned.argv.iter().map(String::as_str).collect();
+        let mut text = String::new();
+        blaze_build_script::c_tasks::rooted(&argv, &cwd, &mut text).expect("script_sandbox: writing to a String does not fail");
+        // A process tree runs later with the folder and environment it was spawned with
+        // (outputs.rs `CTree`): `configure` reads CC, CFLAGS and the rest.
+        if blaze_build_script::c_tasks::is_tree(program) {
+            let env = crate::spawn_route::child_env(&self.script.env, spawned);
+            self.c_trees.push((self.c_requests.len() as u32, cwd, env));
+        }
+        self.c_requests.push((text, state));
+        self.set_reply(0, &[], &[]);
         Ok(())
     }
 }
@@ -1990,15 +2086,31 @@ impl System for ScriptSandbox {
 /// A folder's files as a [`Tree::Mem`]: every file under `dir` of a record, by path from `dir`;
 /// `git` is the commit when the record is a fetched git source's.
 pub fn mem_tree<'f>(files: impl IntoIterator<Item = (&'f str, &'f [u8])>, dir: &str, git: Option<git::Oid>) -> Tree {
+    mem_tree_with_submodules(files, core::iter::empty(), dir, git)
+}
+
+/// [`mem_tree`], also carrying unpopulated git submodules (`(path, commit_oid)`) inside `dir`
+/// so sibling submodules outside `dir` are ignored while accesses to package-local submodules
+/// fail closed.
+pub fn mem_tree_with_submodules<'f>(
+    files: impl IntoIterator<Item = (&'f str, &'f [u8])>,
+    submodules: impl IntoIterator<Item = (&'f str, [u8; 20])>,
+    dir: &str,
+    git: Option<git::Oid>,
+) -> Tree {
     let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
-    let mut out: Vec<(String, Vec<u8>)> = files.into_iter().filter_map(|(path, bytes)| path.strip_prefix(prefix.as_str()).map(|rel| (rel.to_owned(), bytes.to_vec()))).collect();
+    let (mut out, mut subs): (Vec<(String, Vec<u8>)>, Vec<(String, [u8; 20])>) = (
+        files.into_iter().filter_map(|(path, bytes)| path.strip_prefix(prefix.as_str()).map(|rel| (rel.to_owned(), bytes.to_vec()))).collect(),
+        submodules.into_iter().filter_map(|(path, commit)| path.strip_prefix(prefix.as_str()).map(|rel| (rel.to_owned(), commit))).collect(),
+    );
     out.sort_by(|a, b| a.0.cmp(&b.0));
-    Tree::Mem { files: Arc::new(out), git }
+    subs.sort_by(|a, b| a.0.cmp(&b.0));
+    Tree::Mem { files: Arc::new(out), submodules: Arc::from(subs), git }
 }
 
 /// A folder of the checkout as a [`Tree::Dir`], at the root the command resolved once.
 pub fn dir_tree(root: &RealRoot) -> Tree {
-    Tree::Dir(root.clone())
+    Tree::Dir(blaze_own::Share::share(root))
 }
 
 #[cfg(test)]
@@ -2007,3 +2119,36 @@ mod side_refusal_tests;
 mod escape_tests;
 #[cfg(all(test, unix))]
 mod served_tests;
+
+#[cfg(test)]
+mod submodule_tests {
+    use super::*;
+
+    #[test]
+    fn mem_tree_skips_sibling_submodules_and_fails_closed_on_package_local_submodules() {
+        let oid = [0xab; 20];
+        let tree = mem_tree_with_submodules(
+            [("pkg/Cargo.toml", b"[package]\nname = \"p\"\n".as_slice()), ("pkg/src/lib.rs", b"".as_slice())],
+            [("sibling_sub", oid), ("pkg/v8", oid)],
+            "pkg",
+            None,
+        );
+        // Normal files and parent directory listing work; sibling submodule outside `pkg` is ignored.
+        assert!(tree.node("Cargo.toml").expect("manifest").is_some());
+        assert!(tree.node("sibling_sub").expect("outside dir").is_none());
+        let Some(Node::Folder(root_entries)) = tree.node("").expect("root dir") else {
+            panic!("root must be a folder");
+        };
+        assert!(root_entries.iter().any(|(name, ft)| name.as_slice() == b"v8" && *ft == Filetype::Directory));
+        assert!(!root_entries.iter().any(|(name, _)| name.as_slice() == b"sibling_sub"));
+
+        // Package-local submodule and any path beneath it fail closed with TreeFault::Submodule.
+        for bad in ["v8", "v8/include/v8.h"] {
+            let err = tree.node(bad).err().expect("submodule path must fail closed");
+            let msg = err.to_string();
+            assert!(msg.contains("unpopulated git submodule `v8`"), "{msg}");
+            assert!(msg.contains("abababababababababababababababababababab"), "{msg}");
+            assert!(tree.file_bytes(bad).is_err());
+        }
+    }
+}

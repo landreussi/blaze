@@ -261,7 +261,7 @@ fn renamed<'n, S: NamesSource<'n>>(names: S, krate: usize, lib: LibKey, text: &s
         // The value cooked as the native image reads it (links.rs `symbol_of`: a value written
         // as a macro call is the names' row of the item, as the link table's).
         if v.text_at(a.path).map_err(|_| ())?.trim() == "link_name"
-            && super::links::symbol_of(v.text_at(a.args).map_err(|_| ())?, Some(lib), |item| names.attr_value(item, "link_name"), edition, alloc).map_err(|_| ())? != name
+            && super::links::with_symbol_of(v.text_at(a.args).map_err(|_| ())?, Some(lib), |item| names.attr_value(item, "link_name"), edition, |res| res.map(|sym| sym != name).map_err(|_| ()))?
         {
             return Ok(true);
         }
@@ -392,7 +392,7 @@ pub(crate) fn record_search<'n>(
     let searches = facts.rows.iter().filter(|r| r.fact.kind == FactKind::Head).any(|r| {
         // A type check can finish before linkage is decided. An unread declaration keeps
         // the covering reads too. Linkage reports its own typed refusal at the call.
-        !matches!(declares(tables, store, ItemKey(r.fact.key), store.tys.alloc()), Ok(None))
+        !matches!(declares(tables, store, ItemKey(r.fact.key), store.work_alloc()), Ok(None))
     });
     if searches {
         for k in 0..tables.crate_count() {
@@ -406,11 +406,12 @@ pub(crate) fn record_search<'n>(
     }
 }
 
-/// One covering read for all the facts the search can ask of this crate. Keeping it even
-/// for an empty or currently ineligible crate covers a new definition or runtime there.
+/// One covering read for all the facts the search can ask of this crate: its `#![panic_runtime]`
+/// flag and any `#[rustc_std_internal_symbol]` function items (`NameCell::InternalSymbols`), which
+/// is absent for every crate with neither so ordinary edits in unrelated crates wake no callers.
 pub(crate) fn search_read(key: blaze_id::CrateItemKey) -> super::tables::recorder::TableRead {
-    use blaze_scope::names_cells::{NameCell, Section};
-    super::tables::recorder::TableRead::Names(NameCell::Whole { krate: key.prefix(), section: Section::Items })
+    use blaze_scope::names_cells::NameCell;
+    super::tables::recorder::TableRead::Names(NameCell::InternalSymbols { krate: key.prefix() })
 }
 
 fn may_declare(head: &super::heads::FnHead<'_>) -> bool {

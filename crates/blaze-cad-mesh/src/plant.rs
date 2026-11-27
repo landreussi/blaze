@@ -79,3 +79,45 @@ pub enum QuantPlant {
 }
 
 impl Plants for QuantPlant {}
+
+/// UV unwrapping and tangent generation's planted bugs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UvPlant {
+    None,
+    /// Places all charts at `(0, 0)` without packing, caught by the non-overlap oracle.
+    OverlapCharts,
+    /// Outputs raw un-orthogonalized tangent and wrong handedness, caught by the tangent-frame
+    /// oracle.
+    SkipTangentOrtho,
+}
+
+impl Plants for UvPlant {}
+
+/// Semantic metric UV projection & tangent attachment's planted bugs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UvProjectPlant {
+    None,
+    /// Skips UV-seam vertex splitting so triangles across 90° box-projection chart boundaries share
+    /// corrupted UV coordinates.
+    SkipSeamSplit,
+    /// Flips tangent handedness `w` from `+1` to `-1` (and vice versa).
+    FlipHandedness,
+}
+
+impl Plants for UvProjectPlant {}
+
+/// Analytic SDF surface & normal-map baking's planted bugs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BakePlant {
+    None,
+    /// Force ambient occlusion to `1.0` everywhere.
+    FlatAo,
+    /// Force mean curvature to `0.5` (flat) everywhere.
+    ZeroCurvature,
+    /// Force baked normal maps to flat `[0, 0, 1]` everywhere.
+    FlatNormalMap,
+    /// Skip gutter dilation passes.
+    SkipDilation,
+}
+
+impl Plants for BakePlant {}

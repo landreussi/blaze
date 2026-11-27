@@ -69,7 +69,7 @@ fn bstd_rt_names_std_over_records_as_over_names() {
         Box::leak(Box::new(UserCrate { name: "hb", dir: "/hb/", root: "/hb/src/main.rs", files, edition, panic: blaze_build::Panic::Unwind }));
     let inputs: &'static Inputs<'static> = Box::leak(Box::new(Inputs::new(user, tc).unwrap_or_else(|e| panic!("the crates: {e}"))));
     let crates = Box::leak(Box::new(inputs.crates()));
-    let names = Box::leak(Box::new(inputs.resolve(crates, g).unwrap_or_else(|e| panic!("resolve_crates: {e}"))));
+    let names = Box::leak(Box::new(inputs.resolve(crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))));
 
     let all: Vec<&str> = names.crates().iter().map(|c| c.name).collect();
     println!("crates: {all:?}");
@@ -92,8 +92,8 @@ fn bstd_rt_names_std_over_records_as_over_names() {
     let order: Vec<usize> = std::iter::once(bstd).chain((0..names.crates().len()).filter(|&i| i != bstd)).collect();
     for &i in order.iter() {
         let c = &names.crates()[i];
-        kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), g));
-        kept.items.push(aligned(&items_record::encode(c, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), g));
+        kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
+        kept.items.push(aligned(&items_record::encode(c, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
         kept.files.push(c.files.iter().map(|f| (f.package.as_str().to_string(), f.text)).collect());
         crate_names.push(c.name);
         keys.push(c.key);
@@ -205,7 +205,8 @@ fn the_shelfs_crates_read_with_every_module_file() {
         let root = if krate.dir.is_empty() || row.root.starts_with(krate.dir) { row.root.to_string() } else { format!("{}/{}", krate.dir, row.root) };
         let mut cfg = target_cfg.clone();
         cfg.extend(row.features().map(|f| ("feature", Some(f))));
-        let file = |p: &str| pack.find(p).and_then(|f| std::str::from_utf8(f.bytes).ok());
+        let frame = blaze_mem::Frame::new(blaze_mem::Tag::Other).expect("decode frame");
+        let file = |p: &str| pack.read_str_slice(p, &frame).ok().flatten();
         match blaze_toolchain::implied::crate_facts(&root, file, &cfg, blaze_own::Alloc::global()) {
             Ok(facts) => {
                 read += 1;
@@ -221,7 +222,10 @@ fn the_shelfs_crates_read_with_every_module_file() {
     println!("crate facts on the shelf: {read} libraries read, edges gained {gained:?}");
     assert!(refused.is_empty(), "refused: {refused:#?}");
     let lib = view.krate(all[sys.bstd.0 as usize].krate).lib;
-    assert!(gained.iter().any(|g| *g == format!("{lib} +std")), "bstd asks for std: {gained:?}");
+    assert!(
+        deps[sys.bstd.0 as usize].contains(&sys.std.0),
+        "bstd ({lib}) reaches std (explicit or implied): gained {gained:?}"
+    );
     let slices: Vec<&[u32]> = deps.iter().map(Vec::as_slice).collect();
     let cycle = blaze_toolchain::implied::first_in_cycle(&slices, blaze_own::Alloc::global()).expect("memory");
     assert_eq!(cycle.map(|u| view.krate(all[u].krate).lib), None, "the gained edges make a cycle");

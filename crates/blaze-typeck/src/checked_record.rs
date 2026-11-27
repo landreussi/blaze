@@ -34,9 +34,9 @@
 
 use blaze_own::{Alloc, Soa, Vec};
 
-use crate::columns::{AdjustKind, CaptureKind, Checked, CoroutineWitness, SigFrom};
+use crate::columns::{AdjustKind, CaptureKind, Checked, CoroutineWitness, SigFrom, UnionPat};
 use crate::error::CheckError;
-use crate::ids::{ExprId, FloatTy, FnPtrHeader, IntTy, ItemKey, LangItem, List, Mutbl, Name, PatId, PathIdx, ScopeId, UintTy};
+use crate::ids::{ExprId, FloatTy, FnPtrHeader, IntTy, ItemKey, LangItem, List, Mutbl, Name, PatId, PathIdx, RecordSchema, ScopeId, UintTy};
 use crate::portable::{PNode, PTy, PortableTys};
 use crate::rules::suggest::Suggests;
 use crate::selected::{Projected, Selected};
@@ -56,7 +56,9 @@ use crate::world::{CtorKind, Def, Needs, Prim, Question, ReadList, Shape};
 /// borrow of a `repr(packed)` struct's field captures the struct (capture_places.rs
 /// `packed_field`).
 /// 06: a type node may be an extern type (`PNode::Foreign`, node tag 30).
-pub const CHECKED_RECORD_MAGIC: [u8; 8] = *b"bzchkd06";
+/// 07: structural record schemas/names, union pattern narrowing (`union_pats`), and union
+/// coercion adjustments (`AdjustKind::UnionInject`, `AdjustKind::UnionWiden`).
+pub const CHECKED_RECORD_MAGIC: [u8; 8] = *b"bzchkd07";
 
 /// The record's columns, in the order the header and the body lay them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,10 +91,13 @@ pub enum Col {
     NeedFirst,
     CapturePlaces,
     CaptureProjs,
+    TyRecordSchemas,
+    TyRecordNames,
+    UnionPats,
 }
 
 /// Every column, in layout order.
-pub const COLS: [Col; 28] = [
+pub const COLS: [Col; 31] = [
     Col::TyNodes,
     Col::TyLists,
     Col::TyListRows,
@@ -121,6 +126,9 @@ pub const COLS: [Col; 28] = [
     Col::NeedFirst,
     Col::CapturePlaces,
     Col::CaptureProjs,
+    Col::TyRecordSchemas,
+    Col::TyRecordNames,
+    Col::UnionPats,
 ];
 
 /// A type node: a tag and at most 36 payload bytes (`ExProj`).
@@ -142,7 +150,7 @@ impl Col {
             Col::TyLists => 4,
             Col::TyListRows => 8,
             Col::ExprTy | Col::PatTy | Col::LocalTy | Col::Promoted | Col::IndexMut => 4,
-            Col::Adjusts => 4 + 2 + 4,
+            Col::Adjusts => 4 + 2 + 4 + 4,
             Col::Callees => 4 + 16 + 8,
             Col::ExprDefs | Col::PatDefs => 4 + DEF,
             Col::ConstArgs | Col::PatConstArgs => 4 + 8,
@@ -158,6 +166,9 @@ impl Col {
             Col::FruFields => 4 + 4 + 4,
             Col::DefaultFields => 4 + 4 + 16,
             Col::NeedQuestions | Col::NeedMissing | Col::NeedFirst => QUESTION,
+            Col::TyRecordSchemas => 8 + 8,
+            Col::TyRecordNames => 8,
+            Col::UnionPats => 4 + 1 + 4,
         }
     }
 
@@ -192,6 +203,9 @@ impl Col {
             Col::NeedQuestions => "needs.questions",
             Col::NeedMissing => "needs.missing",
             Col::NeedFirst => "needs.first",
+            Col::TyRecordSchemas => "types.record_schemas",
+            Col::TyRecordNames => "types.record_names",
+            Col::UnionPats => "union_pats",
         }
     }
 
@@ -242,7 +256,7 @@ impl core::fmt::Display for CheckedRecordError {
             CheckedRecordError::TooBig { column } => write!(f, "{AT}: column `{column}` has more rows than a u32 counts"),
             CheckedRecordError::Width { column, row } => write!(f, "{AT}: row {row} of `{column}` is wider than its column"),
             CheckedRecordError::Magic => write!(f, "{AT}: the bytes are not a checked-body record of this version"),
-            CheckedRecordError::Columns { have } => write!(f, "{AT}: the header names {have} columns, this version 28"),
+            CheckedRecordError::Columns { have } => write!(f, "{AT}: the header names {have} columns, this version {}", COLS.len()),
             CheckedRecordError::Length { need, have } => write!(f, "{AT}: {have} bytes where the header's columns need {need}"),
             CheckedRecordError::Tag { column, row, tag } => write!(f, "{AT}: row {row} of `{column}` has tag {tag}, which no value has"),
             CheckedRecordError::TypeOrder { column, row, ty } => write!(f, "{AT}: row {row} of `{column}` names type {ty}, not in the table before it"),
@@ -578,6 +592,15 @@ fn put_node(p: &mut Put, n: PNode) {
             p.u8(30);
             p.key(k);
         }
+        PNode::Record(s, l) => {
+            p.u8(31);
+            p.u64(s.0);
+            p.list(l);
+        }
+        PNode::Union(l) => {
+            p.u8(32);
+            p.list(l);
+        }
     }
 }
 
@@ -667,6 +690,8 @@ fn get_node(g: &mut Get<'_>, b: Bounds) -> Result<PNode, E> {
         28 => PNode::ExProj { trait_: g.key()?, name: Name(g.u64()?), args: b.list(g)?, term: b.ty(g, me)? },
         29 => PNode::ExAuto(g.key()?),
         30 => PNode::Foreign(g.key()?),
+        31 => PNode::Record(RecordSchema(g.u64()?), b.list(g)?),
+        32 => PNode::Union(b.list(g)?),
         _ => return Err(g.bad(tag)),
     })
 }
@@ -674,29 +699,36 @@ fn get_node(g: &mut Get<'_>, b: Bounds) -> Result<PNode, E> {
 // ---- rows of the sparse tables -------------------------------------------------------------
 
 fn put_adjust(p: &mut Put, k: AdjustKind) {
-    let (tag, arg) = match k {
-        AdjustKind::NeverToAny => (0, 0),
-        AdjustKind::Deref { overloaded: None } => (1, 0),
-        AdjustKind::Deref { overloaded: Some(Mutbl::Not) } => (1, 1),
-        AdjustKind::Deref { overloaded: Some(Mutbl::Mut) } => (1, 2),
-        AdjustKind::Borrow { mutbl, two_phase, raw } => (2, mutbl_tag(mutbl) | u8::from(two_phase) << 1 | u8::from(raw) << 2),
-        AdjustKind::ReifyFnPointer => (3, 0),
-        AdjustKind::ClosureFnPointer => (4, 0),
-        AdjustKind::UnsafeFnPointer => (5, 0),
-        AdjustKind::MutToConstPointer => (6, 0),
-        AdjustKind::Unsize => (7, 0),
+    let (tag, arg, variant) = match k {
+        AdjustKind::NeverToAny => (0, 0, 0),
+        AdjustKind::Deref { overloaded: None } => (1, 0, 0),
+        AdjustKind::Deref { overloaded: Some(Mutbl::Not) } => (1, 1, 0),
+        AdjustKind::Deref { overloaded: Some(Mutbl::Mut) } => (1, 2, 0),
+        AdjustKind::Borrow { mutbl, two_phase, raw } => {
+            (2, mutbl_tag(mutbl) | u8::from(two_phase) << 1 | u8::from(raw) << 2, 0)
+        }
+        AdjustKind::ReifyFnPointer => (3, 0, 0),
+        AdjustKind::ClosureFnPointer => (4, 0, 0),
+        AdjustKind::UnsafeFnPointer => (5, 0, 0),
+        AdjustKind::MutToConstPointer => (6, 0, 0),
+        AdjustKind::Unsize => (7, 0, 0),
+        AdjustKind::UnionInject { variant } => (8, 0, variant),
+        AdjustKind::UnionWiden => (9, 0, 0),
+        AdjustKind::RecordProject => (10, 0, 0),
     };
     p.u8(tag);
     p.u8(arg);
+    p.u32(variant);
 }
 
 fn get_adjust(g: &mut Get<'_>) -> Result<AdjustKind, E> {
     let tag = g.u8()?;
     let arg = g.u8()?;
-    let plain = |k: AdjustKind| if arg == 0 { Ok(k) } else { Err(g.bad(arg)) };
+    let variant = g.u32()?;
+    let plain = |k: AdjustKind| if arg == 0 && variant == 0 { Ok(k) } else { Err(g.bad(arg)) };
     match tag {
         0 => plain(AdjustKind::NeverToAny),
-        1 => Ok(AdjustKind::Deref {
+        1 if variant == 0 => Ok(AdjustKind::Deref {
             overloaded: match arg {
                 0 => None,
                 1 => Some(Mutbl::Not),
@@ -704,13 +736,21 @@ fn get_adjust(g: &mut Get<'_>) -> Result<AdjustKind, E> {
                 _ => return Err(g.bad(arg)),
             },
         }),
-        2 if arg < 8 => Ok(AdjustKind::Borrow { mutbl: if arg & 1 == 0 { Mutbl::Not } else { Mutbl::Mut }, two_phase: arg & 2 != 0, raw: arg & 4 != 0 }),
-        2 => Err(g.bad(arg)),
+        2 if arg < 8 && variant == 0 => Ok(AdjustKind::Borrow {
+            mutbl: if arg & 1 == 0 { Mutbl::Not } else { Mutbl::Mut },
+            two_phase: arg & 2 != 0,
+            raw: arg & 4 != 0,
+        }),
+        1 | 2 => Err(g.bad(arg)),
         3 => plain(AdjustKind::ReifyFnPointer),
         4 => plain(AdjustKind::ClosureFnPointer),
         5 => plain(AdjustKind::UnsafeFnPointer),
         6 => plain(AdjustKind::MutToConstPointer),
         7 => plain(AdjustKind::Unsize),
+        8 if arg == 0 => Ok(AdjustKind::UnionInject { variant }),
+        8 => Err(g.bad(arg)),
+        9 => plain(AdjustKind::UnionWiden),
+        10 => plain(AdjustKind::RecordProject),
         _ => Err(g.bad(tag)),
     }
 }
@@ -868,6 +908,17 @@ fn put_shape(p: &mut Put, s: Shape) {
         }
         Shape::AnyInt => p.u8(21),
         Shape::AnyFloat => p.u8(22),
+        Shape::Record(s, n) => {
+            p.u8(23);
+            p.u8(0);
+            p.u64(s);
+            p.u32(n);
+        }
+        Shape::Union(n) => {
+            p.u8(24);
+            p.u8(0);
+            p.u32(n);
+        }
     }
     p.to(start + SHAPE);
 }
@@ -904,6 +955,8 @@ fn get_shape(g: &mut Get<'_>) -> Result<Shape, E> {
         }
         21 => Shape::AnyInt,
         22 => Shape::AnyFloat,
+        23 => Shape::Record(g.u64()?, g.u32()?),
+        24 => Shape::Union(g.u32()?),
         _ => return Err(g.bad(tag)),
     };
     g.to(start + SHAPE);
@@ -1090,7 +1143,7 @@ fn encode_rows<'b>(c: &Checked<'_>, stalled_proved: bool, alloc: Alloc<'b>) -> R
         Some(q) => core::slice::from_ref(q),
         None => &[],
     };
-    let rows: [usize; 28] = [
+    let rows: [usize; 31] = [
         view.len(),
         view.lists_len(),
         list_rows.len(),
@@ -1119,6 +1172,9 @@ fn encode_rows<'b>(c: &Checked<'_>, stalled_proved: bool, alloc: Alloc<'b>) -> R
         first.len(),
         c.capture_places.len(),
         c.capture_projs.len(),
+        view.record_schemas_len(),
+        view.record_names_len(),
+        c.union_pats.len(),
     ];
     let mut size = CHECKED_RECORD_MAGIC.len() + 4 + 4 * COLS.len();
     for col in COLS {
@@ -1274,6 +1330,25 @@ fn encode_rows<'b>(c: &Checked<'_>, stalled_proved: bool, alloc: Alloc<'b>) -> R
         p.u32(a.column::<2>()[i]);
         p.ty(a.column::<3>()[i]);
     })?;
+    w.column(Col::TyRecordSchemas, view.record_schema_rows(), |p, &(s, l)| {
+        p.u64(s.0);
+        p.list(l);
+    })?;
+    w.column(Col::TyRecordNames, view.record_names_iter(), |p, &n| p.u64(n.0))?;
+    let a = &c.union_pats;
+    w.column(Col::UnionPats, a.column::<0>().iter().copied().zip(a.column::<1>().iter().copied()), |p, (pat, kind)| {
+        p.u32(pat.0);
+        match kind {
+            UnionPat::Variant(v) => {
+                p.u8(0);
+                p.u32(v);
+            }
+            UnionPat::Residual => {
+                p.u8(1);
+                p.u32(0);
+            }
+        }
+    })?;
     Ok(out)
 }
 
@@ -1284,8 +1359,8 @@ fn encode_rows<'b>(c: &Checked<'_>, stalled_proved: bool, alloc: Alloc<'b>) -> R
 #[derive(Clone, Copy, Debug)]
 pub struct CheckedRecord<'r> {
     bytes: &'r [u8],
-    rows: [u32; 28],
-    at: [usize; 28],
+    rows: [u32; 31],
+    at: [usize; 31],
 }
 
 impl<'r> CheckedRecord<'r> {
@@ -1304,8 +1379,8 @@ impl<'r> CheckedRecord<'r> {
         if have as usize != COLS.len() {
             return Err(E::Columns { have });
         }
-        let mut rows = [0u32; 28];
-        let mut at = [0usize; 28];
+        let mut rows = [0u32; 31];
+        let mut at = [0usize; 31];
         let mut next = (magic + 4 + 4 * COLS.len()) as u64;
         for col in COLS {
             let n = word(magic + 4 + 4 * col.at())?;
@@ -1417,6 +1492,30 @@ impl<'r> CheckedRecord<'r> {
         if end != b.lists {
             return Err(E::ListRows { row: self.rows(Col::TyListRows), start: b.lists, expected: end });
         }
+        let mut record_names = Vec::with_capacity_in(usize::try_from(self.rows(Col::TyRecordNames)).unwrap_or(0), alloc);
+        self.each(Col::TyRecordNames, |g| {
+            record_names.push(Name(g.u64()?));
+            Ok(())
+        })?;
+        let n_record_names = u64::try_from(record_names.len()).unwrap_or(u64::MAX);
+        self.each(Col::TyRecordSchemas, |g| {
+            let schema = RecordSchema(g.u64()?);
+            let l = g.raw_list()?;
+            if u64::from(l.start) + u64::from(l.len) > n_record_names {
+                return Err(E::ListOutside { column: Col::TyRecordSchemas.name(), row: g.n, start: l.start, len: l.len });
+            }
+            let names = if l.len == 0 {
+                &[][..]
+            } else {
+                record_names
+                    .get(l.range())
+                    .ok_or(E::ListOutside { column: Col::TyRecordSchemas.name(), row: g.n, start: l.start, len: l.len })?
+            };
+            types
+                .register_record_schema(schema, names)
+                .map_err(|_| E::Types(CheckError::Limit(crate::error::Limit::Table)))?;
+            Ok(())
+        })?;
         let tys = |col: Col| -> Result<Vec<PTy, Alloc<'a>>, E> {
             let mut v = Vec::with_capacity_in(self.rows(col) as usize, alloc);
             self.each(col, |g| {
@@ -1480,6 +1579,19 @@ impl<'r> CheckedRecord<'r> {
         self.each(Col::PatDefs, |g| {
             let p = PatId(g.u32()?);
             pat_defs.push((p, get_def(g)?));
+            Ok(())
+        })?;
+        let mut union_pats = Soa::new_in(alloc);
+        self.each(Col::UnionPats, |g| {
+            let p = PatId(g.u32()?);
+            let tag = g.u8()?;
+            let v = g.u32()?;
+            let kind = match tag {
+                0 => UnionPat::Variant(v),
+                1 if v == 0 => UnionPat::Residual,
+                _ => return Err(g.bad(tag)),
+            };
+            union_pats.push((p, kind));
             Ok(())
         })?;
         let mut fields = Soa::new_in(alloc);
@@ -1645,6 +1757,7 @@ impl<'r> CheckedRecord<'r> {
             const_args,
             pat_const_args,
             pat_defs,
+            union_pats,
             fields,
             captures,
             capture_places,
@@ -1666,6 +1779,7 @@ impl<'r> CheckedRecord<'r> {
             index_mut,
             findings: Vec::new_in(alloc),
             undecided: Vec::new_in(alloc),
+            inferred_output: None,
         })
     }
 }

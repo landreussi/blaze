@@ -37,7 +37,7 @@
 //! first puts `sp` back where the prologue left it ([`Pass::restore_sp`]), from `x29` and the
 //! frame's size, patched once the frame is known.
 
-use std::alloc::Allocator;
+use alloc::alloc::Allocator;
 
 use blaze_lir::{Scalar, Ty, Value};
 
@@ -145,10 +145,11 @@ impl<A: Allocator> Pass<'_, '_, A> {
         let from = 16 + slot.at;
         let from = i32::try_from(from).map_err(|_| EmitError::TooLarge { what: "a stacked parameter's offset" })?;
         if bits == 128 {
+            let off = self.cell_of(inst);
             self.mem(true, Size::X, X9, FP, from);
-            self.st_sp(X9, inst as u32 * 16);
+            self.st_sp(X9, off);
             self.mem(true, Size::X, X9, FP, from + 8);
-            self.st_sp(X9, inst as u32 * 16 + 8);
+            self.st_sp(X9, off + 8);
             return Ok(());
         }
         self.mem(true, size_of_bytes(slot.bytes), X9, FP, from);
@@ -204,7 +205,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 self.st_sp_sized(Size::X, X9, at);
                 continue;
             }
-            let cell = arg.value.0 * 16 + area;
+            let cell = self.cell_of(arg.value.index()) + area;
             if bytes == 16 {
                 self.ld_sp(X9, cell);
                 self.st_sp_sized(Size::X, X9, at);
@@ -237,7 +238,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
 
     /// Writes the frame's size `frame` into every [`Pass::restore_sp`].
     pub(super) fn patch_restores(&mut self, frame: u32) {
-        let fixes = core::mem::take(&mut self.sp_fixes);
+        let fixes = core::mem::replace(&mut self.sp_fixes, blaze_own::AVec::new_in(self.scratch));
         for &at in fixes.iter() {
             self.set(at, enc::sub_imm(X16, FP, frame >> 12, true));
             self.set(at + 4, enc::sub_imm(X16, X16, frame & 0xfff, false));

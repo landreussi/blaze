@@ -43,18 +43,18 @@ const MOST_ROWS: usize = 1 << 22;
 
 /// Keyed rows, filed through `&self`, each at an address that holds until the table drops; in
 /// the allocator `A` the table was made with (the module docs say whose).
-pub struct Rows<K, V, A: Allocator + Clone = Global> {
+pub struct Rows<K, V, A: Allocator + Copy = Global> {
     /// Every row ever filed, with its key, in segments that never move.
     rows: SharedSegs<(K, V), A>,
     /// Each live key's row.
     at: RefCell<HashMap<K, u32, A>>,
 }
 
-impl<K: Copy + Eq + Hash, V, A: Allocator + Clone> Rows<K, V, A> {
+impl<K: Copy + Eq + Hash, V, A: Allocator + Copy> Rows<K, V, A> {
     /// An empty table in `alloc` (its rows and its index): nothing is allocated until a row is
     /// filed.
     pub fn new_in(alloc: A) -> Rows<K, V, A> {
-        Rows { rows: SharedSegs::new_in(alloc.clone()), at: RefCell::new(HashMap::new_in(alloc)) }
+        Rows { rows: SharedSegs::new_in(alloc), at: RefCell::new(HashMap::new_in(alloc)) }
     }
 
     fn row(&self, i: u32) -> Option<&(K, V)> {
@@ -107,6 +107,26 @@ impl<K: Copy + Eq + Hash, V, A: Allocator + Clone> Rows<K, V, A> {
         self.row(old).map(|(_, v)| v)
     }
 
+    /// Temporarily overrides `k`'s live row with `v`, returning the previous row index so
+    /// [`Self::restore_override`] can restore `k` to its original row without copying it.
+    pub fn push_override(&self, k: K, v: V) -> Option<u32> {
+        let prev = self.at.borrow().get(&k).copied();
+        let _ = self.insert(k, v);
+        prev
+    }
+
+    /// Restores `k`'s live index to `prev` (removing `k` if `prev` is `None`).
+    pub fn restore_override(&self, k: K, prev: Option<u32>) {
+        match prev {
+            Some(i) => {
+                let _ = self.at.borrow_mut().insert(k, i);
+            }
+            None => {
+                let _ = self.at.borrow_mut().remove(&k);
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.at.borrow().len()
     }
@@ -128,10 +148,21 @@ impl<K: Copy + Eq + Hash, V, A: Allocator + Clone> Rows<K, V, A> {
     pub fn values(&self) -> impl Iterator<Item = &V> + '_ {
         self.iter().map(|(_, v)| v)
     }
+
+    /// Drops all filed rows and resets the table to empty (`&mut self`: no live references),
+    /// retaining the first segment and bounded index capacity for reuse.
+    pub fn clear(&mut self) {
+        self.rows.clear_keep_first();
+        let at = self.at.get_mut();
+        at.clear();
+        if at.capacity() > 256 {
+            at.shrink_to(64);
+        }
+    }
 }
 
 /// `rows[&k]`, as a map's: the caller has checked `k` is filed; a key that is not stops naming it.
-impl<K: Copy + Eq + Hash + core::fmt::Debug, V, A: Allocator + Clone> core::ops::Index<&K> for Rows<K, V, A> {
+impl<K: Copy + Eq + Hash + core::fmt::Debug, V, A: Allocator + Copy> core::ops::Index<&K> for Rows<K, V, A> {
     type Output = V;
 
     #[track_caller]
@@ -143,7 +174,7 @@ impl<K: Copy + Eq + Hash + core::fmt::Debug, V, A: Allocator + Clone> core::ops:
     }
 }
 
-impl<K: Copy + Eq + Hash + core::fmt::Debug, V: core::fmt::Debug, A: Allocator + Clone> core::fmt::Debug for Rows<K, V, A> {
+impl<K: Copy + Eq + Hash + core::fmt::Debug, V: core::fmt::Debug, A: Allocator + Copy> core::fmt::Debug for Rows<K, V, A> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_map().entries(self.iter()).finish()
     }
@@ -240,6 +271,50 @@ impl<T: Copy, A: Allocator> blaze_typeck::Stable<T> for StableColumn<T, A> {
         // buffer is freed only when the column drops (`&mut self`), so they outlive `&self`.
         unsafe { core::slice::from_raw_parts(at, self.len.get()) }
     }
+
+    fn clear(&mut self) {
+        let count = self.count.get();
+        let Some(last_idx) = count.checked_sub(1) else {
+            return;
+        };
+        let bufs = self.bufs.get_mut();
+        if let Some(prefix) = bufs.get(..last_idx) {
+            for &(at, room) in prefix {
+                let (Some(at), Ok(layout)) = (NonNull::new(at), Layout::array::<T>(room)) else { continue };
+                // SAFETY: allocated by `self.alloc` in `extend` with `room` entries of `T`,
+                // freed once here; `&mut self`: no slice of it is left. `T: Copy`.
+                unsafe { self.alloc.deallocate(at.cast::<u8>(), layout) };
+            }
+        }
+        let Some((last_at, last_room)) = bufs.get(last_idx).copied() else {
+            self.count.set(0);
+            self.len.set(0);
+            return;
+        };
+        if last_room <= 2048 {
+            if let Some(first) = bufs.first_mut() {
+                *first = (last_at, last_room);
+            }
+            if let Some(rest) = bufs.get_mut(1..count) {
+                for slot in rest {
+                    *slot = (core::ptr::null_mut(), 0);
+                }
+            }
+            self.count.set(1);
+        } else {
+            if let (Some(at), Ok(layout)) = (NonNull::new(last_at), Layout::array::<T>(last_room)) {
+                // SAFETY: allocated by `self.alloc` in `extend` with `last_room` entries of `T`.
+                unsafe { self.alloc.deallocate(at.cast::<u8>(), layout) };
+            }
+            if let Some(used) = bufs.get_mut(..count) {
+                for slot in used {
+                    *slot = (core::ptr::null_mut(), 0);
+                }
+            }
+            self.count.set(0);
+        }
+        self.len.set(0);
+    }
 }
 
 impl<T: Copy, A: Allocator> Drop for StableColumn<T, A> {
@@ -260,7 +335,11 @@ impl<T: Copy, A: Allocator> Drop for StableColumn<T, A> {
 pub fn stable_tys(alloc: blaze_own::Alloc<'_>) -> Result<blaze_typeck::PortableTys<'_>, blaze_typeck::CheckError> {
     let nodes: blaze_own::Box<dyn blaze_typeck::Stable<blaze_typeck::PNode>, blaze_own::Alloc<'_>> = blaze_own::Box::new_in(StableColumn::new_in(alloc), alloc);
     let lists: blaze_own::Box<dyn blaze_typeck::Stable<blaze_typeck::PTy>, blaze_own::Alloc<'_>> = blaze_own::Box::new_in(StableColumn::new_in(alloc), alloc);
-    blaze_typeck::PortableTys::new_stable(alloc, nodes, lists)
+    let record_schemas: blaze_own::Box<dyn blaze_typeck::Stable<(blaze_typeck::RecordSchema, blaze_typeck::List)>, blaze_own::Alloc<'_>> =
+        blaze_own::Box::new_in(StableColumn::new_in(alloc), alloc);
+    let record_names: blaze_own::Box<dyn blaze_typeck::Stable<blaze_typeck::Name>, blaze_own::Alloc<'_>> =
+        blaze_own::Box::new_in(StableColumn::new_in(alloc), alloc);
+    blaze_typeck::PortableTys::new_stable(alloc, nodes, lists, record_schemas, record_names)
 }
 
 #[cfg(test)]

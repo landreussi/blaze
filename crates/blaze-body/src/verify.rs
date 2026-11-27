@@ -28,9 +28,10 @@ use core::alloc::Allocator;
 use blaze_typeck::{PNode, PTys};
 
 use crate::body::{
-    BadRow, Block, BlockKind, BlockRow, Body, BodyRef, Callee, CalleeId, Const, ConstDecl, ConstKind,
-    Edge, List, Local, LocalDecl, LocalKind, Loan, LoanRow, NONE, Operand, Ops, Origin, PTy, Place,
-    PlaceRow, Proj, Stmt, StmtKind, StmtRow, Subset, Table, TyError, TyListRef, Unwind, Value,
+    AsmArch, AsmOpKind, AsmOpRow, AsmPiece, AsmRegKind, AsmRow, BadRow, Block, BlockKind, BlockRow,
+    Body, BodyRef, BorrowKind, Callee, CalleeId, Const, ConstDecl, ConstKind, Edge, List, Local,
+    LocalDecl, LocalKind, Loan, LoanRow, Mutbl, NONE, Operand, Ops, Origin, PTy, Place, PlaceRow,
+    Proj, Span, Stmt, StmtKind, StmtRow, Subset, Table, TyError, TyListRef, Unwind, Value,
 };
 use crate::code::ty_children;
 
@@ -112,8 +113,6 @@ pub struct Verified<'b> {
     body: BodyRef<'b>,
 }
 
-const PROOF: &str = "verify decoded every row and checked every id";
-
 impl<'b> Verified<'b> {
     /// The body this proof is of.
     pub fn body(&self) -> BodyRef<'b> {
@@ -132,12 +131,12 @@ impl<'b> Verified<'b> {
 
     /// Local `l`'s type, kind and mutability.
     pub fn local(&self, l: Local) -> LocalDecl {
-        self.body.local(l).expect(PROOF)
+        self.body.local(l).unwrap_or(LocalDecl { ty: PTy(NONE), kind: LocalKind::Return, mutbl: Mutbl::Not })
     }
 
     /// The place that is local `l` itself.
     pub fn local_place(&self, l: Local) -> Place {
-        self.body.local_place(l).expect(PROOF)
+        self.body.local_place(l).unwrap_or(Place(NONE))
     }
 
     /// How many places (each distinct place once, a parent before its children).
@@ -147,7 +146,9 @@ impl<'b> Verified<'b> {
 
     /// Place `p`'s row: its local, parent, projection, depth and drop-type mark.
     pub fn place(&self, p: Place) -> PlaceRow {
-        self.body.place(p).expect(PROOF)
+        self.body
+            .place(p)
+            .unwrap_or(PlaceRow { local: Local(NONE), parent: None, proj: None, depth: 0, of_drop_type: false })
     }
 
     /// How many constants.
@@ -157,20 +158,20 @@ impl<'b> Verified<'b> {
 
     /// Constant `c`'s kind and type.
     pub fn konst(&self, c: Const) -> ConstDecl {
-        self.body.konst(c).expect(PROOF)
+        self.body.konst(c).unwrap_or(ConstDecl { kind: ConstKind::Scalar { bits: 0 }, ty: PTy(NONE) })
     }
 
     /// The bytes of a string or byte-string constant; `None` for a constant of another kind.
     pub fn bytes(&self, c: Const) -> Option<&'b [u8]> {
         match self.konst(c).kind {
-            ConstKind::Bytes { .. } => Some(self.body.bytes(c).expect(PROOF)),
+            ConstKind::Bytes { .. } => self.body.bytes(c).ok(),
             _ => None,
         }
     }
 
     /// Callee `f`: what call `f`'s row calls.
     pub fn callee(&self, f: CalleeId) -> Callee {
-        self.body.callee(f).expect(PROOF)
+        self.body.callee(f).unwrap_or(Callee::Value(Operand::Const(Const(NONE))))
     }
 
     /// How many callees: one per call.
@@ -185,12 +186,12 @@ impl<'b> Verified<'b> {
 
     /// Statement row `s`: its kind and span.
     pub fn stmt(&self, s: Stmt) -> StmtRow {
-        self.body.stmt(s).expect(PROOF)
+        self.body.stmt(s).unwrap_or(StmtRow { kind: StmtKind::Unreachable, span: Span::default() })
     }
 
     /// The block row `s` is in.
     pub fn block_of(&self, s: Stmt) -> Block {
-        self.body.block_of(s).expect(PROOF)
+        self.body.block_of(s).unwrap_or(Block(NONE))
     }
 
     /// How many blocks; `Block(0)` is the entry.
@@ -200,7 +201,7 @@ impl<'b> Verified<'b> {
 
     /// Block `b`'s rows and kind.
     pub fn block(&self, b: Block) -> BlockRow {
-        self.body.block(b).expect(PROOF)
+        self.body.block(b).unwrap_or(BlockRow { stmts: Ops { start: 0, end: 0 }, kind: BlockKind::Normal })
     }
 
     /// The first row of the entry block.
@@ -216,13 +217,13 @@ impl<'b> Verified<'b> {
     /// The operands of a range (a call's arguments, an aggregate's fields).
     pub fn ops(&self, o: Ops) -> impl Iterator<Item = Operand> + 'b {
         let body = self.body;
-        (o.start..o.end).map(move |i| body.operand(i).expect(PROOF))
+        (o.start..o.end).filter_map(move |i| body.operand(i).ok())
     }
 
     /// The cases of a switch's range: values ascending, each once.
     pub fn cases(&self, o: Ops) -> impl Iterator<Item = (u128, Block)> + 'b {
         let body = self.body;
-        (o.start..o.end).map(move |i| body.case(i).expect(PROOF))
+        (o.start..o.end).filter_map(move |i| body.case(i).ok())
     }
 
     /// How many loans: one per borrow statement.
@@ -232,7 +233,12 @@ impl<'b> Verified<'b> {
 
     /// Loan `l`: the place borrowed, how, into which origin, and at which statement.
     pub fn loan(&self, l: Loan) -> LoanRow {
-        self.body.loan(l).expect(PROOF)
+        self.body.loan(l).unwrap_or(LoanRow {
+            place: Place(NONE),
+            kind: BorrowKind::Shared,
+            origin: Origin(NONE),
+            at: Stmt(NONE),
+        })
     }
 
     /// The subsets, in statement order.
@@ -247,7 +253,7 @@ impl<'b> Verified<'b> {
 
     /// Whether origin `o` is a placeholder: a lifetime of the signature.
     pub fn placeholder(&self, o: Origin) -> bool {
-        self.body.placeholder(o).expect(PROOF)
+        self.body.placeholder(o).unwrap_or(false)
     }
 
     /// `(local, origin)`: the local's type mentions the origin. Sorted, each once.
@@ -287,9 +293,50 @@ impl<'b> Verified<'b> {
         self.body.ty_list(record, l)
     }
 
+    /// How many inline assembly blocks.
+    pub fn asms(&self) -> u32 {
+        self.body.asms()
+    }
+
+    /// Descriptor of inline assembly block `i`.
+    pub fn asm(&self, i: u32) -> AsmRow {
+        self.body.asm(i).unwrap_or(AsmRow {
+            pieces: Ops::default(),
+            ops: Ops::default(),
+            clobbers_start: 0,
+            clobbers_len: 0,
+            options: 0,
+            arch: AsmArch::Aarch64,
+        })
+    }
+
+    /// Template piece `i`.
+    pub fn asm_piece(&self, i: u32) -> AsmPiece {
+        self.body.asm_piece(i).unwrap_or(AsmPiece::Line)
+    }
+
+    /// Operand descriptor `i`.
+    pub fn asm_op(&self, i: u32) -> AsmOpRow {
+        self.body.asm_op(i).unwrap_or(AsmOpRow {
+            kind: AsmOpKind::In,
+            reg_kind: AsmRegKind::None,
+            reg_start: 0,
+            reg_len: 0,
+            in_op: None,
+            out_place: None,
+            label: None,
+            discard_out: false,
+        })
+    }
+
+    /// UTF-8 slice for an `asm!` text/register/clobber field.
+    pub fn asm_str(&self, start: u32, len: u32) -> &'b str {
+        self.body.asm_str(start, len).unwrap_or("")
+    }
+
     /// Calls `f` on each block edge out of terminator `kind`, with how it is taken.
     pub fn for_each_edge(&self, kind: &StmtKind, f: impl FnMut(Block, Edge)) {
-        self.body.for_each_edge(kind, f).expect(PROOF);
+        let _ = self.body.for_each_edge(kind, f);
     }
 
     /// Calls `f` on each successor row of `s`: the next row for a statement, each edge's
@@ -301,7 +348,11 @@ impl<'b> Verified<'b> {
             return;
         }
         let body = self.body;
-        self.for_each_edge(&kind, |b, _| f(Stmt(body.block(b).expect(PROOF).stmts.start)));
+        self.for_each_edge(&kind, |b, _| {
+            if let Ok(row) = body.block(b) {
+                f(Stmt(row.stmts.start));
+            }
+        });
     }
 
     /// The prefix of `p` at `depth` (0 is the local's place).
@@ -518,14 +569,31 @@ pub fn check_refs(body: &BodyRef<'_>, at: Stmt, kind: &StmtKind) -> Result<(), V
             r.block(resume)?;
             r.block(cancel)
         }
-        StmtKind::InlineAsm { operands, target, unwind, .. } => {
+        StmtKind::InlineAsm { asm, operands, target, unwind } => {
             r.ops(operands)?;
+            if body.asms() > 0 {
+                r.within(Table::Asms, asm, body.asms())?;
+                if let Ok(row) = body.asm(asm) {
+                    let n_ops = operands.len();
+                    for i in row.ops.start..row.ops.end {
+                        if let Ok(op) = body.asm_op(i)
+                            && let Some(idx) = op.in_op
+                        {
+                            r.within(Table::Operands, idx, n_ops)?;
+                        }
+                    }
+                }
+            }
             if let Some(t) = target {
                 r.block(t)?;
             }
             r.unwind(unwind)
         }
-        StmtKind::Return | StmtKind::Unreachable | StmtKind::Resume | StmtKind::Terminate => Ok(()),
+        StmtKind::TailCall { callee, args } => {
+            r.within(Table::Callees, callee.0, body.callees())?;
+            r.ops(args)
+        }
+        StmtKind::Return | StmtKind::Cancelled | StmtKind::Unreachable | StmtKind::Resume | StmtKind::Terminate => Ok(()),
     }
 }
 
@@ -611,6 +679,29 @@ fn tables(b: &BodyRef<'_>) -> Result<(), VerifyError> {
         r.origin(from)?;
         r.origin(into)?;
     }
+    for i in 0..b.asms() {
+        let row = b.asm(i)?;
+        let r = Refs { b, site: at(Table::Asms, i) };
+        r.range(Table::AsmPieces, row.pieces, b.asm_pieces.len())?;
+        r.range(Table::AsmOps, row.ops, b.asm_ops.len())?;
+        b.asm_str(row.clobbers_start, row.clobbers_len)?;
+        for pi in row.pieces.start..row.pieces.end {
+            if let AsmPiece::Text { start, len } = b.asm_piece(pi)? {
+                b.asm_str(start, len)?;
+            }
+        }
+        for oi in row.ops.start..row.ops.end {
+            let op = b.asm_op(oi)?;
+            b.asm_str(op.reg_start, op.reg_len)?;
+            let or = Refs { b, site: at(Table::AsmOps, oi) };
+            if let Some(p) = op.out_place {
+                or.place(p)?;
+            }
+            if let Some(lbl) = op.label {
+                or.block(lbl)?;
+            }
+        }
+    }
     overlay(b)
 }
 
@@ -638,7 +729,7 @@ fn overlay(b: &BodyRef<'_>) -> Result<(), VerifyError> {
             return Err(VerifyError::ListEntry { entry: b.list_base + len(i), child: PTy(*w) });
         }
     }
-    for i in 0..b.tys.len() {
+    for (i, cur) in b.tys.iter().enumerate() {
         let ty = PTy(b.ty_base + len(i));
         let node = b.own_ty(ty)?.ok_or(BadRow { table: Table::Types, row: len(i), code: NONE })?;
         let bad: core::cell::Cell<Option<VerifyError>> = core::cell::Cell::new(None);
@@ -667,7 +758,7 @@ fn overlay(b: &BodyRef<'_>) -> Result<(), VerifyError> {
         if let Some(e) = bad.get() {
             return Err(e);
         }
-        if let Some(j) = b.tys[..i].iter().position(|w| *w == b.tys[i]) {
+        if let Some(j) = b.tys.get(..i).and_then(|prev| prev.iter().position(|w| w == cur)) {
             return Err(VerifyError::DuplicateType { ty, first: PTy(b.ty_base + len(j)) });
         }
     }

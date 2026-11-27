@@ -36,13 +36,14 @@
 //! length), every word a form leaves unused [`NONE`].
 #![blaze::sans_io]
 
-use blaze_typeck::{FloatTy, FnPtrHeader, IntTy, Name, PNode, UintTy};
+use blaze_typeck::{FloatTy, FnPtrHeader, IntTy, Name, PNode, RecordSchema, UintTy};
 
 use crate::body::{
-    AggregateKind, AssertKind, BinOp, BlockKind, BlockRow, BorrowKind, Block, Callee, CalleeId,
-    CastKind, Const, ConstDecl, ConstKind, ExprId, ItemKey, List, Loan, LoanRow, Local, LocalDecl,
-    LocalKind, Mutbl, NONE, Operand, Ops, Origin, PTy, PatId, Place, PlaceRow, Proj, Role, Stmt,
-    StmtKind, UnOp, Unwind, Value,
+    AggregateKind, AsmArch, AsmOpKind, AsmOpRow, AsmPiece, AsmRegKind, AsmRow, AssertKind, BinOp,
+    Block, BlockKind, BlockRow, BorrowKind, Callee, CalleeId, CastKind, Const, ConstDecl,
+    ConstKind, ExprId, ItemKey, List, Loan, LoanRow, Local, LocalDecl, LocalKind, Mutbl, NONE,
+    Operand, Ops, Origin, PTy, PatId, Place, PlaceRow, Proj, Role, Stmt, StmtKind, UnOp, Unwind,
+    Value,
 };
 
 blaze_format_core::record! {
@@ -180,6 +181,45 @@ blaze_format_core::record! {
     }
 }
 
+blaze_format_core::record! {
+    /// One inline assembly block descriptor.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    pub struct AsmWords: 1 {
+        pub pieces_start: u32,
+        pub pieces_end: u32,
+        pub ops_start: u32,
+        pub ops_end: u32,
+        pub clobbers_start: u32,
+        pub clobbers_len: u32,
+        pub options: u16,
+        pub arch: u16,
+    }
+}
+
+blaze_format_core::record! {
+    /// One template piece of an inline assembly block.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    pub struct AsmPieceWords: 1 {
+        pub kind: u32,
+        pub a: u32,
+        pub b: u32,
+    }
+}
+
+blaze_format_core::record! {
+    /// One operand descriptor of an inline assembly block.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    pub struct AsmOpWords: 1 {
+        pub reg_start: u32,
+        pub reg_len: u32,
+        pub in_op: u32,
+        pub target: u32,
+        pub kind: u8,
+        pub reg_kind: u8,
+        pub flags: u16,
+    }
+}
+
 /// The overlay type tags, one per form of blaze-typeck's `PNode`. 0 is no form.
 pub mod ty_tag {
     pub const BOOL: u32 = 1;
@@ -213,6 +253,8 @@ pub mod ty_tag {
     pub const EX_PROJ: u32 = 29;
     pub const EX_AUTO: u32 = 30;
     pub const FOREIGN: u32 = 31;
+    pub const RECORD: u32 = 32;
+    pub const UNION: u32 = 33;
 }
 
 /// The statement tags. 0 is no form.
@@ -248,6 +290,8 @@ pub mod tag {
     pub const RESUME: u16 = 48;
     pub const TERMINATE: u16 = 49;
     pub const INLINE_ASM: u16 = 50;
+    pub const TAIL_CALL: u16 = 51;
+    pub const CANCELLED: u16 = 52;
 }
 
 /// For each fieldless enum: its number and its text name, one table each.
@@ -551,6 +595,7 @@ pub fn encode_stmt(k: StmtKind) -> StmtWords {
             w.flags = kc | (ku << 4) | (u16::from(expected) << 6);
         }
         StmtKind::Suspend { resume, cancel } => (w.tag, w.a, w.b) = (tag::SUSPEND, resume.0, cancel.0),
+        StmtKind::Cancelled => w.tag = tag::CANCELLED,
         StmtKind::Return => w.tag = tag::RETURN,
         StmtKind::Unreachable => w.tag = tag::UNREACHABLE,
         StmtKind::Resume => w.tag = tag::RESUME,
@@ -560,6 +605,10 @@ pub fn encode_stmt(k: StmtKind) -> StmtWords {
             (w.a, w.b, w.c, w.e) = (asm, operands.start, operands.end, opt(target.map(|b| b.0)));
             let (k, f) = unwind_bits(unwind);
             (w.f, w.flags) = (f, k << 4);
+        }
+        StmtKind::TailCall { callee, args } => {
+            w.tag = tag::TAIL_CALL;
+            (w.a, w.b, w.c) = (callee.0, args.start, args.end);
         }
     }
     w
@@ -623,6 +672,7 @@ pub fn decode_stmt(w: StmtWords) -> Option<StmtKind> {
             unwind: unwind?,
         },
         tag::SUSPEND => StmtKind::Suspend { resume: Block(w.a), cancel: Block(w.b) },
+        tag::CANCELLED => StmtKind::Cancelled,
         tag::RETURN => StmtKind::Return,
         tag::UNREACHABLE => StmtKind::Unreachable,
         tag::RESUME => StmtKind::Resume,
@@ -632,6 +682,10 @@ pub fn decode_stmt(w: StmtWords) -> Option<StmtKind> {
             operands: Ops { start: w.b, end: w.c },
             target: unopt(w.e).map(Block),
             unwind: unwind?,
+        },
+        tag::TAIL_CALL => StmtKind::TailCall {
+            callee: CalleeId(w.a),
+            args: Ops { start: w.b, end: w.c },
         },
         _ => return None,
     };
@@ -841,11 +895,7 @@ pub const FLOAT_TYS: [(FloatTy, &str); 4] = [(FloatTy::F16, "f16"), (FloatTy::F3
 
 /// The index of `x` in a table of numbered forms; every form is in its table.
 fn code_in<T: PartialEq + Copy>(table: &[(T, &str)], x: T) -> u32 {
-    let mut i = 0;
-    while i < table.len() && table[i].0 != x {
-        i += 1;
-    }
-    i as u32
+    table.iter().position(|&(t, _)| t == x).unwrap_or(table.len()) as u32
 }
 
 fn form_of<T: Copy>(table: &[(T, &str)], code: u32) -> Option<T> {
@@ -853,27 +903,42 @@ fn form_of<T: Copy>(table: &[(T, &str)], code: u32) -> Option<T> {
 }
 
 fn put_key(w: &mut [u32; 9], at: usize, k: ItemKey) {
-    w[at..at + 4].copy_from_slice(&split(k.0));
+    if let Some(dst) = w.get_mut(at..at + 4) {
+        dst.copy_from_slice(&split(k.0));
+    }
 }
 
 fn put_list(w: &mut [u32; 9], at: usize, l: List) {
-    (w[at], w[at + 1]) = (l.start, l.len);
+    if let Some([a, b]) = w.get_mut(at..at + 2) {
+        (*a, *b) = (l.start, l.len);
+    }
 }
 
 fn put_name(w: &mut [u32; 9], at: usize, n: Name) {
-    (w[at], w[at + 1]) = (n.0 as u32, (n.0 >> 32) as u32);
+    if let Some([a, b]) = w.get_mut(at..at + 2) {
+        (*a, *b) = (n.0 as u32, (n.0 >> 32) as u32);
+    }
 }
 
 fn key_at(w: &[u32; 9], at: usize) -> ItemKey {
-    ItemKey(join([w[at], w[at + 1], w[at + 2], w[at + 3]]))
+    match w.get(at..at + 4) {
+        Some(&[a, b, c, d]) => ItemKey(join([a, b, c, d])),
+        _ => ItemKey(0),
+    }
 }
 
 fn list_at(w: &[u32; 9], at: usize) -> List {
-    List { start: w[at], len: w[at + 1] }
+    match w.get(at..at + 2) {
+        Some(&[start, len]) => List { start, len },
+        _ => List { start: 0, len: 0 },
+    }
 }
 
 fn name_at(w: &[u32; 9], at: usize) -> Name {
-    Name(u64::from(w[at]) | (u64::from(w[at + 1]) << 32))
+    match w.get(at..at + 2) {
+        Some(&[lo, hi]) => Name(u64::from(lo) | (u64::from(hi) << 32)),
+        _ => Name(0),
+    }
 }
 
 /// An overlay type as its row.
@@ -899,6 +964,15 @@ pub fn encode_ty(n: PNode) -> TyWords {
         PNode::Tuple(l) => {
             put_list(&mut w, 0, l);
             ty_tag::TUPLE
+        }
+        PNode::Record(s, l) => {
+            put_name(&mut w, 0, Name(s.0));
+            put_list(&mut w, 2, l);
+            ty_tag::RECORD
+        }
+        PNode::Union(l) => {
+            put_list(&mut w, 0, l);
+            ty_tag::UNION
         }
         PNode::Ref(m, t) | PNode::Ptr(m, t) => {
             (w[0], w[1]) = (mutbl_code(m), t.0);
@@ -1004,6 +1078,8 @@ pub fn decode_ty(r: TyWords) -> Option<PNode> {
         ty_tag::STR => PNode::Str,
         ty_tag::NEVER => PNode::Never,
         ty_tag::TUPLE => PNode::Tuple(list_at(w, 0)),
+        ty_tag::RECORD => PNode::Record(RecordSchema(name_at(w, 0).0), list_at(w, 2)),
+        ty_tag::UNION => PNode::Union(list_at(w, 0)),
         ty_tag::REF => PNode::Ref(mutbl_of(w[0])?, PTy(w[1])),
         ty_tag::PTR => PNode::Ptr(mutbl_of(w[0])?, PTy(w[1])),
         ty_tag::ARRAY => PNode::Array(PTy(w[0]), PTy(w[1])),
@@ -1048,6 +1124,8 @@ pub fn ty_children(n: PNode, mut ty: impl FnMut(PTy), mut list: impl FnMut(List)
             list(l);
         }
         PNode::Tuple(l)
+        | PNode::Record(_, l)
+        | PNode::Union(l)
         | PNode::Adt(_, l)
         | PNode::FnDef(_, l)
         | PNode::FnPtr(l, _)
@@ -1078,6 +1156,8 @@ pub fn ty_children(n: PNode, mut ty: impl FnMut(PTy), mut list: impl FnMut(List)
 pub fn map_ty_lists(n: PNode, mut f: impl FnMut(List) -> List) -> PNode {
     match n {
         PNode::Tuple(l) => PNode::Tuple(f(l)),
+        PNode::Record(s, l) => PNode::Record(s, f(l)),
+        PNode::Union(l) => PNode::Union(f(l)),
         PNode::Pat(t, l) => PNode::Pat(t, f(l)),
         PNode::Adt(k, l) => PNode::Adt(k, f(l)),
         PNode::FnDef(k, l) => PNode::FnDef(k, f(l)),
@@ -1109,4 +1189,137 @@ pub fn map_ty_lists(n: PNode, mut f: impl FnMut(List) -> List) -> PNode {
         | PNode::ExAuto(_)
         | PNode::Foreign(_) => n,
     }
+}
+
+pub fn encode_asm(r: AsmRow) -> AsmWords {
+    AsmWords {
+        pieces_start: r.pieces.start,
+        pieces_end: r.pieces.end,
+        ops_start: r.ops.start,
+        ops_end: r.ops.end,
+        clobbers_start: r.clobbers_start,
+        clobbers_len: r.clobbers_len,
+        options: r.options,
+        arch: match r.arch {
+            AsmArch::Aarch64 => 0,
+            AsmArch::X86_64 => 1,
+        },
+    }
+}
+
+pub fn decode_asm(w: AsmWords) -> Option<AsmRow> {
+    let arch = match w.arch {
+        0 => AsmArch::Aarch64,
+        1 => AsmArch::X86_64,
+        _ => return None,
+    };
+    Some(AsmRow {
+        pieces: Ops { start: w.pieces_start, end: w.pieces_end },
+        ops: Ops { start: w.ops_start, end: w.ops_end },
+        clobbers_start: w.clobbers_start,
+        clobbers_len: w.clobbers_len,
+        options: w.options,
+        arch,
+    })
+}
+
+pub fn encode_asm_piece(p: AsmPiece) -> AsmPieceWords {
+    match p {
+        AsmPiece::Text { start, len } => AsmPieceWords { kind: 0, a: start, b: len },
+        AsmPiece::Line => AsmPieceWords { kind: 1, a: NONE, b: NONE },
+        AsmPiece::Operand { index, modifier } => {
+            AsmPieceWords { kind: 2, a: index, b: modifier.map_or(NONE, u32::from) }
+        }
+    }
+}
+
+pub fn decode_asm_piece(w: AsmPieceWords) -> Option<AsmPiece> {
+    let p = match w.kind {
+        0 => AsmPiece::Text { start: w.a, len: w.b },
+        1 => AsmPiece::Line,
+        2 => {
+            let modifier = match w.b {
+                NONE => None,
+                c => Some(char::from_u32(c)?),
+            };
+            AsmPiece::Operand { index: w.a, modifier }
+        }
+        _ => return None,
+    };
+    (encode_asm_piece(p) == w).then_some(p)
+}
+
+pub fn encode_asm_op(op: AsmOpRow) -> AsmOpWords {
+    let kind = match op.kind {
+        AsmOpKind::In => 0,
+        AsmOpKind::Out => 1,
+        AsmOpKind::LateOut => 2,
+        AsmOpKind::InOut => 3,
+        AsmOpKind::InLateOut => 4,
+        AsmOpKind::Sym => 5,
+        AsmOpKind::Const => 6,
+        AsmOpKind::Label => 7,
+    };
+    let reg_kind = match op.reg_kind {
+        AsmRegKind::None => 0,
+        AsmRegKind::Class => 1,
+        AsmRegKind::Explicit => 2,
+    };
+    let (target, mut flags) = match (op.out_place, op.label) {
+        (Some(p), None) => (p.0, 2u16),
+        (None, Some(b)) => (b.0, 4u16),
+        _ => (NONE, 0u16),
+    };
+    if op.discard_out {
+        flags |= 1;
+    }
+    AsmOpWords {
+        reg_start: op.reg_start,
+        reg_len: op.reg_len,
+        in_op: op.in_op.unwrap_or(NONE),
+        target,
+        kind,
+        reg_kind,
+        flags,
+    }
+}
+
+pub fn decode_asm_op(w: AsmOpWords) -> Option<AsmOpRow> {
+    let kind = match w.kind {
+        0 => AsmOpKind::In,
+        1 => AsmOpKind::Out,
+        2 => AsmOpKind::LateOut,
+        3 => AsmOpKind::InOut,
+        4 => AsmOpKind::InLateOut,
+        5 => AsmOpKind::Sym,
+        6 => AsmOpKind::Const,
+        7 => AsmOpKind::Label,
+        _ => return None,
+    };
+    let reg_kind = match w.reg_kind {
+        0 => AsmRegKind::None,
+        1 => AsmRegKind::Class,
+        2 => AsmRegKind::Explicit,
+        _ => return None,
+    };
+    let discard_out = (w.flags & 1) != 0;
+    let has_place = (w.flags & 2) != 0;
+    let has_label = (w.flags & 4) != 0;
+    if (w.flags & !7) != 0 || (has_place && has_label) {
+        return None;
+    }
+    let out_place = if has_place { Some(Place(w.target)) } else { None };
+    let label = if has_label { Some(Block(w.target)) } else { None };
+    let in_op = unopt(w.in_op);
+    let row = AsmOpRow {
+        kind,
+        reg_kind,
+        reg_start: w.reg_start,
+        reg_len: w.reg_len,
+        in_op,
+        out_place,
+        label,
+        discard_out,
+    };
+    (encode_asm_op(row) == w).then_some(row)
 }

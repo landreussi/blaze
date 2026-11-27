@@ -37,6 +37,7 @@ use std::alloc::Global;
 
 #[cfg(unix)]
 use blaze_mem::{Slab, Tag as MemTag};
+use blaze_own::Share;
 
 use crate::{
     Completion, Confine, Done, Driver, Effect, IoError, Tag,
@@ -291,8 +292,10 @@ impl<T> Mailbox<T> {
     fn new(room: usize) -> Mailbox<T> {
         // alloc: once per driver, the room of what is told between two polls.
         let items = VecDeque::with_capacity(room);
+        let state = Lock::new("core.threads.inbox", Inbox { items, waiting: 0, closed: false });
+        state.prewarm_contention();
         Mailbox {
-            state: Lock::new("core.threads.inbox", Inbox { items, waiting: 0, closed: false }),
+            state,
             ready: Signal::new("core.threads.inbox_ready"),
         }
     }
@@ -1167,13 +1170,13 @@ pub(crate) fn changes(effect: &Effect) -> [Option<crate::FileName>; 2] {
         | Effect::WriteUnsynced { file, .. }
         | Effect::Truncate { file, .. }
         | Effect::Remove { file, .. }
-        | Effect::Prewarm { file, .. } => [Some(file.clone()), None],
-        Effect::RemoveDir { dir, .. } => [Some(dir.clone()), None],
+        | Effect::Prewarm { file, .. } => [Some(file.share()), None],
+        Effect::RemoveDir { dir, .. } => [Some(dir.share()), None],
         Effect::Rename { from, to, .. } | Effect::RenameUnsynced { from, to, .. } => {
-            [Some(from.clone()), Some(to.clone())]
+            [Some(from.share()), Some(to.share())]
         }
         Effect::Clone { to, .. } | Effect::CopyData { to, .. } | Effect::Link { to, .. } => {
-            [Some(to.clone()), None]
+            [Some(to.share()), None]
         }
         _ => [None, None],
     }
@@ -1209,7 +1212,7 @@ fn read_many(root: &Path, kept: &Descriptors, parts: &mut [crate::ReadPart], cac
 /// resolved spans read by one call.
 fn read_run(root: &Path, kept: &Descriptors, run: &mut [crate::ReadPart], cache: crate::Cache) {
     use crate::{Got, ReadPart};
-    let file = run[0].file.clone(); // clone: a refcount
+    let file = run[0].file.share(); // clone: a refcount
     let opened = match kept.file(root, &file, cache) {
         Ok(opened) => opened,
         Err(error) => {

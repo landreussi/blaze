@@ -16,6 +16,12 @@ repository.workspace = true
 [package.metadata.blaze]
 producer = ["body-checker", "code-builder"]
 
+[package.metadata.blaze.producer-exclude]
+# `blaze-ladder` depends on `blaze-export` only for `natives.rs` (`Kind::Native`, keyed by
+# `Row::Whole`) and `run/wasm64.rs` (`MacroModule`), never for `CodeRecord` emission
+# (`code_records.rs`, `run/make_one.rs`). Guarded by `code_builder_never_calls_blaze_export`.
+code-builder = ["blaze-export"]
+
 [lib]
 doctest = false
 
@@ -103,6 +109,14 @@ blaze-expand.workspace = true
 blaze-core.workspace = true
 
 [dev-dependencies]
+# D119 Wave 4 live cutover & side-by-side ladder oracles (front2/tables/task.rs):
+# `blaze-body` and `blaze-body-lower` are already in `[dependencies]`; the remaining four crates
+# live in `[dev-dependencies]` until Wave 5 resolves D173's `bare` ratchet (`0 -> 1` on `reached`).
+blaze-body-drops.workspace = true
+blaze-body-flow.workspace = true
+blaze-body-build.workspace = true
+blaze-body-eval.workspace = true
+blaze-lir = { workspace = true, features = ["eval"] }
 # The store the command keeps records in (`plain::Driven`, `plain::Lent`), for the tests that
 # write and read records through it.
 blaze-cas.workspace = true
@@ -111,6 +125,8 @@ blaze-sim.workspace = true
 blaze-std.workspace = true
 # tests/front2_borrows.rs: `blaze_own::testing::heap()`, the test's root allocator.
 blaze-own = { workspace = true, features = ["std", "testing"] }
+# tests/per_fn_bump_frame_allocs.rs: per-function Global heap allocation budget proof.
+blaze-alloc-count.workspace = true
 # tests/toolchain_store/mod.rs: the `names` producer's digest in the prepared std world's key.
 blaze-producers.workspace = true
 

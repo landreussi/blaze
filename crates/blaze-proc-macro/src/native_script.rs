@@ -27,7 +27,6 @@ use blaze_build_script::{
     instr::OutputLimits,
     key::RunLimits,
     host_tools::{self, HostTool},
-    native::Grant,
     outputs::{FileLimits, FileMode, Outputs},
     toolchain::{CInputs, c_env, depfile_reads, headers_digest, map_paths},
 };
@@ -48,6 +47,16 @@ use bstd::{
 };
 
 use crate::record::native_world;
+
+/// A confined workspace file list for certifying a native build script's reads: instead of
+/// granting the whole package or workspace subtree, `workspace` is mounted as a
+/// [`RootKind::Package`] whose only admitted paths are `files` (relative to `workspace`),
+/// enforced file-by-file by the OS confinement (macOS Seatbelt literal rules / Linux Landlock).
+#[derive(Clone, Copy, Debug)]
+pub struct ConfinedFiles<'s> {
+    pub workspace: &'s str,
+    pub files: &'s [&'s str],
+}
 
 /// One script to run.
 #[derive(Clone, Copy, Debug)]
@@ -84,6 +93,9 @@ pub struct NativeScript<'s> {
     /// `None` only in an example or test of something else: `NUM_JOBS` `1`, no jobserver. A
     /// command always gives one (`NativeSetting::jobs`).
     pub jobs: Option<&'s crate::jobserver::Jobserver>,
+    /// When `Some`, omits `c.package` from tree-root grants and instead mounts `workspace` as a
+    /// [`RootKind::Package`] admitting only `files` (used to certify exact workspace reads).
+    pub confined: Option<ConfinedFiles<'s>>,
     pub limits: RunLimits,
     pub deadline: Duration,
     /// The home's file area (`<store>/build-script/files`, canonical, made): where each file
@@ -96,6 +108,9 @@ pub struct NativeScript<'s> {
 #[derive(Debug)]
 pub struct NativeScriptRun<'a> {
     pub outputs: Outputs<'a>,
+    /// The raw `cargo:rerun-if-changed=` / `cargo::rerun-if-changed=` paths printed by the
+    /// script (before path remapping), used only as candidate hints for confined certification.
+    pub rerun_if_changed: AVec<'a, AString<'a>>,
     /// The digest of the sysroot headers its compiles read, and how many.
     pub headers: ContentId,
     pub headers_read: usize,
@@ -112,8 +127,6 @@ pub enum NativeScriptError {
     /// The hermetic run (bstd `procs::hermetic`, D177) refused it or failed: the fault names the
     /// rule ([`Fault::rule`]).
     Refused { program: std::string::String, fault: Fault },
-    /// The grant names a path no confinement can say (D65), refused before anything runs.
-    Grant { program: std::string::String, why: std::string::String },
     /// The world the run is started from offers no `capability` (a host, its spawner, a clock).
     NoHost { program: std::string::String, capability: &'static str },
     /// The script ran to an end that was not exit 0. `exit` is how it ended (a status, or the
@@ -152,7 +165,6 @@ impl std::fmt::Display for NativeScriptError {
             NativeScriptError::Refused { program, fault } => {
                 write!(f, "{program}: the native build script's hermetic run was refused by {:?}: {fault:?}", fault.rule())
             }
-            NativeScriptError::Grant { program, why } => write!(f, "{program}: {why}"),
             NativeScriptError::NoHost { program, capability } => {
                 write!(f, "{program}: the world a native build script is started from offers no `{capability}` (rule 9: nothing runs then)")
             }
@@ -298,6 +310,36 @@ pub fn listed_under(folder: &str) -> Result<std::vec::Vec<Listed>, NativeScriptE
     Ok(out)
 }
 
+/// Lists every subdirectory and non-directory entry under `folder` (skipping `target`, `.blaze`,
+/// `.git`), sorted by path bytes, allocated in `alloc`.
+pub(crate) fn walk_tree<'a>(folder: &str, alloc: Alloc<'a>) -> Option<(AVec<'a, AString<'a>>, AVec<'a, AString<'a>>)> {
+    let (io, root) = native_world(Path::new(folder)).ok()?;
+    let cx = io.cx(Duration::from_secs(60), TASK_FRAME).ok()?;
+    let limits = bstd::fs::WalkLimits { folders: 32768, entries: 1 << 18, depth: 64 };
+    let mut dirs: AVec<'a, AString<'a>> = Vec::new_in(alloc);
+    let mut files: AVec<'a, AString<'a>> = Vec::new_in(alloc);
+    root.walk(&cx, None, limits, cx.frame(), |entries, enter| {
+        for i in 0..entries.len() {
+            let kind = entries.kind(i);
+            let path = entries.path(i).map_err(|_| "entry is not a valid path")?;
+            if kind == bstd::fs::EntryKind::Dir {
+                let name = entries.name(i);
+                if name != "target" && name != ".blaze" && name != ".git" {
+                    dirs.push(String::from_str_in(path.as_str(), alloc));
+                    enter.enter(i);
+                }
+                continue;
+            }
+            files.push(String::from_str_in(path.as_str(), alloc));
+        }
+        Ok::<(), &'static str>(())
+    })
+    .ok()?;
+    dirs.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    files.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    Some((dirs, files))
+}
+
 /// The bytes one read of a stored file's digest takes: one buffer, reused for every chunk of
 /// every file.
 const CHUNK: usize = 256 << 10;
@@ -402,8 +444,8 @@ pub fn store_out_dir<'a>(out_dir: &str, area: &str, listed: &[Listed], outputs: 
         let to_text = joined(&area_rel, &hex64(&sha256));
         let to = bstd::path::Path::new(&to_text).map_err(|_| named(format!("{to_text}: not a relative path")))?;
         match root.stat(&cx, &to).map_err(|e| named(e.to_string()))? {
-            Some(_) => stored.present += 1,
-            None => root.rename_replacing_unsynced(&cx, &from, &to, bstd::fs::Unsynced::No).map_err(|e| named(format!("renamed into the file area {area}: {e}")))?,
+            Some(meta) if !meta.dir && meta.len == file.len => stored.present += 1,
+            _ => root.rename_replacing_unsynced(&cx, &from, &to, bstd::fs::Unsynced::No).map_err(|e| named(format!("renamed into the file area {area}: {e}")))?,
         }
         let mode = if file.executable { FileMode::Executable } else { FileMode::Plain };
         outputs.add_stored(&file.name, at, mode, sha256, limits, alloc).map_err(|e| named(format!("{e:?}")))?;
@@ -604,11 +646,12 @@ impl NativeBudget {
 }
 
 /// `OUT_DIR` as the hermetic run's output root: listed with digests after the run, emptied
-/// after a stopped one. The run has no package root and no report of its own, so the other
-/// calls are a driver's bug, refused by name.
+/// after a stopped one. When a certification run mounts the workspace as a [`RootKind::Package`],
+/// `package_root` holds that root's id and its admitted relative file paths.
 pub(crate) struct OutDir<'d> {
     pub(crate) root: RootId,
     pub(crate) folder: &'d str,
+    pub(crate) package_root: Option<(RootId, &'d [&'d str])>,
 }
 
 impl OutDir<'_> {
@@ -619,8 +662,19 @@ impl OutDir<'_> {
 }
 
 impl RootFiles for OutDir<'_> {
-    fn package_files(&self, root: RootId, _: &mut dyn FnMut(RelPath<'_>, Digest, u64) -> Result<(), Fault>) -> Result<(), Fault> {
-        Err(Fault::Files(FilesError { op: FilesOp::PackageFiles, root, code: 0 }))
+    fn package_files(&self, root: RootId, each: &mut dyn FnMut(RelPath<'_>, Digest, u64) -> Result<(), Fault>) -> Result<(), Fault> {
+        let Some((expected, files)) = self.package_root else {
+            return Err(Fault::Files(FilesError { op: FilesOp::PackageFiles, root, code: 0 }));
+        };
+        if root != expected {
+            return Err(Fault::Files(FilesError { op: FilesOp::PackageFiles, root, code: 0 }));
+        }
+        for &rel in files {
+            let path = RelPath::new(rel, blaze_roots::Limits::SHIPPED.most_path)
+                .map_err(|_| Fault::Files(FilesError { op: FilesOp::PackageFiles, root, code: 0 }))?;
+            each(path, Digest([0; 32]), 0)?;
+        }
+        Ok(())
     }
 
     fn seen(&self, root: RootId, _: RelPath<'_>) -> Result<Seen, Fault> {
@@ -818,19 +872,26 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
     // configure's test programs) links those programs: the pinned linker too (the shelf's
     // clang.cfg says `-fuse-ld=lld`; clang starts `ld64.lld`, a link to `lld`), and it may start
     // what is under OUT_DIR. Every other script is granted neither.
-    let linker: &[&str] = if runs_out_dir { &["bin/ld64.lld", "bin/lld"] } else { &[] };
+    let linker: &[&str] = if runs_out_dir { &["bin/ld64.lld", "bin/ld.lld", "bin/lld"] } else { &[] };
     let mut exec: AVec<'a, AString<'a>> = Vec::new_in(alloc);
     for name in ["bin/clang-23", "bin/clang", "bin/clang++", "bin/llvm-ar"].iter().chain(linker) {
         let mut path: AString<'a> = String::from_str_in(c.shelf.dir, alloc);
         path.push('/');
         path.push_str(name);
-        exec.push(path);
+        // Linux Landlock opens every plan path (`O_PATH`) when building the ruleset; skip shelf
+        // binaries absent on disk (e.g. empty test shelves or platform-specific linkers) without
+        // weakening confinement.
+        if Path::new(path.as_str()).exists() {
+            exec.push(path);
+        }
     }
     // Each tool and the programs it starts itself (perl's piped `open`: /bin/sh, /bin/bash), at
     // their real paths: a shelf row's (nm-row: nm, the shelf's llvm-nm) under the shelf.
     for tool in script.host_tools {
         for program in tool.programs_in(c.shelf.dir, alloc) {
-            exec.push(program);
+            if Path::new(program.as_str()).exists() {
+                exec.push(program);
+            }
         }
     }
     let exec: AVec<'a, &str> = {
@@ -862,7 +923,10 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
         out
     };
     let mut reads: AVec<'a, &str> = Vec::new_in(alloc);
-    reads.extend_from_slice(&[c.package, c.shelf.dir, c.sysroot]);
+    if script.confined.is_none() {
+        reads.push(c.package);
+    }
+    reads.extend_from_slice(&[c.shelf.dir, c.sysroot]);
     if let Some((sysroot_dir, _)) = pinned_rustc {
         reads.push(sysroot_dir.as_str());
     }
@@ -878,23 +942,8 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
             reads.push(folder);
         }
     }
-    // The fact shim's folder: its links and pins read; only its log written (N7).
-    let mut writes: AVec<'a, &str> = Vec::new_in(alloc);
-    writes.push(c.out_dir);
-    if let Some(facts) = script.facts {
-        reads.push(facts.folder.as_str());
-        writes.push(facts.log_dir.as_str());
-    }
-    // The jobserver's fifo, read and written (a client opens it so: `jobserver`'s `fifo:`).
-    if let Some(server) = script.jobs {
-        writes.push(server.fifo());
-    }
     let out_only = [c.out_dir];
     let exec_under: &[&str] = if runs_out_dir { &out_only } else { &[] };
-    // The grant's paths are checked as the Seatbelt profile would say them (one check for both
-    // hosts: a grant refused on one is refused on both), before anything runs.
-    blaze_build_script::native::seatbelt_with(&Grant { program: script.program, exec: &exec, read: &reads, write: &writes }, exec_under, alloc)
-        .map_err(|why| NativeScriptError::Grant { program: program(), why: why.to_string() })?;
 
     // D177: the run is a hermetic spec at `Level::Inputs`. Each read folder is a tree root
     // named by the key; `OUT_DIR` the output root; the jobserver's fifo and the fact shim's
@@ -908,14 +957,26 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
     for folder in reads.iter() {
         // One mount a spelling: a folder named twice (a tool's and the shelf's) is one root.
         // The fact shim's folder is a channel, not a root (below).
-        if !spellings.contains(folder) && Some(*folder) != facts_folder {
+        if spellings.scan_for(folder).is_none() && Some(*folder) != facts_folder {
             roots.push(Root { name: "a folder a native build script reads", kind: tree });
             spellings.push(folder);
         }
     }
+    let out_err = |why: &str| NativeScriptError::Output { program: program(), why: why.to_owned() };
+    let all_glob = [blaze_roots::Glob::new("**").map_err(|_| out_err("invalid confined glob"))?];
+    let mut package_root: Option<(RootId, &[&str])> = None;
+    if let Some(confined) = script.confined {
+        if spellings.scan_for(&confined.workspace).is_some() || Some(confined.workspace) == facts_folder {
+            return Err(out_err("confined workspace overlaps another mount"));
+        }
+        let id = RootId(u8::try_from(roots.len()).map_err(|_| out_err("more than 255 folders read"))?);
+        roots.push(Root { name: "confined workspace files", kind: RootKind::Package { globs: &all_glob } });
+        spellings.push(confined.workspace);
+        package_root = Some((id, confined.files));
+    }
     roots.push(Root { name: "OUT_DIR", kind: RootKind::Output });
     spellings.push(c.out_dir);
-    let output = RootId(u8::try_from(roots.len() - 1).map_err(|_| NativeScriptError::Output { program: program(), why: "more than 255 folders read".to_owned() })?);
+    let output = RootId(u8::try_from(roots.len() - 1).map_err(|_| out_err("more than 255 folders read"))?);
     let mut mounts: AVec<'_, Mount<'_>> = Vec::new_in(alloc);
     for (at, spelling) in spellings.iter().enumerate() {
         mounts.push(Mount { spelling: spelling.as_bytes(), root: RootId(at as u8) });
@@ -987,7 +1048,7 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
         report: ReportSpec::WholeRoots,
     })
     .map_err(|error| NativeScriptError::Refused { program: program(), fault: error.fault })?;
-    let files = OutDir { root: output, folder: c.out_dir };
+    let files = OutDir { root: output, folder: c.out_dir, package_root };
     // Lent before the child starts, ended after it and its process group are gone (the run
     // kills the group): a token it kept comes back by count (jobserver.rs).
     let lent = match script.jobs {
@@ -1025,6 +1086,14 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
             confinement: bstd::procs::hermetic::confinement_digest(&confinement),
             profile: gave_no_reason.then(|| std::string::String::from_utf8_lossy(&confinement).into_owned()),
         });
+    }
+
+    let mut rerun_if_changed: AVec<'a, AString<'a>> = Vec::new_in(alloc);
+    for raw_line in ran.stdout.split(|&b| b == b'\n') {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        if let blaze_build_script::instr::Line::Instr(_, blaze_build_script::instr::Instr::RerunIfChanged(path)) = blaze_build_script::instr::parse(line) {
+            rerun_if_changed.push(String::from_str_in(path, alloc));
+        }
     }
 
     // The laid trees first (brief N8): they are the most specific folders; then `OUT_DIR`, then
@@ -1080,5 +1149,5 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
     }
     let mut keyed: std::vec::Vec<(&str, [u8; 32])> = headers.iter().map(|(p, d)| (p.as_str(), *d)).collect();
     let digest = headers_digest(&mut keyed);
-    Ok(NativeScriptRun { outputs, headers: digest, headers_read: headers.len(), other_reads, stderr: ran.stderr, wall })
+    Ok(NativeScriptRun { outputs, rerun_if_changed, headers: digest, headers_read: headers.len(), other_reads, stderr: ran.stderr, wall })
 }

@@ -93,9 +93,7 @@ For wrong generated code:
    hash, and `blaze trace --out PATH` writes every result of the last build with its edges, as
    CBOR. (v1's `--report`, `--deny` and `--isolate`, which listed, left to rustc and split out
    functions, are gone with its crate-at-a-time entry.)
-2. `BLAZE_DUMP_MIR=<function name>` prints the MIR of functions with exactly that name
-   (`{closure}` for closures). `BLAZE_DUMP_LLVM=1` prints the LLVM module of every function
-   compiled, and `BLAZE_DUMP_CLIF=1` the Cranelift IR of drop glue.
+2. Reproduce against a unit test in `crates/blaze-body`, `crates/blaze-build`, or `crates/blaze-emit` to inspect the lowered body or LIR.
 3. Reduce it to a test ([Adding a test](#adding-a-test)), and fix it there.
 
 For a CI failure, the last line of the harness step lists which scripts failed.
@@ -108,7 +106,7 @@ job of the gate runs on Linux AArch64 on an ix runner ([ix runners](#ix-runners)
 | Workflow | Event | What runs |
 |---|---|---|
 | `blaze.yaml` (`changes`) | pull request, merge-queue entry, push to main | `scripts/src/bin/gate_changes.rs`: whether the change touches a file the `cargo` job reads (below) |
-| `blaze.yaml` (`scripts`) | every change | ruff and pyright over the Python workspace, `harness/imports.py`, the selftests of `harness/failures.py` and `harness/v2/ran.py`, `harness/library.py check`, the agent rules (`tools/agents/rules.ts --check`), the Rust scripts of `scripts/src/bin` (the docs, `rustcsites`, the ledger, `changed`, the invariants, the lint table, the hash domains, and the ratchets of `tools/ratchets` and of persisted layouts), and `harness/v2/lean_gate.py`'s checks that need no Lean |
+| `blaze.yaml` (`scripts`) | every change | ruff and pyright over the Python workspace, `harness/imports.py`, the selftests of `harness/failures.py` and `harness/v2/ran.py`, `harness/library.py check`, the agent rules (`scripts/src/bin/rules.rs`), the Rust scripts of `scripts/src/bin` (the docs, `rustcsites`, the ledger, `changed`, the invariants, the lint table, the hash domains, and the ratchets of `tools/ratchets` and of persisted layouts), and `harness/v2/lean_gate.py`'s checks that need no Lean |
 | `blaze.yaml` (`lean`) | every change | the Lean proofs (`harness/v2/lean_gate.py`, [v2/plan/proofs.md](v2/plan/proofs.md)): `lake build` of `lean/` and `lean/analysis` with the pinned Lean, no `sorry`, and each theorem of `lean/theorems.json` held to Lean's three axioms by `#print axioms` |
 | `blaze.yaml` (`workflows`) | every change | actionlint over `.github/workflows` (below) |
 | `blaze.yaml` (`cargo`) | a change of code | on a 64-vCPU ix runner, with cargo and the pinned nightly (`pins/toolchain`): `cargo check --locked --workspace --exclude blaze-std --all-targets`, then `cargo test --locked --workspace --exclude blaze-std --no-fail-fast` |
@@ -202,7 +200,7 @@ for an old glibc; the ix image's glibc is 2.39. Windows, which ix does not serve
 [toolchain-c.md](v2/plan/design/toolchain-c.md) are not built. A driver given one
 (`CC_aarch64_unknown_linux_gnu="gcc --sysroot=<glibc 2.34 tree>"`) finds the old glibc's files,
 but blaze-link then takes the ELF interpreter from inside that tree, as libc's directory is not
-an FHS one (`crates/blaze-link/src/target.rs`, `fhs`), so the binaries would not run elsewhere.
+an FHS one (`crates/blaze-native`), so the binaries would not run elsewhere.
 Once blaze links against an old glibc sysroot, these move to ix.
 
 ### Concurrency, the check and the ruleset

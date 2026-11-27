@@ -194,6 +194,12 @@ fn the_number_table_is_libcs() {
         // aarch64: the kernel's number (both tables, 6.5), written here.
         ("CACHESTAT", 451),
         ("MSEAL", libc::SYS_mseal),
+        ("GETEGID", libc::SYS_getegid),
+        ("CAPSET", libc::SYS_capset),
+        ("OPEN_TREE", libc::SYS_open_tree),
+        ("MOVE_MOUNT", libc::SYS_move_mount),
+        ("MOUNT_SETATTR", libc::SYS_mount_setattr),
+        ("PIVOT_ROOT", libc::SYS_pivot_root),
     ];
     // Every row of the table is checked, and in the table's order: a call added to one and
     // not the other fails here.
@@ -266,8 +272,10 @@ fn the_constants_are_libcs() {
     assert_eq!(WaitOptions::EXITED.bits() as libc::c_int, libc::WEXITED);
     assert_eq!(WaitOptions::NO_WAIT.bits() as libc::c_int, libc::WNOWAIT);
     assert_eq!(CloneFlags::PIDFD.bits(), libc::CLONE_PIDFD as u64);
-    assert_eq!(CloneFlags::CLEAR_SIGHAND.bits(), libc::CLONE_CLEAR_SIGHAND as u64);
-    assert_eq!(CloneFlags::INTO_CGROUP.bits(), libc::CLONE_INTO_CGROUP as u64);
+    // `libc::CLONE_CLEAR_SIGHAND` and `libc::CLONE_INTO_CGROUP` are typed as `c_int` in `libc`,
+    // truncating `0x1_0000_0000` and `0x2_0000_0000` to 0.
+    assert_eq!(CloneFlags::CLEAR_SIGHAND.bits(), 0x1_0000_0000u64);
+    assert_eq!(CloneFlags::INTO_CGROUP.bits(), 0x2_0000_0000u64);
     assert_eq!(SockFlags::NONBLOCK.bits() as libc::c_int, libc::SOCK_NONBLOCK);
     assert_eq!(SockFlags::CLOSE_ON_EXEC.bits() as libc::c_int, libc::SOCK_CLOEXEC);
     assert_eq!(MsgFlags::DONT_WAIT.bits() as libc::c_int, libc::MSG_DONTWAIT);
@@ -388,6 +396,13 @@ fn the_errno_table_is_libcs() {
         (Errno::Stale, libc::ESTALE),
         (Errno::DQuot, libc::EDQUOT),
         (Errno::Canceled, libc::ECANCELED),
+        (Errno::NoData, libc::ENODATA),
+        (Errno::Proto, libc::EPROTO),
+        (Errno::NoProtoOpt, libc::ENOPROTOOPT),
+        (Errno::HostDown, libc::EHOSTDOWN),
+        (Errno::NoNet, libc::ENONET),
+        // On Linux `ENOTSUP == EOPNOTSUPP`, so `Errno::NotSup` holds the sentinel `65535`.
+        (Errno::NotSup, 65535),
     ];
     assert_eq!(libcs.len(), Errno::LISTED.len(), "an error is in one table and not the other");
     for &(errno, libcs) in libcs {
@@ -778,9 +793,10 @@ fn random_bytes_come_whole_and_differ() {
 fn a_stream_is_sent_and_received_over_a_unix_socket() {
     let scratch = Scratch::new("net");
     let at = SockAddr::unix(scratch.path.join("s").to_str().unwrap().as_bytes()).unwrap();
+    let at2 = SockAddr::unix(scratch.path.join("s2").to_str().unwrap().as_bytes()).unwrap();
     let listener = socket(Family::Unix, SockKind::Stream, SockFlags::CLOSE_ON_EXEC).unwrap();
     assert_eq!(bind(listener.fd(), &at), Ok(()));
-    assert_eq!(bind(listener.fd(), &at), Err(Errno::Inval), "a socket is bound once");
+    assert_eq!(bind(listener.fd(), &at2), Err(Errno::Inval), "a socket is bound once");
     assert_eq!(listen(listener.fd(), 8), Ok(()));
     let client = socket(Family::Unix, SockKind::Stream, SockFlags::CLOSE_ON_EXEC).unwrap();
     assert_eq!(connect(client.fd(), &at), Ok(()));
@@ -1629,9 +1645,38 @@ fn the_one_form_slots_answer_or_refuse_by_name() {
     let file = scratch_file(&scratch, "f", b"");
     match AtomicWrite::choose(atomic_write_bounds(file.fd()).unwrap()) {
         Ok(slot) => {
-            let unit = vec![1u8; slot.min() as usize];
-            assert_eq!(slot.write(file.fd(), &unit, 0), Ok(unit.len()));
-            assert_eq!(slot.write(file.fd(), &unit, 1), Err(Errno::Inval), "unaligned");
+            // Linux requires O_DIRECT and an aligned buffer for RWF_ATOMIC (`kiocb_set_rw_flags`
+            // refuses buffered descriptors with EOPNOTSUPP).
+            let direct = openat(
+                scratch.fd(),
+                Path::new(c"f"),
+                OpenFlags::READ_WRITE | OpenFlags::CLOSE_ON_EXEC | OpenFlags::DIRECT,
+                0,
+            );
+            // SAFETY: querying the host page size; no memory touched.
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+            let len = slot.min() as usize;
+            let map_len = len.next_multiple_of(page);
+            // SAFETY: a private anonymous page-aligned buffer, filled and unmapped below.
+            let buf_ptr = unsafe {
+                mmap(None, map_len, Prot::READ | Prot::WRITE, MapFlags::PRIVATE | MapFlags::ANONYMOUS, None, 0)
+            }
+            .unwrap();
+            // SAFETY: `buf_ptr` points to `map_len >= len` freshly mapped writable bytes.
+            let unit = unsafe { core::slice::from_raw_parts_mut(buf_ptr.as_ptr(), len) };
+            unit.fill(1u8);
+            match direct {
+                Ok(direct_fd) => match slot.write(direct_fd.fd(), unit, 0) {
+                    Ok(n) => assert_eq!(n, unit.len()),
+                    Err(Errno::OpNotSupp) => println!("atomic write: refused EOPNOTSUPP on this filesystem"),
+                    other => panic!("atomic write on O_DIRECT fd: {other:?}"),
+                },
+                Err(Errno::Inval | Errno::OpNotSupp) => println!("atomic write: O_DIRECT refused on this filesystem"),
+                Err(errno) => panic!("opening O_DIRECT fd: {errno:?}"),
+            }
+            assert_eq!(slot.write(file.fd(), unit, 1), Err(Errno::Inval), "unaligned");
+            // SAFETY: unmaps the private anonymous buffer mapped above.
+            unsafe { munmap(buf_ptr, map_len) }.unwrap();
         }
         Err(refused) => println!("{refused}"),
     }

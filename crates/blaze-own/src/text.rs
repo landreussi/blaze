@@ -187,6 +187,18 @@ impl<A: Allocator> String<A> {
     }
 
     /// The text as a `Box<str, A>`, its room shrunk to its length.
+    /// Freezes this bump-allocated string into a `&'a mut str` tied to the arena's lifetime `'a`,
+    /// with no UTF-8 re-validation and no heap leak.
+    #[inline]
+    pub fn into_bump_str<'a>(self) -> &'a mut str
+    where
+        A: crate::BumpAlloc + 'a,
+    {
+        let bytes = self.bytes.into_bump_slice();
+        // SAFETY: `String` maintains valid UTF-8 for `self.bytes[..len]`.
+        unsafe { str::from_utf8_unchecked_mut(bytes) }
+    }
+
     pub fn into_boxed_str(self) -> Box<str, A> {
         let (raw, alloc) = Box::into_raw_with_allocator(self.bytes.into_boxed_slice());
         // SAFETY: `raw` and `alloc` are a `Box<[u8], A>` taken apart just above, whose bytes are
@@ -432,7 +444,9 @@ impl<A: Allocator> Extend<char> for String<A> {
 
 impl<'a, A: Allocator> Extend<&'a char> for String<A> {
     fn extend<I: IntoIterator<Item = &'a char>>(&mut self, iter: I) {
-        self.extend(iter.into_iter().copied());
+        let iter = iter.into_iter();
+        self.reserve(iter.size_hint().0);
+        iter.for_each(|&ch| self.push(ch));
     }
 }
 

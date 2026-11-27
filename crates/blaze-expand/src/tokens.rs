@@ -716,11 +716,25 @@ impl<'a> TokenStream<'a> {
         from: &TokenStream<'_>,
         ctx: Ctx,
     ) -> Result<Ctx, StreamError> {
-        let Some(at) = ctx.node() else { return Ok(ctx) };
-        let node =
-            *from.contexts.get(at as usize).ok_or(StreamError::NoSuchContext { ctx: ctx.0 })?;
-        let parent = self.import_ctx(from, node.parent)?;
-        self.context(CtxNode { parent, mark: node.mark })
+        let Some(mut node_at) = ctx.node() else { return Ok(ctx) };
+        let mut marks: AVec<'a, Mark> = AVec::new_in(*self.contexts.allocator());
+        let mut cur = ctx;
+        let root = loop {
+            if marks.len() > from.contexts.len() {
+                return Err(StreamError::NoSuchContext { ctx: cur.0 });
+            }
+            let node =
+                *from.contexts.get(node_at as usize).ok_or(StreamError::NoSuchContext { ctx: cur.0 })?;
+            marks.push(node.mark);
+            cur = node.parent;
+            let Some(next) = cur.node() else { break cur };
+            node_at = next;
+        };
+        let mut parent = root;
+        while let Some(mark) = marks.pop() {
+            parent = self.context(CtxNode { parent, mark })?;
+        }
+        Ok(parent)
     }
 
     /// Appends the token at `at` of `from`, its context imported.
@@ -921,6 +935,9 @@ pub(crate) fn lex_placed<'a>(
             let spacing = if joint { Spacing::Joint } else { Spacing::Alone };
             let char = token.chars().next().ok_or(refused)?;
             out.punct(char, spacing, ctx)?;
+            if !joint {
+                last = Some((out.len() - 1, offset));
+            }
         } else if kind.is_any_identifier() || kind == UNDERSCORE {
             joined_to(&mut out, &mut last, start);
             let (raw, name) = match token.strip_prefix("r#") {
@@ -979,12 +996,13 @@ fn place_new(places: &mut Option<&mut AVec<'_, (u32, u32)>>, tokens: usize, star
     Ok(())
 }
 
-/// Whether a punctuation token is joint with a next token of `kind`: one that is punctuation
-/// alone, or a lifetime (its `'`), as rustc's lexer glues operators.
+/// Whether a punctuation token is joint (`Spacing::Joint`) with a next token of `kind`: one that
+/// is punctuation alone, as rustc's lexer glues operators. Lifetimes are not punctuation in rustc
+/// (`&'a` gives `&` `Spacing::JointHidden`, not `Spacing::Joint`).
 fn glues_after(kind: parser::SyntaxKind) -> bool {
     use parser::SyntaxKind::{
-        AMP, AT, BANG, CARET, COLON, COMMA, DOLLAR, DOT, EQ, L_ANGLE, LIFETIME_IDENT, MINUS,
-        PERCENT, PIPE, PLUS, POUND, QUESTION, R_ANGLE, SEMICOLON, SLASH, STAR, TILDE,
+        AMP, AT, BANG, CARET, COLON, COMMA, DOLLAR, DOT, EQ, L_ANGLE, MINUS, PERCENT, PIPE, PLUS,
+        POUND, QUESTION, R_ANGLE, SEMICOLON, SLASH, STAR, TILDE,
     };
     matches!(
         kind,
@@ -1008,7 +1026,6 @@ fn glues_after(kind: parser::SyntaxKind) -> bool {
             | SLASH
             | PERCENT
             | CARET
-            | LIFETIME_IDENT
     )
 }
 
@@ -1150,37 +1167,60 @@ pub fn lex_marked<'a>(
             None => token.ctx,
             Some(mark) => out.context(CtxNode { parent: token.ctx, mark: mark.as_outer_mark() })?,
         };
-        // A marked `$` whose next token is a plain `crate` starting where it ends.
+        // A marked `$` whose next token is a plain `crate` starting where it ends, or a plain
+        // `crate` carrying an opaque crate-root mark (`blaze_scope::crate_roots::root_mark`: what
+        // the item renderer wrote for `$crate` in an item-level expansion): restore both to one
+        // `$crate` identifier with `ctx` so an inner macro's `$p:path`/`$t:tt`/`$e:expr` keeps
+        // the defining crate's root.
         let crate_after = match (token.kind, mark, tokens.get(i + 1), places.get(i + 1)) {
             (TokenKind::Punct { char: '$', .. }, Some(_), Some(next), Some(&(next_start, _)))
                 if next_start == end && lexed.text_of(next) == "crate" =>
             {
                 match next.kind {
-                    TokenKind::Ident { raw: Raw::No, spacing } => Some(spacing),
+                    TokenKind::Ident { raw: Raw::No, spacing } => Some((spacing, 2usize)),
                     _ => None,
                 }
+            }
+            (TokenKind::Ident { raw: Raw::No, spacing }, Some(m), _, _)
+                if m.transparency == crate::Transparency::Opaque
+                    && m.site.module.is_none()
+                    && lexed.text_of(&token) == "crate" =>
+            {
+                Some((spacing, 1usize))
             }
             _ => None,
         };
         match crate_after {
-            Some(spacing) => {
+            Some((spacing, step)) => {
                 out.push(TokenKind::Ident { raw: Raw::No, spacing }, "$crate", ctx)?;
-                i += 2;
+                i += step;
             }
             None => {
                 out.push_whole(token.kind, lexed.whole_at(i), ctx)?;
-                i += 1;
+                // A lifetime `'name` is one parser word whose mark is stored at the `'`, while
+                // `body_words` reads the lifetime's hygiene and mark from its name token.
+                if mark.is_some()
+                    && matches!(token.kind, TokenKind::Punct { char: '\'', spacing: Spacing::Joint })
+                    && let Some(next) = tokens.get(i + 1)
+                    && matches!(next.kind, TokenKind::Ident { .. })
+                    && places.get(i + 1).is_some_and(|&(next_start, _)| next_start == end && mark_at(next_start).is_none())
+                {
+                    out.push_whole(next.kind, lexed.whole_at(i + 1), ctx)?;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             }
         }
     }
     Ok(out)
 }
 
-/// The last identifier or literal pushed, and where its text ends: it is joint with the next
-/// token if that one starts there.
+/// The last identifier, literal, or non-glued punctuation pushed, and where its text ends: it is
+/// joint (`Spacing::JointHidden`) with the next token if that one starts there.
 type Pending = Option<(usize, usize)>;
 
-/// Marks the pending identifier or literal joint when the next token starts where it ends.
+/// Marks the pending token `Spacing::JointHidden` when the next token starts where it ends.
 fn joined_to(out: &mut TokenStream<'_>, last: &mut Pending, next: usize) {
     if let Some((at, end)) = last.take()
         && end == next

@@ -37,7 +37,7 @@ use blaze_lir::builder::MemAttrs;
 use blaze_lir::func::SlotKind;
 use blaze_lir::{Block, Flags, IntCond, Op, Ty, Value};
 use blaze_own::Vec;
-use blaze_typeck::{Def, ExprId, List, Lit, Mutbl, Name, PNode, PTy, Pat, PatId};
+use blaze_typeck::{Def, ExprId, List, Lit, Mutbl, Name, PNode, PTy, Pat, PatId, UnionPat};
 
 mod alts;
 mod forms;
@@ -46,16 +46,24 @@ mod ref_bind;
 
 use super::{Home, MatchState, Owner, PTR_BITS, Repr, Shape, Task, V, Walk, malformed, mask, unsupported};
 use crate::BuildError;
+use crate::layout::Variants;
+
+/// Outcome of testing whether a union value matches a residual sub-union pattern.
+enum ResidualTest {
+    Never,
+    Always,
+    Cond(Value),
+}
 
 /// A place a pattern is matched against.
 #[derive(Clone, Copy)]
 pub(super) struct At {
     /// The place; of an unsized type (`[T]`, `str`), the memory of the wide pointer to it.
-    at: (Value, i32),
+    pub(super) at: (Value, i32),
     /// Its ground type.
     g: PTy,
     /// The default binding mode is `ref`: a reference was followed by a non-reference pattern.
-    by_ref: bool,
+    pub(super) by_ref: bool,
     /// The scrutinee's value copied into the match's own slot: a `ref mut` would write a copy.
     copy: bool,
 }
@@ -64,7 +72,7 @@ pub(super) struct At {
 /// failure.
 type Test = (PatId, At, Block, Block, Block);
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Whether the switch takes the match on `scrutinee` (held as `srepr`) with arms `arms`:
     /// an integer, a `bool` or an enum (through references, with variant patterns), and each
     /// arm's pattern flat (a literal, a path, `_`, a plain binding, an or of literals and
@@ -103,9 +111,14 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         })
     }
 
-    /// `g` is an enum laid out as one.
+    /// `g` is an enum (or multi-member tagged union) laid out as one.
     fn is_enum(&mut self, scrutinee: ExprId, g: PTy) -> Result<bool, BuildError> {
-        if !matches!(self.ground_node(g).map_err(|error| Self::ty_err(scrutinee, error))?, PNode::Adt(..)) {
+        let is_enum_node = match self.ground_node(g).map_err(|error| Self::ty_err(scrutinee, error))? {
+            PNode::Adt(..) => true,
+            PNode::Union(l) => l.len != 1,
+            _ => false,
+        };
+        if !is_enum_node {
             return Ok(false);
         }
         let l = self.layout(g).map_err(|error| Self::ty_err(scrutinee, error))?;
@@ -117,7 +130,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let plain = |w: &Self, q: PatId| -> Result<bool, BuildError> {
             Ok(match w.pat(q)? {
                 Pat::Wild => true,
-                Pat::Bind { ann, sub: None, .. } => ann.by_ref.is_none(),
+                Pat::Bind { ann, sub: None, .. } => ann.by_ref.is_none() && w.checked.union_pat_of(q).is_none(),
                 _ => false,
             })
         };
@@ -128,7 +141,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         Ok(match self.pat(p)? {
             Pat::Wild => true,
             Pat::Path(_) => variant(self, p),
-            Pat::Bind { ann, sub: None, .. } => ann.by_ref.is_none(),
+            Pat::Bind { ann, sub: None, .. } => ann.by_ref.is_none() && self.checked.union_pat_of(p).is_none(),
             Pat::Lit(l) | Pat::NegLit(l) => lit(l),
             Pat::Or { alts } => {
                 let list = self.body.pat_lists.get(alts.range()).ok_or(malformed("an or-pattern past `pat_lists`"))?;
@@ -162,6 +175,75 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         })
     }
 
+    /// Single-arm irrefutable plain by-value binding match (`match e { mut iter => body }`, as
+    /// `for` loops desugar): moves/binds directly without creating a temporary scrutinee drop
+    /// mask (`Held::Moved`), so an iterator holding a drop impl does not leave an unnamed mask
+    /// slot alive across an `.await` inside the loop body.
+    pub(super) fn try_match_whole_bind(&mut self, e: ExprId, scrutinee: ExprId, arms: List, s: V) -> Result<bool, BuildError> {
+        let list = self.body.arms.get(arms.range()).ok_or(malformed("a match's arms past `arms`"))?;
+        let [arm] = list else { return Ok(false) };
+        if arm.guard.is_some() {
+            return Ok(false);
+        }
+        let Pat::Bind { ann, sub: None, .. } = self.pat(arm.pat)? else {
+            return Ok(false);
+        };
+        if ann.by_ref.is_some() || self.checked.union_pat_of(arm.pat).is_some() {
+            return Ok(false);
+        }
+        if self.scrutinee_in_place(scrutinee)? || self.owned_field_scrutinee(scrutinee)?.is_some() {
+            return Ok(false);
+        }
+        if self.adjust_rows(scrutinee).is_empty()
+            && let Some(x) = self.local_of(scrutinee)?
+        {
+            self.moved(e, x)?;
+        }
+        match s {
+            V::Place(at, off) if self.live && self.is_fresh(scrutinee)? => self.bind_at(arm.pat, (at, off))?,
+            _ => {
+                self.bind_value(arm.pat, s)?;
+                self.end_temp_val(s);
+            }
+        }
+        let mark = u32::try_from(self.scope_pats.len()).map_err(|_| malformed("drop scope depth past u32::MAX"))?;
+        self.scope_marks.push(mark);
+        self.own(arm.pat, true)?;
+        self.work.push(Task::ScopeEnd(e));
+        self.work.push(Task::Eval(arm.body));
+        Ok(true)
+    }
+
+    /// Whether pattern `root` contains any `ref` / `ref mut` binding (which borrows from the
+    /// scrutinee's place).
+    pub(super) fn pat_has_ref(&self, root: PatId) -> Result<bool, BuildError> {
+        let mut todo = Vec::new_in(self.alloc);
+        todo.push(root);
+        while let Some(p) = todo.pop() {
+            match self.pat(p)? {
+                Pat::Bind { ann, sub, .. } => {
+                    if ann.by_ref.is_some() {
+                        return Ok(true);
+                    }
+                    todo.extend(sub);
+                }
+                Pat::Ref { inner, .. } => todo.push(inner),
+                Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } | Pat::Or { alts: elems } => {
+                    let list = self.body.pat_lists.get(elems.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?;
+                    todo.extend_from_slice(list);
+                }
+                Pat::Struct { fields, .. } => {
+                    let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
+                    for fp in fps {
+                        todo.push(fp.pat);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
     /// Starts match `e` by tests: the scrutinee's place (a scalar copied to a slot), every arm
     /// tested in turn (`arm_tested`).
     pub(super) fn match_tested(&mut self, e: ExprId, scrutinee: ExprId, arms: List, s: V, srepr: Repr) -> Result<(), BuildError> {
@@ -182,6 +264,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let to = self.arm_blocks[first as usize];
         self.jump(to, &[]);
         let tested = Some(At { at, g, by_ref: false, copy });
+        let res = self.join_slot(repr);
         self.matches.push(MatchState {
             expr: e,
             scrutinee: at.0,
@@ -189,13 +272,15 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             of_enum: None,
             join,
             repr,
+            res,
             first,
             arms: n,
             guarded: true,
-            by_ref: false,
+            by_ref: None,
             owner: Owner::None,
             tested,
         });
+        self.du_match_enter();
         let m = (self.matches.len() - 1) as u32;
         self.work.push(Task::MatchEnd);
         for i in (0..n).rev() {
@@ -278,10 +363,18 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             }
         };
         self.begin(pass);
-        self.scope_marks.push(self.scope_pats.len() as u32);
+        let mark = u32::try_from(self.scope_pats.len()).map_err(|_| malformed("drop scope depth past u32::MAX"))?;
+        self.scope_marks.push(mark);
         let bound = self.bind_tested(arm.pat, at);
         self.move_arm_end();
         bound?;
+        if arm.guard.is_none()
+            && !at.by_ref
+            && !self.pat_has_ref(arm.pat)?
+            && let Some(slot) = self.whole_slot(at.at)
+        {
+            self.end_temp_slot(slot);
+        }
         self.work.push(Task::ArmEnd { m });
         self.work.push(Task::ScopeEnd(arm.body));
         // An `if let` guard (walk/lets.rs `let_guard`): its links, each failure to `next`.
@@ -319,10 +412,10 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// or-pattern tests only the alternative `choice` takes for it, so the chain is the tests
     /// of ONE or-free pattern.
     fn test_pat_chosen(&mut self, root: PatId, at: At, ok: Block, fail: Block, choice: Option<&[alts::Choice]>) -> Result<(), BuildError> {
-        let mut todo: Vec<Test, A> = Vec::new_in(self.alloc.clone());
-        let mut parts: Vec<(PatId, At), A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<Test, A> = Vec::new_in(self.alloc);
+        let mut parts: Vec<(PatId, At), A> = Vec::new_in(self.alloc);
         // Each name's first binding in `root`, filled at the first or-pattern that binds.
-        let mut alias: Vec<(Name, PatId), A> = Vec::new_in(self.alloc.clone());
+        let mut alias: Vec<(Name, PatId), A> = Vec::new_in(self.alloc);
         let entry = self.create();
         self.jump(entry, &[]);
         todo.push((root, at, entry, ok, fail));
@@ -347,7 +440,56 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 at = self.peel(p, at)?;
             }
             match pat {
-                Pat::Wild | Pat::Bind { .. } => self.jump(ok, &[]),
+                Pat::Wild => self.jump(ok, &[]),
+                Pat::Bind { ann, sub, .. } => match self.checked.union_pat_of(p) {
+                    None => self.jump(ok, &[]),
+                    Some(UnionPat::Variant(v)) => {
+                        let peeled = self.peel(p, at)?;
+                        let test = self.union_variant_test(p, peeled, v)?;
+                        match (test, sub) {
+                            (None, None) => self.jump(ok, &[]),
+                            (Some(c), None) => self.br(c, (ok, &[]), (fail, &[])),
+                            (None, Some(s)) => {
+                                let payload = self.union_variant_at(p, peeled, v)?;
+                                let mid = self.create();
+                                self.jump(mid, &[]);
+                                todo.push((s, payload, mid, ok, fail));
+                            }
+                            (Some(c), Some(s)) => {
+                                let payload = self.union_variant_at(p, peeled, v)?;
+                                let mid = self.create();
+                                self.br(c, (mid, &[]), (fail, &[]));
+                                todo.push((s, payload, mid, ok, fail));
+                            }
+                        }
+                    }
+                    Some(UnionPat::Residual) => {
+                        let peeled = self.peel(p, at)?;
+                        let by_ref = ann.by_ref.is_some() || (!ann.mutable && peeled.by_ref);
+                        let dst_g = self.union_residual_ty(p, by_ref)?;
+                        match (self.union_residual_test(p, peeled, dst_g)?, sub) {
+                            (ResidualTest::Never, _) => self.jump(fail, &[]),
+                            (ResidualTest::Always, None) => self.jump(ok, &[]),
+                            (ResidualTest::Cond(c), None) => self.br(c, (ok, &[]), (fail, &[])),
+                            (ResidualTest::Always, Some(s)) => {
+                                let dst_at = self.union_residual_narrow(p, peeled, dst_g)?;
+                                let mid = self.create();
+                                self.jump(mid, &[]);
+                                todo.push((s, dst_at, mid, ok, fail));
+                            }
+                            (ResidualTest::Cond(c), Some(s)) => {
+                                let mid = self.create();
+                                self.br(c, (mid, &[]), (fail, &[]));
+                                self.begin(mid);
+                                self.live = live;
+                                let dst_at = self.union_residual_narrow(p, peeled, dst_g)?;
+                                let next_b = self.create();
+                                self.jump(next_b, &[]);
+                                todo.push((s, dst_at, next_b, ok, fail));
+                            }
+                        }
+                    }
+                },
                 // matches/forms.rs: a float by `==`, a string by length and bytes.
                 Pat::Lit(Lit::Float(_)) | Pat::NegLit(Lit::Float(_)) => {
                     let c = self.float_test(p, at)?;
@@ -397,7 +539,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                         }
                     }
                 }
-                Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Tuple { .. } | Pat::Slice { .. } => {
+                Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Record { .. } | Pat::Tuple { .. } | Pat::Slice { .. } => {
                     let c = match pat {
                         Pat::TupleStruct { .. } | Pat::Struct { .. } => self.variant_test(p, at)?,
                         Pat::Slice { elems, rest } => self.length_test(p, at, elems.len, rest.is_some())?,
@@ -487,8 +629,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// `bind_tested`, each binding stored into the slot of its name's first binding in
     /// `alias` (an or-alternative's: matches/forms.rs `first_binds`), else its own.
     fn bind_with(&mut self, root: PatId, at: At, alias: &[(Name, PatId)]) -> Result<(), BuildError> {
-        let mut todo: Vec<(PatId, At), A> = Vec::new_in(self.alloc.clone());
-        let mut parts: Vec<(PatId, At), A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<(PatId, At), A> = Vec::new_in(self.alloc);
+        let mut parts: Vec<(PatId, At), A> = Vec::new_in(self.alloc);
         // An or-alternative's bindings (matches/forms.rs `first_binds`): bound on the
         // alternative's own pass, where its moves clear their bits; the first bindings own
         // their parts once, at the arm's pass (the `Pat::Or` row below).
@@ -497,7 +639,20 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         while let Some((p, at)) = todo.pop() {
             let pat = self.pat(p)?;
             match pat {
-                Pat::Bind { ann, name, sub } => {
+                Pat::Bind { ann, name, sub, .. } => {
+                    let at = match self.checked.union_pat_of(p) {
+                        None => at,
+                        Some(UnionPat::Variant(v)) => {
+                            let peeled = self.peel(p, at)?;
+                            self.union_variant_at(p, peeled, v)?
+                        }
+                        Some(UnionPat::Residual) => {
+                            let peeled = self.peel(p, at)?;
+                            let by_ref = ann.by_ref.is_some() || (!ann.mutable && peeled.by_ref);
+                            let dst_g = self.union_residual_ty(p, by_ref)?;
+                            self.union_residual_narrow(p, peeled, dst_g)?
+                        }
+                    };
                     if at.copy && ann.by_ref == Some(Mutbl::Mut) {
                         return Err(BuildError::UnsupportedPat { pat: p, what: "a `ref mut` binding of a scrutinee held as a value (a copy)" });
                     }
@@ -538,6 +693,10 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                         // in a guarded arm, once its guard passed (walk/moves.rs `Pending`).
                         let hold = self.holding_moves();
                         self.arm_effect(super::moves::Pending::Own(target), hold)?;
+                    } else if !by_ref {
+                        self.own_kept(target, true);
+                    } else {
+                        self.track_local_slot(target);
                     }
                     if let Some(s) = sub {
                         todo.push((s, at));
@@ -556,7 +715,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 // owns it, once, by its first binding (every alternative stored there): in
                 // declaration order, as the bindings around it are owned.
                 Pat::Or { .. } if !alt => {
-                    let mut names: Vec<(Name, PatId), A> = Vec::new_in(self.alloc.clone());
+                    let mut names: Vec<(Name, PatId), A> = Vec::new_in(self.alloc);
                     self.first_binds(p, &mut names)?;
                     for &(_, first) in names.iter() {
                         if self.take_alt_moved(first) {
@@ -566,7 +725,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                     }
                 }
                 Pat::Or { .. } => {}
-                Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Slice { .. } => {
+                Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Record { .. } | Pat::Slice { .. } => {
                     let a = self.peel(p, at)?;
                     parts.clear();
                     self.parts(p, a, &mut parts)?;
@@ -594,6 +753,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 let repr = self.local_repr(p)?;
                 let (size, align) = self.size_align(repr);
                 let slot = self.b.slot(size, align, SlotKind::Named);
+                self.name_slot(slot, blaze_flow_lower::identity::Identity::Binding(p));
                 self.slots[p.ix()] = Some((Home::Slot(slot), repr));
                 (Home::Slot(slot), repr)
             }
@@ -606,7 +766,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     fn through(&mut self, mut p: PatId, mut at: At) -> Result<(PatId, At), BuildError> {
         loop {
             match self.pat(p)? {
-                Pat::Bind { sub: Some(s), .. } => p = s,
+                Pat::Bind { sub: Some(s), .. } if self.checked.union_pat_of(p).is_none() => p = s,
                 Pat::Ref { inner, .. } => {
                     let PNode::Ref(_, to) = self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))? else {
                         return Err(malformed("a `&` pattern over other than a reference"));
@@ -623,7 +783,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// The patterns that follow references (rules/pat.rs `step_pat`'s `peel`).
     fn peels(pat: Pat) -> bool {
         match pat {
-            Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Slice { .. } | Pat::Path(_) | Pat::Range { .. } => true,
+            Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Record { .. } | Pat::Slice { .. } | Pat::Path(_) | Pat::Range { .. } => true,
             Pat::Lit(l) | Pat::NegLit(l) => !matches!(l, Lit::Str | Lit::ByteStr(_) | Lit::CStr),
             _ => false,
         }
@@ -763,13 +923,17 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                     out.push((sub, part(at, i64::from(off), g)?));
                 }
             }
-            Pat::Struct { fields, .. } => {
+            Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                 let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
                 if fps.is_empty() {
                     return Ok(());
                 }
                 let l = self.layout(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
-                let variant = Self::def_variant(self.pat_def(p)).ok_or(malformed("a variant pattern the check did not resolve"))?;
+                let variant = if matches!(self.pat(p)?, Pat::Record { .. }) {
+                    0
+                } else {
+                    Self::def_variant(self.pat_def(p)).ok_or(malformed("a variant pattern the check did not resolve"))?
+                };
                 let (first, len, _) = self.variant_rows(l, variant)?;
                 for fp in fps {
                     let row = (first..first + len)
@@ -853,7 +1017,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 
     /// Some binding inside pattern `p`, by a work list.
     fn binds_any(&self, p: PatId) -> Result<bool, BuildError> {
-        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
         todo.push(p);
         while let Some(q) = todo.pop() {
             match self.pat(q)? {
@@ -865,7 +1029,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                         todo.push(s);
                     }
                 }
-                Pat::Struct { fields, .. } => {
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                     let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
                     for fp in fps {
                         todo.push(fp.pat);
@@ -875,5 +1039,192 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             }
         }
         Ok(false)
+    }
+
+    /// The test that a union value at `at` (references peeled) holds variant `v`: `None` when it
+    /// always holds `v` (single-arm transparent union or single-present-variant layout).
+    fn union_variant_test(&mut self, p: PatId, at: At, v: u32) -> Result<Option<Value>, BuildError> {
+        let PNode::Union(ul) = self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))? else {
+            return Err(malformed("a union variant pattern over other than a structural union"));
+        };
+        if ul.len == 1 {
+            if v != 0 {
+                return Err(malformed("a single-member union pattern at a non-zero variant"));
+            }
+            return Ok(None);
+        }
+        let l = self.layout(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
+        let l_idx = usize::try_from(l).map_err(|_| malformed("a layout index past `usize`"))?;
+        let Some(&Shape::Enum { id, .. }) = self.layouts.get(l_idx).map(|row| &row.shape) else {
+            return Err(malformed("a multi-member union not laid out as an enum"));
+        };
+        match self.ls.get(id).variants {
+            Variants::Single { index } if index == v => Ok(None),
+            Variants::Single { .. } => {
+                let z = self.b.iconst(Ty::I8, 0);
+                let o = self.b.iconst(Ty::I8, 1);
+                Ok(Some(self.b.icmp(IntCond::Eq, z, o)))
+            }
+            Variants::Multiple { .. } => {
+                let d = self.read_discriminant(id, at.at)?;
+                let case = self.discriminant_case(id, v)?;
+                let k = self.b.iconst(Ty::I64, case);
+                Ok(Some(self.b.icmp(IntCond::Eq, d, k)))
+            }
+        }
+    }
+
+    /// Projects union place `at` (references peeled) to the payload of member `v`.
+    fn union_variant_at(&mut self, p: PatId, at: At, v: u32) -> Result<At, BuildError> {
+        let PNode::Union(ul) = self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))? else {
+            return Err(malformed("a union variant pattern over other than a structural union"));
+        };
+        if ul.len == 1 {
+            if v != 0 {
+                return Err(malformed("a single-member union pattern at a non-zero variant"));
+            }
+            let only = self
+                .ground
+                .view()
+                .list(ul)
+                .ok()
+                .and_then(|xs| xs.first().copied())
+                .ok_or(malformed("a union list past the ground table"))?;
+            return Ok(At { at: at.at, g: only, by_ref: at.by_ref, copy: at.copy });
+        }
+        let l = self.layout(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
+        let (first, len, _) = self.variant_rows(l, v)?;
+        if len != 1 {
+            return Err(malformed("a union variant without exactly one payload field"));
+        }
+        let first_idx = usize::try_from(first).map_err(|_| malformed("a union field index past `usize`"))?;
+        let off = self
+            .layout_fields
+            .get(first_idx)
+            .ok_or(malformed("a union variant's field past `layout_fields`"))?
+            .1;
+        let off_i32 = i32::try_from(i64::from(at.at.1) + i64::from(off))
+            .map_err(|_| BuildError::UnsupportedPat { pat: p, what: "a part past an `i32` offset" })?;
+        let member_g = *self
+            .layout_field_tys
+            .get(first_idx)
+            .ok_or(malformed("a union variant's field type past `layout_field_tys`"))?;
+        Ok(At { at: (at.at.0, off_i32), g: member_g, by_ref: at.by_ref, copy: at.copy })
+    }
+
+    /// The narrowed sub-union ground type of a `UnionPat::Residual` binding pattern `p`.
+    fn union_residual_ty(&mut self, p: PatId, by_ref: bool) -> Result<PTy, BuildError> {
+        let lt = *self.checked.local_ty.get(p.ix()).ok_or(malformed("a binding without a type in the record"))?;
+        let lg = self.ground_ty(lt).map_err(|error| Self::pat_ty_err(p, error))?;
+        if by_ref
+            && let PNode::Ref(_, inner) = self.ground_node(lg).map_err(|error| Self::pat_ty_err(p, error))?
+        {
+            return Ok(inner);
+        }
+        Ok(lg)
+    }
+
+    /// Tests whether union value `at` holds any variant whose ground type appears in `dst_g`.
+    fn union_residual_test(&mut self, p: PatId, at: At, dst_g: PTy) -> Result<ResidualTest, BuildError> {
+        let PNode::Union(src_l) = self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))? else {
+            return Err(malformed("a union residual pattern over other than a structural union"));
+        };
+        let PNode::Union(dst_l) = self.ground_node(dst_g).map_err(|error| Self::pat_ty_err(p, error))? else {
+            return Err(malformed("a union residual binding whose type is not a structural union"));
+        };
+        let mut src_members: Vec<PTy, A> = Vec::new_in(self.alloc);
+        src_members.extend_from_slice(
+            self.ground
+                .view()
+                .list(src_l)
+                .map_err(|_| malformed("a source union's members past the ground table"))?,
+        );
+        let mut dst_members: Vec<PTy, A> = Vec::new_in(self.alloc);
+        dst_members.extend_from_slice(
+            self.ground
+                .view()
+                .list(dst_l)
+                .map_err(|_| malformed("a target union's members past the ground table"))?,
+        );
+        if let [only] = src_members.as_slice() {
+            return Ok(if dst_members.contains(only) {
+                ResidualTest::Always
+            } else {
+                ResidualTest::Never
+            });
+        }
+        let l = self.layout(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
+        let l_idx = usize::try_from(l).map_err(|_| malformed("a layout index past `usize`"))?;
+        let Some(&Shape::Enum { id, .. }) = self.layouts.get(l_idx).map(|row| &row.shape) else {
+            return Err(malformed("a multi-member union not laid out as an enum"));
+        };
+        match self.ls.get(id).variants {
+            Variants::Single { index } => {
+                let idx = usize::try_from(index).ok();
+                Ok(if idx.and_then(|i| src_members.get(i)).is_some_and(|sm| dst_members.contains(sm)) {
+                    ResidualTest::Always
+                } else {
+                    ResidualTest::Never
+                })
+            }
+            Variants::Multiple { .. } => {
+                let d = self.read_discriminant(id, at.at)?;
+                let mut cond: Option<Value> = None;
+                for (i_idx, &sm) in src_members.iter().enumerate() {
+                    if !dst_members.contains(&sm) {
+                        continue;
+                    }
+                    let i = u32::try_from(i_idx).map_err(|_| malformed("a union variant index past `u32`"))?;
+                    let case = self.discriminant_case(id, i)?;
+                    let k = self.b.iconst(Ty::I64, case);
+                    let eq = self.b.icmp(IntCond::Eq, d, k);
+                    cond = Some(match cond {
+                        Some(prev) => self.b.binary(Op::Or, Flags::NONE, prev, eq),
+                        None => eq,
+                    });
+                }
+                Ok(match cond {
+                    Some(c) => ResidualTest::Cond(c),
+                    None => ResidualTest::Never,
+                })
+            }
+        }
+    }
+
+    /// Materializes the narrowed sub-union `dst_g` from source union `at` into a temp slot.
+    fn union_residual_narrow(&mut self, p: PatId, at: At, dst_g: PTy) -> Result<At, BuildError> {
+        let PNode::Union(src_l) = self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))? else {
+            return Err(malformed("a union residual pattern over other than a structural union"));
+        };
+        let PNode::Union(dst_l) = self.ground_node(dst_g).map_err(|error| Self::pat_ty_err(p, error))? else {
+            return Err(malformed("a union residual binding whose type is not a structural union"));
+        };
+        let mut src_members: Vec<PTy, A> = Vec::new_in(self.alloc);
+        src_members.extend_from_slice(
+            self.ground
+                .view()
+                .list(src_l)
+                .map_err(|_| malformed("a source union's members past the ground table"))?,
+        );
+        let mut dst_members: Vec<PTy, A> = Vec::new_in(self.alloc);
+        dst_members.extend_from_slice(
+            self.ground
+                .view()
+                .list(dst_l)
+                .map_err(|_| malformed("a target union's members past the ground table"))?,
+        );
+        let dst_repr = self.repr(dst_g).map_err(|error| Self::pat_ty_err(p, error))?;
+        if dst_repr == Repr::None {
+            return Ok(At { at: (self.b.uninit(Ty::PTR), 0), g: dst_g, by_ref: at.by_ref, copy: true });
+        }
+        let Repr::Agg(dst_layout) = dst_repr else {
+            return Err(malformed("a narrowed sub-union not held as an aggregate"));
+        };
+        let dst_at = self.temp(dst_repr);
+        if self.live {
+            let src_layout = self.layout(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
+            self.remap_union(None, src_layout, at.at, &src_members, dst_layout, dst_at, &dst_members)?;
+        }
+        Ok(At { at: dst_at, g: dst_g, by_ref: at.by_ref, copy: true })
     }
 }

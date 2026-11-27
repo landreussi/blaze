@@ -29,9 +29,10 @@ use blaze_mem::Kept;
 use blaze_own::Arc;
 
 use super::arena::{Arena, ArenaView, RunEntry, Visibility};
-use super::core::{Batch, Committed, LentRecord, Named, POINTER_LEN, Probes, PutPath, Report, Sliced};
-use super::driven::Driven;
+use super::core::{Batch, CommitDurability, Committed, GcPlan, LentRecord, Named, POINTER_LEN, PidCheck, Probes, PutPath, Renewed, Report, Sliced};
+use super::driven::{Driven, HeadIdentity};
 use super::format::record_crc;
+use super::par::{Par, Serial};
 use crate::Key;
 
 /// One arena chunk's blocks (1 MiB); a larger record gets a chunk of its own size.
@@ -185,6 +186,15 @@ impl<'l> Lend<'l> {
         }
         Aligned16::new(self.bytes).map_err(NotInPlace::Misaligned)
     }
+}
+
+/// Answer of [`Lent::get_committed`]: a committed segment borrow, an uncommitted arena record
+/// (caller reads through a [`super::Snapshot`] so the arena frees on commit), or absent.
+#[derive(Clone, Copy, Debug)]
+pub enum CommittedLend<'l> {
+    Found(Lend<'l>),
+    InArena,
+    Absent,
 }
 
 /// The alignment every record of a segment starts at, and every section a reader cuts at a
@@ -541,11 +551,105 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         self.inner.borrow_mut().store.driver().wall_ns()
     }
 
+    /// A non-lending lookup against committed segments alone ([`Lent::get_committed`]).
+    /// Never marks an uncommitted arena chunk or shared arena as lent.
+    pub fn get_committed(&self, key: &Key) -> Result<CommittedLend<'_>, LentError> {
+        let mut inner = self.inner.borrow_mut();
+        let inner = &mut *inner;
+        inner.counts.gets += 1;
+        if let Some(at) = inner.puts.get(&key.0.0).copied() {
+            if at.tag == ReservedTag::Pointer.tag() {
+                return Err(LentError::PointerTag { key: *key });
+            }
+            return Ok(CommittedLend::InArena);
+        }
+        let Some(found) = inner.store.get(key).map_err(stopped("reading a committed record"))? else {
+            inner.counts.misses += 1;
+            return Ok(CommittedLend::Absent);
+        };
+        let got = inner.store.got(found);
+        if got.tag == ReservedTag::Pointer.tag() {
+            return Err(LentError::PointerTag { key: *key });
+        }
+        let (ptr, len, tag, namespace) = (got.bytes.as_ptr(), got.bytes.len(), got.tag, got.namespace);
+        inner.counts.from_segments += 1;
+        // SAFETY: `got` comes from a proved segment mapping held by `inner.store`, which stays
+        // mapped for the life of this `Lent` (`lend`'s contract).
+        Ok(CommittedLend::Found(Lend { tag, namespace, bytes: unsafe { lend(ptr, len) }, own: false, shared: false }))
+    }
+
+    /// The tag of the record under `key`, without lending its bytes: inspects uncommitted puts
+    /// first, else committed segments. Never sets `shared_lent` or pins an arena chunk.
+    pub fn tag_of(&self, key: &Key) -> Result<Option<Tag>, LentError> {
+        let mut inner = self.inner.borrow_mut();
+        let inner = &mut *inner;
+        if let Some(at) = inner.puts.get(&key.0.0).copied() {
+            if at.tag == ReservedTag::Pointer.tag() {
+                return Err(LentError::PointerTag { key: *key });
+            }
+            return Ok(Some(at.tag));
+        }
+        let Some(found) = inner.store.get(key).map_err(stopped("inspecting a record's tag"))? else {
+            return Ok(None);
+        };
+        let got = inner.store.got(found);
+        if got.tag == ReservedTag::Pointer.tag() {
+            return Err(LentError::PointerTag { key: *key });
+        }
+        Ok(Some(got.tag))
+    }
+
+    /// Reads the bytes under `key` inside `f` without lending them past this call, so an
+    /// uncommitted put never pins its arena chunk or shared arena.
+    pub fn with_bytes<R>(&self, key: &Key, f: impl FnOnce(Tag, Namespace, &[u8]) -> R) -> Result<Option<R>, LentError> {
+        let mut inner = self.inner.borrow_mut();
+        let inner = &mut *inner;
+        inner.counts.gets += 1;
+        if let Some(at) = inner.puts.get(&key.0.0).copied() {
+            if at.tag == ReservedTag::Pointer.tag() {
+                return Err(LentError::PointerTag { key: *key });
+            }
+            inner.counts.from_puts += 1;
+            let kept = inner.kept(&at);
+            return Ok(Some(f(at.tag, at.namespace, kept)));
+        }
+        let Some(found) = inner.store.get(key).map_err(stopped("reading a record into a buffer"))? else {
+            inner.counts.misses += 1;
+            return Ok(None);
+        };
+        let got = inner.store.got(found);
+        if got.tag == ReservedTag::Pointer.tag() {
+            return Err(LentError::PointerTag { key: *key });
+        }
+        inner.counts.from_segments += 1;
+        Ok(Some(f(got.tag, got.namespace, got.bytes)))
+    }
+
+    /// Number of shared arenas pinned past commit because a `Lent::get` borrowed from them.
+    pub fn kept_arenas(&self) -> usize {
+        self.inner.borrow().kept_arenas.len()
+    }
+
     /// The record under `key`, for the life of this borrow: this command's own put while it
     /// is not yet committed (from the arena: not in place), else the committed record of the
     /// first namespace read that holds it (a segment mapped at its first probe, `Driven::get`),
     /// in place. `None`: absent.
     pub fn get(&self, key: &Key) -> Result<Option<Lend<'_>>, LentError> {
+        self.get_hinted(key, None)
+    }
+
+    /// Zero-allocation lookup of manifest root `name` and its root record, using the root's
+    /// creation generation as a segment-locality hint (avoids mapping older/larger segments on
+    /// warm reads).
+    pub fn get_root(&self, name: &str) -> Result<Option<Lend<'_>>, LentError> {
+        let target = self.inner.borrow().store.core().root_target(name);
+        let Some((key, generation)) = target else {
+            return Ok(None);
+        };
+        self.get_hinted(&key, Some(generation))
+    }
+
+    fn get_hinted(&self, key: &Key, hint_gen: Option<u64>) -> Result<Option<Lend<'_>>, LentError> {
         let mut inner = self.inner.borrow_mut();
         let inner = &mut *inner;
         inner.counts.gets += 1;
@@ -568,7 +672,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
             let shared = matches!(at.place, Place::Shared { .. });
             return Ok(Some(Lend { tag: at.tag, namespace: at.namespace, bytes: unsafe { lend(ptr, len) }, own: true, shared }));
         }
-        let Some(found) = inner.store.get(key).map_err(stopped("reading a record"))? else {
+        let Some(found) = inner.store.get_hinted(key, hint_gen).map_err(stopped("reading a record"))? else {
             inner.counts.misses += 1;
             return Ok(None);
         };
@@ -641,7 +745,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
                 return Ok(Put::Same);
             }
             let held = Held { namespace: at.namespace, tag: at.tag, bytes: kept, own: true };
-            return Err(held.against(key, namespace, tag, &joined(parts, self.alloc.clone())));
+            return Err(held.against(key, namespace, tag, &joined(parts, &self.alloc)));
         }
         if let Some(found) = inner.store.get(key).map_err(stopped("checking a put against the store"))? {
             let got = inner.store.got(found);
@@ -650,7 +754,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
                 return Ok(Put::Same);
             }
             let held = Held { namespace: got.namespace, tag: got.tag, bytes: got.bytes, own: false };
-            return Err(held.against(key, namespace, tag, &joined(parts, self.alloc.clone())));
+            return Err(held.against(key, namespace, tag, &joined(parts, &self.alloc)));
         }
         let (place, block, len) = self.copy_in(inner, key, tag, parts)?;
         let at = PutAt { place, block, len, tag, namespace, order: inner.order.len() as u32 };
@@ -755,9 +859,9 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// command already pointed at `target`, not yet committed, is [`Put::Same`]; every other
     /// point is written, so of two processes the later commit wins.
     pub fn point(&self, tag: Tag, name: &Key, target: &Key) -> Result<Put, LentError> {
-        match self.get(target)? {
+        match self.tag_of(target)? {
             None => return Err(LentError::PointsAtNothing { name: *name, target: *target }),
-            Some(lend) if lend.tag != tag => return Err(LentError::TargetTag { name: *name, target: *target, want: tag, found: lend.tag }),
+            Some(found) if found != tag => return Err(LentError::TargetTag { name: *name, target: *target, want: tag, found }),
             Some(_) => {}
         }
         let now = self.newest_target(name)?;
@@ -790,9 +894,9 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// [`LentError::TargetGone`]; one of another tag [`LentError::TargetTag`].
     pub fn pointed(&self, tag: Tag, name: &Key) -> Result<Option<Key>, LentError> {
         let Some(target) = self.newest_target(name)? else { return Ok(None) };
-        match self.get(&target)? {
+        match self.tag_of(&target)? {
             None => Err(LentError::TargetGone { name: *name, target }),
-            Some(lend) if lend.tag != tag => Err(LentError::TargetTag { name: *name, target, want: tag, found: lend.tag }),
+            Some(found) if found != tag => Err(LentError::TargetTag { name: *name, target, want: tag, found }),
             Some(_) => Ok(Some(target)),
         }
     }
@@ -845,30 +949,46 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         self.inner.borrow().store.core().roots()
     }
 
+    /// Whether the current manifest names a root called `name`, without allocating.
+    pub fn has_root(&self, name: &str) -> bool {
+        self.inner.borrow().store.core().root_target(name).is_some()
+    }
+
     /// What is not yet committed, one segment per namespace, one flip (a whole store: the
     /// commit maps what is left first). From then on every put so far is read from its segment,
     /// in place; every arena chunk no get lent from is freed, and what a get lent stays lent
     /// (`lend`'s contract: its chunk is kept, holding no key).
     pub fn commit(&self) -> Result<Committed<A>, LentError> {
+        self.commit_par(&Serial)
+    }
+
+    /// Parallel twin of [`Lent::commit`]: runs `TwoValues` verification, BLAKE3 segment sealing,
+    /// Bloom construction, and targeted prior-boot segment checks through `par`.
+    pub fn commit_par<P: Par>(&self, par: &P) -> Result<Committed<A>, LentError> {
         let mut inner = self.inner.borrow_mut();
         let inner = &mut *inner;
         if self.plant == LentPlant::RootFirst {
-            inner.store.commit_with(&[]).map_err(stopped("committing the roots first (planted)"))?;
+            inner.store.commit_with_par(&[], par).map_err(stopped("committing the roots first (planted)"))?;
+        }
+        let upto = inner.order.len();
+        if self.plant == LentPlant::None && inner.committed == upto && !inner.store.core().needs_commit() {
+            let committed = inner.store.commit_records_par(&[], &[], par).map_err(stopped("committing nothing"))?;
+            inner.counts.commits += 1;
+            return Ok(committed);
         }
         // The measure (rule 16): the calling thread's time in the commit, from its layout to its
         // flip and the new segment's map (the driver's wall clock: the simulation's in a test).
         let began = inner.store.driver().wall_ns();
-        let upto = inner.order.len();
         // THE SEAM (rule 78): under `InArena` the puts are lent to the layout where they lie,
         // no batch between (copy 2 gone, the CRC made at the put); under `AfterCommit` each is
         // copied into its namespace's batch first, as before. The same segments either way
         // (arena_tests.rs `the_two_visibilities_write_the_same_segments`).
         let (committed, batch_bytes) = if matches!(self.visibility, Visibility::InArena { .. }) {
-            (self.commit_shared(inner, upto)?, 0)
+            (self.commit_shared_par(inner, upto, par)?, 0)
         } else {
-            let mut writes: Vec<Namespace, A> = Vec::with_capacity_in(inner.store.core().writes().len(), self.alloc.clone());
+            let mut writes: Vec<Namespace, &A> = Vec::with_capacity_in(inner.store.core().writes().len(), &self.alloc);
             writes.extend_from_slice(inner.store.core().writes());
-            let mut batches: Vec<Batch, A> = Vec::with_capacity_in(writes.len(), self.alloc.clone());
+            let mut batches: Vec<Batch, &A> = Vec::with_capacity_in(writes.len(), &self.alloc);
             batches.extend(writes.iter().map(|namespace| Batch::new(*namespace)));
             let mut first = Batch::new(Namespace::LOCAL);
             for key in &inner.order[inner.committed..upto] {
@@ -886,11 +1006,11 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
             }
             let batch_bytes = batches.iter().map(Batch::bytes).sum::<u64>() + first.bytes();
             if !first.is_empty() {
-                inner.store.commit_with(&[&first]).map_err(stopped("committing the pointers first (planted)"))?;
+                inner.store.commit_with_par(&[&first], par).map_err(stopped("committing the pointers first (planted)"))?;
             }
-            let mut refs: Vec<&Batch, A> = Vec::with_capacity_in(batches.len(), self.alloc.clone());
+            let mut refs: Vec<&Batch, &A> = Vec::with_capacity_in(batches.len(), &self.alloc);
             refs.extend(batches.iter().filter(|batch| !batch.is_empty()));
-            (inner.store.commit_with(&refs).map_err(stopped("committing"))?, batch_bytes)
+            (inner.store.commit_with_par(&refs, par).map_err(stopped("committing"))?, batch_bytes)
         };
         inner.committed = upto;
         inner.uncommitted_bytes = 0;
@@ -938,14 +1058,14 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
 
     /// `Visibility::InArena`'s commit of the puts `order[committed..upto]`: each lent to the
     /// layout from the shared arena where it lies, with the CRC its put made (core.rs
-    /// `LentRecord`, `Plain::commit_records`): its bytes read once, by the layout's one copy
+    /// `LentRecord`, `Plain::commit_records_par`): its bytes read once, by the layout's one copy
     /// into the segment's piece. The list of records is in the handed allocator.
     /// (`LentPlant::PointerFirst`, planted: the pointers committed alone first, as the batch
     /// path's control does.)
-    fn commit_shared(&self, inner: &mut Inner<D, A>, upto: usize) -> Result<Committed<A>, LentError> {
+    fn commit_shared_par<P: Par>(&self, inner: &mut Inner<D, A>, upto: usize, par: &P) -> Result<Committed<A>, LentError> {
         let Inner { store, shared, puts, order, committed, .. } = inner;
         let from = (*committed).min(upto);
-        let mut records: Vec<LentRecord<'_>, A> = Vec::new_in(self.alloc.clone());
+        let mut records: Vec<LentRecord<'_>, &A> = Vec::new_in(&self.alloc);
         records.try_reserve_exact(upto - from).map_err(|_| LentError::Arena { bytes: (upto - from) * core::mem::size_of::<LentRecord<'_>>() })?;
         for key in &order[from..upto] {
             let Some(at) = puts.get(key) else { continue };
@@ -962,12 +1082,12 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         }
         if self.plant == LentPlant::PointerFirst && records.iter().any(|it| it.tag == ReservedTag::Pointer.tag()) {
             // The planted bug: the pointers laid apart, for a commit before their targets'.
-            let mut first: Vec<LentRecord<'_>, A> = Vec::new_in(self.alloc.clone());
+            let mut first: Vec<LentRecord<'_>, &A> = Vec::new_in(&self.alloc);
             first.extend(records.iter().filter(|it| it.tag == ReservedTag::Pointer.tag()).copied());
             records.retain(|it| it.tag != ReservedTag::Pointer.tag());
-            store.commit_records(&[], &first).map_err(stopped("committing the pointers first (planted)"))?;
+            store.commit_records_par(&[], &first, par).map_err(stopped("committing the pointers first (planted)"))?;
         }
-        store.commit_records(&[], &records).map_err(stopped("committing"))
+        store.commit_records_par(&[], &records, par).map_err(stopped("committing"))
     }
 
     /// `Visibility::InArena`: the puts since the last take sealed into one run of the current
@@ -980,7 +1100,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         let inner = &mut *inner;
         let Some(arena) = inner.shared.as_ref() else { return Ok(None) };
         let from = inner.sealed.max(inner.committed);
-        let mut run: Vec<RunEntry, A> = Vec::new_in(self.alloc.clone());
+        let mut run: Vec<RunEntry, &A> = Vec::new_in(&self.alloc);
         let count = inner.order.len().saturating_sub(from);
         run.try_reserve_exact(count).map_err(|_| LentError::Arena { bytes: count * core::mem::size_of::<RunEntry>() })?;
         for key in &inner.order[from.min(inner.order.len())..] {
@@ -999,7 +1119,12 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// Every segment mapped and every parked one checked (probe.rs): asked once, when the
     /// request's first pool task is about to start.
     pub fn map_all(&self) -> Result<(), LentError> {
-        self.inner.borrow_mut().store.map_all().map_err(stopped("mapping every segment named"))
+        self.map_all_par(&Serial)
+    }
+
+    /// Parallel twin of [`Lent::map_all`]: verifies large earlier-boot segments through `par`.
+    pub fn map_all_par<P: Par>(&self, par: &P) -> Result<(), LentError> {
+        self.inner.borrow_mut().store.map_all_par(par).map_err(stopped("mapping every segment named"))
     }
 
     /// After the answer: the exit tail sealed (`Driven::seal`). Whether a flip was made.
@@ -1007,9 +1132,19 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         self.inner.borrow_mut().store.seal().map_err(stopped("sealing the exit tail"))
     }
 
+    /// Foreground exit-tail seal at the calling thread's current priority (`Driven::seal_foreground`).
+    pub fn seal_foreground(&self) -> Result<bool, LentError> {
+        self.inner.borrow_mut().store.seal_foreground().map_err(stopped("sealing the exit tail"))
+    }
+
     /// After the answer: at most `slices` compaction slices (`Driven::compact`).
     pub fn compact(&self, slices: u32) -> Result<Vec<Sliced, A>, LentError> {
         self.inner.borrow_mut().store.compact(slices).map_err(stopped("compacting"))
+    }
+
+    /// Foreground compaction at the calling thread's current priority (`Driven::compact_foreground`).
+    pub fn compact_foreground(&self, slices: u32) -> Result<Vec<Sliced, A>, LentError> {
+        self.inner.borrow_mut().store.compact_foreground(slices).map_err(stopped("compacting"))
     }
 
     /// After the answer, before its commit: one cleanup slice written with no lock, which the
@@ -1029,13 +1164,18 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// `CLEANUP_SLICES_MOST`, the bytes read under this process's work budget). The slices
     /// summed (`Sliced::and`) and how many replaced something.
     pub fn clean_on(&self, first: Option<Sliced>) -> Result<(Option<Sliced>, u32), LentError> {
+        self.clean_on_par(first, &Serial)
+    }
+
+    /// Parallel twin of [`Lent::clean_on`]: commits each folded cleanup slice through `par`.
+    pub fn clean_on_par<P: Par>(&self, first: Option<Sliced>, par: &P) -> Result<(Option<Sliced>, u32), LentError> {
         let Some(mut so_far) = first else { return Ok((None, 0)) };
         let (mut last, mut slices) = (so_far, u32::from(so_far.segments > 0 && !so_far.aborted));
         while self.inner.borrow().store.core().cleanup_goes_on(&so_far, slices, &last) {
             if !self.fold_slice()? {
                 break;
             }
-            self.commit()?;
+            self.commit_par(par)?;
             let Some(next) = self.take_sliced() else { break };
             slices += u32::from(next.segments > 0 && !next.aborted);
             so_far = so_far.and(next);
@@ -1067,6 +1207,11 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         store.root_through_owned(name, indexes, life_ns, &|key| puts.get(&key.0.0).is_some()).map_err(stopped("setting an indexed root"))
     }
 
+    /// Provides optional probe-order hints to `Plain::reused` (`Plain::hint_replaced_indexes`).
+    pub fn hint_replaced_indexes(&self, indexes: &[Key]) {
+        self.inner.borrow_mut().store.hint_replaced_indexes(indexes);
+    }
+
     /// An index of `keys` filed beside the record `owner` (`Plain::index_beside`).
     pub fn index_beside(&self, owner: Key, keys: &[Key]) -> Result<Key, LentError> {
         self.inner.borrow_mut().store.index_beside(owner, keys).map_err(stopped("putting an index beside a record"))
@@ -1084,6 +1229,39 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         self.inner.borrow().store.core().leases()
     }
 
+    /// Number of active leases named by the current manifest, without allocating.
+    pub fn leases_len(&self) -> usize {
+        self.inner.borrow().store.core().leases_len()
+    }
+
+    /// Overrides the commit durability policy on the underlying plain store.
+    pub fn set_commit_durability(&self, durability: CommitDurability) {
+        self.inner.borrow_mut().store.set_commit_durability(durability);
+    }
+
+    /// Records this process's OS PID (`0` when unknown/simulated) for committed leases.
+    pub fn set_pid(&self, pid: u32) {
+        self.inner.borrow_mut().store.set_pid(pid);
+    }
+
+    /// Probes same-boot leases via `check` and marks provably dead-PID leases for immediate GC
+    /// reclamation ([`super::core::Plain::reclaim_dead_leases`]).
+    pub fn reclaim_dead_leases(&self, check: &dyn PidCheck) -> u32 {
+        self.inner.borrow_mut().store.reclaim_dead_leases(check)
+    }
+
+    /// Whether [`Lent::commit`] has any uncommitted puts, pending roots, open stamps, or a
+    /// folded slice to write/flip.
+    pub fn needs_commit(&self) -> bool {
+        let inner = self.inner.borrow();
+        inner.committed < inner.order.len() || inner.store.core().needs_commit()
+    }
+
+    /// Whether [`Lent::seal`] has any unsealed segments of this boot or pending open stamps.
+    pub fn needs_seal(&self) -> bool {
+        self.inner.borrow().store.core().needs_seal()
+    }
+
     /// Records this process's commits carried forward (`Plain::carried`).
     pub fn carried(&self) -> u64 {
         self.inner.borrow().store.core().carried()
@@ -1092,6 +1270,43 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// The record the root `name` names unexpired (`Plain::root_named`).
     pub fn root_named(&self, name: &str) -> Option<Key> {
         self.inner.borrow().store.core().root_named(name)
+    }
+
+    /// O(1) lease renewal for an already-live root `name` ([`Plain::renew_root`]): refreshes the
+    /// lease without reading, probing, sorting, or hashing the keys it holds.
+    pub fn renew_root(&self, name: &str, life_ns: u64) -> Renewed {
+        self.inner.borrow_mut().store.renew_root(name, life_ns)
+    }
+
+    /// O(segments + roots + retired) check of whether compaction or GC housekeeping is due at
+    /// `now_ns` ([`Plain::needs_housekeeping`]).
+    pub fn needs_housekeeping(&self, now_ns: u64) -> bool {
+        self.inner.borrow().store.needs_housekeeping(now_ns)
+    }
+
+    /// Read-only inspection of what a GC pass would reclaim now ([`Driven::plan_gc`]).
+    pub fn plan_gc(&self) -> Result<GcPlan, LentError> {
+        self.inner.borrow_mut().store.plan_gc().map_err(stopped("planning gc"))
+    }
+
+    /// Whether total committed segment bytes exceed the high watermark of a finite budget.
+    pub fn over_budget(&self) -> bool {
+        self.inner.borrow().store.over_budget()
+    }
+
+    /// Total committed segment bytes.
+    pub fn total_bytes(&self) -> u64 {
+        self.inner.borrow().store.total_bytes()
+    }
+
+    /// Configured store byte budget (`u64::MAX` = unlimited).
+    pub fn cap_bytes(&self) -> u64 {
+        self.inner.borrow().store.cap_bytes()
+    }
+
+    /// Overrides the store byte budget for this handle (`u64::MAX` = unlimited).
+    pub fn set_cap(&self, cap_bytes: u64) {
+        self.inner.borrow_mut().store.set_cap(cap_bytes);
     }
 
     /// The roots this process set and the keys they name (`Plain::named`).
@@ -1103,6 +1318,98 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// (`Plain::release_lease`).
     pub fn release_lease(&self) {
         self.inner.borrow_mut().store.release_lease()
+    }
+
+    /// Drops a named root at the next commit (`Plain::unroot`).
+    pub fn unroot(&self, name: &str) {
+        self.inner.borrow_mut().store.unroot(name)
+    }
+
+    /// Re-enables automatic lease acquisition for the next request after [`Lent::release_lease`]
+    /// (`Plain::rearm_lease`), so a resident daemon holds zero leases while idle yet acquires
+    /// fresh lease protection on the next multi-phase request.
+    pub fn rearm_lease(&self) {
+        self.inner.borrow_mut().store.rearm_lease()
+    }
+
+    /// The generation this open store holds (`Plain::generation`).
+    pub fn generation(&self) -> u64 {
+        self.inner.borrow().store.core().generation()
+    }
+
+    /// Reads the reset-safe [`HeadIdentity`] of `head` on disk (`Driven::head_identity_on_disk`,
+    /// bounded to `HEAD_LEN + 1` bytes plus path-based `Stat` `(dev, ino)`).
+    pub fn head_identity_on_disk(&self) -> Result<Option<HeadIdentity>, LentError> {
+        self.inner.borrow_mut().store.head_identity_on_disk().map_err(stopped("reading the head identity"))
+    }
+
+    /// Reads only the fixed head file on disk (`Driven::head_generation_on_disk`, zero segment
+    /// opens or mmaps) and returns the committed generation on disk.
+    pub fn head_generation_on_disk(&self) -> Result<u64, LentError> {
+        self.inner.borrow_mut().store.head_generation_on_disk().map_err(stopped("reading the head generation"))
+    }
+
+    /// Reclaims arenas and lent private chunks held past commit once all [`Lend`] borrows have
+    /// ended (proven statically by `&mut self`) and no uncommitted puts remain. Mapped segments
+    /// stay open and warm inside the underlying store. Shared arenas still retained by a live
+    /// [`Snapshot`] are kept until their last owner drops so `held_bytes` stays accurate.
+    pub fn reclaim_between_requests(&mut self) -> usize {
+        let inner = self.inner.get_mut();
+        if inner.uncommitted_bytes > 0 || inner.committed < inner.order.len() || !inner.puts.is_empty() {
+            return 0;
+        }
+        let mut reclaimed = 0usize;
+        let mut i = 0usize;
+        while i < inner.kept_arenas.len() {
+            let arena = inner.kept_arenas.swap_remove(i);
+            match Arc::try_unwrap(arena) {
+                Ok(owned) => {
+                    inner.counts.held_bytes = inner.counts.held_bytes.saturating_sub(u64::from(owned.blocks()) * 16);
+                    inner.counts.freed_chunks = inner.counts.freed_chunks.saturating_add(1);
+                    reclaimed += 1;
+                }
+                Err(shared) => {
+                    inner.kept_arenas.push(shared);
+                    let last = inner.kept_arenas.len() - 1;
+                    inner.kept_arenas.swap(i, last);
+                    i += 1;
+                }
+            }
+        }
+        if inner.kept_arenas.capacity() > 16 && inner.kept_arenas.len() <= 16 {
+            inner.kept_arenas.shrink_to_fit();
+        }
+        if let Some(arena) = inner.shared.take() {
+            inner.shared_lent = false;
+            match Arc::try_unwrap(arena) {
+                Ok(owned) => {
+                    inner.counts.held_bytes = inner.counts.held_bytes.saturating_sub(u64::from(owned.blocks()) * 16);
+                    inner.counts.freed_chunks = inner.counts.freed_chunks.saturating_add(1);
+                    reclaimed += 1;
+                }
+                Err(shared) => inner.kept_arenas.push(shared),
+            }
+        }
+        while let Some(chunk) = inner.chunks.pop() {
+            if chunk.capacity() > 0 {
+                let bytes = u64::try_from(chunk.len()).unwrap_or(u64::MAX).saturating_mul(16);
+                inner.counts.held_bytes = inner.counts.held_bytes.saturating_sub(bytes);
+                inner.counts.freed_chunks = inner.counts.freed_chunks.saturating_add(1);
+                reclaimed += 1;
+            }
+        }
+        inner.lent.clear();
+        if inner.chunks.capacity() > 16 {
+            inner.chunks.shrink_to_fit();
+            inner.lent.shrink_to_fit();
+        }
+        inner.order.clear();
+        if inner.order.capacity() > 1024 {
+            inner.order.shrink_to_fit();
+        }
+        inner.committed = 0;
+        inner.sealed = 0;
+        reclaimed
     }
 
     /// Adds what names this machine to the scan of every put into a shared namespace.

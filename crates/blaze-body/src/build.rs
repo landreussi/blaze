@@ -21,14 +21,16 @@ use core::cell::Cell;
 use core::hash::BuildHasher;
 
 use crate::body::{
-    Block, BlockKind, BlockRow, Body, BorrowKind, Callee, CalleeId, Const, ConstDecl, ConstKind, List,
-    Local, LocalDecl, LocalKind, Loan, LoanRow, NONE, Operand, Ops, Origin, PTy, Place, PlaceRow,
-    Proj, Span, Stmt, StmtKind, Table, Value,
+    AsmArch, AsmOpKind, AsmOpRow, AsmPiece, AsmRegKind, AsmRow, Block, BlockKind, BlockRow, Body,
+    BorrowKind, Callee, CalleeId, Const, ConstDecl, ConstKind, List, Local, LocalDecl, LocalKind,
+    Loan, LoanRow, NONE, Operand, Ops, Origin, PTy, Place, PlaceRow, Proj, Span, Stmt, StmtKind,
+    Table, Value,
 };
 use crate::code::{
-    ConstWords, PairWords, PlaceWords, SubsetWords, TyWords, encode_block, encode_callee, encode_case,
-    encode_const, encode_loan, encode_local, encode_operand, encode_place, encode_stmt, encode_ty, join,
-    map_ty_lists, ty_children,
+    ConstWords, PairWords, PlaceWords, SubsetWords, TyWords, encode_asm, encode_asm_op,
+    encode_asm_piece, encode_block, encode_callee, encode_case, encode_const, encode_loan,
+    encode_local, encode_operand, encode_place, encode_stmt, encode_ty, join, map_ty_lists,
+    ty_children,
 };
 use crate::verify::{VerifyError, check_refs};
 
@@ -80,9 +82,29 @@ impl From<VerifyError> for BuildError {
     }
 }
 
+/// Input piece for [`BodyBuilder::new_asm`].
+#[derive(Clone, Copy, Debug)]
+pub enum AsmPieceInput<'a> {
+    Text(&'a str),
+    Line,
+    Operand { index: u32, modifier: Option<char> },
+}
+
+/// Input operand descriptor for [`BodyBuilder::new_asm`].
+#[derive(Clone, Copy, Debug)]
+pub struct AsmOpInput<'a> {
+    pub kind: AsmOpKind,
+    pub reg_kind: AsmRegKind,
+    pub reg: &'a str,
+    pub in_op: Option<u32>,
+    pub out_place: Option<Place>,
+    pub label: Option<Block>,
+    pub discard_out: bool,
+}
+
 /// Builds a body: make locals, constants and blocks, then fill each block in turn, ending it
 /// with a terminator.
-pub struct BodyBuilder<A: Allocator + Clone> {
+pub struct BodyBuilder<A: Allocator + Copy> {
     body: Body<A>,
     filled: Vec<bool, A>,
     open: Option<Block>,
@@ -100,7 +122,7 @@ pub struct BodyBuilder<A: Allocator + Clone> {
 /// The record's types and the overlay's, by node, and their lists, by entries: what
 /// [`BodyBuilder::intern_ty`] and [`BodyBuilder::intern_list`] look up. Built once from the
 /// record's table, O(its size); no borrow of the table is kept.
-struct TypeIndex<A: Allocator + Clone> {
+struct TypeIndex<A: Allocator + Copy> {
     ty_base: u32,
     list_base: u32,
     /// Every type, the record's then the overlay's, by its canonical node (each list the first
@@ -138,7 +160,7 @@ fn find_list<A: Allocator>(
     Err(k)
 }
 
-impl<A: Allocator + Clone> TypeIndex<A> {
+impl<A: Allocator + Copy> TypeIndex<A> {
     /// `l` as its canonical list: the empty list, the first list of its entries, or itself.
     fn canonical_list(&self, l: List) -> List {
         match (l.len, self.canon.get(&l)) {
@@ -234,13 +256,13 @@ impl<A: Allocator + Clone> TypeIndex<A> {
     }
 }
 
-impl<A: Allocator + Clone> BodyBuilder<A> {
+impl<A: Allocator + Copy> BodyBuilder<A> {
     /// An empty body that names the types of `record` (the checked record's table, from
     /// `ck.types.view()`) and may add its own: [`Self::intern_ty`] answers the record's handle
     /// for a node the record holds, else a handle numbered after the record's types. Indexes
     /// the record's nodes and lists once, in `alloc`.
     pub fn new_with_types_in(record: PTys<'_>, alloc: A) -> BodyBuilder<A> {
-        let mut b = BodyBuilder::new_in(alloc.clone());
+        let mut b = BodyBuilder::new_in(alloc);
         // The table the body's handles index, named once so the kept record (kept.rs) can
         // refuse this body written against another table of the same size.
         b.body.table = Some(crate::kept::TableId::of(record));
@@ -256,15 +278,15 @@ impl<A: Allocator + Clone> BodyBuilder<A> {
             list_base,
             nodes: Map::new(MapOpts {
                 hasher: FixedState,
-                alloc: alloc.clone(),
+                alloc,
                 capacity: Some(ty_base as usize),
             }),
             lists: Map::new(MapOpts {
                 hasher: FixedState,
-                alloc: alloc.clone(),
+                alloc,
                 capacity: Some((list_base as usize).min(ty_base as usize)),
             }),
-            canon: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            canon: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
             entries: Vec::with_capacity_in(list_base as usize, alloc),
         };
         for t in record.lists() {
@@ -328,35 +350,38 @@ impl<A: Allocator + Clone> BodyBuilder<A> {
     pub fn new_in(alloc: A) -> BodyBuilder<A> {
         BodyBuilder {
             body: Body {
-                locals: Vec::new_in(alloc.clone()),
-                local_places: Vec::new_in(alloc.clone()),
-                places: Vec::new_in(alloc.clone()),
-                consts: Vec::new_in(alloc.clone()),
-                data: Vec::new_in(alloc.clone()),
-                callees: Vec::new_in(alloc.clone()),
-                stmts: Vec::new_in(alloc.clone()),
-                spans: Vec::new_in(alloc.clone()),
-                stmt_block: Vec::new_in(alloc.clone()),
-                blocks: Vec::new_in(alloc.clone()),
-                operands: Vec::new_in(alloc.clone()),
-                cases: Vec::new_in(alloc.clone()),
-                loans: Vec::new_in(alloc.clone()),
-                subsets: Vec::new_in(alloc.clone()),
-                placeholder: Vec::new_in(alloc.clone()),
-                local_origins: Vec::new_in(alloc.clone()),
-                known: Vec::new_in(alloc.clone()),
+                locals: Vec::new_in(alloc),
+                local_places: Vec::new_in(alloc),
+                places: Vec::new_in(alloc),
+                consts: Vec::new_in(alloc),
+                data: Vec::new_in(alloc),
+                callees: Vec::new_in(alloc),
+                stmts: Vec::new_in(alloc),
+                spans: Vec::new_in(alloc),
+                stmt_block: Vec::new_in(alloc),
+                blocks: Vec::new_in(alloc),
+                operands: Vec::new_in(alloc),
+                cases: Vec::new_in(alloc),
+                loans: Vec::new_in(alloc),
+                subsets: Vec::new_in(alloc),
+                placeholder: Vec::new_in(alloc),
+                local_origins: Vec::new_in(alloc),
+                known: Vec::new_in(alloc),
                 ty_base: NONE,
                 list_base: NONE,
-                tys: Vec::new_in(alloc.clone()),
-                ty_lists: Vec::new_in(alloc.clone()),
+                tys: Vec::new_in(alloc),
+                ty_lists: Vec::new_in(alloc),
+                asms: Vec::new_in(alloc),
+                asm_pieces: Vec::new_in(alloc),
+                asm_ops: Vec::new_in(alloc),
                 table: None,
             },
-            filled: Vec::new_in(alloc.clone()),
+            filled: Vec::new_in(alloc),
             open: None,
             error: None,
-            places_index: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
-            consts_index: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
-            bytes_index: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
+            places_index: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
+            consts_index: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
+            bytes_index: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
             types: None,
         }
     }
@@ -373,6 +398,123 @@ impl<A: Allocator + Clone> BodyBuilder<A> {
     /// The body as built so far, to read.
     pub fn body(&self) -> &Body<A> {
         &self.body
+    }
+
+    /// Copies the overlay type columns (`ty_base`, `list_base`, `tys`, `ty_lists`) from `from`
+    /// so a body-to-body pass (such as drop elaboration) preserves every overlay type handle.
+    pub fn copy_overlay(&mut self, from: &crate::body::BodyRef<'_>) {
+        self.body.ty_base = from.ty_base;
+        self.body.list_base = from.list_base;
+        self.body.tys.extend_from_slice(from.tys);
+        self.body.ty_lists.extend_from_slice(from.ty_lists);
+    }
+
+    /// Appends UTF-8 bytes to the body's data table and returns `(start, len)`.
+    fn push_asm_text(&mut self, s: &str) -> (u32, u32) {
+        if s.is_empty() {
+            return (0, 0);
+        }
+        let bytes = s.as_bytes();
+        let (start, len) = match (next(self.body.data.len(), Table::Data), u32::try_from(bytes.len())) {
+            (Ok(s), Ok(l)) if s.checked_add(l).is_some_and(|e| e < NONE) => (s, l),
+            _ => {
+                self.fail(BuildError::Full(Table::Data));
+                return (0, 0);
+            }
+        };
+        self.body.data.extend_from_slice(bytes);
+        (start, len)
+    }
+
+    /// Adds one inline assembly block descriptor and returns its ordinal (`StmtKind::InlineAsm::asm`).
+    pub fn new_asm(
+        &mut self,
+        arch: AsmArch,
+        options: u16,
+        clobbers: &str,
+        pieces: &[AsmPieceInput<'_>],
+        ops: &[AsmOpInput<'_>],
+    ) -> u32 {
+        let pieces_start = match next(self.body.asm_pieces.len(), Table::AsmPieces) {
+            Ok(n) => n,
+            Err(e) => {
+                self.fail(e);
+                return NONE;
+            }
+        };
+        for piece in pieces {
+            let row = match *piece {
+                AsmPieceInput::Text(t) => {
+                    let (start, len) = self.push_asm_text(t);
+                    AsmPiece::Text { start, len }
+                }
+                AsmPieceInput::Line => AsmPiece::Line,
+                AsmPieceInput::Operand { index, modifier } => AsmPiece::Operand { index, modifier },
+            };
+            self.body.asm_pieces.push(encode_asm_piece(row));
+        }
+        let pieces_end = match next(self.body.asm_pieces.len(), Table::AsmPieces) {
+            Ok(n) => n,
+            Err(e) => {
+                self.fail(e);
+                return NONE;
+            }
+        };
+        let ops_start = match next(self.body.asm_ops.len(), Table::AsmOps) {
+            Ok(n) => n,
+            Err(e) => {
+                self.fail(e);
+                return NONE;
+            }
+        };
+        for op in ops {
+            if let Some(p) = op.out_place
+                && p.0 >= self.body.view().places()
+            {
+                self.fail(self.out_of_range(Table::Places, p.0));
+            }
+            if let Some(b) = op.label
+                && b.0 >= self.body.view().blocks()
+            {
+                self.fail(self.out_of_range(Table::Blocks, b.0));
+            }
+            let (reg_start, reg_len) = self.push_asm_text(op.reg);
+            let row = AsmOpRow {
+                kind: op.kind,
+                reg_kind: op.reg_kind,
+                reg_start,
+                reg_len,
+                in_op: op.in_op,
+                out_place: op.out_place,
+                label: op.label,
+                discard_out: op.discard_out,
+            };
+            self.body.asm_ops.push(encode_asm_op(row));
+        }
+        let ops_end = match next(self.body.asm_ops.len(), Table::AsmOps) {
+            Ok(n) => n,
+            Err(e) => {
+                self.fail(e);
+                return NONE;
+            }
+        };
+        let (clobbers_start, clobbers_len) = self.push_asm_text(clobbers);
+        let id = match next(self.body.asms.len(), Table::Asms) {
+            Ok(n) => n,
+            Err(e) => {
+                self.fail(e);
+                return NONE;
+            }
+        };
+        self.body.asms.push(encode_asm(AsmRow {
+            pieces: Ops { start: pieces_start, end: pieces_end },
+            ops: Ops { start: ops_start, end: ops_end },
+            clobbers_start,
+            clobbers_len,
+            options,
+            arch,
+        }));
+        id
     }
 
     /// A new local; its own place is made with it. Locals come in order: the return place,
@@ -508,10 +650,11 @@ impl<A: Allocator + Clone> BodyBuilder<A> {
         let h = FixedState.hash_one((bytes, ty.0));
         let mut k = 0u32;
         while let Some(c) = self.bytes_index.get(&(h, k)).copied() {
-            let w = self.body.consts[c as usize];
-            let (start, len) = (w.a as usize, w.b as usize);
-            if w.ty == ty.0 && self.body.data.get(start..start + len) == Some(bytes) {
-                return Const(c);
+            if let Some(&w) = self.body.consts.get(c as usize) {
+                let (start, len) = (w.a as usize, w.b as usize);
+                if w.ty == ty.0 && self.body.data.get(start..start + len) == Some(bytes) {
+                    return Const(c);
+                }
             }
             k += 1;
         }
@@ -612,7 +755,9 @@ impl<A: Allocator + Clone> BodyBuilder<A> {
             }
             self.body.cases.push(encode_case(value, b));
         }
-        self.body.cases[start..].sort_unstable_by_key(|c| join(c.value));
+        if let Some(slice) = self.body.cases.get_mut(start..) {
+            slice.sort_unstable_by_key(|c| join(c.value));
+        }
         if next(self.body.cases.len(), Table::Cases).is_err() {
             self.fail(BuildError::Full(Table::Cases));
         }
@@ -692,8 +837,10 @@ impl<A: Allocator + Clone> BodyBuilder<A> {
         }
         self.open = Some(b);
         let at = self.body.stmts.len() as u32;
-        self.body.blocks[b.index()].start = at;
-        self.body.blocks[b.index()].end = at;
+        if let Some(slot) = self.body.blocks.get_mut(b.index()) {
+            slot.start = at;
+            slot.end = at;
+        }
     }
 
     fn row(&mut self, kind: StmtKind, span: Span) -> Stmt {
@@ -712,9 +859,13 @@ impl<A: Allocator + Clone> BodyBuilder<A> {
         self.body.stmts.push(encode_stmt(kind));
         self.body.spans.push(span);
         self.body.stmt_block.push(b.0);
-        self.body.blocks[b.index()].end = at.0 + 1;
+        if let Some(slot) = self.body.blocks.get_mut(b.index()) {
+            slot.end = at.0 + 1;
+        }
         if kind.is_terminator() {
-            self.filled[b.index()] = true;
+            if let Some(slot) = self.filled.get_mut(b.index()) {
+                *slot = true;
+            }
             self.open = None;
         }
         at

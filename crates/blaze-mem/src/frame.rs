@@ -77,8 +77,8 @@ pub const FRAME_RESERVE: usize = 4 << 30;
 #[cfg(not(target_pointer_width = "64"))]
 pub const FRAME_RESERVE: usize = 16 << 20;
 
-/// Chunks a thread keeps warm for its next tasks: 16 MB.
-pub const SHELF: usize = 8;
+/// Chunks a thread keeps warm for its next tasks: 10 MB.
+pub const SHELF: usize = 5;
 
 /// Spans a thread keeps warm, each with its first [`SPAN_WARM`] bytes committed.
 const SPANS: usize = SHELF;
@@ -96,16 +96,23 @@ const SPAN_WARM: usize = CHUNK;
 /// more.
 pub const WARM: usize = SHELF * CHUNK + SPANS * SPAN_WARM;
 
-/// The frame memory all of a machine's threads keep warm between tasks, at most: eight shelves
-/// at their most, 256 MiB, what a typical Mac's eight workers keep. A machine of more threads
-/// shares it ([`ShelfSize::for_threads`]): before, every thread kept [`WARM`], 32 MiB, so 128
-/// workers kept 4 GiB idle and charged to no task (the outside review, thoughts2.md 4.2).
-pub const WARM_ALL: usize = 8 * WARM;
+/// The frame memory all of a machine's threads keep warm between tasks, at most: 512 MiB total
+/// (the hard ceiling across up to 64 workers at 8 MiB each; [`ShelfSize::for_threads`] targets
+/// [`SHELF_TARGET`] so 16–18 core Macs keep 8 MiB per active worker rather than 32 MiB, while
+/// parked workers cool to 0 via [`cool_before_park`]).
+pub const WARM_ALL: usize = 512 << 20;
 
-/// Warm spans the process keeps behind its threads' shelves, for a thread whose shelf has none:
-/// 16 of [`SPAN_WARM`], 32 MiB. Chunks have the process's cache behind them already
+/// Target total warm shelf budget divided across workers by [`ShelfSize::for_threads`]: 8 shelves
+/// at [`ShelfSize::MOST`] (160 MiB), scaling down to 2 chunks + 2 spans (8 MiB) by 16 workers.
+const SHELF_TARGET: usize = 8 * WARM;
+
+/// Total span-pool committed-byte cap in units of [`SPAN_WARM`]: 24 (48 MiB ceiling across all
+/// [`SPAN_POOL_SHARDS`] shards including cold granules even on 64 KiB Linux pages), while active
+/// warm spans are globally capped at [`SPAN_POOL_WARM_CAP`] (4 × 2 MiB = 8 MiB) so non-task
+/// spans never hoard hundreds of MiB dirty while still reusing virtual reservations cold without
+/// `munmap`/`mmap_lock` storms. Chunks have the process's cache behind them already
 /// ([`chunks::WARM_KEEP`]); a span past this goes to the kernel.
-pub const SPAN_POOL: usize = 16;
+pub const SPAN_POOL: usize = 24;
 
 /// How many blocks one thread's shelf keeps warm, from the machine it is on (rule 75: the pool
 /// that starts the thread hands it in, [`size_shelf`]; one code path, sized by the machine).
@@ -121,15 +128,15 @@ impl ShelfSize {
     /// Today's on every thread that is handed no size: [`WARM`].
     pub const MOST: ShelfSize = ShelfSize { chunks: SHELF, spans: SPANS };
 
-    /// A thread's part of [`WARM_ALL`] on a machine of `threads` workers, as chunks and spans
-    /// half each: [`ShelfSize::MOST`] up to eight threads, one of each (4 MiB) from 64 threads
-    /// on, so 128 threads keep at most 512 MiB (and the process's pools behind them).
+    /// A thread's part of [`SHELF_TARGET`] on a machine of `threads` workers, as chunks and spans
+    /// half each: [`ShelfSize::MOST`] up to 8 threads, scaling down to 2 chunks + 2 spans (8 MiB)
+    /// per worker from 14+ threads onward (staying well within [`WARM_ALL`] up to 64 threads).
     pub const fn for_threads(threads: usize) -> ShelfSize {
         let threads = if threads == 0 { 1 } else { threads };
-        let blocks = WARM_ALL / threads / CHUNK;
+        let blocks = SHELF_TARGET / threads / CHUNK;
         let half = blocks / 2;
-        let half = if half == 0 {
-            1
+        let half = if half < 2 {
+            2
         } else if half > SHELF {
             SHELF
         } else {
@@ -589,17 +596,21 @@ impl Frame {
         Ok(block)
     }
 
-    /// A span for `layout`: a warm one of the thread's that is big enough, or a new region
-    /// reserved far past it, on the thread's node; its pages for `layout` committed.
+    /// A span for `layout`: a warm one of the thread's (or the process's span pool) that is big
+    /// enough, or a new region reserved far past it, on the thread's node; its pages for `layout`
+    /// committed.
     fn new_span(&self, layout: Layout) -> Result<*mut Block, MemError> {
         let tag = self.tag.get();
         let need = HEADER
             .checked_add(layout.align())
             .and_then(|it| it.checked_add(layout.size()))
             .ok_or(MemError::TooLarge { tag, what: "a frame allocation", wanted: layout.size() })?;
-        if self.task
-            && let Ok(Some(block)) = SHELF_OF.try_with(|shelf| shelf.take_span(need))
-        {
+        let pooled = if self.task {
+            SHELF_OF.try_with(|shelf| shelf.take_span(need)).ok().flatten()
+        } else {
+            take_pooled_span(need)
+        };
+        if let Some(block) = pooled {
             let head = header_mut(block);
             let committed = head.span.as_deref().map_or(0, Region::committed);
             head.prev = ptr::null_mut();
@@ -655,10 +666,14 @@ impl Frame {
         }
         let committed = head.span.as_deref().map_or(0, Region::committed);
         self.held.set(self.held.get() - committed);
-        if self.task && !cold && SHELF_OF.try_with(|shelf| shelf.give_span(block)).is_ok() {
+        if cold {
+            pool_cold_or_drop_span(block);
             return;
         }
-        drop_span(block);
+        if self.task && SHELF_OF.try_with(|shelf| shelf.give_span(block)).is_ok() {
+            return;
+        }
+        pool_or_drop_span(block);
     }
 
     /// Stops with the error when memory cannot be had.
@@ -876,6 +891,44 @@ impl Frame {
         if current.is_null() || self.held.get() <= keep {
             return;
         }
+        // When the frame is completely empty (`used() == 0`), `current == first` and nothing in it
+        // is live: release `current` too on `trim(0)`, resetting the frame to empty so even a
+        // single 2 MiB chunk goes back cold to the OS immediately.
+        if keep == 0
+            && self.used() == 0
+            && !self.lent.get()
+            && current == self.first.get()
+            && header(current).next.is_null()
+        {
+            self.first.set(ptr::null_mut());
+            self.current.set(ptr::null_mut());
+            self.cursor.set(ptr::without_provenance_mut(EMPTY));
+            self.end.set(EMPTY);
+            self.floor.set(usize::MAX);
+            self.bias.set(0usize.wrapping_sub(EMPTY));
+            self.release(current, true);
+            return;
+        }
+        let head = header_mut(current);
+        if let Some(region) = head.span.as_deref_mut() {
+            let before = region.committed();
+            let in_use = self.cursor.get().addr() - region.base().addr().get();
+            // A refused decommit leaves the pages committed: memory held, nothing broken.
+            _ = region.decommit_after(in_use.max(HEADER));
+            let freed = before - region.committed();
+            self.held.set(self.held.get() - freed);
+            self.end.set(self.usable_end(current, head.before));
+        }
+    }
+
+    /// Decommits committed pages strictly past the cursor in the current span, keeping every live
+    /// allocation before the cursor intact. Safe through `&Frame` because `Frame` is `!Sync` and
+    /// no allocation is live at or past `cursor`.
+    pub fn trim_tail(&self) {
+        let current = self.current.get();
+        if current.is_null() || self.lent.get() {
+            return;
+        }
         let head = header_mut(current);
         if let Some(region) = head.span.as_deref_mut() {
             let before = region.committed();
@@ -976,6 +1029,10 @@ impl Drop for Frame {
 // live `&Frame` an allocation borrows allows; growing commits a span further, never moving it.
 // `deallocate` and `shrink` only move the cursor back over the top block, never touching
 // another.
+// SAFETY: `Frame` is a bump arena whose allocations stay live until the frame resets or drops,
+// reclaiming all storage in bulk; forgetting a container handle never leaks memory past the frame.
+unsafe impl blaze_own::BumpAlloc for Frame {}
+
 unsafe impl Allocator for Frame {
     #[inline]
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
@@ -1079,11 +1136,60 @@ struct Shelf {
     most_spans: Cell<usize>,
 }
 
-/// Warm spans no thread's shelf had room for ([`SPAN_POOL`] at most), each with its pages past
-/// [`SPAN_WARM`] given back.
+/// Number of cache-line-padded shards backing [`SPANS_POOLED`] (power of two): 128 shards give
+/// 1 shard per core on 128-core Graviton 5 / EPYC hosts, eliminating mutex and `mmap_lock`
+/// contention on concurrent non-task `Frame::with_reserve` releases.
+const SPAN_POOL_SHARDS: usize = 128;
+/// Warm slots per shard.
+const SPAN_POOL_WARM_PER_SHARD: usize = 1;
+/// Global cap on warm spans held across all shards: 4 × 2 MiB = 8 MiB dirty max, while excess
+/// spans move straight to the cold tier (decommitted to one granule) to preserve virtual
+/// reservations without `mmap`/`munmap` churn.
+const SPAN_POOL_WARM_CAP: u32 = 4;
+/// Cold slots per shard: 4 × 128 = 512 cold spans (decommitted down to one granule, 8 MiB max on
+/// 16 KiB macOS pages), reusing virtual reservations without `mmap`/`munmap` churn.
+const SPAN_POOL_COLD_PER_SHARD: usize = 4;
+/// Total committed-byte ceiling across all shards (`SPAN_POOL * SPAN_WARM` = 48 MiB).
+const SPAN_POOL_BUDGET: usize = SPAN_POOL * SPAN_WARM;
+/// Committed-byte budget per shard (1 warm span + 4 cold granules even on 64 KiB pages).
+const SPAN_POOL_SHARD_BUDGET: usize = SPAN_WARM + SPAN_POOL_COLD_PER_SHARD * (64 << 10);
+/// 64-bit bitmap words covering [`SPAN_POOL_SHARDS`].
+const SPAN_POOL_MASK_WORDS: usize = SPAN_POOL_SHARDS / 64;
+
+const _: () = assert!(SPAN_POOL_SHARDS == 128 && SPAN_POOL_SHARDS.is_power_of_two());
+const _: () = assert!(SPAN_POOL_WARM_CAP as usize * SPAN_WARM <= SPAN_POOL_BUDGET);
+const _: () = assert!(SPAN_POOL_SHARD_BUDGET >= SPAN_WARM);
+const _: () = assert!(SPAN_POOL_MASK_WORDS * 64 == SPAN_POOL_SHARDS);
+
+/// Global count of warm spans currently held across all shards of [`SPANS_POOLED`], bounded by
+/// [`SPAN_POOL_WARM_CAP`].
+static SPAN_POOL_WARM_LIVE: AtomicU32 = AtomicU32::new(0);
+
+#[inline]
+fn try_acquire_warm_span() -> bool {
+    SPAN_POOL_WARM_LIVE
+        .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
+            (cur < SPAN_POOL_WARM_CAP).then_some(cur + 1)
+        })
+        .is_ok()
+}
+
+#[inline]
+fn release_warm_spans(count: usize) {
+    let n = u32::try_from(count).unwrap_or(u32::MAX);
+    if n > 0 {
+        SPAN_POOL_WARM_LIVE.fetch_sub(n, Ordering::Release);
+    }
+}
+
+/// Pooled spans in one shard of [`SPANS_POOLED`]: up to [`SPAN_POOL_WARM_PER_SHARD`] warm spans
+/// (each down to [`SPAN_WARM`]) plus up to [`SPAN_POOL_COLD_PER_SHARD`] cold spans (each down to
+/// [`HEADER`], one granule), keeping committed bytes within [`SPAN_POOL_SHARD_BUDGET`].
 struct SpanPool {
-    spans: [*mut Block; SPAN_POOL],
-    len: usize,
+    warm: [*mut Block; SPAN_POOL_WARM_PER_SHARD],
+    warm_len: usize,
+    cold: [*mut Block; SPAN_POOL_COLD_PER_SHARD],
+    cold_len: usize,
 }
 
 // SAFETY: a pooled span is the pool's alone: by the invariant above `header`, its header and
@@ -1091,60 +1197,338 @@ struct SpanPool {
 // into it; handing it to another thread moves that ownership whole.
 unsafe impl Send for SpanPool {}
 
-/// The process's [`SpanPool`]. A `std` mutex (as os.rs's and region.rs's): blaze-mem is below
-/// blaze-core's named locks, and the lock is taken only when a shelf is full or empty of spans.
-static SPANS_POOLED: std::sync::Mutex<SpanPool> = std::sync::Mutex::new(SpanPool { spans: [ptr::null_mut(); SPAN_POOL], len: 0 });
+impl SpanPool {
+    const fn empty() -> SpanPool {
+        SpanPool {
+            warm: [ptr::null_mut(); SPAN_POOL_WARM_PER_SHARD],
+            warm_len: 0,
+            cold: [ptr::null_mut(); SPAN_POOL_COLD_PER_SHARD],
+            cold_len: 0,
+        }
+    }
 
-fn span_pool() -> std::sync::MutexGuard<'static, SpanPool> {
+    fn committed_bytes(&self) -> usize {
+        let warm: usize = self
+            .warm
+            .iter()
+            .take(self.warm_len)
+            .map(|&span| header(span).span.as_deref().map_or(0, Region::committed))
+            .sum();
+        let cold: usize = self
+            .cold
+            .iter()
+            .take(self.cold_len)
+            .map(|&span| header(span).span.as_deref().map_or(0, Region::committed))
+            .sum();
+        warm + cold
+    }
+
+    /// Best-fit index in `slots` (first `len` elements) whose reservation holds `need` bytes.
+    fn best_fit(slots: &[*mut Block], len: usize, need: usize) -> Option<usize> {
+        let mut best: Option<(usize, usize)> = None;
+        for (i, &span) in slots.iter().take(len).enumerate() {
+            let cap = header(span).end - data(span).addr();
+            if cap >= need && best.is_none_or(|(_, best_cap)| cap < best_cap) {
+                best = Some((i, cap));
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+
+    /// Removes and returns the element at `at` from `slots[..*len]` via swap-remove.
+    fn take_at(slots: &mut [*mut Block], len: &mut usize, at: usize) -> Option<*mut Block> {
+        let last = len.checked_sub(1)?;
+        let span = *slots.get(at)?;
+        let tail = *slots.get(last)?;
+        if let Some(slot) = slots.get_mut(at) {
+            *slot = tail;
+        }
+        if let Some(slot) = slots.get_mut(last) {
+            *slot = ptr::null_mut();
+        }
+        *len = last;
+        Some(span)
+    }
+
+    fn take_matching(&mut self, need: usize) -> Option<(*mut Block, bool)> {
+        if let Some(at) = SpanPool::best_fit(&self.warm, self.warm_len, need) {
+            let mut len = self.warm_len;
+            let span = SpanPool::take_at(&mut self.warm, &mut len, at);
+            self.warm_len = len;
+            return span.map(|s| (s, true));
+        }
+        if let Some(at) = SpanPool::best_fit(&self.cold, self.cold_len, need) {
+            let mut len = self.cold_len;
+            let span = SpanPool::take_at(&mut self.cold, &mut len, at);
+            self.cold_len = len;
+            return span.map(|s| (s, false));
+        }
+        None
+    }
+}
+
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+/// 128-byte cache-line padded span pool shard (rule 86: prevents cross-core false sharing).
+#[repr(C, align(128))]
+struct SpanPoolShard(Mutex<SpanPool>);
+
+const _: () = assert!(mem::align_of::<SpanPoolShard>() == 128);
+
+impl SpanPoolShard {
+    const fn new() -> SpanPoolShard {
+        SpanPoolShard(Mutex::new(SpanPool::empty()))
+    }
+}
+
+/// The process's sharded [`SpanPool`]. `std` mutexes (as os.rs's and region.rs's): blaze-mem is
+/// below blaze-core's named locks, and each shard is 128-byte padded and indexed by thread id.
+static SPANS_POOLED: [SpanPoolShard; SPAN_POOL_SHARDS] =
+    [const { SpanPoolShard::new() }; SPAN_POOL_SHARDS];
+
+/// 128-byte cache-padded word of the non-empty shard bitmap for [`SPANS_POOLED`].
+#[repr(align(128))]
+struct SpanPoolMaskWord(AtomicU64);
+
+/// Bit `i` is set while shard `i` holds at least one warm or cold span (updated only under shard
+/// `i`'s mutex, so no set/clear race is possible). Lets [`take_pooled_span`] skip empty shards in
+/// two atomic loads instead of issuing 128 `try_lock` RMWs on cold span allocation.
+static SPAN_POOL_NONEMPTY: [SpanPoolMaskWord; SPAN_POOL_MASK_WORDS] =
+    [const { SpanPoolMaskWord(AtomicU64::new(0)) }; SPAN_POOL_MASK_WORDS];
+
+#[inline]
+fn set_span_shard_nonempty(idx: usize, nonempty: bool) {
+    let idx = idx & (SPAN_POOL_SHARDS - 1);
+    let bit = 1u64 << (idx % 64);
+    if let Some(word) = SPAN_POOL_NONEMPTY.get(idx / 64) {
+        if nonempty {
+            word.0.fetch_or(bit, Ordering::Release);
+        } else {
+            word.0.fetch_and(!bit, Ordering::Release);
+        }
+    }
+}
+
+#[inline]
+fn span_shard_has_any(idx: usize) -> bool {
+    let idx = idx & (SPAN_POOL_SHARDS - 1);
+    let bit = 1u64 << (idx % 64);
+    SPAN_POOL_NONEMPTY.get(idx / 64).is_some_and(|word| (word.0.load(Ordering::Acquire) & bit) != 0)
+}
+
+/// Monotonic counter assigning threads round-robin to [`SPANS_POOLED`] shards so 128 workers
+/// distribute evenly (1 worker/shard) without hash collisions.
+static SPAN_SHARD_NEXT: AtomicU32 = AtomicU32::new(0);
+
+thread_local! {
+    /// This thread's home shard in [`SPANS_POOLED`] (`usize::MAX` until first use; no destructor).
+    static SPAN_SHARD: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+#[inline]
+pub(crate) fn thread_span_shard() -> usize {
+    SPAN_SHARD
+        .try_with(|cell| {
+            let cur = cell.get();
+            if cur < SPAN_POOL_SHARDS {
+                return cur;
+            }
+            let assigned =
+                usize::try_from(SPAN_SHARD_NEXT.fetch_add(1, Ordering::Relaxed)).unwrap_or(0)
+                    & (SPAN_POOL_SHARDS - 1);
+            cell.set(assigned);
+            assigned
+        })
+        .unwrap_or_else(|_| {
+            // During thread teardown: deterministic stack-address hash, zero allocation.
+            #[cfg(target_pointer_width = "64")]
+            const MUL: usize = 0x9e37_79b9_7f4a_7c15;
+            #[cfg(not(target_pointer_width = "64"))]
+            const MUL: usize = 0x9e37_79b9;
+            let anchor = 0u8;
+            let mixed = ptr::from_ref(&anchor).addr().wrapping_mul(MUL);
+            (mixed >> 16) & (SPAN_POOL_SHARDS - 1)
+        })
+}
+
+fn span_pool_shard(idx: usize) -> MutexGuard<'static, SpanPool> {
+    let shard = SPANS_POOLED.get(idx & (SPAN_POOL_SHARDS - 1)).unwrap_or(&SPANS_POOLED[0]);
     // A panic while it was held left a consistent pool: each push and pop is one store each.
-    SPANS_POOLED.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    shard.0.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// `span`, which no shelf kept, to the process's pool with its pages past [`SPAN_WARM`] given
-/// back, or to the kernel when the pool is full.
+/// `span`, which no shelf kept, to the calling thread's shard of the process's pool with its pages
+/// past [`SPAN_WARM`] given back (or cooled to [`HEADER`] in the cold tier when warm is full or
+/// [`SPAN_POOL_WARM_CAP`] is reached), or to the kernel when both tiers or the shard byte budget
+/// are full.
 fn pool_or_drop_span(span: *mut Block) {
-    let mut pool = span_pool();
-    if pool.len >= SPAN_POOL {
-        drop(pool);
-        drop_span(span);
-        return;
+    let home = thread_span_shard();
+    if try_acquire_warm_span() {
+        // Decommit past `SPAN_WARM` outside the pool lock so threads never serialize on syscalls.
+        if let Some(region) = header_mut(span).span.as_deref_mut()
+            && region.committed() > SPAN_WARM
+        {
+            // A refused decommit leaves the pages committed: memory held, nothing broken.
+            _ = region.decommit_after(SPAN_WARM);
+        }
+        let committed = header(span).span.as_deref().map_or(0, Region::committed);
+        {
+            let mut pool = span_pool_shard(home);
+            let len = pool.warm_len;
+            if len < SPAN_POOL_WARM_PER_SHARD
+                && pool.committed_bytes() + committed <= SPAN_POOL_SHARD_BUDGET
+            {
+                if let Some(slot) = pool.warm.get_mut(len) {
+                    *slot = span;
+                    pool.warm_len = len + 1;
+                    set_span_shard_nonempty(home, true);
+                    return;
+                }
+            }
+        }
+        release_warm_spans(1);
     }
+    pool_cold_or_drop_span_in(home, span);
+}
+
+/// Decommits `span` down to its header granule (`HEADER`) and keeps its virtual reservation in
+/// the cold tier of the calling thread's shard in [`SPANS_POOLED`], or releases it to the kernel
+/// if the cold tier or shard budget is full.
+fn pool_cold_or_drop_span(span: *mut Block) {
+    pool_cold_or_drop_span_in(thread_span_shard(), span);
+}
+
+fn pool_cold_or_drop_span_in(shard: usize, span: *mut Block) {
     if let Some(region) = header_mut(span).span.as_deref_mut() {
-        // A refused decommit leaves the pages committed: memory held, nothing broken.
-        _ = region.decommit_after(SPAN_WARM);
+        _ = region.decommit_after(HEADER);
     }
-    let len = pool.len;
-    pool.spans[len] = span;
-    pool.len = len + 1;
-}
-
-/// A pooled span whose reservation holds `need` bytes, out of the pool.
-fn take_pooled_span(need: usize) -> Option<*mut Block> {
-    let mut pool = span_pool();
-    let len = pool.len;
-    let at = pool.spans[..len].iter().position(|&span| header(span).end - data(span).addr() >= need)?;
-    let span = pool.spans[at];
-    pool.spans[at] = pool.spans[len - 1];
-    pool.spans[len - 1] = ptr::null_mut();
-    pool.len = len - 1;
-    Some(span)
-}
-
-/// The bytes the process's pool of spans keeps committed.
-pub fn pooled_span_bytes() -> usize {
-    let pool = span_pool();
-    pool.spans[..pool.len].iter().map(|&span| header(span).span.as_deref().map_or(0, Region::committed)).sum()
-}
-
-/// Gives every pooled span to the kernel: with [`trim_spare`], after a burst.
-pub fn trim_span_pool() {
-    let mut pool = span_pool();
-    let len = pool.len;
-    pool.len = 0;
-    let spans = pool.spans;
+    let committed = header(span).span.as_deref().map_or(0, Region::committed);
+    let mut pool = span_pool_shard(shard);
+    let len = pool.cold_len;
+    if len < SPAN_POOL_COLD_PER_SHARD
+        && pool.committed_bytes() + committed <= SPAN_POOL_SHARD_BUDGET
+    {
+        if let Some(slot) = pool.cold.get_mut(len) {
+            *slot = span;
+            pool.cold_len = len + 1;
+            set_span_shard_nonempty(shard, true);
+            return;
+        }
+    }
     drop(pool);
-    for &span in &spans[..len] {
-        drop_span(span);
+    drop_span(span);
+}
+
+/// A pooled span whose reservation holds `need` bytes, out of the calling thread's shard first
+/// (preferring warm, then cold, best-fit by reservation capacity), then non-blocking steal across
+/// non-empty sibling shards via [`SPAN_POOL_NONEMPTY`] + `try_lock` so asymmetric producer/consumer
+/// threads reuse reservations without scanning empty shards or serializing on locks.
+fn take_pooled_span(need: usize) -> Option<*mut Block> {
+    let home = thread_span_shard();
+    if span_shard_has_any(home) {
+        let mut pool = span_pool_shard(home);
+        let taken = pool.take_matching(need);
+        if pool.warm_len == 0 && pool.cold_len == 0 {
+            set_span_shard_nonempty(home, false);
+        }
+        if let Some((span, was_warm)) = taken {
+            if was_warm {
+                release_warm_spans(1);
+            }
+            return Some(span);
+        }
+    }
+    let start_word = home / 64;
+    for wstep in 0..SPAN_POOL_MASK_WORDS {
+        let word_idx = (start_word + wstep) % SPAN_POOL_MASK_WORDS;
+        let mut bits = SPAN_POOL_NONEMPTY
+            .get(word_idx)
+            .map_or(0, |word| word.0.load(Ordering::Acquire));
+        while bits != 0 {
+            let bit = usize::try_from(bits.trailing_zeros()).unwrap_or(0);
+            bits &= bits - 1;
+            let idx = word_idx * 64 + bit;
+            if idx == home {
+                continue;
+            }
+            let Some(shard) = SPANS_POOLED.get(idx) else { continue };
+            let Ok(mut pool) = shard.0.try_lock() else { continue };
+            let taken = pool.take_matching(need);
+            if pool.warm_len == 0 && pool.cold_len == 0 {
+                set_span_shard_nonempty(idx, false);
+            }
+            if let Some((span, was_warm)) = taken {
+                if was_warm {
+                    release_warm_spans(1);
+                }
+                return Some(span);
+            }
+        }
+    }
+    None
+}
+
+/// The bytes the process's sharded pool of spans keeps committed.
+pub fn pooled_span_bytes() -> usize {
+    let mut total = 0usize;
+    for i in 0..SPAN_POOL_SHARDS {
+        total = total.saturating_add(span_pool_shard(i).committed_bytes());
+    }
+    total
+}
+
+/// Moves every warm pooled span across all shards to the cold tier (decommitted down to one
+/// granule) without unmapping its virtual reservation: sheds resident RAM between phases without
+/// `munmap` churn.
+pub fn cool_span_pool() {
+    for i in 0..SPAN_POOL_SHARDS {
+        let (warm, warm_len) = {
+            let mut pool = span_pool_shard(i);
+            let len = pool.warm_len;
+            pool.warm_len = 0;
+            let spans = pool.warm;
+            for slot in pool.warm.iter_mut().take(len) {
+                *slot = ptr::null_mut();
+            }
+            if pool.cold_len == 0 {
+                set_span_shard_nonempty(i, false);
+            }
+            (spans, len)
+        };
+        release_warm_spans(warm_len);
+        for &span in warm.iter().take(warm_len) {
+            pool_cold_or_drop_span_in(i, span);
+        }
+    }
+}
+
+/// Gives every pooled span across all shards to the kernel: with [`trim_spare`], after a burst.
+pub fn trim_span_pool() {
+    for i in 0..SPAN_POOL_SHARDS {
+        let (warm, warm_len, cold, cold_len) = {
+            let mut pool = span_pool_shard(i);
+            let wlen = pool.warm_len;
+            let clen = pool.cold_len;
+            pool.warm_len = 0;
+            pool.cold_len = 0;
+            let warm = pool.warm;
+            let cold = pool.cold;
+            for slot in pool.warm.iter_mut().take(wlen) {
+                *slot = ptr::null_mut();
+            }
+            for slot in pool.cold.iter_mut().take(clen) {
+                *slot = ptr::null_mut();
+            }
+            set_span_shard_nonempty(i, false);
+            (warm, wlen, cold, clen)
+        };
+        release_warm_spans(warm_len);
+        for &span in warm.iter().take(warm_len) {
+            drop_span(span);
+        }
+        for &span in cold.iter().take(cold_len) {
+            drop_span(span);
+        }
     }
 }
 
@@ -1275,6 +1659,25 @@ impl Shelf {
                 self.span_count.set(self.span_count.get() - 1);
                 drop_span(span);
             }
+            span = next;
+        }
+    }
+
+    /// Gives all chunks on this shelf to the chunk cache cold and moves all spans to the
+    /// process's cold span pool (decommitted down to one granule) without `munmap`.
+    fn cool(&self) {
+        while let Some(len) = self.len.get().checked_sub(1) {
+            self.len.set(len);
+            if let Some(slot) = self.chunks.get(len) {
+                self.give_chunk(Chunk::from_index(slot.get()), true);
+            }
+        }
+        let mut span = self.spans.get();
+        self.spans.set(ptr::null_mut());
+        self.span_count.set(0);
+        while !span.is_null() {
+            let next = header(span).next;
+            pool_cold_or_drop_span(span);
             span = next;
         }
     }
@@ -1800,12 +2203,30 @@ pub fn trim_spare(keep: usize) {
     _ = SHELF_OF.try_with(|shelf| shelf.trim(keep));
 }
 
-/// How many times every thread was asked to let its warm frame memory go ([`ask_spare_trim`]).
+/// Gives back pages of the calling thread's warm frame memory without unmapping spans: chunks go
+/// cold to the chunk cache and spans move to the cold span pool (decommitted to one granule).
+pub fn cool_spare() {
+    _ = SHELF_OF.try_with(Shelf::cool);
+}
+
+/// Settles any pending process-wide trim/cool request ([`settle_spare`]) and then cools this
+/// thread's remaining warm shelf chunks and spans ([`cool_spare`]) right before an OS park
+/// syscall so parked workers never hold dirty shelves across phases even if [`ask_spare_cool`]
+/// arrives after the worker has already parked.
+///
+/// Fast path when the shelf is already empty (e.g. repeated idle wakeups): zero syscalls.
+pub fn cool_before_park() {
+    let _ = settle_spare();
+    cool_spare();
+}
+
+/// Packed trim/cool generation counter: high 32 bits count hard trims ([`ask_spare_trim`]) and
+/// low 32 bits count non-unmapping cools ([`ask_spare_cool`]).
 static SPARE_TRIMS: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
-    /// The last [`ask_spare_trim`] this thread answered ([`settle_spare`]). `const`, with no
-    /// destructor.
+    /// The last packed trim/cool generation this thread answered ([`settle_spare`]). `const`,
+    /// with no destructor.
     static SPARE_TRIMMED: Cell<u64> = const { Cell::new(0) };
 }
 
@@ -1814,19 +2235,39 @@ thread_local! {
 /// asks, since the shelves are charged to no task and an idle daemon's next task can wait for
 /// the page faults. It wakes nobody and waits for nobody.
 pub fn ask_spare_trim() {
-    SPARE_TRIMS.fetch_add(1, Ordering::Release);
+    SPARE_TRIMS.fetch_add(1u64 << 32, Ordering::Release);
 }
 
-/// Gives the calling thread's warm frame memory back if [`ask_spare_trim`] was called since
-/// it last did; one load and a thread-local compare otherwise. What a pool worker does as it
-/// goes idle, outside any task. Whether it trimmed.
+/// Asks every thread to shed resident pages of its warm frame memory between phases without
+/// unmapping span reservations ([`cool_spare`] + [`cool_span_pool`]).
+pub fn ask_spare_cool() {
+    // Wrapping increment of the low 32-bit cool counter without carrying into the high 32 bits.
+    let _ = SPARE_TRIMS.fetch_update(Ordering::Release, Ordering::Relaxed, |cur| {
+        let hi = cur & !0xFFFF_FFFFu64;
+        let lo = (cur & 0xFFFF_FFFFu64).wrapping_add(1) & 0xFFFF_FFFFu64;
+        Some(hi | lo)
+    });
+}
+
+/// Gives the calling thread's warm frame memory back if [`ask_spare_trim`] or [`ask_spare_cool`]
+/// was called since it last did; one load and a thread-local compare otherwise. What a pool
+/// worker does as it goes idle, outside any task. Whether it trimmed or cooled.
 pub fn settle_spare() -> bool {
     let asked = SPARE_TRIMS.load(Ordering::Acquire);
-    if SPARE_TRIMMED.try_with(|done| done.replace(asked) == asked).unwrap_or(true) {
+    let prev = match SPARE_TRIMMED.try_with(|done| done.replace(asked)) {
+        Ok(prev) => prev,
+        Err(_) => return false,
+    };
+    if prev == asked {
         return false;
     }
-    trim_spare(0);
-    trim_span_pool();
+    if (prev >> 32) != (asked >> 32) {
+        trim_spare(0);
+        trim_span_pool();
+    } else {
+        cool_spare();
+        cool_span_pool();
+    }
     true
 }
 
@@ -1978,5 +2419,52 @@ mod tests {
         assert_eq!(frame.take_exhaustion(), None, "reset clears an unconsumed exhaustion");
         assert!(frame.try_alloc_layout(fitting).is_ok());
         assert_eq!(frame.take_exhaustion(), None, "a fitting allocation after reset leaves none");
+    }
+
+    #[test]
+    fn sharded_span_pool_handles_concurrent_non_task_frames_within_budget() {
+        trim_span_pool();
+        let handles: Vec<_> = (0..16)
+            .map(|tid| {
+                std::thread::spawn(move || {
+                    for round in 0..4u8 {
+                        let frame = Frame::with_reserve(16 << 20, Tag::Other).expect("non-task frame");
+                        let slice = frame.alloc_slice_fill_with(3 << 20, |i| {
+                            u8::try_from((i.wrapping_add(tid).wrapping_add(usize::from(round))) & 0xff).unwrap_or(0)
+                        });
+                        assert_eq!(slice.len(), 3 << 20);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker joined");
+        }
+        let pooled = pooled_span_bytes();
+        assert!(pooled > 0, "concurrent non-task frames populate sharded span pool");
+        assert!(
+            pooled <= SPAN_POOL * SPAN_WARM,
+            "sharded span pool committed {pooled} bytes, past budget {}",
+            SPAN_POOL * SPAN_WARM
+        );
+        cool_span_pool();
+        let cooled = pooled_span_bytes();
+        assert!(cooled > 0 && cooled < pooled, "cool_span_pool reduced {pooled} -> {cooled}");
+        trim_span_pool();
+        assert_eq!(pooled_span_bytes(), 0, "trim_span_pool emptied all shards");
+        assert!(
+            SPAN_POOL_NONEMPTY.iter().all(|w| w.0.load(Ordering::Acquire) == 0),
+            "trim_span_pool cleared all non-empty bitmap bits"
+        );
+    }
+
+    #[test]
+    fn shelf_size_128_cores_keeps_at_least_two_warm_chunks_and_spans() {
+        assert_eq!(SPAN_POOL_SHARDS, 128);
+        let wide = ShelfSize::for_threads(128);
+        assert!(wide.chunks >= 2 && wide.spans >= 2, "128 cores got {wide:?}");
+        assert_eq!(wide, ShelfSize { chunks: 2, spans: 2 });
+        let huge = ShelfSize::for_threads(256);
+        assert!(huge.chunks >= 2 && huge.spans >= 2, "256 cores got {huge:?}");
     }
 }

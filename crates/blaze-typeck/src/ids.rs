@@ -65,6 +65,43 @@ impl ContentHash for Name {
     }
 }
 
+/// Content hash of a structural record's sorted canonical field names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RecordSchema(pub u64);
+
+impl RecordSchema {
+    /// The empty structural record `{}`.
+    pub const EMPTY: RecordSchema = RecordSchema(
+        StableHasher::new("record-schema").bytes(&0u64.to_le_bytes()).finish(),
+    );
+
+    /// Computes the schema hash from canonical sorted field names.
+    pub fn of_sorted_names(names: &[Name]) -> RecordSchema {
+        let mut h = StableHasher::new("record-schema");
+        h.u64(u64::try_from(names.len()).unwrap_or(u64::MAX));
+        for &name in names {
+            h.u64(name.0);
+        }
+        RecordSchema(h.finish())
+    }
+
+    /// Deterministic synthetic key under which anonymous record type-level field defaults are
+    /// indexed in `World::field_defaults`.
+    pub fn defaults_key(self) -> ItemKey {
+        let mut lo = StableHasher::new("blaze-typeck record defaults lo");
+        lo.u64(self.0);
+        let mut hi = StableHasher::new("blaze-typeck record defaults hi");
+        hi.u64(self.0);
+        ItemKey(u128::from(lo.finish()) | (u128::from(hi.finish()) << 64))
+    }
+}
+
+impl ContentHash for RecordSchema {
+    fn hash_into(&self, h: &mut StableHasher) {
+        h.u64(self.0);
+    }
+}
+
 macro_rules! index {
     ($(#[$m:meta])* $name:ident) => {
         $(#[$m])*
@@ -336,6 +373,18 @@ pub enum LangItem {
     CallOnceFuture,
     /// `AsyncFnMut::CallRefFuture` (`call_ref_future`).
     CallRefFuture,
+    /// The trait `From` (`from` / `core::convert::From`), for error-union `?` propagation.
+    /// Last, so the earlier items keep their content hashes.
+    From,
+    /// Compiler-builtin marker trait satisfied by every `enum` ADT (`#[lang = "blaze_enum"]`).
+    Enum,
+    /// Compiler-builtin marker trait satisfied by every fieldless `enum` ADT (`#[lang = "blaze_unit_enum"]`).
+    UnitEnum,
+    /// `core::any::TryAsDynCompatible` (`#[lang = "try_as_dyn"]`).
+    TryAsDyn,
+    /// `core::ffi::VaList` (`#[lang = "va_list"]`): the type of the `...` parameter in a
+    /// C-variadic fn definition. Last, so the earlier items keep their content hashes.
+    VaList,
 }
 
 impl LangItem {
@@ -371,7 +420,7 @@ impl LangItem {
     /// and the checked-body record ([`crate::checked_record`]) write. The one home of the list
     /// (blaze-ladder's front2/langs.rs `ALL` names this one; tests/front2_bounds.rs checks its
     /// length against `variant_count` and its order, so a new variant cannot be left out).
-    pub const ALL: [LangItem; 98] = {
+    pub const ALL: [LangItem; 103] = {
         use LangItem::*;
         [
             Sized, Copy, Deref, DerefMut, Add, Sub, Mul, Div, Rem, BitAnd, BitOr, BitXor, Shl, Shr, AddAssign, SubAssign, MulAssign, DivAssign, RemAssign, BitAndAssign, BitOrAssign,
@@ -382,6 +431,7 @@ impl LangItem {
             RangeToInclusive, IntoFutureIntoFuture, FuturePoll, PinNewUnchecked, GetContext, PollReady, PollPending, FutureOutput, TryTraitFromOutput,
             Freeze,
             AsyncFn, AsyncFnMut, AsyncFnOnce, AsyncFnOnceOutput, CallOnceFuture, CallRefFuture,
+            From, Enum, UnitEnum, TryAsDyn, VaList,
         ]
     };
 

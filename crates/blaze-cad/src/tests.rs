@@ -53,7 +53,7 @@ fn harness(e: impl fmt::Debug) -> Broken<CadBroken> {
 #[derive(Clone, PartialEq, Debug)]
 enum CadBroken {
     /// Two placements of one solid gave parts of different digests.
-    KeyMoved { a: String, b: String },
+    KeyMoved { a: [u8; 32], b: [u8; 32] },
     /// The assembly differs from the placed solid at a point.
     PlacedWrong { at: [f64; 3], got: f64, want: f64 },
     /// A rounded cube's field is off at a probe.
@@ -74,6 +74,10 @@ enum CadBroken {
     OverhangWrong { should_fail: bool, verdict: String },
     /// A draft-angle DFM verdict disagrees with the geometry.
     DraftWrong { should_fail: bool, verdict: String },
+    /// A mesh fidelity check missed a lost hole or lost bevel (or falsely rejected a good mesh).
+    FidelityWrong { what: &'static str, verdict: String },
+    /// Strict export validation or the publish gate silently accepted an invalid/failing export.
+    PublishWrong { what: &'static str, got: String },
 }
 
 impl fmt::Display for CadBroken {
@@ -139,6 +143,25 @@ blaze_sim::plants! {
     }
 }
 
+blaze_sim::plants! {
+    impl FidelityPlant breaks CadBroken {
+        None,
+        SkipVoidSubdivision => CadBroken::FidelityWrong { what: "off-center lost hole", .. },
+        IgnoreNormalDeviation => CadBroken::FidelityWrong { what: "lost bevel", .. },
+        IgnoreFeatureTargets => CadBroken::FidelityWrong { what: "critical feature target", .. },
+    }
+}
+
+blaze_sim::plants! {
+    impl PublishPlant breaks CadBroken {
+        None,
+        IgnoreUnknownFeaturePart => CadBroken::PublishWrong { what: "unknown feature part", .. },
+        AllowPartialFeatures => CadBroken::PublishWrong { what: "partial features", .. },
+        AllowFailedFeature => CadBroken::PublishWrong { what: "failed feature", .. },
+        AllowOverBudget => CadBroken::PublishWrong { what: "over budget", .. },
+    }
+}
+
 fn mm(x: i64) -> Length {
     Length::mm(x as f64)
 }
@@ -172,7 +195,7 @@ fn part_case(tape: &Tape, plant: impl Planted<PartPlant> + Copy) -> Result<(), B
     let da = part_tape(&g, &a, Detail::Full, heap()).map_err(harness)?.digest();
     let db = part_tape(&g, &b, Detail::Full, heap()).map_err(harness)?.digest();
     if da != db {
-        return Err(Broken::Oracle(CadBroken::KeyMoved { a: format!("{da:02x?}"), b: format!("{db:02x?}") }));
+        return Err(Broken::Oracle(CadBroken::KeyMoved { a: da, b: db }));
     }
     let whole = assemble(&mut g, &[a.weaken()]).map_err(harness)?;
     let tw = compile(&g, whole.id(), CompileOpts { alloc: heap(), .. }).map_err(harness)?;
@@ -260,7 +283,7 @@ fn mass_case(tape: &Tape, plant: impl Planted<MassPlant> + Copy) -> Result<(), B
     // A fortieth of the radius (half a millimetre to one): a debug run in a second a case; every
     // bound below is in tolerances.
     let tol = r_mm / 40.0;
-    let meshed = mesh_part(&g, &part, MeshPartOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(tol) }, None).map_err(harness)?;
+    let meshed = mesh_part(&g, &part, MeshPartOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(tol), .. }, None).map_err(harness)?;
     let m = mass_properties_planted(&meshed.verified(), Density::kg_per_m3(rho), plant);
 
     let r = r_mm / 1000.0;
@@ -520,6 +543,7 @@ fn export_glb_gpu_optimized_lods_colliders_materials_and_hierarchy() {
         emissive_strength: None,
         clearcoat: None,
         double_sided: false,
+        ..
     };
     let materials = [STEEL, COPPER];
     let steel = Density::kg_per_m3(7850.0);
@@ -581,7 +605,7 @@ fn export_glb_gpu_optimized_lods_colliders_materials_and_hierarchy() {
 
     // Verify Tipsify vertex-cache optimization directly reduces or keeps low ACMR on a meshed sphere.
     let cap_part = *model.part(cap_id).expect("cap part");
-    let meshed = mesh_part(model.graph_ref(), &cap_part, MeshPartOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(0.8) }, None)
+    let meshed = mesh_part(model.graph_ref(), &cap_part, MeshPartOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(0.8), .. }, None)
         .expect("mesh sphere");
     let raw_acmr = blaze_cad_mesh::acmr(&meshed.mesh.view(), blaze_cad_mesh::AcmrOpts { cache_size: 32, scratch: heap() }).expect("raw acmr");
     let cached = blaze_cad_mesh::optimize_vertex_cache(
@@ -1012,7 +1036,7 @@ fn decimate_mesh_reduces_triangles_within_hausdorff_bound() {
     let meshed = mesh_part(
         model.graph_ref(),
         &part,
-        MeshPartOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(0.3) },
+        MeshPartOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(0.3), .. },
         None,
     )
     .expect("mesh");
@@ -1032,4 +1056,1380 @@ fn decimate_mesh_reduces_triangles_within_hausdorff_bound() {
     assert!(dec.verified().is_some(), "decimated mesh keeps Verified proof");
     assert!(dec_tris < orig_tris, "expected fewer triangles: {dec_tris} vs {orig_tris}");
     assert!(dec.error_bound <= max_err, "error_bound {:?} exceeded {:?}", dec.error_bound, max_err);
+}
+
+// ---- SOTA Game-Asset Workflow: Fidelity (Lost Holes & Bevels), Budgets, Report & Mesh Preview ----
+
+fn fidelity_case(tape: &Tape, plant: impl Planted<FidelityPlant> + Copy) -> Result<(), Broken<CadBroken>> {
+    use blaze_cad_mesh::{COS_32_DEGREES, DecimateOpts, MeshLimits, Source, Target, decimate};
+
+    // 1) Off-center through-hole hidden inside a large flat plate's 2-triangle face:
+    // the solid box mesh bridges the hole completely; its centroid sits on solid material, so
+    // only interval-guided triangle subdivision catches the lost hole!
+    let hole_r = tape.int_in(10..=15i64, "hole radius mm") as f64;
+    let hole_x = tape.int_in(42..=58i64, "hole offset x mm") as f64;
+    let hole_y = tape.int_in(38..=54i64, "hole offset y mm") as f64;
+
+    let mut g = Graph::new(GraphOpts { alloc: heap(), .. });
+    let plate = g.cuboid(BoxOpts { size: mm3(200.0, 200.0, 20.0), .. }).map_err(harness)?;
+    let cutter = g.cylinder(CylinderOpts { radius: Length::mm(hole_r), height: Length::mm(40.0), .. }).map_err(harness)?;
+    let cutter = g
+        .place(cutter, Placement::shift(Length::mm(hole_x), Length::mm(hole_y), Length::ZERO))
+        .map_err(harness)?;
+    let holed = g.difference(plate, cutter).map_err(harness)?;
+    let holed_part = Part::new(&mut g, PartOpts { solid: holed, name: "holed_plate" }).map_err(harness)?;
+    let solid_part = Part::new(&mut g, PartOpts { solid: plate, name: "solid_plate" }).map_err(harness)?;
+
+    // Build a minimal 12-triangle sharp box mesh of the un-holed plate (giant wall faces).
+    let raw_solid = mesh_part(&g, &solid_part, MeshPartOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(2.0), .. }, None)
+        .map_err(harness)?;
+    let box_12 = decimate(
+        Source::Verified(raw_solid.verified()),
+        DecimateOpts {
+            target: Target::Error(Length::mm(1.0)),
+            cos_crease: COS_32_DEGREES,
+            limits: MeshLimits::SHIPPED,
+            alloc: heap(),
+            scratch: heap(),
+            ..
+        },
+    )
+    .map_err(harness)?;
+
+    let res_hole = check_mesh_fidelity_planted(
+        &g,
+        &holed_part,
+        &box_12.mesh.view(),
+        None,
+        FidelityOpts {
+            hole_tolerance: Length::mm(3.0),
+            surface_tolerance: Length::mm(3.0),
+            min_hole_feature: Length::mm(6.0),
+            scratch: heap(),
+            ..
+        },
+        plant,
+    )
+    .map_err(harness)?;
+    if !matches!(res_hole.verdict, Verdict::Found(FidelityFinding::LostHole { .. })) {
+        return Err(Broken::Oracle(CadBroken::FidelityWrong {
+            what: "off-center lost hole",
+            verdict: format!("{:?}", res_hole.verdict),
+        }));
+    }
+
+    // 2) Lost bevel whose positional corner offset `r*(sqrt(2)-1)` (~2.9..3.7 mm) is BELOW a
+    // permissive 8 mm position tolerance, yet whose surface normal deviates by 45 deg!
+    let bevel_r = tape.int_in(7..=9i64, "bevel radius mm") as f64;
+    let rounded = g
+        .cuboid(BoxOpts { size: mm3(100.0, 100.0, 40.0), round: Length::mm(bevel_r), .. })
+        .map_err(harness)?;
+    let sharp = g.cuboid(BoxOpts { size: mm3(100.0, 100.0, 40.0), .. }).map_err(harness)?;
+    let rounded_part = Part::new(&mut g, PartOpts { solid: rounded, name: "beveled" }).map_err(harness)?;
+    let sharp_part = Part::new(&mut g, PartOpts { solid: sharp, name: "sharp" }).map_err(harness)?;
+
+    let raw_sharp = mesh_part(&g, &sharp_part, MeshPartOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(1.5), .. }, None)
+        .map_err(harness)?;
+    let sharp_12 = decimate(
+        Source::Verified(raw_sharp.verified()),
+        DecimateOpts {
+            target: Target::Error(Length::mm(1.0)),
+            cos_crease: COS_32_DEGREES,
+            limits: MeshLimits::SHIPPED,
+            alloc: heap(),
+            scratch: heap(),
+            ..
+        },
+    )
+    .map_err(harness)?;
+
+    let res_bevel = check_mesh_fidelity_planted(
+        &g,
+        &rounded_part,
+        &sharp_12.mesh.view(),
+        None,
+        FidelityOpts {
+            hole_tolerance: Length::mm(8.0),
+            surface_tolerance: Length::mm(8.0),
+            bevel_probe_tolerance: Some(Length::mm(0.5)),
+            max_normal_error: Angle::degrees(18.0),
+            min_hole_feature: Length::mm(4.0),
+            scratch: heap(),
+            ..
+        },
+        plant,
+    )
+    .map_err(harness)?;
+    if !matches!(res_bevel.verdict, Verdict::Found(FidelityFinding::LostBevel { .. })) {
+        return Err(Broken::Oracle(CadBroken::FidelityWrong {
+            what: "lost bevel",
+            verdict: format!("{:?}", res_bevel.verdict),
+        }));
+    }
+
+    // 3) Per-feature critical target: mark the bridged off-center hole with a tight 1.5 mm
+    // keyhole target even when the part-wide tolerances are super loose (25 mm, 60 deg) so ONLY
+    // per-feature target enforcement catches it!
+    let feat = [FeatureTarget::new(FeatureTargetOpts {
+        name: "keyhole_a",
+        kind: FeatureKind::Keyhole,
+        region: FeatureRegion::Ball {
+            center: blaze_math::Vec3::new(hole_x / 1000.0, hole_y / 1000.0, 0.010),
+            radius: Length::mm(hole_r + 4.0),
+        },
+        max_error: Some(Length::mm(1.5)),
+        max_normal_error: Some(Angle::degrees(45.0)),
+        min_feature: Some(Length::mm(5.0)),
+        protect: FeatureProtect::Pinned,
+    })];
+    let res_feat = check_mesh_fidelity_planted(
+        &g,
+        &holed_part,
+        &box_12.mesh.view(),
+        None,
+        FidelityOpts {
+            hole_tolerance: Length::mm(25.0),
+            surface_tolerance: Length::mm(25.0),
+            max_normal_error: Angle::degrees(60.0),
+            min_hole_feature: Length::mm(20.0),
+            features: &feat,
+            scratch: heap(),
+            ..
+        },
+        plant,
+    )
+    .map_err(harness)?;
+    if !matches!(res_feat.verdict, Verdict::Found(FidelityFinding::FeatureMissed { .. })) {
+        return Err(Broken::Oracle(CadBroken::FidelityWrong {
+            what: "critical feature target",
+            verdict: format!("{:?}", res_feat.verdict),
+        }));
+    }
+    Ok(())
+}
+
+#[test]
+fn fidelity_plants_are_caught() {
+    controls(Config::cases(4), |tape, plant: FidelityPlant| fidelity_case(tape, plant));
+}
+
+#[test]
+fn allocate_budgets_honors_explicit_caps_weights_and_total() {
+    let inputs = [
+        BudgetInput { natural_triangles: 10_000, explicit_cap: Some(3_000), weight: 1.0 },
+        BudgetInput { natural_triangles: 20_000, explicit_cap: None, weight: 2.0 },
+        BudgetInput { natural_triangles: 15_000, explicit_cap: None, weight: 1.0 },
+        BudgetInput { natural_triangles: 40, explicit_cap: None, weight: 1.0 },
+    ];
+    let alloc = allocate_budgets(&inputs, 10_000, 24, heap()).expect("allocate");
+    assert_eq!(alloc[0], 3_000, "explicit cap honored");
+    assert!(alloc[1] > alloc[2], "higher weight & natural count gets more budget: {} vs {}", alloc[1], alloc[2]);
+    assert!(alloc[3] >= 24 && alloc[3] <= 40, "small part keeps floor: {}", alloc[3]);
+    let sum: u32 = alloc.iter().copied().sum();
+    assert!(sum <= 10_000, "total {sum} exceeded budget 10000");
+
+    // When natural total already fits, zero compression occurs.
+    let easy = allocate_budgets(&inputs, 100_000, 24, heap()).expect("easy");
+    assert_eq!(easy.as_slice(), &[3_000, 20_000, 15_000, 40]);
+}
+
+#[test]
+fn game_asset_workflow_budgets_fidelity_report_and_mesh_preview() {
+    let mut model = Model::new(ModelOpts { alloc: heap(), .. });
+
+    // Meter-scale mini-cabin assembly:
+    // 1. Walls shell (3.0 x 2.4 x 2.0 m) with 2 window cutouts + 1 door opening (genus = 3!)
+    let g = model.graph();
+    let outer = g.cuboid(BoxOpts { size: mm3(3000.0, 2400.0, 2000.0), round: Length::mm(20.0), .. }).expect("outer");
+    let inner = g.cuboid(BoxOpts { size: mm3(2700.0, 2100.0, 2200.0), .. }).expect("inner");
+    let shell = g.difference(outer, inner).expect("shell");
+    let win_a = g.cuboid(BoxOpts { size: mm3(500.0, 600.0, 600.0), .. }).expect("win a");
+    let win_a = g.place(win_a, Placement::shift(Length::mm(-700.0), Length::mm(-1200.0), Length::mm(100.0))).expect("place win a");
+    let win_b = g.cuboid(BoxOpts { size: mm3(500.0, 600.0, 600.0), .. }).expect("win b");
+    let win_b = g.place(win_b, Placement::shift(Length::mm(700.0), Length::mm(-1200.0), Length::mm(100.0))).expect("place win b");
+    let door = g.cuboid(BoxOpts { size: mm3(650.0, 600.0, 1200.0), .. }).expect("door");
+    let door = g.place(door, Placement::shift(Length::ZERO, Length::mm(1200.0), Length::mm(-200.0))).expect("place door");
+    let cutouts = union_all(g, &[win_a, win_b, door]).expect("cutouts");
+    let walls = g.difference(shell, cutouts).expect("walls");
+    let walls = g.place(walls, Placement::shift(Length::ZERO, Length::ZERO, Length::mm(1000.0))).expect("place walls");
+
+    // 2. Beveled roof slab resting atop the walls.
+    let roof = g.cuboid(BoxOpts { size: mm3(3400.0, 2800.0, 220.0), round: Length::mm(25.0), .. }).expect("roof");
+    let roof = g.place(roof, Placement::shift(Length::ZERO, Length::ZERO, Length::mm(2110.0))).expect("place roof");
+
+    // 3. Stone chimney with a cylindrical through-flue (genus = 1!).
+    let chim_body = g.cuboid(BoxOpts { size: mm3(550.0, 550.0, 1400.0), .. }).expect("chim body");
+    let flue = g.cylinder(CylinderOpts { radius: Length::mm(120.0), height: Length::mm(1800.0), .. }).expect("flue");
+    let chimney = g.difference(chim_body, flue).expect("chimney");
+    let chimney = g.place(chimney, Placement::shift(Length::mm(950.0), Length::mm(550.0), Length::mm(2500.0))).expect("place chimney");
+
+    let (walls_id, _) = model.add(PartOpts { solid: walls, name: "walls" }).expect("add walls");
+    let (roof_id, _) = model.add(PartOpts { solid: roof, name: "roof" }).expect("add roof");
+    let (chimney_id, _) = model.add(PartOpts { solid: chimney, name: "chimney" }).expect("add chimney");
+
+    model.set_material(walls_id, MaterialRole(0)).expect("mat walls");
+    model.set_material(roof_id, MaterialRole(1)).expect("mat roof");
+    model.set_material(chimney_id, MaterialRole(2)).expect("mat chimney");
+
+    model.set_budget(roof_id, PartBudget::max_triangles(1_500)).expect("budget roof");
+
+    const WOOD: Material<'static> = Material {
+        name: "wood.wall",
+        base_colour: [0.46, 0.28, 0.14, 1.0],
+        metallic: 0.0,
+        roughness: 0.78,
+        emissive: [0.0; 3],
+        emissive_strength: None,
+        clearcoat: None,
+        double_sided: false,
+        ..
+    };
+    const SLATE: Material<'static> = Material {
+        name: "slate.roof",
+        base_colour: [0.18, 0.21, 0.26, 1.0],
+        metallic: 0.05,
+        roughness: 0.65,
+        emissive: [0.0; 3],
+        emissive_strength: None,
+        clearcoat: None,
+        double_sided: false,
+        ..
+    };
+    const STONE: Material<'static> = Material {
+        name: "stone.chimney",
+        base_colour: [0.42, 0.41, 0.39, 1.0],
+        metallic: 0.0,
+        roughness: 0.88,
+        emissive: [0.0; 3],
+        emissive_strength: None,
+        clearcoat: None,
+        double_sided: false,
+        ..
+    };
+    let materials = [WOOD, SLATE, STONE];
+
+    let asset = build_game_asset(
+        model.graph_ref(),
+        model.parts(),
+        GameAssetOpts {
+            alloc: heap(),
+            scratch: heap(),
+            preset: AssetPreset::Environment,
+            total_budget: Some(TriangleBudget(6_000)),
+            materials: &materials,
+            lods: Some(ExportLodOpts { ratio: 0.5, fewest_triangles: 64, .. }),
+            colliders: Some(ColliderMode::ConvexHull),
+            ..
+        },
+        None,
+    )
+    .expect("build game asset");
+
+    assert!(asset.report.budget_passed, "budget must pass:\n{}", Shown(&asset.report));
+    assert!(asset.triangles() <= 6_000, "total {} exceeded 6000", asset.triangles());
+    assert!(asset.report.parts[1].written_triangles <= 1_500, "roof exceeded explicit 1500 cap");
+    // Open-ended rectangular tube (top & bottom open) with 3 side cutouts (2 windows + door)
+    // has 5 openings connecting inside to outside, so its exact topological genus is 5 - 1 = 4!
+    assert_eq!(asset.report.parts[0].holes, Some(4), "walls must preserve all openings (genus 4):\n{}", Shown(&asset.report));
+    assert_eq!(asset.report.parts[2].holes, Some(1), "chimney must preserve its flue hole:\n{}", Shown(&asset.report));
+    assert!(asset.report.fidelity_passed, "fidelity checks must pass:\n{}", Shown(&asset.report));
+
+    let report_text = format!("{}", Shown(&asset.report));
+    assert!(report_text.contains("walls") && report_text.contains("roof") && report_text.contains("chimney"));
+    assert!(report_text.contains("TOTAL (3 parts)"));
+    assert!(report_text.contains("fidelity=PASS"));
+
+    // Preview using the ACTUAL exported meshes (materials + wireframe overlay).
+    let view = View {
+        eye: mm3(4800.0, -5600.0, 3600.0),
+        target: mm3(0.0, 0.0, 1400.0),
+        projection: Projection::Perspective { fov: Angle::degrees(38.0) },
+        width: 64,
+        height: 48,
+        ..
+    };
+    let preview = asset
+        .preview(
+            &materials,
+            view,
+            MeshPictureOpts {
+                alloc: heap(),
+                scratch: heap(),
+                wireframe: Wireframe::Overlay { width_px: 1.0, colour: [24, 28, 34] },
+                ..
+            },
+        )
+        .expect("preview exported asset");
+    assert!(preview.stats.hits > 400, "exported mesh preview must hit the cabin, got {} hits", preview.stats.hits);
+    let part_col = asset
+        .preview_part_colors(view, MeshPictureOpts { alloc: heap(), scratch: heap(), .. })
+        .expect("preview part colors");
+    assert_ne!(preview.pixels[..], part_col.pixels[..], "material+wireframe preview must differ from part-color preview");
+}
+
+#[test]
+fn per_feature_fidelity_targets_preserve_geometry_report_and_highlight_misses() {
+    use blaze_math::{Aabb3, Vec3};
+
+    let mut model = Model::new(ModelOpts { alloc: heap(), .. });
+
+    // Panel with a keyhole through-slot + 45-degree French cleat rail.
+    let plate = model.graph().cuboid(BoxOpts { size: mm3(300.0, 18.0, 360.0), .. }).expect("plate");
+    let bore = model.graph().cylinder(CylinderOpts { radius: Length::mm(7.0), height: Length::mm(30.0), .. }).expect("bore");
+    let bore = model
+        .graph()
+        .place(
+            bore,
+            Placement::shift(Length::mm(0.0), Length::ZERO, Length::mm(80.0))
+                .then_after(&Placement::rotation(Axis::X, Angle::degrees(90.0))),
+        )
+        .expect("place bore");
+    let slot = model.graph().cuboid(BoxOpts { size: mm3(7.0, 30.0, 18.0), .. }).expect("slot");
+    let slot = model
+        .graph()
+        .place(slot, Placement::shift(Length::ZERO, Length::ZERO, Length::mm(90.0)))
+        .expect("place slot");
+    let keyhole = model.graph().union(bore, slot).expect("keyhole");
+    let panel = model.graph().difference(plate, keyhole).expect("panel");
+    let (panel_id, _) = model.add(PartOpts { solid: panel, name: "panel" }).expect("add panel");
+
+    let cleat_raw = model.graph().cuboid(BoxOpts { size: mm3(240.0, 20.0, 56.0), .. }).expect("cleat raw");
+    let cutter = model.graph().cuboid(BoxOpts { size: mm3(260.0, 40.0, 80.0), .. }).expect("cutter");
+    let cutter = model
+        .graph()
+        .place(
+            cutter,
+            Placement::shift(Length::ZERO, Length::mm(14.0), Length::mm(32.0))
+                .then_after(&Placement::rotation(Axis::X, Angle::degrees(45.0))),
+        )
+        .expect("place cutter");
+    let cleat = model.graph().difference(cleat_raw, cutter).expect("cleat");
+    let cleat = model
+        .graph()
+        .place(cleat, Placement::shift(Length::ZERO, Length::mm(20.0), Length::mm(-60.0)))
+        .expect("place cleat");
+    let (cleat_id, _) = model.add(PartOpts { solid: cleat, name: "cleat" }).expect("add cleat");
+
+    let kh_region = FeatureRegion::Box(Aabb3::new(Vec3::new(-0.012, -0.012, 0.068), Vec3::new(0.012, 0.012, 0.105)));
+    let mating_region = FeatureRegion::Box(Aabb3::new(Vec3::new(-0.122, -0.012, 0.006), Vec3::new(0.122, 0.012, 0.030)));
+
+    model
+        .mark_feature(
+            panel_id,
+            FeatureTarget::new(FeatureTargetOpts {
+                name: "keyhole_top",
+                kind: FeatureKind::Keyhole,
+                region: kh_region,
+                max_error: Some(Length::mm(0.6)),
+                max_normal_error: Some(Angle::degrees(22.0)),
+                min_feature: Some(Length::mm(3.5)),
+                protect: FeatureProtect::Pinned,
+            }),
+        )
+        .expect("mark keyhole");
+    model
+        .mark_feature(
+            cleat_id,
+            FeatureTarget::new(FeatureTargetOpts {
+                name: "mating_45",
+                kind: FeatureKind::MatingSurface,
+                region: mating_region,
+                max_error: Some(Length::mm(0.5)),
+                max_normal_error: Some(Angle::degrees(12.0)),
+                protect: FeatureProtect::Pinned,
+                ..
+            }),
+        )
+        .expect("mark mating");
+
+    // 1) Normal build: keyhole preserved (genus 1), 45-degree cleat passes with zero false normal
+    // errors, both marked features pass, and missed_highlights is empty.
+    let asset = build_game_asset(
+        model.graph_ref(),
+        model.parts(),
+        GameAssetOpts {
+            alloc: heap(),
+            scratch: heap(),
+            preset: AssetPreset::GameProp,
+            total_budget: Some(TriangleBudget(4_000)),
+            features: model.features(),
+            ..
+        },
+        None,
+    )
+    .expect("build protected asset");
+    let text = format!("{}", Shown(&asset.report));
+    assert!(asset.report.budget_passed, "budget must pass:\n{text}");
+    assert!(asset.report.fidelity_passed, "fidelity must pass:\n{text}");
+    assert_eq!(asset.report.parts[0].holes, Some(1), "keyhole genus must stay 1:\n{text}");
+    assert_eq!(asset.report.features.len(), 2, "expected 2 feature reports:\n{text}");
+    assert!(asset.missed_highlights.is_empty(), "passing asset must have 0 missed highlights");
+    assert_eq!(asset.all_highlights.len(), 2, "all_highlights should include both passing outlines");
+    assert!(text.contains("FEATURES") && text.contains("keyhole_top") && text.contains("mating_45"));
+
+    // 2) Intentionally over-tight/starved target misses tolerance and auto-highlights in preview!
+    let strict = [PartFeature::new(
+        "panel",
+        FeatureTarget::new(FeatureTargetOpts {
+            name: "keyhole_impossible",
+            kind: FeatureKind::Keyhole,
+            region: kh_region,
+            max_error: Some(Length::mm(0.01)),
+            max_normal_error: Some(Angle::degrees(1.0)),
+            protect: FeatureProtect::Critical,
+            ..
+        }),
+    )];
+    let missed = build_game_asset(
+        model.graph_ref(),
+        model.parts(),
+        GameAssetOpts {
+            alloc: heap(),
+            scratch: heap(),
+            preset: AssetPreset::Environment,
+            total_budget: Some(TriangleBudget(140)),
+            features: &strict,
+            ..
+        },
+        None,
+    )
+    .expect("build missed asset");
+    assert!(!missed.report.fidelity_passed, "impossible target must fail fidelity");
+    assert_eq!(missed.missed_highlights.len(), 1, "missed feature must populate missed_highlights");
+
+    let view = View {
+        eye: mm3(0.0, -420.0, 80.0),
+        target: mm3(0.0, 0.0, 80.0),
+        projection: Projection::Orthographic { height: Length::mm(120.0) },
+        width: 48,
+        height: 48,
+        ..
+    };
+    let auto_pic = missed
+        .preview(STEEL_ONLY, view, MeshPictureOpts { alloc: heap(), scratch: heap(), .. })
+        .expect("auto highlighted preview");
+    let plain_pic = picture_mesh(
+        missed.parts[0].mesh.view(),
+        STEEL_ONLY,
+        view,
+        MeshPictureOpts { alloc: heap(), scratch: heap(), .. },
+    )
+    .expect("plain mesh preview");
+    assert_ne!(
+        auto_pic.pixels[..],
+        plain_pic.pixels[..],
+        "auto-highlighted export preview must visibly highlight the missed feature"
+    );
+}
+
+fn publish_validation_case(tape: &Tape, plant: impl Planted<PublishPlant> + Copy) -> Result<(), Broken<CadBroken>> {
+    use blaze_math::{Aabb3, Vec3};
+
+    let side = tape.int_in(40..=60i64, "box side mm") as f64;
+    let mut model = Model::new(ModelOpts { alloc: heap(), .. });
+    let cube = model
+        .graph()
+        .cuboid(BoxOpts { size: mm3(side, side, side), round: Length::mm(5.0), .. })
+        .map_err(harness)?;
+    model.add(PartOpts { solid: cube, name: "bracket" }).map_err(harness)?;
+
+    let region = FeatureRegion::Box(Aabb3::new(Vec3::new(-0.015, -0.015, -0.015), Vec3::new(0.015, 0.015, 0.015)));
+
+    // 1) Misspelled part name on a pinned feature target MUST be a hard error!
+    let typo_feats = [PartFeature::new(
+        "brackte",
+        FeatureTarget::new(FeatureTargetOpts {
+            name: "mount_pad",
+            kind: FeatureKind::MatingSurface,
+            region,
+            protect: FeatureProtect::Pinned,
+            ..
+        }),
+    )];
+    let typo_res = build_game_asset_planted(
+        model.graph_ref(),
+        model.parts(),
+        GameAssetOpts { alloc: heap(), scratch: heap(), features: &typo_feats, .. },
+        None,
+        plant,
+    );
+    if !matches!(typo_res, Err(ModelError::UnknownFeaturePart { .. })) {
+        return Err(Broken::Oracle(CadBroken::PublishWrong {
+            what: "unknown feature part",
+            got: format!("{:?}", typo_res.map(|a| a.report.checked_features)),
+        }));
+    }
+
+    // 2) Partial feature coverage (`fidelity: None` with a requested feature target) MUST block publish!
+    let valid_feat = [PartFeature::new(
+        "bracket",
+        FeatureTarget::new(FeatureTargetOpts {
+            name: "bevel_edge",
+            kind: FeatureKind::Bevel,
+            region: FeatureRegion::Box(Aabb3::new(
+                Vec3::new(-side / 2000.0, -side / 2000.0, side / 2000.0 - 0.01),
+                Vec3::new(side / 2000.0, side / 2000.0, side / 2000.0 + 0.005),
+            )),
+            protect: FeatureProtect::Critical,
+            ..
+        }),
+    )];
+    let unchecked = build_game_asset(
+        model.graph_ref(),
+        model.parts(),
+        GameAssetOpts { alloc: heap(), scratch: heap(), fidelity: None, features: &valid_feat, .. },
+        None,
+    )
+    .map_err(harness)?;
+    let partial_res = unchecked.report.check_publish_planted(
+        PublishCheckOpts { require_fidelity: false, require_all_features: true, .. },
+        plant,
+    );
+    if !matches!(partial_res, Err(PublishFailure::FeatureTargetMismatch { requested: 1, checked: 0, passed: 0 })) {
+        return Err(Broken::Oracle(CadBroken::PublishWrong {
+            what: "partial features",
+            got: format!("{partial_res:?}"),
+        }));
+    }
+
+    // 3) Failed requested feature target MUST block publish!
+    let impossible = [PartFeature::new(
+        "bracket",
+        FeatureTarget::new(FeatureTargetOpts {
+            name: "impossible_bevel",
+            kind: FeatureKind::Bevel,
+            region: FeatureRegion::Box(Aabb3::new(
+                Vec3::new(-side / 2000.0, -side / 2000.0, side / 2000.0 - 0.01),
+                Vec3::new(side / 2000.0, side / 2000.0, side / 2000.0 + 0.005),
+            )),
+            max_error: Some(Length::mm(0.001)),
+            max_normal_error: Some(Angle::degrees(0.5)),
+            protect: FeatureProtect::Critical,
+            ..
+        }),
+    )];
+    let failed_asset = build_game_asset(
+        model.graph_ref(),
+        model.parts(),
+        GameAssetOpts {
+            alloc: heap(),
+            scratch: heap(),
+            preset: AssetPreset::Environment,
+            total_budget: Some(TriangleBudget(48)),
+            features: &impossible,
+            ..
+        },
+        None,
+    )
+    .map_err(harness)?;
+    let fail_res = failed_asset
+        .report
+        .check_publish_planted(PublishCheckOpts { require_budget: false, require_all_features: true, .. }, plant);
+    if !matches!(fail_res, Err(PublishFailure::FeatureFailed { .. })) {
+        return Err(Broken::Oracle(CadBroken::PublishWrong {
+            what: "failed feature",
+            got: format!("{fail_res:?}"),
+        }));
+    }
+
+    // 4) Over-budget part MUST block publish!
+    let mut over_model = Model::new(ModelOpts { alloc: heap(), .. });
+    let s2 = over_model
+        .graph()
+        .cuboid(BoxOpts { size: mm3(side, side, side), round: Length::mm(5.0), .. })
+        .map_err(harness)?;
+    let (id2, _) = over_model.add(PartOpts { solid: s2, name: "bracket" }).map_err(harness)?;
+    over_model
+        .set_budget(
+            id2,
+            PartBudget::Detailed {
+                max_triangles: Some(TriangleBudget(4)),
+                tolerance: None,
+                min_feature: None,
+                max_error: Some(Length::mm(0.5)),
+                weight: 1.0,
+            },
+        )
+        .map_err(harness)?;
+    let over_asset = build_game_asset(
+        over_model.graph_ref(),
+        over_model.parts(),
+        GameAssetOpts { alloc: heap(), scratch: heap(), .. },
+        None,
+    )
+    .map_err(harness)?;
+    let over_res = over_asset
+        .report
+        .check_publish_planted(PublishCheckOpts { require_fidelity: false, require_all_features: false, .. }, plant);
+    if !matches!(over_res, Err(PublishFailure::BudgetExceeded { .. })) {
+        return Err(Broken::Oracle(CadBroken::PublishWrong {
+            what: "over budget",
+            got: format!("{over_res:?}"),
+        }));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn publish_validation_plants_are_caught() {
+    controls(Config::cases(3), |tape, plant: PublishPlant| publish_validation_case(tape, plant));
+}
+
+#[test]
+fn strict_export_validation_and_publish_gate_enforce_all_requested_targets() {
+    use blaze_math::{Aabb3, Vec3};
+
+    let mut model = Model::new(ModelOpts { alloc: heap(), .. });
+    let body = model.graph().cuboid(BoxOpts { size: mm3(100.0, 60.0, 20.0), .. }).expect("body");
+    let (body_id, _) = model.add(PartOpts { solid: body, name: "plate" }).expect("add plate");
+
+    let valid_box = FeatureRegion::Box(Aabb3::new(Vec3::new(-0.02, -0.02, -0.015), Vec3::new(0.02, 0.02, 0.015)));
+    let valid_target = FeatureTarget::new(FeatureTargetOpts {
+        name: "top_face",
+        kind: FeatureKind::MatingSurface,
+        region: valid_box,
+        max_error: Some(Length::mm(0.5)),
+        max_normal_error: Some(Angle::degrees(10.0)),
+        protect: FeatureProtect::Pinned,
+        ..
+    });
+
+    // 1) Unknown / misspelled part name is a hard error naming both part and feature.
+    let misspelled = [
+        PartFeature::new("plate", valid_target),
+        PartFeature::new(
+            "pltae",
+            FeatureTarget::new(FeatureTargetOpts {
+                name: "pinned_hole",
+                kind: FeatureKind::Keyhole,
+                region: valid_box,
+                protect: FeatureProtect::Pinned,
+                ..
+            }),
+        ),
+    ];
+    let err = build_game_asset(
+        model.graph_ref(),
+        model.parts(),
+        GameAssetOpts { alloc: heap(), scratch: heap(), features: &misspelled, .. },
+        None,
+    )
+    .expect_err("misspelled part name must fail");
+    assert_eq!(err, ModelError::UnknownFeaturePart { part: Name::new("pltae"), feature: Name::new("pinned_hole") });
+
+    // 2) Duplicate feature name on the same part is a hard error (both on Model and build_game_asset).
+    model.mark_feature(body_id, valid_target).expect("first mark");
+    let dup_err = model.mark_feature(body_id, valid_target).expect_err("duplicate feature name must fail");
+    assert_eq!(dup_err, ModelError::DuplicateFeatureName { part: Name::new("plate"), feature: Name::new("top_face") });
+
+    // 3) Invalid region (zero radius / inverted box) is refused upfront.
+    let bad_region = FeatureTarget::new(FeatureTargetOpts {
+        name: "bad_ball",
+        kind: FeatureKind::Keyhole,
+        region: FeatureRegion::Ball { center: Vec3::ZERO, radius: Length::ZERO },
+        ..
+    });
+    assert!(matches!(
+        model.mark_feature(body_id, bad_region),
+        Err(ModelError::InvalidFeatureTarget { .. })
+    ));
+
+    // 4) Passing asset with all requested targets mints a PublishProof and exposes publish_glb.
+    let (asset, proof) = publish_game_asset(
+        model.graph_ref(),
+        model.parts(),
+        GameAssetOpts {
+            alloc: heap(),
+            scratch: heap(),
+            preset: AssetPreset::HeroAsset,
+            features: model.features(),
+            ..
+        },
+        PublishCheckOpts { require_non_empty_features: true, .. },
+        None,
+    )
+    .expect("all targets pass publish gate");
+    assert_eq!(proof.parts(), 1);
+    assert_eq!(proof.requested_features(), 1);
+    assert_eq!(proof.passed_features(), 1);
+    assert_eq!(asset.publish_glb(proof).len(), asset.glb.len());
+    let rep_text = format!("{}", Shown(&asset.report));
+    assert!(rep_text.contains("features=1/1"), "report must show passed/requested features:\n{rep_text}");
+
+    // 5) `require_non_empty_features` blocks publishing when no targets were declared.
+    let bare = build_game_asset(
+        model.graph_ref(),
+        model.parts(),
+        GameAssetOpts { alloc: heap(), scratch: heap(), .. },
+        None,
+    )
+    .expect("bare build");
+    assert_eq!(
+        bare.check_publish(PublishCheckOpts { require_non_empty_features: true, .. }),
+        Err(PublishFailure::NoFeaturesDeclared)
+    );
+}
+
+#[test]
+fn feature_spec_derives_physical_mesh_budgets() {
+    use blaze_math::{Aabb3, Vec3};
+
+    let region = FeatureRegion::Box(Aabb3::new(Vec3::new(-0.02, -0.01, -0.01), Vec3::new(0.02, 0.01, 0.01)));
+    let groove = FeatureTarget::from_spec("g", region, FeatureSpec::Groove { width: Length::mm(1.8), depth: Length::mm(1.2) });
+    let bevel = FeatureTarget::from_spec("b", region, FeatureSpec::Bevel { radius: Length::mm(3.0) });
+    let seam = FeatureTarget::from_spec("s", region, FeatureSpec::PanelSeam { gap: Length::mm(1.0), depth: Length::mm(2.5) });
+    let stencil = FeatureTarget::from_spec("st", region, FeatureSpec::Stencil { stroke_width: Length::mm(2.0) });
+    let slot = FeatureTarget::from_spec("sl", region, FeatureSpec::Slot { width: Length::mm(2.4) });
+
+    assert!(groove.min_feature.unwrap() <= Length::mm(0.65));
+    assert!(bevel.max_error.unwrap() <= Length::mm(0.12));
+    assert_eq!(seam.protect, FeatureProtect::Pinned);
+    assert!(seam.min_feature.unwrap() <= Length::mm(0.45));
+    assert!(stencil.min_feature.unwrap() <= Length::mm(1.05));
+    assert_eq!(slot.kind, FeatureKind::Keyhole);
+}
+
+#[test]
+fn camera_fidelity_checks_silhouette_seams_decals_and_catches_plants() {
+    use blaze_cad_field::compile;
+    use blaze_cad_mesh::{MeshOpts, mesh};
+    use blaze_cad_picture::{Projection, View};
+    use blaze_math::{Aabb3, Vec3};
+
+    let mut model = Model::new(ModelOpts { alloc: heap(), .. });
+    let cyl = model
+        .graph()
+        .cylinder(CylinderOpts { radius: Length::mm(40.0), height: Length::mm(80.0), .. })
+        .expect("cyl");
+    let (_, part) = model.add(PartOpts { solid: cyl, name: "cell" }).expect("add");
+    let tape = compile(model.graph_ref(), part.solid.id(), blaze_cad_field::CompileOpts { alloc: heap(), .. }).expect("tape");
+
+    // Deliberately coarse mesh so silhouette visibly shifts at close range.
+    let coarse = mesh(&tape, MeshOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(3.5), .. }).expect("coarse");
+    let view = View {
+        eye: [Length::ZERO, Length::mm(-220.0), Length::ZERO],
+        target: [Length::ZERO; 3],
+        projection: Projection::Perspective { fov: Angle::degrees(38.0) },
+        width: 480,
+        height: 480,
+        ..
+    };
+    let cams = [NamedCamera::new("inspect", view)];
+    let tiny_seam = [SeamSpec::new(
+        "micro_seam",
+        FeatureRegion::Box(Aabb3::new(Vec3::new(-0.002, -0.042, -0.002), Vec3::new(0.002, -0.038, 0.002))),
+        Length::mm(0.05),
+        Length::mm(0.2),
+    )];
+    let tiny_decal = [DecalSpec::new(
+        "micro_07",
+        Vec3::new(0.0, -0.040, 0.0),
+        Vec3::new(0.0, -1.0, 0.0),
+        Length::mm(0.10),
+        Some(100.0),
+    )];
+    let opts = CameraFidelityOpts {
+        cameras: &cams,
+        seams: &tiny_seam,
+        decals: &tiny_decal,
+        max_silhouette_shift_px: 0.5,
+        min_seam_px: 1.0,
+        min_decal_stroke_px: 1.5,
+        min_decal_texel_ratio: 0.75,
+        alloc: heap(),
+        scratch: heap(),
+    };
+
+    let clean = check_camera_fidelity(&tape, &part.placement, &[coarse.mesh.view()], opts).expect("clean check");
+    assert!(!clean.passed, "coarse mesh with sub-pixel seam/decal must fail camera fidelity");
+    assert!(!clean.silhouette_issues.is_empty(), "must flag silhouette shift");
+    assert!(clean.seam_checks.iter().any(|s| !s.visible), "must flag disappearing seam");
+    assert!(clean.decal_checks.iter().any(|d| !d.legible), "must flag illegible decal");
+    let shown = format!("{}", Shown(&clean));
+    assert!(shown.contains("inspect"), "Shown report must name camera:\n{shown}");
+
+    // Planted bug controls: each plant hides its own defect class.
+    let p_sil = check_camera_fidelity_planted(
+        &tape,
+        &part.placement,
+        &[coarse.mesh.view()],
+        opts,
+        CameraFidelityPlant::IgnoreSilhouetteShift,
+    )
+    .expect("plant sil");
+    assert!(p_sil.silhouette_issues.is_empty(), "IgnoreSilhouetteShift must drop silhouette issues");
+
+    let p_seam = check_camera_fidelity_planted(
+        &tape,
+        &part.placement,
+        &[coarse.mesh.view()],
+        opts,
+        CameraFidelityPlant::IgnoreSeamLoss,
+    )
+    .expect("plant seam");
+    assert!(p_seam.seam_checks.iter().all(|s| s.visible), "IgnoreSeamLoss must falsely mark seams visible");
+
+    let p_decal = check_camera_fidelity_planted(
+        &tape,
+        &part.placement,
+        &[coarse.mesh.view()],
+        opts,
+        CameraFidelityPlant::IgnoreDecalBreakup,
+    )
+    .expect("plant decal");
+    assert!(p_decal.decal_checks.iter().all(|d| d.legible), "IgnoreDecalBreakup must falsely mark decals legible");
+}
+
+#[test]
+fn power_cell_milestone_curvature_edit_keeps_cover_decal_and_highlights_aligned() {
+    use blaze_cad_field::{
+        EdgeSelect, GuideRail, GuidedLoftOpts, GuidedStation, LoftContinuity, Profile, ProfileOpts, RadiusProfile, RailPoint,
+        Scratch, SweepCrossSection, VariableBlendOpts, compile, eval_point,
+    };
+    use blaze_cad_out::{GlbReadOpts, Material, Up, read_glb};
+    use blaze_cad_picture::StripLight;
+    use blaze_math::Vec3;
+
+    const MATS: [Material<'static>; 3] = [
+        Material {
+            name: "ceramic",
+            base_colour: [0.76, 0.75, 0.71, 1.0],
+            metallic: 0.0,
+            roughness: 0.45,
+            emissive: [0.0; 3],
+            emissive_strength: None,
+            clearcoat: None,
+            double_sided: false,
+            ..
+        },
+        Material {
+            name: "graphite",
+            base_colour: [0.16, 0.17, 0.19, 1.0],
+            metallic: 0.15,
+            roughness: 0.68,
+            emissive: [0.0; 3],
+            emissive_strength: None,
+            clearcoat: None,
+            double_sided: false,
+            ..
+        },
+        Material {
+            name: "titanium",
+            base_colour: [0.64, 0.67, 0.71, 1.0],
+            metallic: 0.90,
+            roughness: 0.25,
+            emissive: [0.0; 3],
+            emissive_strength: None,
+            clearcoat: None,
+            double_sided: false,
+            ..
+        },
+    ];
+
+    let build_rev = |flare_mm: f64| {
+        let mut model = Model::new(ModelOpts { alloc: heap(), .. });
+        let prof = model
+            .graph()
+            .profile(ProfileOpts {
+                profile: Profile::RoundedRect { width: Length::mm(64.0), height: Length::mm(40.0), radius: Length::mm(10.0) },
+                name: None,
+            })
+            .expect("prof");
+        let stations = [
+            GuidedStation { z: Length::mm(-60.0), profile: prof, .. },
+            GuidedStation { z: Length::mm(0.0), profile: prof, .. },
+            GuidedStation { z: Length::mm(60.0), profile: prof, .. },
+        ];
+        let side_pts = [
+            RailPoint { z: Length::mm(-60.0), value: Length::mm(29.0), tangent: Some(0.05) },
+            RailPoint { z: Length::mm(15.0), value: Length::mm(32.0 + flare_mm * 0.6), tangent: None },
+            RailPoint { z: Length::mm(60.0), value: Length::mm(26.0), tangent: Some(-0.18) },
+        ];
+        let ridge_pts = [
+            RailPoint { z: Length::mm(-60.0), value: Length::mm(18.0), tangent: Some(0.05) },
+            RailPoint { z: Length::mm(15.0), value: Length::mm(20.0 + flare_mm), tangent: None },
+            RailPoint { z: Length::mm(60.0), value: Length::mm(16.0), tangent: Some(-0.16) },
+        ];
+        let shell = model
+            .graph()
+            .guided_loft(GuidedLoftOpts {
+                stations: &stations,
+                side_rail: Some(GuideRail { points: &side_pts }),
+                ridge_rail: Some(GuideRail { points: &ridge_pts }),
+                continuity: LoftContinuity::CurvatureC2,
+                cap_round: Length::mm(4.0),
+                ..
+            })
+            .expect("loft");
+
+        // Selective variable-radius notch on upper +X edge.
+        let notch = model.graph().cuboid(BoxOpts { size: mm3(16.0, 22.0, 28.0), .. }).expect("notch");
+        let notch = model
+            .graph()
+            .place(notch, Placement::shift(Length::mm(34.0 + flare_mm * 0.4), Length::ZERO, Length::mm(16.0)))
+            .expect("place notch");
+        let shell = model
+            .graph()
+            .variable_round_difference(
+                shell,
+                notch,
+                VariableBlendOpts {
+                    profile: RadiusProfile::Linear {
+                        from: mm3(24.0, 0.0, 2.0),
+                        to: mm3(24.0, 0.0, 30.0),
+                        r0: Length::mm(1.5),
+                        r1: Length::mm(4.5),
+                    },
+                    select: EdgeSelect::Box { lo: mm3(14.0, -24.0, -4.0), hi: mm3(52.0, 24.0, 42.0), fade: Length::mm(3.0) },
+                    ..
+                },
+            )
+            .expect("var round diff");
+
+        let shell_tape = compile(model.graph_ref(), shell.id(), blaze_cad_field::CompileOpts { alloc: heap(), .. }).expect("tape");
+        let mut sc = Scratch::new(heap());
+
+        let outer_reg = SurfaceRegion::new(SurfaceRegionOpts {
+            name: "cell.outer_face",
+            selector: RegionSelector::Extremal { dir: [0.0, -1.0, 0.0], at_frac: [0.5, 0.0, 0.38] },
+            ..
+        });
+        let shoulder_reg = SurfaceRegion::new(SurfaceRegionOpts {
+            name: "cell.shoulder",
+            selector: RegionSelector::Extremal { dir: [0.0, -1.0, 0.0], at_frac: [0.5, 0.0, 0.72] },
+            ..
+        });
+        let outer_frame = resolve_region(&shell_tape, &outer_reg, heap()).expect("outer frame");
+        let shoulder_frame = resolve_region(&shell_tape, &shoulder_reg, heap()).expect("shoulder frame");
+        assert!(eval_point(&shell_tape, outer_frame.origin, &mut sc).abs() < 1e-4);
+        assert!(eval_point(&shell_tape, shoulder_frame.origin, &mut sc).abs() < 1e-4);
+
+        let derived = derive_panel(
+            model.graph(),
+            shell,
+            &outer_frame,
+            PanelOpts {
+                outline: Profile::RoundedRect { width: Length::mm(34.0), height: Length::mm(28.0), radius: Length::mm(4.0) },
+                gap: Length::mm(1.5),
+                cover_thickness: Length::mm(3.0),
+                pocket_depth: Length::mm(5.0),
+                lip_width: Length::mm(2.0),
+                lip_thickness: Length::mm(2.0),
+                name: "bay",
+                ..
+            },
+        )
+        .expect("derive panel");
+
+        // Compound surface curve + tapered groove.
+        let cpts = [
+            Curve2dPoint { u: Length::mm(-18.0), v: Length::mm(20.0), width: Length::mm(2.4), depth: Length::mm(1.5) },
+            Curve2dPoint { u: Length::ZERO, v: Length::mm(23.0), width: Length::mm(2.8), depth: Length::mm(1.8) },
+            Curve2dPoint { u: Length::mm(18.0), v: Length::mm(20.0), width: Length::mm(2.4), depth: Length::mm(1.5) },
+        ];
+        let curve = project_curve_to_surface(&shell_tape, &outer_frame, &cpts, ProjectCurveOpts {
+            samples_per_segment: 3,
+            alloc: heap(),
+            scratch: heap(),
+            ..
+        })
+        .expect("curve");
+        let groove = sweep_on_surface(
+            model.graph(),
+            &curve,
+            SurfaceSweepOpts {
+                section: SweepCrossSection::Channel,
+                taper_start: Length::mm(5.0),
+                taper_end: Length::mm(5.0),
+                name: "groove",
+                scratch: heap(),
+                ..
+            },
+        )
+        .expect("sweep");
+        let host = model.graph().difference(derived.host_with_pocket, groove.solid).expect("cut groove");
+
+        // Bounded grip pattern on the -X face.
+        let grip_reg = SurfaceRegion::new(SurfaceRegionOpts {
+            name: "cell.grip",
+            selector: RegionSelector::Extremal { dir: [-1.0, 0.0, 0.0], at_frac: [0.0, 0.5, 0.45] },
+            ..
+        });
+        let grip_frame = resolve_region(&shell_tape, &grip_reg, heap()).expect("grip frame");
+        let poly = [
+            [Length::mm(-8.0), Length::mm(-16.0)],
+            [Length::mm(8.0), Length::mm(-16.0)],
+            [Length::mm(6.0), Length::mm(16.0)],
+            [Length::mm(-6.0), Length::mm(16.0)],
+        ];
+        let pat = fill_region_pattern(
+            model.graph(),
+            shell,
+            &shell_tape,
+            &grip_frame,
+            PatternOpts {
+                boundary: Profile::Polygon { points: &poly },
+                border: Length::mm(1.5),
+                pattern: SurfacePattern::Ribs {
+                    pitch: Length::mm(6.0),
+                    width: Length::mm(2.0),
+                    depth: Length::mm(1.2),
+                    angle: Angle::ZERO,
+                },
+                trim: TrimMode::Clip,
+                raised: true,
+                name: "grip",
+                scratch: heap(),
+                ..
+            },
+        )
+        .expect("pattern");
+        assert!(pat.element_count >= 2);
+        let host = model.graph().union(host, pat.solid).expect("add grip");
+
+        let (hid, _) = model.add(PartOpts { solid: host, name: "housing" }).expect("add host");
+        model.set_material(hid, MaterialRole(0)).expect("hmat");
+        let (cid, _) = model.add(PartOpts { solid: derived.flush_cover, name: "cover" }).expect("add cover");
+        model.set_material(cid, MaterialRole(2)).expect("cmat");
+
+        // Cover must fit cleanly inside derived pocket with zero interference!
+        let clear = model
+            .no_interference(InterferenceOpts { clearance: Length::mm(0.2), scratch: heap(), .. })
+            .expect("clearance");
+        assert!(clear.verdict.passed(), "derived cover interfered at flare={flare_mm}mm: {}", Shown(&clear.verdict));
+
+        // Multi-material regions + physical finishes + surface-conforming "07" + SVG chevron decal.
+        let mregs = [PartMaterialRegion::new(
+            "housing",
+            MaterialRegion {
+                role: MaterialRole(1),
+                rule: MaterialRule::RecessDepth { outer_shell: shell, min_depth: Length::mm(1.8) },
+            },
+        )];
+        let finishes = [
+            FinishAssignment {
+                role: MaterialRole(0),
+                finish: Some(SurfaceFinish::MoldedGrain {
+                    grain_size: Length::mm(0.8),
+                    depth: Length::mm(0.03),
+                    roughness_variation: 0.08,
+                }),
+                wear: Some(EdgeWearMask {
+                    substrate_colour: [0.64, 0.67, 0.71],
+                    substrate_metallic: 0.85,
+                    substrate_roughness: 0.30,
+                    curvature_threshold: 20.0,
+                    intensity: 0.5,
+                    noise_scale: Length::mm(3.0),
+                }),
+            },
+            FinishAssignment {
+                role: MaterialRole(2),
+                finish: Some(SurfaceFinish::BrushedMetal {
+                    direction: [1.0, 0.0, 0.0],
+                    pitch: Length::mm(0.5),
+                    depth: Length::mm(0.025),
+                    roughness_variation: 0.12,
+                }),
+                wear: None,
+            },
+        ];
+        let stencil = Decal::new(DecalOpts {
+            name: "stencil_07",
+            frame: shoulder_frame,
+            shape: DecalShape::Text {
+                text: "07",
+                height: Length::mm(16.0),
+                stroke_width: Length::mm(2.4),
+                tracking: 0.18,
+            },
+            material: DecalMaterial {
+                base_colour: [0.88, 0.28, 0.08, 1.0],
+                roughness: 0.35,
+                metallic: 0.05,
+                relief: Some(Length::mm(0.08)),
+            },
+            projection: DecalProjection::ConformalArcLength,
+            clip_role: Some(MaterialRole(0)),
+            ..
+        });
+        let svg_mark = Decal::new(DecalOpts {
+            name: "svg_arrow",
+            frame: outer_frame,
+            shape: DecalShape::SvgPath {
+                d: "M -6 -2 L 0 4 L 6 -2 Z",
+                scale: Length::mm(1.0),
+                filled: true,
+                stroke_width: Length::mm(1.0),
+            },
+            material: DecalMaterial { base_colour: [0.12, 0.12, 0.14, 1.0], roughness: 0.4, metallic: 0.1, relief: None },
+            ..
+        });
+        let decals = [PartDecal::new("housing", stencil), PartDecal::new("cover", svg_mark)];
+
+        let asset = build_game_asset(
+            model.graph_ref(),
+            model.parts(),
+            GameAssetOpts {
+                alloc: heap(),
+                scratch: heap(),
+                preset: AssetPreset::GameProp,
+                total_budget: Some(TriangleBudget(4_500)),
+                materials: &MATS,
+                material_regions: &mregs,
+                decals: &decals,
+                finishes: &finishes,
+                bake: Some(AssetBakeOpts { size: 128, gutter_px: 2, bake_cad_normals: true, normal_strength: 1.0 }),
+                fidelity: None,
+                ..
+            },
+            None,
+        )
+        .expect("build asset");
+
+        // Verify textured GLB contains embedded PNG textures and UVs/tangents via actual read_glb!
+        let loaded = read_glb(&asset.glb, GlbReadOpts { up: Up::Z, limits: blaze_cad_out::Limits::SHIPPED, alloc: heap(), scratch: heap() })
+            .expect("read_glb");
+        assert_eq!(loaded.parts.len(), 2);
+        assert!(loaded.images.len() >= 6, "both baked parts should embed 3 PNG maps each, got {}", loaded.images.len());
+        let h_mesh = loaded.parts[0].mesh.as_ref().expect("housing mesh");
+        assert!(h_mesh.view().uvs().is_some(), "housing GLB must carry TEXCOORD_0");
+        assert!(h_mesh.view().tangents().is_some(), "housing GLB must carry TANGENT");
+        let h_baked = asset.parts[0].baked.as_ref().expect("housing baked");
+        assert!(h_baked.decal_texels > 0, "07 decal must bake onto curved housing shoulder");
+        assert!(h_baked.covered_texels > 0);
+
+        (asset, outer_frame, shoulder_frame, shell_tape.aabb())
+    };
+
+    let (rev1, outer1, sh1, b1) = build_rev(3.0);
+    let (rev2, outer2, sh2, b2) = build_rev(10.0);
+
+    // Changing the shell curvature moves the live surface frames outward cleanly!
+    assert!(
+        (sh2.origin.y - sh1.origin.y).abs() > 0.002,
+        "shoulder frame must move with shell curvature: y1={} y2={}",
+        sh1.origin.y,
+        sh2.origin.y
+    );
+    assert!(
+        (outer2.origin - outer1.origin).length() > 0.001,
+        "outer_face frame must follow updated shell curvature"
+    );
+
+    // Render BOTH actual exported GLBs side-by-side from saved game cameras (Inspect + Zebra)!
+    let rig = GameCameraRig::standard_views(&b1.union(&b2), 96, 96, heap()).expect("rig");
+    let views = [(Some(rig[2].0), rig[2].1), (Some(rig[5].0), rig[5].1)];
+    let cmp = compare_glb_revisions(
+        &rev1.glb,
+        &rev2.glb,
+        &views,
+        GlbPreviewOpts {
+            supersample: 1,
+            strip_lights: [Some(StripLight::OVERHEAD_HORIZONTAL), None, None, None],
+            alloc: heap(),
+            scratch: heap(),
+            ..
+        },
+    )
+    .expect("compare glb revisions");
+    assert_eq!(cmp.views.len(), 2);
+    assert!(cmp.views[0].rms_error > 0.0, "Inspect view must detect curvature change between Rev 1 and Rev 2");
+    assert!(cmp.views[1].rms_error > 0.0, "Zebra view must detect curvature change between Rev 1 and Rev 2");
+    assert!(!cmp.sheet_png.is_empty());
+
+    // Also test selective variable-radius rounding (`round_selected_edges`) on a sharp block.
+    let mut m3 = Model::new(ModelOpts { alloc: heap(), .. });
+    let blk = m3.graph().cuboid(BoxOpts { size: mm3(40.0, 40.0, 40.0), .. }).expect("blk");
+    let sel_rounded = round_selected_edges(
+        m3.graph(),
+        blk,
+        SelectedRoundOpts {
+            profile: RadiusProfile::Constant(Length::mm(5.0)),
+            select: EdgeSelect::Box { lo: mm3(10.0, 10.0, -25.0), hi: mm3(25.0, 25.0, 25.0), fade: Length::mm(3.0) },
+            step: Length::mm(2.0),
+            scratch: heap(),
+            ..
+        },
+    )
+    .expect("round_selected_edges");
+    let t_sel = compile(m3.graph_ref(), sel_rounded.id(), blaze_cad_field::CompileOpts { alloc: heap(), .. }).expect("t_sel");
+    let mut sc = Scratch::new(heap());
+    // Selected corner (+20, +20, 0) is rounded inward (outside solid, f > 0).
+    assert!(eval_point(&t_sel, Vec3::new(0.020, 0.020, 0.0), &mut sc) > 0.0005);
+    // Unselected opposite corner (-20, -20, 0) stays sharp (f ≈ 0)!
+    assert!(eval_point(&t_sel, Vec3::new(-0.020, -0.020, 0.0), &mut sc).abs() < 1e-4);
+}
+
+#[test]
+fn game_asset_pbr_cc0_sdf_bake_flecs_v42_and_pbr_preview_end_to_end() {
+    use blaze_cad_out::{
+        Anisotropy, FlecsOpts, ImageData, ImageId, Material, NormalTexture, OcclusionTexture, PbrTextures, TextureImage,
+        TextureRef, Transmission, Up,
+    };
+    use blaze_cad_picture::{MaterialLook, PbrOpts, Projection, View};
+    use blaze_pbr::{ProceduralKind, SmartMaterial, synthesize_cc0_pack};
+
+    let alloc = heap();
+    let mut model = Model::new(ModelOpts { alloc, .. });
+    let (hull, canopy) = {
+        let g = model.graph();
+        let body = g.cuboid(BoxOpts { size: mm3(320.0, 180.0, 110.0), round: Length::mm(14.0), .. }).expect("body");
+        let groove = g.cuboid(BoxOpts { size: mm3(160.0, 90.0, 60.0), round: Length::mm(8.0), .. }).expect("groove");
+        let groove = g.place(groove, Placement::shift(Length::mm(30.0), Length::ZERO, Length::mm(55.0))).expect("place groove");
+        let hull = g.difference(body, groove).expect("carve");
+        let glass = g.cuboid(BoxOpts { size: mm3(130.0, 76.0, 48.0), round: Length::mm(10.0), .. }).expect("glass");
+        let glass = g.place(glass, Placement::shift(Length::mm(30.0), Length::ZERO, Length::mm(60.0))).expect("place glass");
+        (hull, glass)
+    };
+    let (hull_id, _) = model.add(PartOpts { solid: hull, name: "hull" }).expect("add hull");
+    model.set_material(hull_id, MaterialRole(0)).expect("mat hull");
+    let (canopy_id, _) = model.add(PartOpts { solid: canopy, name: "canopy" }).expect("add canopy");
+    model.set_material(canopy_id, MaterialRole(1)).expect("mat canopy");
+    model.set_parent(canopy_id, Some(hull_id)).expect("parent");
+
+    let asm_tape = model.assembly_tape(alloc).expect("assembly tape");
+    let pack = synthesize_cc0_pack(
+        ProceduralKind::HullPlating { base_rgb: [0.32, 0.40, 0.48], metallic: 0.72, roughness: 0.34, panels: 2 },
+        64,
+        alloc,
+        alloc,
+    )
+    .expect("synth cc0");
+
+    let images = [
+        TextureImage { name: "hull_albedo", data: ImageData::Rgba8 { width: 64, height: 64, pixels: &pack.albedo.pixels } },
+        TextureImage { name: "hull_normal", data: ImageData::Rgba8 { width: 64, height: 64, pixels: &pack.normal.pixels } },
+        TextureImage { name: "hull_orm", data: ImageData::Rgba8 { width: 64, height: 64, pixels: &pack.orm.pixels } },
+    ];
+    let materials = [
+        Material {
+            name: "hull.titanium",
+            base_colour: [1.0, 1.0, 1.0, 1.0],
+            metallic: 1.0,
+            roughness: 1.0,
+            anisotropy: Some(Anisotropy { strength: 0.55, rotation: 0.0 }),
+            pbr_textures: PbrTextures {
+                base_colour: Some(TextureRef { image: ImageId(0), .. }),
+                normal: Some(NormalTexture { image: ImageId(1), scale: 1.0, .. }),
+                metallic_roughness: Some(TextureRef { image: ImageId(2), .. }),
+                occlusion: Some(OcclusionTexture { image: ImageId(2), strength: 0.9, .. }),
+                ..PbrTextures::NONE
+            },
+            cc0_pack: Some("cc0://blaze/TestHull_64"),
+            ..
+        },
+        Material {
+            name: "canopy.glass",
+            base_colour: [0.35, 0.65, 0.80, 1.0],
+            metallic: 0.0,
+            roughness: 0.06,
+            transmission: Some(Transmission { factor: 0.80, ior: 1.52, thickness: 0.015, .. }),
+            ..
+        },
+    ];
+    let sockets = [
+        PartSocket::new("hull", "thruster.main", Placement::shift(Length::mm(-160.0), Length::ZERO, Length::ZERO)),
+    ];
+
+    let asset = build_game_asset(
+        model.graph_ref(),
+        model.parts(),
+        GameAssetOpts {
+            alloc,
+            scratch: alloc,
+            preset: AssetPreset::GameProp,
+            total_budget: Some(TriangleBudget(4_000)),
+            materials: &materials,
+            images: &images,
+            sockets: &sockets,
+            pbr_mesh: Some(PbrMeshOpts::DEFAULT),
+            assembly_tape: Some(&asm_tape),
+            fidelity: None,
+            ..
+        },
+        None,
+    )
+    .expect("build pbr game asset");
+
+    for part in asset.parts.iter() {
+        let v = part.mesh.view();
+        assert!(v.uvs().is_some(), "part {} must have TEXCOORD_0", part.name.as_str());
+        assert!(v.tangents().is_some(), "part {} must have TANGENT", part.name.as_str());
+        assert!(v.colours().is_some(), "part {} must have baked SDF COLOR_0", part.name.as_str());
+    }
+
+    let json_len = u32::from_le_bytes([asset.glb[12], asset.glb[13], asset.glb[14], asset.glb[15]]) as usize;
+    let gltf_json = core::str::from_utf8(&asset.glb[20..20 + json_len]).expect("valid utf8 gltf json");
+    for needle in [
+        "\"TEXCOORD_0\"",
+        "\"TANGENT\"",
+        "\"COLOR_0\"",
+        "\"images\"",
+        "\"KHR_materials_anisotropy\"",
+        "\"KHR_materials_transmission\"",
+        "\"cc0://blaze/TestHull_64\"",
+        "\"thruster.main\"",
+    ] {
+        assert!(gltf_json.contains(needle), "GLB JSON missing {needle}");
+    }
+
+    let flecs = asset
+        .export_flecs_prefab(
+            &materials,
+            &sockets,
+            FlecsOpts {
+                module: Some("ships"),
+                prefab_name: "MiniScout",
+                asset_uri: "assets/mini_scout.glb",
+                up: Up::Y,
+                include_schema: true,
+                alloc,
+                scratch: alloc,
+            },
+        )
+        .expect("export flecs");
+    let flecs_txt = core::str::from_utf8(&flecs).expect("valid utf8 flecs");
+    for needle in [
+        "module ships",
+        "@tree ChildOf",
+        "(OnInstantiate, Copy)",
+        "(OnInstantiate, Inherit)",
+        "prefab MiniScout",
+        "cc0://blaze/TestHull_64",
+        "thruster.main",
+    ] {
+        assert!(flecs_txt.contains(needle), "Flecs v4.2 prefab missing {needle}:\n{flecs_txt}");
+    }
+
+    let looks = [
+        MaterialLook { textures: pack.view(1.0, false), smart: SmartMaterial::PAINTED_METAL },
+        MaterialLook::NONE,
+    ];
+    let view = View {
+        eye: mm3(480.0, -420.0, 260.0),
+        target: mm3(0.0, 0.0, 20.0),
+        projection: Projection::Perspective { fov: Angle::degrees(38.0) },
+        width: 96,
+        height: 72,
+        ..
+    };
+    let pbr = PbrOpts { ao_steps: 4, shadow_samples: 2, ..PbrOpts::STUDIO };
+    let pic_a = asset.preview_pbr(&materials, &looks, view, pbr, 1, alloc, alloc).expect("pbr preview a");
+    let pic_b = asset.preview_pbr(&materials, &looks, view, pbr, 1, alloc, alloc).expect("pbr preview b");
+    assert_eq!(&*pic_a.pixels, &*pic_b.pixels, "PBR+GI preview must be bit-for-bit deterministic");
+    assert!(pic_a.stats.hits > 100, "preview must hit the asset: {}", pic_a.stats.hits);
+
+    let prepared = asset.prepare_pbr_scene(&materials, alloc, alloc).expect("prepare_pbr_scene");
+    let scene_ref = prepared.as_ref();
+    let params = blaze_cad_picture::PbrRenderParams { material_looks: &looks, supersample: 1, .. };
+    let n = (view.width * view.height) as usize;
+    let mut hdr = std::vec![[0.0f64; 3]; n];
+    let mut gbuf = std::vec![blaze_cad_picture::GBufferPixel::SKY; n];
+    let mut depth = std::vec![f64::INFINITY; n];
+    let st = scene_ref
+        .render_pbr_rows(view, &params, &pbr, 0, view.height, &mut hdr, &mut gbuf, &mut depth)
+        .expect("render_pbr_rows");
+    assert_eq!(st.hits, pic_a.stats.hits, "PreparedMeshScene ray hits must match preview_pbr");
 }

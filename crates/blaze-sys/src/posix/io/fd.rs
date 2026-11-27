@@ -13,9 +13,7 @@ use core::ffi::{c_int, c_ulong, c_void};
 
 #[cfg(target_os = "macos")]
 use super::{counted, said};
-#[cfg(target_os = "macos")]
-use crate::Fd;
-use crate::{Errno, Path};
+use crate::{Errno, Fd, Path};
 
 // ---- Linux: the raw-system-call layer's own items. ----
 
@@ -112,7 +110,7 @@ pub use crate::linux::fdctl::{FallocateFlags, fallocate};
 /// libc::F_SEAL_WRITE (`Seals`). Linux: [`crate::linux::fdctl`].
 /// replaces libc::F_ADD_SEALS (with fcntl: blaze_sys::posix::io::add_seals(fd, Seals); Linux only)
 #[cfg(target_os = "linux")]
-pub use crate::linux::fdctl::{MemfdFlags, Seals, add_seals, memfd_create};
+pub use crate::linux::fdctl::{MemfdExec, MemfdFlags, Seals, add_seals, memfd_create, probe_memfd_exec};
 /// `fcntl`'s command numbers, for the comparison test with libc's.
 #[cfg(all(test, target_os = "linux"))]
 pub(in crate::posix::io) use crate::linux::fdctl::{
@@ -221,6 +219,9 @@ mod on_macos {
             TRUNCATE = 0x0400;
             /// `O_EXCL`. replaces libc::O_EXCL.
             EXCLUSIVE = 0x0800;
+            /// `O_EVTONLY`: open for event notifications only (`EVFILT_VNODE`), without blocking
+            /// volume unmount or updating access time. replaces libc::O_EVTONLY.
+            EVTONLY = 0x8000;
             /// `O_NOCTTY`. replaces libc::O_NOCTTY.
             NO_CONTROLLING_TTY = 0x0002_0000;
             /// `O_DIRECTORY`. replaces libc::O_DIRECTORY.
@@ -556,6 +557,56 @@ mod on_macos {
 #[blaze::nopanic]
 pub fn open(path: Path<'_>, flags: OpenFlags, mode: u32) -> Result<OwnedFd, Errno> {
     openat(CWD, path, flags, mode)
+}
+
+/// Non-blocking `flock` operations supported across both macOS and Linux.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FlockOp {
+    SharedNonBlock,
+    ExclusiveNonBlock,
+    Unlock,
+}
+
+/// Non-blocking advisory file lock (`flock`) across macOS and Linux.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn flock(fd: Fd, op: FlockOp) -> Result<(), Errno> {
+    #[cfg(target_os = "macos")]
+    {
+        let raw_op: c_int = match op {
+            FlockOp::SharedNonBlock => 1 | 4,
+            FlockOp::ExclusiveNonBlock => 2 | 4,
+            FlockOp::Unlock => 8,
+        };
+        // SAFETY: `flock` takes only integer fd and operation flags, touching no memory.
+        said(unsafe { crate::macos::cold::flock(fd.raw(), raw_op) }).map(|_| ())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use crate::linux::LockOp;
+        let lock_op = match op {
+            FlockOp::SharedNonBlock => LockOp::SHARED | LockOp::NONBLOCK,
+            FlockOp::ExclusiveNonBlock => LockOp::EXCLUSIVE | LockOp::NONBLOCK,
+            FlockOp::Unlock => LockOp::UNLOCK,
+        };
+        crate::linux::flock(fd, lock_op)
+    }
+}
+
+/// `mkdirat`: creates directory `path` beneath directory descriptor `dir` with permissions `mode`.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn mkdirat(dir: Fd, path: Path<'_>, mode: u32) -> Result<(), Errno> {
+    #[cfg(target_os = "macos")]
+    {
+        let mode_u16 = u16::try_from(mode).map_err(|_| Errno::Inval)?;
+        // SAFETY: `path` is a live NUL-terminated string read by libSystem's `mkdirat`.
+        said(unsafe { crate::macos::cold::mkdirat(dir.raw(), path.as_ptr().cast(), mode_u16) }).map(|_| ())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::mkdirat(dir, path, mode)
+    }
 }
 
 // ---- macOS: fcntl, dup, ioctl, preadv over libSystem ----

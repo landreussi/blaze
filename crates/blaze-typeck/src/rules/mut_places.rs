@@ -94,11 +94,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             let mut how = DIRECT;
             loop {
                 let node = self.body.expr(x)?;
-                if mutable[x.ix()] >= how {
+                let Some(slot) = mutable.get_mut(x.ix()) else {
+                    return Err(Stop::Error(CheckError::Malformed(Malformed::Expr(x))));
+                };
+                if *slot >= how {
                     // Its chain below was walked from it already, as strongly.
                     break;
                 }
-                mutable[x.ix()] = how;
+                *slot = how;
                 match node {
                     Expr::Paren(base)
                     | Expr::Field { base, .. }
@@ -106,7 +109,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     | Expr::Index { base, .. } => x = base,
                     Expr::Unary { op: UnOp::Deref, operand } => {
                         // `*p` of a raw pointer: the place below is only read for the pointer.
-                        let t = self.try_structurally_resolve(self.expr_ty[operand.ix()])?;
+                        let &op_ty = self.expr_ty.get(operand.ix()).ok_or(Stop::Error(CheckError::Malformed(Malformed::Expr(operand))))?;
+                        let t = self.try_structurally_resolve(op_ty)?;
                         if matches!(self.view(t), TyView::Ptr(..)) {
                             how = THROUGH_RAW;
                         }
@@ -145,10 +149,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             };
             let source = match *prev {
                 Some(t) => t,
-                None => self.expr_ty[e.ix()],
+                None => *self.expr_ty.get(e.ix()).ok_or(Stop::Error(CheckError::Malformed(Malformed::Expr(e))))?,
             };
             *prev = Some(target);
-            if kind != shared_deref || mutable[e.ix()] == UNUSED {
+            if kind != shared_deref || mutable.get(e.ix()).copied() == Some(UNUSED) {
                 continue;
             }
             let tr = match deref_mut {
@@ -166,7 +170,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             let args = self.mk_list(&[source])?;
             if self.ty.may_hold(Goal::Trait { trait_: tr, args }, &mut self.reads)? {
                 self.register_trait(tr, args, Cause::Expr(e))?;
-                self.adjust.column_mut::<1>()[i] = AdjustKind::Deref { overloaded: Some(Mutbl::Mut) };
+                self.adjust.set_kind(i, AdjustKind::Deref { overloaded: Some(Mutbl::Mut) });
             }
         }
         Ok(last)
@@ -306,7 +310,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
                 Pat::Or { alts } => work.extend_from_slice(body.pat_list(alts)?),
                 Pat::Ref { inner, .. } => work.push(inner),
-                Pat::Struct { fields, .. } => {
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                     for fp in body.field_pat_list(fields)? {
                         work.push(fp.pat);
                     }

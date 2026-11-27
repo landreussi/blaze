@@ -15,17 +15,17 @@
 
 use blaze_own::{Alloc, Soa, Vec};
 
-use crate::columns::{Adjusts, Callees, CapturePlaceRows, CaptureProjs, Captures, Checked, Closures, ConstArgs, ExprDefs, Fields, FruFields, PatConstArgs, PatDefs};
+use crate::columns::{Adjusts, Callees, CapturePlaceRows, CaptureProjs, Captures, Checked, Closures, ConstArgs, ExprDefs, Fields, FruFields, PatConstArgs, PatDefs, UnionPats};
 use crate::ty::ClosureKind;
 
 /// `Checked::selected`'s rows (impl-per-call).
 mod selected_rows;
 use crate::diag::{At, Diag, DiagCode};
 use crate::error::{CheckError, Limit, Malformed};
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, HashMap, Map, MapOpts};
 
 use crate::ids::{ExprId, ItemKey, List, PatId};
-use crate::machine::Machine;
+use crate::machine::{Machine, NAME_HASH_THRESHOLD};
 use crate::portable::{PNode, PTy, PortableTys};
 use crate::ty::{Ty, TyList, TyView, TypeCtx};
 use crate::world::World;
@@ -43,6 +43,8 @@ struct Export<'a> {
     /// Each exported handle: its portable type, and whether it held an unresolved variable
     /// (then the portable type is the error type).
     cache: HashMap<Ty, (PTy, bool), Alloc<'a>>,
+    /// Lazily populated `ExprId -> closure ordinal` map for O(1) `closure_ordinal` lookups.
+    closure_ordinals: Option<Map<ExprId, u32, FixedState, Alloc<'a>>>,
     steps: u64,
     /// Whether E0282 was reported by writeback.
     reported: bool,
@@ -71,7 +73,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
         };
         match v {
-            TyView::Tuple(l) | TyView::Adt(_, l) | TyView::FnDef(_, l) | TyView::FnPtr(l, _) | TyView::Opaque(_, l) => {
+            TyView::Tuple(l) | TyView::Record(_, l) | TyView::Union(l) | TyView::Adt(_, l) | TyView::FnDef(_, l) | TyView::FnPtr(l, _) | TyView::Opaque(_, l) => {
                 list(l, out)
             }
             TyView::Alias { args, .. } | TyView::ClosureOf { args, .. } => list(args, out),
@@ -164,6 +166,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             let (args, extra) = match g {
                 crate::ty::Goal::Trait { args, .. } | crate::ty::Goal::ConstHolds { args, .. } => (Some(args), None),
                 crate::ty::Goal::Projection { args, term, .. } => (Some(args), Some(term)),
+                crate::ty::Goal::ForFields { container, args, .. } => (Some(args), Some(container)),
                 crate::ty::Goal::WellFormed(t) => (None, Some(t)),
             };
             if let Some(l) = args {
@@ -178,7 +181,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             let kept = match g {
                 crate::ty::Goal::Trait { trait_, args } => Some(PendingGoal::Trait { trait_, args }),
                 crate::ty::Goal::Projection { trait_, args, name, term } => Some(PendingGoal::Projection { trait_, args, name, term }),
-                crate::ty::Goal::WellFormed(_) | crate::ty::Goal::ConstHolds { .. } => None,
+                crate::ty::Goal::WellFormed(_) | crate::ty::Goal::ConstHolds { .. } | crate::ty::Goal::ForFields { .. } => None,
             };
             if let (Some(k), Some(slot)) = (kept, pending.iter_mut().find(|s| s.is_none())) {
                 *slot = Some(k);
@@ -332,6 +335,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 TyView::Str => PNode::Str,
                 TyView::Never => PNode::Never,
                 TyView::Tuple(l) => PNode::Tuple(self.export_list(ex, x_res, l)?),
+                TyView::Record(s, l) => PNode::Record(s, self.export_list(ex, x_res, l)?),
+                TyView::Union(l) => PNode::Union(self.export_list(ex, x_res, l)?),
                 TyView::Ref(m, c) => PNode::Ref(m, one(ex, c, self.ty)?),
                 TyView::Ptr(m, c) => PNode::Ptr(m, one(ex, c, self.ty)?),
                 TyView::Array(c, n) => PNode::Array(one(ex, c, self.ty)?, one(ex, n, self.ty)?),
@@ -343,7 +348,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 // A closure of this body is named by its ordinal at the owner's own parameters
                 // (typeck.md, "A closure's identity"); its signature goes to `Checked::closures`.
                 TyView::Closure(e, _) => {
-                    let ordinal = self.closure_ordinal(e)?;
+                    let ordinal = self.closure_ordinal(ex, e)?;
                     let mut ps: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(self.own_params as usize, self.alloc);
                     for i in 0..self.own_params {
                         let is_const = self.own_consts.binary_search_by_key(&i, |&(index, _)| index).is_ok();
@@ -387,11 +392,209 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
 
     /// Closure `e`'s ordinal: the number of closure expressions before it in `ExprId` order
     /// (typeck.md, "A closure's identity": nested closures count in the item's sequence).
-    fn closure_ordinal(&self, e: ExprId) -> Result<u32, CheckError> {
-        let Some(before) = self.body.exprs.get(..e.ix()) else {
+    fn closure_ordinal(&self, ex: &mut Export<'a>, e: ExprId) -> Result<u32, CheckError> {
+        if e.ix() >= self.body.exprs.len() {
             return Err(CheckError::Malformed(crate::error::Malformed::Unreached(e)));
-        };
+        }
+        let map = ex.closure_ordinals.get_or_insert_with(|| {
+            let mut m = Map::new(MapOpts { hasher: FixedState, alloc: self.alloc, capacity: None });
+            let mut ord = 0u32;
+            for (i, expr) in self.body.exprs.iter().enumerate() {
+                if matches!(expr, crate::body::Expr::Closure { .. }) {
+                    m.insert(ExprId(i as u32), ord);
+                    ord += 1;
+                }
+            }
+            m
+        });
+        if let Some(&ord) = map.get(&e) {
+            return Ok(ord);
+        }
+        let before = &self.body.exprs[..e.ix()];
         Ok(before.iter().filter(|x| matches!(x, crate::body::Expr::Closure { .. })).count() as u32)
+    }
+
+    /// Rewrites every `PNode::Future` reachable from `root` (at top level or nested inside an
+    /// ADT, tuple, reference, combinator, etc.) to its cross-body identity `PNode::Coroutine`
+    /// (`coroutine_id::coroutine_ordinal` at the owner's generic parameters). Types that cross a
+    /// body boundary (`Checked::hidden`, `Checked::inferred_output`) must never carry a
+    /// body-local expression id.
+    fn canonicalize_futures(&self, out: &mut PortableTys<'a>, root: PTy) -> Result<PTy, CheckError> {
+        let to_idx = |id: u32| -> Result<usize, CheckError> {
+            usize::try_from(id).map_err(|_| CheckError::Malformed(Malformed::TypeOrder { node: id, child: id }))
+        };
+        let to_u32 = |at: usize| -> Result<u32, CheckError> {
+            u32::try_from(at).map_err(|_| CheckError::Malformed(Malformed::TypeOrder { node: u32::MAX, child: u32::MAX }))
+        };
+        let top = to_idx(root.0)?;
+        let len = top.checked_add(1).ok_or(CheckError::Malformed(Malformed::TypeOrder { node: root.0, child: root.0 }))?;
+        let mut reached: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(len, self.alloc);
+        reached.resize(len, false);
+        if let Some(slot) = reached.get_mut(top) {
+            *slot = true;
+        }
+        let mut children: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut has_future = false;
+        {
+            let view = out.view();
+            for at in (0..=top).rev() {
+                if !reached.get(at).copied().unwrap_or(false) {
+                    continue;
+                }
+                let at_u32 = to_u32(at)?;
+                let node = view.node(PTy(at_u32))?;
+                if matches!(node, PNode::Future(..)) {
+                    has_future = true;
+                    continue;
+                }
+                children.clear();
+                view.children_of(node, &mut children)?;
+                for &child in children.iter() {
+                    let child_idx = to_idx(child.0)?;
+                    let Some(slot) = reached.get_mut(child_idx) else {
+                        return Err(CheckError::Malformed(Malformed::TypeOrder { node: at_u32, child: child.0 }));
+                    };
+                    *slot = true;
+                }
+            }
+        }
+        if !has_future {
+            return Ok(root);
+        }
+        let mut ps: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(to_idx(self.own_params)?, self.alloc);
+        for i in 0..self.own_params {
+            let is_const = self.own_consts.binary_search_by_key(&i, |&(index, _)| index).is_ok();
+            ps.push(out.intern(if is_const { PNode::ConstParam(i) } else { PNode::Param(i) })?);
+        }
+        let owner_args = out.intern_list(&ps)?;
+        let mut mapped: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(len, self.alloc);
+        mapped.resize(len, PTy(u32::MAX));
+        let mut kids: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
+        let lookup = |mapped: &[PTy], at_u32: u32, c: PTy| -> Result<PTy, CheckError> {
+            let idx = to_idx(c.0)?;
+            mapped.get(idx).copied().ok_or(CheckError::Malformed(Malformed::TypeOrder { node: at_u32, child: c.0 }))
+        };
+        for at in 0..=top {
+            if !reached.get(at).copied().unwrap_or(false) {
+                continue;
+            }
+            let at_u32 = to_u32(at)?;
+            let cur = PTy(at_u32);
+            let raw = out.view().node(cur)?;
+            let map_list = |out: &mut PortableTys<'a>, l: List, mapped: &[PTy], kids: &mut Vec<PTy, Alloc<'a>>| -> Result<(List, bool), CheckError> {
+                kids.clear();
+                let mut changed = false;
+                for &c in out.view().list(l)? {
+                    let m = lookup(mapped, at_u32, c)?;
+                    changed |= m != c;
+                    kids.push(m);
+                }
+                if changed { Ok((out.intern_list(kids)?, true)) } else { Ok((l, false)) }
+            };
+            let next = match raw {
+                PNode::Future(e, ..) => {
+                    let Some(ordinal) = crate::coroutine_id::coroutine_ordinal(&self.body, e) else {
+                        return Err(CheckError::Malformed(crate::error::Malformed::Unreached(e)));
+                    };
+                    out.intern(PNode::Coroutine { owner: self.body.owner, ordinal, args: owner_args })?
+                }
+                PNode::Bool
+                | PNode::Char
+                | PNode::Int(_)
+                | PNode::Uint(_)
+                | PNode::Float(_)
+                | PNode::Str
+                | PNode::Never
+                | PNode::Param(_)
+                | PNode::ConstParam(_)
+                | PNode::Infer
+                | PNode::Error
+                | PNode::ExAuto(_)
+                | PNode::Foreign(_) => cur,
+                PNode::Ref(m, c) => {
+                    let mc = lookup(&mapped, at_u32, c)?;
+                    if mc == c { cur } else { out.intern(PNode::Ref(m, mc))? }
+                }
+                PNode::Ptr(m, c) => {
+                    let mc = lookup(&mapped, at_u32, c)?;
+                    if mc == c { cur } else { out.intern(PNode::Ptr(m, mc))? }
+                }
+                PNode::Slice(c) => {
+                    let mc = lookup(&mapped, at_u32, c)?;
+                    if mc == c { cur } else { out.intern(PNode::Slice(mc))? }
+                }
+                PNode::ConstValue { ty: c, bits } => {
+                    let mc = lookup(&mapped, at_u32, c)?;
+                    if mc == c { cur } else { out.intern(PNode::ConstValue { ty: mc, bits })? }
+                }
+                PNode::Array(a, b) => {
+                    let (ma, mb) = (lookup(&mapped, at_u32, a)?, lookup(&mapped, at_u32, b)?);
+                    if ma == a && mb == b { cur } else { out.intern(PNode::Array(ma, mb))? }
+                }
+                PNode::Pat(c, l) => {
+                    let mc = lookup(&mapped, at_u32, c)?;
+                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
+                    if mc == c && !ch { cur } else { out.intern(PNode::Pat(mc, ml))? }
+                }
+                PNode::ExProj { trait_, name, args, term } => {
+                    let mt = lookup(&mapped, at_u32, term)?;
+                    let (ml, ch) = map_list(out, args, &mapped, &mut kids)?;
+                    if mt == term && !ch { cur } else { out.intern(PNode::ExProj { trait_, name, args: ml, term: mt })? }
+                }
+                PNode::Tuple(l) => {
+                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::Tuple(ml))? }
+                }
+                PNode::Record(s, l) => {
+                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::Record(s, ml))? }
+                }
+                PNode::Union(l) => {
+                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::Union(ml))? }
+                }
+                PNode::Adt(k, l) => {
+                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::Adt(k, ml))? }
+                }
+                PNode::FnDef(k, l) => {
+                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::FnDef(k, ml))? }
+                }
+                PNode::FnPtr(l, h) => {
+                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::FnPtr(ml, h))? }
+                }
+                PNode::Closure { owner, ordinal, args } => {
+                    let (ml, ch) = map_list(out, args, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::Closure { owner, ordinal, args: ml })? }
+                }
+                PNode::Coroutine { owner, ordinal, args } => {
+                    let (ml, ch) = map_list(out, args, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::Coroutine { owner, ordinal, args: ml })? }
+                }
+                PNode::Alias { trait_, name, args } => {
+                    let (ml, ch) = map_list(out, args, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::Alias { trait_, name, args: ml })? }
+                }
+                PNode::Opaque(k, l) => {
+                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::Opaque(k, ml))? }
+                }
+                PNode::Dynamic(l) => {
+                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::Dynamic(ml))? }
+                }
+                PNode::ExTrait(k, l) => {
+                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::ExTrait(k, ml))? }
+                }
+            };
+            if let Some(slot) = mapped.get_mut(at) {
+                *slot = next;
+            }
+        }
+        mapped.get(top).copied().ok_or(CheckError::Malformed(Malformed::TypeOrder { node: root.0, child: root.0 }))
     }
 
     /// `resolve_type_vars_in_body`: the record, or the needs when writeback's own reads met a
@@ -401,9 +604,20 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let mut ex = Export {
             out: PortableTys::new_in(alloc),
             cache: HashMap::new_in(alloc),
+            closure_ordinals: None,
             steps: 0,
             reported: false,
         };
+        for &(schema, list) in self.record_schemas.iter() {
+            let names = if list.len == 0 {
+                &[][..]
+            } else {
+                self.record_names.get(list.range()).unwrap_or(&[])
+            };
+            ex.out
+                .register_record_schema(schema, names)
+                .map_err(|_| CheckError::Limit(Limit::Table))?;
+        }
         let mut expr_ty: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(self.expr_ty.len(), alloc);
         for i in 0..self.expr_ty.len() {
             let t = self.expr_ty[i];
@@ -481,6 +695,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         expr_defs.sort_by_key(|rows, i| rows.column::<0>()[i]);
         pat_defs.sort_by_key(|rows, i| rows.column::<0>()[i]);
+        let mut union_pats: UnionPats<'a> = Soa::with_capacity_in(self.union_pats.len(), alloc);
+        for &(p, kind) in self.union_pats.iter() {
+            union_pats.push((p, kind));
+        }
+        union_pats.sort_by_key(|rows, i| rows.column::<0>().get(i).copied().unwrap_or(PatId(0)));
         let mut fields: Fields<'a> = Soa::with_capacity_in(self.fields.len(), alloc);
         for &(e, v, f) in self.fields.iter() {
             fields.push((e, v, f));
@@ -512,21 +731,38 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         capture_places.sort_by_key(|rows, i| rows.column::<0>()[i]);
         // One row per closure expression, in `ExprId` order: row `i` is ordinal `i`. The kind
         // is the strongest of its captures' (`analyze_closures`'s rule, which settled it).
+        let closure_kinds_map = if self.closure_kinds.len() > NAME_HASH_THRESHOLD {
+            let mut m = Map::new(MapOpts { hasher: FixedState, alloc, capacity: Some(self.closure_kinds.len()) });
+            for &(c, k, env) in self.closure_kinds.iter() {
+                m.entry(c).or_insert((k, env));
+            }
+            Some(m)
+        } else {
+            None
+        };
+        let closure_sig_from_map = if self.closures.len() > NAME_HASH_THRESHOLD {
+            let mut m = Map::new(MapOpts { hasher: FixedState, alloc, capacity: Some(self.closures.len()) });
+            for c in self.closures.iter() {
+                m.entry(c.expr).or_insert(c.sig_from);
+            }
+            Some(m)
+        } else {
+            None
+        };
         let mut closures: Closures<'a> = Soa::new_in(alloc);
         for i in 0..self.body.exprs.len() {
             let e = ExprId(i as u32);
             if !matches!(self.body.exprs[i], crate::body::Expr::Closure { .. }) {
                 continue;
             }
-            let mut kind = ClosureKind::Fn;
-            let mut upvars = None;
-            for &(c, k, env) in self.closure_kinds.iter() {
-                if c == e {
-                    kind = k;
-                    upvars = env;
-                    break;
-                }
-            }
+            let (kind, upvars) = match &closure_kinds_map {
+                Some(m) => m.get(&e).copied().unwrap_or((ClosureKind::Fn, None)),
+                None => self
+                    .closure_kinds
+                    .iter()
+                    .find(|&&(c, _, _)| c == e)
+                    .map_or((ClosureKind::Fn, None), |&(_, k, env)| (k, env)),
+            };
             let t = self.ty.resolve(self.expr_ty[i])?;
             let sig = match self.ty.view(t) {
                 TyView::Closure(_, sig) => self.export(&mut ex, sig, At::Expr(e))?,
@@ -535,7 +771,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             let upvars = upvars.map(|t| self.export(&mut ex, t, At::Expr(e))).transpose()?;
             // Where its signature came from (D148): a closure the walk never reached took no
             // expectation, so every region of it is its maker's (`Inferred`).
-            let sig_from = self.closures.iter().find(|c| c.expr == e).map_or(crate::columns::SigFrom::Inferred, |c| c.sig_from);
+            let sig_from = match &closure_sig_from_map {
+                Some(m) => m.get(&e).copied().unwrap_or(crate::columns::SigFrom::Inferred),
+                None => self.closures.iter().find(|c| c.expr == e).map_or(crate::columns::SigFrom::Inferred, |c| c.sig_from),
+            };
             closures.push((e, kind, sig, upvars, sig_from));
         }
         // The fields each struct update takes from its base, exported before the diagnostics
@@ -696,21 +935,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         for &(k, t) in defined.iter() {
             let n = self.diags.len();
             let p = self.export(&mut ex, t, At::Body)?;
-            let p = match ex.out.view().node(p)? {
-                PNode::Future(e, ..) => {
-                    let Some(ordinal) = crate::coroutine_id::coroutine_ordinal(&self.body, e) else {
-                        return Err(CheckError::Malformed(crate::error::Malformed::Unreached(e)));
-                    };
-                    let mut ps: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(self.own_params as usize, self.alloc);
-                    for i in 0..self.own_params {
-                        let is_const = self.own_consts.binary_search_by_key(&i, |&(index, _)| index).is_ok();
-                        ps.push(ex.out.intern(if is_const { PNode::ConstParam(i) } else { PNode::Param(i) })?);
-                    }
-                    let args = ex.out.intern_list(&ps)?;
-                    ex.out.intern(PNode::Coroutine { owner: self.body.owner, ordinal, args })?
-                }
-                _ => p,
-            };
+            let p = self.canonicalize_futures(&mut ex.out, p)?;
             if self.diags.len() == n {
                 hidden.push((k, p));
             } else {
@@ -737,7 +962,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         awaited.sort_unstable_by_key(|r| r.0);
         // The impl chosen for each projection of a callee's signature at each call
         // (writeback/selected_rows.rs), over the body's own reads: before they are finished.
-        let selected = self.selected_rows(&mut ex, &closures);
+        let selected = self.selected_rows(&mut ex, &closures, &expr_ty, &adjusts);
         // Reading an unfiled coroutine supplies a stand-in. Any result of selection
         // using it (including a missing-facts error) belongs to this unfinished round.
         if self.reads.holed() {
@@ -757,10 +982,18 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let mut coroutine_witnesses = Vec::with_capacity_in(self.futures.len(), alloc);
         coroutine_witnesses.extend(self.futures.iter().map(|f| (f.expr, f.witness)));
         coroutine_witnesses.sort_unstable_by_key(|r| r.0);
+        let inferred_output = match self.inferred_output_ty {
+            Some(t) => {
+                let p = self.export(&mut ex, t, At::Expr(self.body.root))?;
+                Some(self.canonicalize_futures(&mut ex.out, p)?)
+            }
+            None => None,
+        };
         let (reads, needs) = self.reads.finish(alloc);
         Ok(crate::Outcome::Done(Checked {
             findings,
             undecided,
+            inferred_output,
             index_mut,
             suggests,
             hidden,
@@ -781,6 +1014,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             const_args,
             pat_const_args,
             pat_defs,
+            union_pats,
             fields,
             captures,
             capture_places,
@@ -843,6 +1077,8 @@ fn first_unknown(r: Recs<'_, '_>, alloc: Alloc<'_>) -> Result<Option<crate::erro
             PNode::Pat(c, l) => one(c) || any(l)?,
             PNode::ExProj { args, term, .. } => one(term) || any(args)?,
             PNode::Tuple(l)
+            | PNode::Record(_, l)
+            | PNode::Union(l)
             | PNode::Adt(_, l)
             | PNode::FnDef(_, l)
             | PNode::FnPtr(l, _)
@@ -893,7 +1129,7 @@ mod tests {
         let child = machine.common.bool_;
         let children = machine.ty.mk_list(&[child]).expect("elements");
         let parent = machine.ty.mk(TyView::Tuple(children)).expect("tuple");
-        let mut ex = Export { out: PortableTys::new_in(alloc), cache: HashMap::new_in(alloc), steps: 0, reported: false };
+        let mut ex = Export { out: PortableTys::new_in(alloc), cache: HashMap::new_in(alloc), closure_ordinals: None, steps: 0, reported: false };
 
         // Plant the traversal bug: assemble the list before its child was visited.
         assert_eq!(machine.export_list(&mut ex, parent, children), Err(CheckError::Malformed(Malformed::WritebackChild { owner, parent, child })));
@@ -910,5 +1146,69 @@ mod tests {
         let PNode::Tuple(list) = types.node(tuple).expect("tuple") else { panic!("expected (bool,)") };
         let &[element] = types.list(list).expect("elements") else { panic!("expected one element") };
         assert_eq!(types.node(element), Ok(PNode::Bool));
+    }
+
+    #[test]
+    fn many_closures_200_writeback_ordinals_and_hints_are_exact() {
+        use std::vec::Vec as StdVec;
+        use crate::ids::{LangItem, Name, UintTy};
+        use crate::world::PClause;
+
+        const N: usize = 200;
+        let mut fx = Fx::new();
+        let sized = fx.tr("Sized", 1, StdVec::new(), &[]);
+        fx.lang(LangItem::Sized, sized);
+        let u8_ = fx.ty(PNode::Uint(UintTy::U8));
+        let unit = fx.unit();
+        let (p0, p1) = (fx.param(0), fx.param(1));
+        let fn_once = fx.tr("FnOnce", 2, StdVec::new(), &["Output"]);
+        fx.lang(LangItem::FnOnce, fn_once);
+        let sup_once = fx.bound(fn_once, &[p0, p1]);
+        let fn_mut = fx.tr("FnMut", 2, std::vec![sup_once], &[]);
+        fx.lang(LangItem::FnMut, fn_mut);
+        let sup_mut = fx.bound(fn_mut, &[p0, p1]);
+        let fn_ = fx.tr("Fn", 2, std::vec![sup_mut], &[]);
+        fx.lang(LangItem::Fn, fn_);
+        let args_tuple = fx.tuple(&[u8_]);
+        let fn_args = fx.list(&[p0, args_tuple]);
+        let take_clauses = std::vec![
+            PClause::Trait { trait_: fn_, args: fn_args },
+            PClause::Projection { trait_: fn_once, args: fn_args, name: Name::of("Output"), term: u8_ },
+        ];
+        fx.func("take", 1, &[p0], u8_, take_clauses);
+        let main = fx.func("main", 0, &[], unit, StdVec::new());
+        fx.finish();
+
+        let mut b = Bb::new();
+        let mut stmts = StdVec::with_capacity(N);
+        let mut closure_exprs = StdVec::with_capacity(N);
+        for _ in 0..N {
+            let x = b.bind("x");
+            let x_use = b.local(x);
+            let cl = b.closure(&[x], x_use);
+            closure_exprs.push(cl);
+            let callee = b.path(&["take"]);
+            let call = b.call(callee, &[cl]);
+            stmts.push(b.semi(call));
+        }
+        let root = b.block(&stmts, None);
+
+        let alloc = Alloc::global();
+        let mut cx = InferCtx::new_in(alloc);
+        let c = match crate::check_with(&b.view(main, root), &fx, &mut cx, &crate::world::Needs::new_in(alloc), Plant::None, alloc).expect("check") {
+            crate::Outcome::Done(c) => c,
+            crate::Outcome::Need(n) => panic!("unexpected need: {n:?}"),
+        };
+        assert!(c.diags.is_empty(), "expected no diags, got {:?}", c.diags);
+        assert_eq!(c.closures.len(), N);
+        let view = c.types.view();
+        for (ord, &cl_expr) in closure_exprs.iter().enumerate() {
+            assert_eq!(c.closures.column::<0>()[ord], cl_expr);
+            assert_eq!(c.closures.column::<1>()[ord], ClosureKind::Fn);
+            let PNode::Closure { ordinal, .. } = view.node(c.expr_ty[cl_expr.ix()]).expect("closure ty") else {
+                panic!("expected PNode::Closure for closure {ord}");
+            };
+            assert_eq!(ordinal, ord as u32);
+        }
     }
 }

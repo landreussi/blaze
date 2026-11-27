@@ -380,7 +380,7 @@ fn expr(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, e: ExprId) -> fmt::
             };
             node(p, work, head, &[W::Expr(scrutinee), W::Rows(arms)])
         }
-        Expr::Loop { body, source } => {
+        Expr::Loop { body, source, .. } => {
             let head = match source {
                 LoopSource::Loop => "loop",
                 LoopSource::While => "loop/while",
@@ -456,6 +456,11 @@ fn expr(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, e: ExprId) -> fmt::
             StructBase::Expr(b) => node(p, work, "struct", &[W::Path(path), W::Rows(fields), W::S(".."), W::Expr(b)]),
             StructBase::Defaults => node(p, work, "struct", &[W::Path(path), W::Rows(fields), W::S("..")]),
         },
+        Expr::Record { fields, base } => match base {
+            StructBase::None => node(p, work, "record", &[W::Rows(fields)]),
+            StructBase::Expr(b) => node(p, work, "record", &[W::Rows(fields), W::S(".."), W::Expr(b)]),
+            StructBase::Defaults => node(p, work, "record", &[W::Rows(fields), W::S("..")]),
+        },
         Expr::Index { base, index } => node(p, work, "index", &[W::Expr(base), W::Expr(index)]),
         Expr::Closure { row } | Expr::FormatArgs { row } | Expr::MacroCall { row } => {
             work.push(W::Row(row));
@@ -465,6 +470,9 @@ fn expr(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, e: ExprId) -> fmt::
         Expr::OffsetOf { ty, fields } => node(p, work, "offset-of", &[W::Ty(ty), W::Names(fields)]),
         Expr::Underscore => p.atom("_"),
         Expr::Await(e) => node(p, work, "await", &[W::Expr(e)]),
+        Expr::InlineFor { pat, iter, body } => {
+            node(p, work, "inline-for", &[W::Pat(pat), W::Expr(iter), W::Expr(body)])
+        }
     }
 }
 
@@ -514,6 +522,10 @@ fn pat(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, x: PatId) -> fmt::Re
         Pat::Struct { path, fields, rest } => match rest {
             true => node(p, work, "struct", &[W::Path(path), W::Rows(fields), W::S("..")]),
             false => node(p, work, "struct", &[W::Path(path), W::Rows(fields)]),
+        },
+        Pat::Record { fields, rest } => match rest {
+            true => node(p, work, "record_pat", &[W::Rows(fields), W::S("..")]),
+            false => node(p, work, "record_pat", &[W::Rows(fields)]),
         },
         Pat::Or { alts } => node(p, work, "or", &[W::Pats(alts)]),
         Pat::Slice { elems, .. } => node(p, work, "slice", &[W::Pats(elems)]),
@@ -593,6 +605,12 @@ fn ty(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, t: TypeId) -> fmt::Re
         TypeRef::For { binder, inner } => node(p, work, "for", &[W::Rows(binder), W::Ty(inner)]),
         TypeRef::Pat { base, pat: TyPat::NotNull } => node(p, work, "pattern_type", &[W::Ty(base), W::S("!null")]),
         TypeRef::Pat { base, pat: TyPat::Of(pat) } => node(p, work, "pattern_type", &[W::Ty(base), W::Pat(pat)]),
+        TypeRef::Pat { base, pat: TyPat::In(c) } => match p.v.const_range(c) {
+            Ok(r) => node(p, work, "pattern_type", &[W::Ty(base), W::S("in"), W::Src(r)]),
+            Err(b) => node(p, work, "pattern_type", &[W::Ty(base), W::S("in"), W::Bad(b)]),
+        },
+        TypeRef::Record(fields) => node(p, work, "record_type", &[W::Rows(fields)]),
+        TypeRef::Union(members) => node(p, work, "union_type", &[W::Types(members)]),
         TypeRef::Error => p.atom("(error)"),
     }
 }
@@ -868,6 +886,12 @@ fn row(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, r: RowIdx) -> fmt::R
                 Ok(r) => node(p, work, "const-pred", &[W::Src(r)]),
                 Err(b) => node(p, work, "const-pred", &[W::Bad(b)]),
             },
+            Ok(WherePred::ForFields { param, container, subject, bounds }) => node(
+                p,
+                work,
+                "for-fields-pred",
+                &[W::Name(param), W::Ty(container), W::Ty(subject), W::Rows(bounds)],
+            ),
             Err(b) => p.atom_fmt(format_args!("<bad {}>", b.column)),
         },
         ROW_ATTR => match p.v.attr(n) {

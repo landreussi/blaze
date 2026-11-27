@@ -11,6 +11,8 @@
 
 use std::{io, path::Path};
 
+use blaze_own::Share;
+
 use crate::{Access, FileName};
 
 /// See [`crate::Effect::Private`]. `dir` is the path of `name`.
@@ -19,12 +21,12 @@ pub(crate) fn private(dir: &Path, name: &FileName) -> io::Result<Option<(FileNam
     let (access, gate) = os::top(dir)?;
     if access != Access::Alone {
         // clone: the refusal names the directory
-        return Ok(Some((name.clone(), access)));
+        return Ok(Some((name.share(), access)));
     }
     os::close(dir)?;
     let start = name.as_str().len() + 1;
     // clone: the listing's name of the store, a refcount.
-    for (file, _) in super::list(dir, &crate::DirName::Named(name.clone()))? {
+    for (file, _) in super::list(dir, &crate::DirName::Named(name.share()))? {
         // alloc: once per file of the store, at its open
         let path = dir.join(&file.as_str()[start..]);
         match os::under(&path, &gate) {
@@ -66,21 +68,24 @@ mod os {
     }
 
     /// The directory's access, and what of a file's bits under it lets someone else write it:
-    /// others' always, the group's while the directory lets its group through.
+    /// others' always, the group's while the directory lets its group through. Also takes the
+    /// group's and others' bits off the directory in one `metadata` call when already needed.
     pub(super) fn top(dir: &Path) -> io::Result<(Access, Gate)> {
         let meta = std::fs::metadata(dir)?;
         let user = crate::raw::euid();
-        let refused = if meta.mode() & 0o010 != 0 { 0o022 } else { 0o002 };
-        Ok((of(&meta, user, 0o022), Gate { user, refused }))
-    }
-
-    /// Takes the group's and others' bits off the directory.
-    pub(super) fn close(dir: &Path) -> io::Result<()> {
-        let mut permissions = std::fs::metadata(dir)?.permissions();
-        if permissions.mode() & 0o077 != 0 {
-            permissions.set_mode(permissions.mode() & !0o077);
+        let mode = meta.mode();
+        let refused = if mode & 0o010 != 0 { 0o022 } else { 0o002 };
+        let access = of(&meta, user, 0o022);
+        if access == Access::Alone && mode & 0o077 != 0 {
+            let mut permissions = meta.permissions();
+            permissions.set_mode(mode & !0o077);
             std::fs::set_permissions(dir, permissions)?;
         }
+        Ok((access, Gate { user, refused }))
+    }
+
+    /// Already closed in [`top`] when `Access::Alone`.
+    pub(super) fn close(_dir: &Path) -> io::Result<()> {
         Ok(())
     }
 

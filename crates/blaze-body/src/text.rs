@@ -243,11 +243,7 @@ fn list<W: Write>(w: &mut W, l: List) -> fmt::Result {
 /// The text name of `x`. Every form of the three primitive enums is in its table (one row per
 /// variant, `code`'s encode reads the same tables), so the search always finds it.
 fn named<T: PartialEq + Copy>(table: &[(T, &'static str)], x: T) -> &'static str {
-    let mut i = 0;
-    while table[i].0 != x {
-        i += 1;
-    }
-    table[i].1
+    table.iter().find_map(|&(t, name)| (t == x).then_some(name)).unwrap_or("")
 }
 
 /// One overlay node in the text form (the module's `node`).
@@ -264,6 +260,14 @@ fn ty_node<W: Write>(w: &mut W, n: PNode) -> fmt::Result {
         PNode::Float(t) => w.write_str(named(&FLOAT_TYS, t)),
         PNode::Tuple(l) => {
             w.write_str("tuple ")?;
+            list(w, l)
+        }
+        PNode::Record(s, l) => {
+            write!(w, "record s{:x} ", s.0)?;
+            list(w, l)
+        }
+        PNode::Union(l) => {
+            w.write_str("union ")?;
             list(w, l)
         }
         PNode::Ref(m, t) => write!(w, "ref {}t{}", if m == Mutbl::Mut { "mut " } else { "" }, t.0),
@@ -312,30 +316,91 @@ fn ty_node<W: Write>(w: &mut W, n: PNode) -> fmt::Result {
     }
 }
 
+fn write_proj<W: Write>(w: &mut W, proj: Proj, of_drop_type: bool) -> fmt::Result {
+    let minus = |from_end: bool| if from_end { "-" } else { "" };
+    match proj {
+        Proj::Field { index, ty } => write!(w, ".{index}:t{}", ty.0)?,
+        Proj::Deref => w.write_str(".*")?,
+        Proj::DerefBox => w.write_str(".box")?,
+        Proj::Index(l) => write!(w, "[{l}]")?,
+        Proj::ConstIndex { offset, min_length, from_end } => {
+            write!(w, "[{}{offset} of {min_length}]", minus(from_end))?;
+        }
+        Proj::Subslice { from, to, from_end } => write!(w, "[{from}..{}{to}]", minus(from_end))?,
+        Proj::Downcast(v) => write!(w, "#{v}")?,
+    }
+    if of_drop_type {
+        w.write_str("!")?;
+    }
+    Ok(())
+}
+
 fn place<W: Write>(b: &BodyRef<'_>, p: Place, w: &mut W) -> Result<(), PrintError> {
-    let row = b.place(p)?;
-    match (row.parent, row.proj) {
-        (None, None) => write!(w, "{}", row.local)?,
-        // A parent is an earlier row (verify's rule), which also ends this recursion.
-        (Some(up), Some(proj)) if up.0 < p.0 => {
-            place(b, up, w)?;
-            let minus = |from_end: bool| if from_end { "-" } else { "" };
-            match proj {
-                Proj::Field { index, ty } => write!(w, ".{index}:t{}", ty.0)?,
-                Proj::Deref => w.write_str(".*")?,
-                Proj::DerefBox => w.write_str(".box")?,
-                Proj::Index(l) => write!(w, "[{l}]")?,
-                Proj::ConstIndex { offset, min_length, from_end } => {
-                    write!(w, "[{}{offset} of {min_length}]", minus(from_end))?;
+    const BUF: usize = 64;
+    let mut projs: [Option<(Proj, bool)>; BUF] = [None; BUF];
+    let mut depth: usize = 0;
+    let mut cur = p;
+    let root_local = loop {
+        let row = b.place(cur)?;
+        match (row.parent, row.proj) {
+            (None, None) => break row.local,
+            // A parent is an earlier row (verify's rule), which also ends this walk.
+            (Some(up), Some(proj)) if up.0 < cur.0 => {
+                if let Some(slot) = projs.get_mut(depth) {
+                    *slot = Some((proj, row.of_drop_type));
                 }
-                Proj::Subslice { from, to, from_end } => write!(w, "[{from}..{}{to}]", minus(from_end))?,
-                Proj::Downcast(v) => write!(w, "#{v}")?,
+                depth += 1;
+                cur = up;
             }
-            if row.of_drop_type {
-                w.write_str("!")?;
+            _ => return Err(PrintError::Bad(BadRow { table: Table::Places, row: cur.0, code: NONE })),
+        }
+    };
+    write!(w, "{root_local}")?;
+    if depth <= BUF {
+        if let Some(slice) = projs.get(..depth) {
+            for entry in slice.iter().rev() {
+                if let Some((proj, of_drop_type)) = *entry {
+                    write_proj(w, proj, of_drop_type)?;
+                }
             }
         }
-        _ => return Err(PrintError::Bad(BadRow { table: Table::Places, row: p.0, code: NONE })),
+        return Ok(());
+    }
+    // Deep place (> BUF projections): emit in chunks from root to leaf without heap allocation.
+    let mut emitted: usize = 0;
+    while emitted < depth {
+        let chunk = (depth - emitted).min(BUF);
+        let skip = depth - emitted - chunk;
+        let mut cur = p;
+        for _ in 0..skip {
+            let row = b.place(cur)?;
+            let Some(up) = row.parent else {
+                return Err(PrintError::Bad(BadRow { table: Table::Places, row: cur.0, code: NONE }));
+            };
+            cur = up;
+        }
+        let mut filled: usize = 0;
+        for _ in 0..chunk {
+            let row = b.place(cur)?;
+            match (row.parent, row.proj) {
+                (Some(up), Some(proj)) => {
+                    if let Some(slot) = projs.get_mut(filled) {
+                        *slot = Some((proj, row.of_drop_type));
+                    }
+                    filled += 1;
+                    cur = up;
+                }
+                _ => return Err(PrintError::Bad(BadRow { table: Table::Places, row: cur.0, code: NONE })),
+            }
+        }
+        if let Some(slice) = projs.get(..filled) {
+            for entry in slice.iter().rev() {
+                if let Some((proj, of_drop_type)) = *entry {
+                    write_proj(w, proj, of_drop_type)?;
+                }
+            }
+        }
+        emitted += chunk;
     }
     Ok(())
 }
@@ -525,6 +590,7 @@ fn stmt<W: Write>(b: &BodyRef<'_>, kind: StmtKind, w: &mut W) -> Result<(), Prin
             unwind(u, w)?;
         }
         StmtKind::Suspend { resume, cancel } => write!(w, "suspend resume {resume} cancel {cancel}")?,
+        StmtKind::Cancelled => w.write_str("cancelled")?,
         StmtKind::Return => w.write_str("return")?,
         StmtKind::Unreachable => w.write_str("unreachable")?,
         StmtKind::Resume => w.write_str("resume")?,
@@ -536,6 +602,19 @@ fn stmt<W: Write>(b: &BodyRef<'_>, kind: StmtKind, w: &mut W) -> Result<(), Prin
                 write!(w, " then {t}")?;
             }
             unwind(u, w)?;
+        }
+        StmtKind::TailCall { callee, args } => {
+            w.write_str("tail_call ")?;
+            match b.callee(callee)? {
+                Callee::FnItem { key, args } => item(w, "fn", key, args)?,
+                Callee::Method { key, args } => item(w, "method", key, args)?,
+                Callee::Intrinsic { key, args } => item(w, "intrinsic", key, args)?,
+                Callee::Value(o) => {
+                    w.write_str("value ")?;
+                    operand(b, o, w)?;
+                }
+            }
+            ops(b, args, w)?;
         }
     }
     Ok(())
@@ -555,7 +634,7 @@ impl<'s> Cur<'s> {
     }
 
     fn rest(&self) -> &'s str {
-        &self.line[self.at..]
+        self.line.get(self.at..).unwrap_or("")
     }
 
     fn err(&self, what: ParseWhat) -> ParseError {
@@ -583,7 +662,7 @@ impl<'s> Cur<'s> {
         self.tight(t)
     }
 
-    fn expect(&mut self, t: &'static str) -> Result<(), ParseError> {
+    fn need(&mut self, t: &'static str) -> Result<(), ParseError> {
         match self.eat(t) {
             true => Ok(()),
             false => Err(self.err(ParseWhat::Expected(t))),
@@ -595,7 +674,7 @@ impl<'s> Cur<'s> {
         let rest = self.rest();
         let n = rest.bytes().take_while(|c| c.is_ascii_alphanumeric() || *c == b'_').count();
         self.at += n;
-        &rest[..n]
+        rest.get(..n).unwrap_or("")
     }
 
     /// The word `k`, consumed only when it is the next whole word.
@@ -613,7 +692,7 @@ impl<'s> Cur<'s> {
         let n = rest.bytes().take_while(|c| (*c as char).is_digit(radix)).count();
         let v = match n {
             0 => None,
-            _ => u128::from_str_radix(&rest[..n], radix).ok(),
+            _ => rest.get(..n).and_then(|s| u128::from_str_radix(s, radix).ok()),
         };
         let v = v.ok_or_else(|| self.err(ParseWhat::Number))?;
         self.at += n;
@@ -634,7 +713,7 @@ impl<'s> Cur<'s> {
 
     /// `p` then a decimal `u32` (`t5`, `bb2`, `'o1`).
     fn prefixed(&mut self, p: &'static str) -> Result<u32, ParseError> {
-        self.expect(p)?;
+        self.need(p)?;
         self.u32()
     }
 
@@ -657,7 +736,7 @@ fn header(c: &mut Cur<'_>) -> Result<(u32, BlockKind), ParseError> {
         true => BlockKind::Cleanup,
         false => BlockKind::Normal,
     };
-    c.expect(":")?;
+    c.need(":")?;
     c.done()?;
     Ok((id, kind))
 }
@@ -668,7 +747,7 @@ enum Row {
     Borrow { dest: Place, kind: BorrowKind, place: Place, loan: Loan, origin: Origin },
 }
 
-struct Parser<A: Allocator + Clone> {
+struct Parser<A: Allocator + Copy> {
     b: BodyBuilder<A>,
     ops: Vec<Operand, A>,
     cases: Vec<(u128, Block), A>,
@@ -676,12 +755,12 @@ struct Parser<A: Allocator + Clone> {
 }
 
 /// Reads a body in the text form, its tables in `alloc`.
-pub fn parse<A: Allocator + Clone>(text: &str, alloc: A) -> Result<Body<A>, ParseError> {
+pub fn parse<A: Allocator + Copy>(text: &str, alloc: A) -> Result<Body<A>, ParseError> {
     let mut p = Parser {
-        b: BodyBuilder::new_in(alloc.clone()),
-        ops: Vec::new_in(alloc.clone()),
-        cases: Vec::new_in(alloc.clone()),
-        bytes: Vec::new_in(alloc.clone()),
+        b: BodyBuilder::new_in(alloc),
+        ops: Vec::new_in(alloc),
+        cases: Vec::new_in(alloc),
+        bytes: Vec::new_in(alloc),
     };
     // Blocks first, by id, so a row may name a block written after it.
     let n = text.lines().filter(|l| is_header(l)).count();
@@ -730,7 +809,7 @@ pub fn parse<A: Allocator + Clone>(text: &str, alloc: A) -> Result<Body<A>, Pars
     p.b.finish().map_err(|e| ParseError { line: last as u32 + 1, col: 1, what: ParseWhat::Build(e) })
 }
 
-impl<A: Allocator + Clone> Parser<A> {
+impl<A: Allocator + Copy> Parser<A> {
     fn next_id(c: &Cur<'_>, table: Table, want: u32, found: u32) -> Result<(), ParseError> {
         match want == found {
             true => Ok(()),
@@ -755,27 +834,27 @@ impl<A: Allocator + Clone> Parser<A> {
     }
 
     fn item(c: &mut Cur<'_>) -> Result<(ItemKey, List), ParseError> {
-        c.expect("k")?;
+        c.need("k")?;
         let key = ItemKey(c.digits(16)?);
-        c.expect("<")?;
+        c.need("<")?;
         let start = c.num()?;
-        c.expect(",")?;
+        c.need(",")?;
         let len = c.num()?;
-        c.expect(">")?;
+        c.need(">")?;
         Ok((key, List { start, len }))
     }
 
     fn list(c: &mut Cur<'_>) -> Result<List, ParseError> {
-        c.expect("<")?;
+        c.need("<")?;
         let start = c.num()?;
-        c.expect(",")?;
+        c.need(",")?;
         let len = c.num()?;
-        c.expect(">")?;
+        c.need(">")?;
         Ok(List { start, len })
     }
 
     fn hex(c: &mut Cur<'_>, prefix: &'static str) -> Result<u128, ParseError> {
-        c.expect(prefix)?;
+        c.need(prefix)?;
         c.digits(16)
     }
 
@@ -802,6 +881,11 @@ impl<A: Allocator + Clone> Parser<A> {
             "infer" => PNode::Infer,
             "error" => PNode::Error,
             "tuple" => PNode::Tuple(Self::list(c)?),
+            "record" => {
+                let s = blaze_typeck::RecordSchema(u64::try_from(Self::hex(c, "s")?).map_err(|_| c.err(ParseWhat::Number))?);
+                PNode::Record(s, Self::list(c)?)
+            }
+            "union" => PNode::Union(Self::list(c)?),
             "ref" => {
                 let m = match c.keyword("mut") {
                     true => Mutbl::Mut,
@@ -870,7 +954,7 @@ impl<A: Allocator + Clone> Parser<A> {
             "local" => {
                 let l = Self::local(c)?;
                 Self::next_id(c, Table::Locals, locals, l.0)?;
-                c.expect(":")?;
+                c.need(":")?;
                 let ty = Self::ty(c)?;
                 let kind = match c.word() {
                     "return" => LocalKind::Return,
@@ -898,14 +982,14 @@ impl<A: Allocator + Clone> Parser<A> {
             "const" => {
                 let k = c.prefixed("c")?;
                 Self::next_id(c, Table::Consts, consts, k)?;
-                c.expect("=")?;
+                c.need("=")?;
                 let kind = match c.word() {
                     "scalar" => {
-                        c.expect("0x")?;
+                        c.need("0x")?;
                         Some(ConstKind::Scalar { bits: c.digits(16)? })
                     }
                     "bytes" => {
-                        c.expect("\"")?;
+                        c.need("\"")?;
                         self.bytes.clear();
                         while !c.tight("\"") {
                             let start = c.at;
@@ -926,14 +1010,14 @@ impl<A: Allocator + Clone> Parser<A> {
                         Some(ConstKind::FnItem { key, args })
                     }
                     "static" => {
-                        c.expect("k")?;
+                        c.need("k")?;
                         Some(ConstKind::StaticAddr(ItemKey(c.digits(16)?)))
                     }
                     "anon" => Some(ConstKind::Anon(ExprId(c.prefixed("e")?))),
                     "param" => Some(ConstKind::Param(c.num()?)),
                     _ => return Err(c.err(ParseWhat::Expected("a constant's kind"))),
                 };
-                c.expect(":")?;
+                c.need(":")?;
                 let ty = Self::ty(c)?;
                 c.done()?;
                 // Appended as written: a text may repeat a constant, and each keeps its number.
@@ -968,7 +1052,7 @@ impl<A: Allocator + Clone> Parser<A> {
                 };
                 let t = Self::ty(c)?;
                 Self::next_id(c, Table::Types, ty_base.saturating_add(view.own_tys()), t.0)?;
-                c.expect("=")?;
+                c.need("=")?;
                 let node = Self::ty_node(c)?;
                 c.done()?;
                 self.b.push_ty_row(encode_ty(node));
@@ -982,7 +1066,7 @@ impl<A: Allocator + Clone> Parser<A> {
             }
             "known" => {
                 let from = Self::origin(c)?;
-                c.expect(":")?;
+                c.need(":")?;
                 let into = Self::origin(c)?;
                 c.done()?;
                 self.b.known(from, into);
@@ -1025,7 +1109,7 @@ impl<A: Allocator + Clone> Parser<A> {
                         let from_end = c.tight("-");
                         Proj::Subslice { from: a, to: c.u32()?, from_end }
                     } else {
-                        c.expect("of")?;
+                        c.need("of")?;
                         Proj::ConstIndex { offset: a, min_length: c.num()?, from_end: back }
                     }
                 };
@@ -1053,7 +1137,7 @@ impl<A: Allocator + Clone> Parser<A> {
     }
 
     fn ops(&mut self, c: &mut Cur<'_>) -> Result<Ops, ParseError> {
-        c.expect("(")?;
+        c.need("(")?;
         self.ops.clear();
         if !c.eat(")") {
             loop {
@@ -1062,18 +1146,18 @@ impl<A: Allocator + Clone> Parser<A> {
                 if c.eat(")") {
                     break;
                 }
-                c.expect(",")?;
+                c.need(",")?;
             }
         }
         Ok(self.b.operands(&self.ops))
     }
 
     fn two(&mut self, c: &mut Cur<'_>) -> Result<(Operand, Operand), ParseError> {
-        c.expect("(")?;
+        c.need("(")?;
         let lhs = self.operand(c)?;
-        c.expect(",")?;
+        c.need(",")?;
         let rhs = self.operand(c)?;
-        c.expect(")")?;
+        c.need(")")?;
         Ok((lhs, rhs))
     }
 
@@ -1133,9 +1217,9 @@ impl<A: Allocator + Clone> Parser<A> {
             }
             "cast" => {
                 let kind = CastKind::from_name(c.word()).ok_or_else(|| c.err(ParseWhat::Expected("a cast kind")))?;
-                c.expect("(")?;
+                c.need("(")?;
                 let operand = self.operand(c)?;
-                c.expect(")")?;
+                c.need(")")?;
                 if !c.keyword("as") {
                     return Err(c.err(ParseWhat::Expected("as")));
                 }
@@ -1153,11 +1237,11 @@ impl<A: Allocator + Clone> Parser<A> {
                 Value::Aggregate { kind, ty, operands: self.ops(c)? }
             }
             "repeat" => {
-                c.expect("(")?;
+                c.need("(")?;
                 let operand = self.operand(c)?;
-                c.expect(",")?;
+                c.need(",")?;
                 let count = Const(c.prefixed("c")?);
-                c.expect(")")?;
+                c.need(")")?;
                 Value::Repeat { operand, count }
             }
             "len" => Value::Len(self.place(c)?),
@@ -1170,9 +1254,9 @@ impl<A: Allocator + Clone> Parser<A> {
                     let (lhs, rhs) = self.two(c)?;
                     Value::Binary { op, lhs, rhs }
                 } else if let Some(op) = UnOp::from_name(w) {
-                    c.expect("(")?;
+                    c.need("(")?;
                     let operand = self.operand(c)?;
-                    c.expect(")")?;
+                    c.need(")")?;
                     Value::Unary { op, operand }
                 } else {
                     *c = start;
@@ -1202,7 +1286,7 @@ impl<A: Allocator + Clone> Parser<A> {
         c.ws();
         if c.rest().starts_with('_') {
             let dest = self.place(c)?;
-            c.expect("=")?;
+            c.need("=")?;
             return self.value(c, dest);
         }
         let k = match c.word() {
@@ -1221,19 +1305,19 @@ impl<A: Allocator + Clone> Parser<A> {
             "goto" => StmtKind::Goto(Self::block(c)?),
             "switch" => {
                 let on = self.operand(c)?;
-                c.expect("[")?;
+                c.need("[")?;
                 self.cases.clear();
                 if !c.eat("]") {
                     loop {
                         c.ws();
                         let v = c.digits(10)?;
-                        c.expect("->")?;
+                        c.need("->")?;
                         let t = Self::block(c)?;
                         self.cases.push((v, t));
                         if c.eat("]") {
                             break;
                         }
-                        c.expect(",")?;
+                        c.need(",")?;
                     }
                 }
                 let cases = self.b.cases(&self.cases);
@@ -1266,13 +1350,13 @@ impl<A: Allocator + Clone> Parser<A> {
             }
             "assert" => {
                 let cond = self.operand(c)?;
-                c.expect("==")?;
+                c.need("==")?;
                 let expected = match c.word() {
                     "true" => true,
                     "false" => false,
                     _ => return Err(c.err(ParseWhat::Expected("true or false"))),
                 };
-                c.expect(",")?;
+                c.need(",")?;
                 let kind = Self::assert_kind(c)?;
                 let msg = self.ops(c)?;
                 let target = Self::need_then(c)?;
@@ -1288,6 +1372,7 @@ impl<A: Allocator + Clone> Parser<A> {
                 }
                 StmtKind::Suspend { resume, cancel: Self::block(c)? }
             }
+            "cancelled" => StmtKind::Cancelled,
             "return" => StmtKind::Return,
             "unreachable" => StmtKind::Unreachable,
             "resume" => StmtKind::Resume,
@@ -1297,6 +1382,18 @@ impl<A: Allocator + Clone> Parser<A> {
                 let operands = self.ops(c)?;
                 let target = Self::then(c)?;
                 StmtKind::InlineAsm { asm, operands, target, unwind: Self::unwind(c)? }
+            }
+            "tail_call" => {
+                let callee = match c.word() {
+                    "fn" => Self::item(c).map(|(key, args)| Callee::FnItem { key, args })?,
+                    "method" => Self::item(c).map(|(key, args)| Callee::Method { key, args })?,
+                    "intrinsic" => Self::item(c).map(|(key, args)| Callee::Intrinsic { key, args })?,
+                    "value" => Callee::Value(self.operand(c)?),
+                    _ => return Err(c.err(ParseWhat::Expected("a callee"))),
+                };
+                let callee = self.b.callee(callee);
+                let args = self.ops(c)?;
+                StmtKind::TailCall { callee, args }
             }
             _ => return Err(c.err(ParseWhat::Expected("a statement"))),
         };
@@ -1331,7 +1428,7 @@ impl<A: Allocator + Clone> Parser<A> {
         if c.eat(";") {
             loop {
                 let from = Self::origin(c)?;
-                c.expect(":")?;
+                c.need(":")?;
                 let into = Self::origin(c)?;
                 self.b.subset(from, into);
                 if !c.eat(",") {

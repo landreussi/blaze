@@ -92,17 +92,25 @@ pub(crate) const END_DEADLINE: Nanos = Nanos(5_000_000_000);
 pub(crate) enum Host {
     Macos,
     Linux,
+    Other,
 }
 
 impl Host {
     /// The host this blaze was built for.
-    pub(crate) const THIS: Host = if cfg!(target_os = "linux") { Host::Linux } else { Host::Macos };
+    pub(crate) const THIS: Host = if cfg!(target_os = "linux") {
+        Host::Linux
+    } else if cfg!(target_os = "macos") {
+        Host::Macos
+    } else {
+        Host::Other
+    };
 
-    /// A test sandbox exists here (macOS `sandbox_init`; Linux's is not built: test.md piece 9).
+    /// A test sandbox exists here (macOS `sandbox_init` / Seatbelt; Linux Landlock + seccomp:
+    /// test.md piece 9).
     pub(crate) const fn has_sandbox(self) -> bool {
         match self {
-            Host::Macos => true,
-            Host::Linux => false,
+            Host::Macos | Host::Linux => true,
+            Host::Other => false,
         }
     }
 }
@@ -677,11 +685,35 @@ impl<'b, Z: Zygotes> Runner<'b, Z> {
             return Err(RunError::NothingOwed);
         }
         self.zygotes.wait(until)?;
-        let now = self.zygotes.now();
+        let mut now = self.zygotes.now();
+        let mut heard = self.zygotes.heard_len();
         let taken = self.take(suite, machine, answers, out, now);
         self.zygotes.clear();
         taken?;
+        // Drain any already-ready completions at `now` before declaring a remaining flight silent:
+        // a sibling's batch may have returned right as another flight finished or updated its
+        // parked credit. Bounded by the remaining flight count plus one (rule 18).
+        let max_drains = self.flights.len().saturating_add(1);
+        for _ in 0..max_drains {
+            if heard == 0 || !self.any_silent(now) {
+                break;
+            }
+            self.zygotes.wait(now)?;
+            now = self.zygotes.now();
+            heard = self.zygotes.heard_len();
+            let taken = self.take(suite, machine, answers, out, now);
+            self.zygotes.clear();
+            taken?;
+        }
         self.watch(suite, now)
+    }
+
+    fn any_silent(&self, now: Nanos) -> bool {
+        let Phase::Ready { at } = self.phase else { return false };
+        let budget = self.budget;
+        self.flights
+            .iter()
+            .any(|flight| !flight.expired && now >= answer_due(at, flight, budget, self.zygotes.parked(flight.row)))
     }
 
     /// One wake's batch: ready first, then the results by row (a timed-out one after the

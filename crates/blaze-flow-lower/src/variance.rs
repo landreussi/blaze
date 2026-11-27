@@ -58,7 +58,7 @@ enum Step {
     Pos(Variance),
 }
 
-impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R> {
+impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> {
     /// The variance of each origin position of `t` ([`Lower::npos_d`]'s count, in its layout
     /// order: a reference's own position before its referent's, an ADT's lifetimes before each
     /// argument's positions, a tuple's elements in order), relative to the whole value at
@@ -81,7 +81,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
             }
             return Ok(());
         }
-        let mut todo: Vec<Step, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: crate::SmallStack<Step, 16, A> = crate::SmallStack::new_in(self.alloc);
         match t.wrap {
             Some(m) => {
                 todo.push(Step::Ty(t.ty, under_ref(m)));
@@ -111,7 +111,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
                 }
                 PNode::Ptr(m, i) => todo.push(Step::Ty(i, v.then(under_ref(m)))),
                 PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => todo.push(Step::Ty(i, v)),
-                PNode::Tuple(l) => {
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => {
                     for &x in self.list(l, e)?.iter().rev() {
                         todo.push(Step::Ty(x, v));
                     }
@@ -239,12 +239,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
             }
             return Ok(());
         }
-        let mut bodies: Vec<(PTy, SlotCount), A> = Vec::new_in(self.alloc.clone());
+        let mut bodies: Vec<(PTy, SlotCount), A> = Vec::new_in(self.alloc);
         self.body_slots(t.ty, &mut bodies, e)?;
         let facts: &'b F = self.facts;
         let arity = FactsArity { facts };
         let types = BodyTypes::new(Columns::new(self.tys, &arity, &arity), &bodies);
-        let mut todo: Vec<Step, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: crate::SmallStack<Step, 16, A> = crate::SmallStack::new_in(self.alloc);
         match t.wrap {
             Some(m) => {
                 todo.push(Step::Ty(t.ty, under_ref(m)));

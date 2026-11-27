@@ -42,7 +42,7 @@ use super::{V, Walk, malformed, unsupported};
 use crate::BuildError;
 use crate::data::{DataRecord, DataTarget};
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Whether the checker listed borrow `e` as promoted (`Checked::promoted`, sorted).
     pub(super) fn is_promoted(&self, e: ExprId) -> bool {
         self.checked.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok()
@@ -70,13 +70,13 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         const TODO: u8 = 0;
         const OPEN: u8 = 1;
         let n = record.allocs.len();
-        let mut state: Vec<u8, A> = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut state: Vec<u8, A> = Vec::with_capacity_in(n, self.alloc);
         state.resize(n, TODO);
-        let mut rows: Vec<Option<RefId>, A> = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut rows: Vec<Option<RefId>, A> = Vec::with_capacity_in(n, self.alloc);
         rows.resize(n, None);
-        let mut stack: Vec<usize, A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<usize, A> = Vec::new_in(self.alloc);
         stack.push(0usize);
-        let mut relocs: Vec<DataReloc, A> = Vec::new_in(self.alloc.clone());
+        let mut relocs: Vec<DataReloc, A> = Vec::new_in(self.alloc);
         while let Some(&k) = stack.last() {
             if rows[k].is_some() {
                 stack.pop();
@@ -117,18 +117,23 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                     DataTarget::Fn(key) => {
                         let adts = self.adts;
                         let instance = adts.const_fn_instance(key, self.ground).ok_or(BuildError::NoConstFnInstance { expr: e, key })?;
-                        self.refuse_tracked_pointer(e, instance)?;
-                        let place = self.ref_place(instance);
+                        let target = self.reify_target(instance)?;
+                        let place = self.ref_place(target);
                         self.b.reference(RefKind::Func, place)
                     }
-                    DataTarget::Vtable(_) => return Err(unsupported(e, "a const holding a `&dyn Trait` (its vtable is not a reference of this function)")),
+                    DataTarget::Vtable(key) => {
+                        let adts = self.adts;
+                        let vtable = adts.const_vtable_ref(key, self.ground).ok_or(BuildError::NoConstVtable { expr: e, key })?;
+                        let place = self.vtable_place(vtable)?;
+                        self.b.reference(RefKind::Vtable, place)
+                    }
                 };
                 relocs.push(DataReloc { offset: r.offset, target, addend });
             }
             if a.mutable {
                 return Err(unsupported(e, "a const with a mutable allocation"));
             }
-            let mut bytes: Vec<u8, A> = Vec::with_capacity_in(a.bytes.len(), self.alloc.clone());
+            let mut bytes: Vec<u8, A> = Vec::with_capacity_in(a.bytes.len(), self.alloc);
             bytes.extend_from_slice(&a.bytes);
             // The word's addend is in the relocation: the row's bytes hold zero there.
             for r in relocs.iter() {

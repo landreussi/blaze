@@ -93,16 +93,17 @@ impl LoadNames<'static> for Loaded {
 /// The three crates of `texts` solved: the fresh solve's names and the records' reader, and
 /// each crate's root module.
 fn solved(texts: &'static Texts) -> (Names<'static>, RecordNames<'static, Loaded>, [ItemKey; 3]) {
-    let g = blaze_own::testing::heap().alloc();
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
     let inputs = [input("k0", "/k0/lib.rs", &[]), input("k1", "/k1/lib.rs", &[("k0", 0)]), input("k2", "/k2/lib.rs", &[("k1", 1)])];
-    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Serial, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("solve: {e:?}"));
+    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("solve: {e:?}"));
     let all: Vec<&'static CrateNames<'static>> = solved.iter().map(|s| s.names).collect();
     for (i, c) in all.iter().enumerate() {
         // The names step resolved `k2`'s root calls through its own `#[macro_use]` layer.
         assert!(c.notes.is_empty(), "crate k{i}: notes {:?}", c.notes);
     }
     let fresh = Names::of_crates(&inputs, Sysroot::default(), &all, g).unwrap_or_else(|e| panic!("names: {e:?}"));
-    let records: Vec<&'static [u8]> = all.iter().map(|n| aligned(&encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")), g)).collect();
+    let records: Vec<&'static [u8]> = all.iter().map(|n| aligned(&encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")), bump)).collect();
     let keys: Vec<CrateItemKey> = all.iter().map(|n| n.key).collect();
     let read = RecordNames::new(&keys, Loaded(records), g);
     let roots = [fresh.root(0), fresh.root(1), fresh.root(2)];
@@ -159,4 +160,43 @@ fn control_without_the_reexport_vec_is_not_found() {
     for (side, got) in ["fresh", "records"].into_iter().zip(macro_at(&fresh, &read, k2, "eprintln")) {
         assert_eq!(got.map(|r| r.def), Ok(want.def), "`eprintln` from k2's root ({side})");
     }
+}
+
+/// An out-of-line module file with inner `#![macro_use]` exports its `macro_rules!` to subsequent
+/// sibling modules, and a `#[cfg_attr(..., // comment, \n allow(...))]` comment with commas does
+/// not split into bogus attribute macros.
+#[test]
+fn inner_macro_use_on_out_of_line_module_and_cfg_attr_comments() {
+    static LIB: &str = "#![no_core]
+mod defs;
+mod user;
+#[cfg_attr(
+    not(feature = \"nope\"),
+    // NB: Rust 1.89, current stable, has commas here.
+    // however, does, allow below still parses cleanly.
+    allow(dead_code, reason = \"keep\")
+)]
+pub trait Kept {}
+";
+    static DEFS: &str = "#![macro_use]
+macro_rules! make_type {
+    ($name:ident) => { pub struct $name; };
+}
+";
+    static USER: &str = "make_type!(Made);
+pub type Alias = (Made, crate::Kept);
+";
+    static FILES: Texts = Texts(&[&[("/k/lib.rs", LIB), ("/k/defs.rs", DEFS), ("/k/user.rs", USER)]]);
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
+    let inputs = [input("k", "/k/lib.rs", &[])];
+    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), &FILES, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("solve: {e:?}"));
+    let c = solved[0].names;
+    assert!(c.notes.is_empty(), "expected no resolution notes, got {:?}", c.notes);
+    let fresh = Names::of_crates(&inputs, Sysroot::default(), &[c], g).unwrap_or_else(|e| panic!("names: {e:?}"));
+    let root = fresh.root(0);
+    let kept = Written { kind: PathKind::Plain, segments: &["Kept"] };
+    assert!(path(&fresh, root, Namespace::Types, kept, g).is_ok(), "`Kept` must be declared despite comments in #[cfg_attr]");
+    let made = Written { kind: PathKind::Plain, segments: &["user", "Made"] };
+    assert!(path(&fresh, root, Namespace::Types, made, g).is_ok(), "`user::Made` must expand via inner #![macro_use] in defs.rs");
 }

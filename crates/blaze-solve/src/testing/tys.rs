@@ -62,7 +62,7 @@ impl TestTys {
             }
             TyKind::Param(_) | TyKind::ConstParam(_) => f |= Flags::HAS_PARAM,
             TyKind::ReParam(_) => f |= Flags::HAS_FREE_REGION,
-            TyKind::Placeholder(..) => f |= Flags::HAS_PLACEHOLDER,
+            TyKind::Placeholder(..) | TyKind::RePlaceholder(..) => f |= Flags::HAS_PLACEHOLDER,
             TyKind::Alias(r, a, ..) => {
                 f |= Flags::HAS_ALIAS;
                 if a == crate::term::AliasKind::Opaque {
@@ -72,7 +72,7 @@ impl TestTys {
                     f |= Flags::HAS_NON_RIGID_ALIAS;
                 }
             }
-            TyKind::Bound(..) => f |= Flags::HAS_BOUND,
+            TyKind::Bound(..) | TyKind::ReBound(..) => f |= Flags::HAS_BOUND,
             TyKind::Error => f |= Flags::HAS_ERROR,
             TyKind::Canonical(_) => f |= Flags::HAS_CANONICAL,
             _ => {}
@@ -153,6 +153,8 @@ impl TestTys {
         };
         let k2 = match k {
             TyKind::Tuple(l) => TyKind::Tuple(list(self, l)?),
+            TyKind::Record(s, l) => TyKind::Record(s, list(self, l)?),
+            TyKind::Union(l) => TyKind::Union(list(self, l)?),
             TyKind::Ref(r, x, m) => TyKind::Ref(sub(self, r)?, sub(self, x)?, m),
             TyKind::RawPtr(x, m) => TyKind::RawPtr(sub(self, x)?, m),
             TyKind::Array(x, n) => TyKind::Array(sub(self, x)?, sub(self, n)?),
@@ -178,7 +180,8 @@ fn same_head(a: TyKind, b: TyKind) -> bool {
         (Int(x), Int(y)) => x == y,
         (Uint(x), Uint(y)) => x == y,
         (Float(x), Float(y)) => x == y,
-        (Tuple(x), Tuple(y)) => x.len == y.len,
+        (Tuple(x), Tuple(y)) | (Union(x), Union(y)) => x.len == y.len,
+        (Record(s1, x), Record(s2, y)) => s1 == s2 && x.len == y.len,
         (Ref(_, _, m), Ref(_, _, n)) | (RawPtr(_, m), RawPtr(_, n)) => m == n,
         (Adt(d, _), Adt(e, _))
         | (FnDef(d, _), FnDef(e, _))
@@ -192,7 +195,10 @@ fn same_head(a: TyKind, b: TyKind) -> bool {
         (Dynamic(x, _), Dynamic(y, _)) => x.len == y.len,
         (Array(..), Array(..)) | (Slice(_), Slice(_)) => true,
         (Param(i), Param(j)) | (ConstParam(i), ConstParam(j)) => i == j,
-        (Placeholder(u, i), Placeholder(v, j)) | (Bound(u, i), Bound(v, j)) => u == v && i == j,
+        (Placeholder(u, i), Placeholder(v, j))
+        | (Bound(u, i), Bound(v, j))
+        | (RePlaceholder(u, i), RePlaceholder(v, j))
+        | (ReBound(u, i), ReBound(v, j)) => u == v && i == j,
         (ConstValue(a, x), ConstValue(b, y)) => a == b && x == y,
         (Canonical(i), Canonical(j)) => i == j,
         _ => core::mem::discriminant(&a) == core::mem::discriminant(&b) && children_free(a),
@@ -308,6 +314,13 @@ impl Tys for TestTys {
                 continue;
             }
             let (kx, ky) = (self.nodes[x.0 as usize], self.nodes[y.0 as usize]);
+            if matches!(
+                (kx, ky),
+                (TyKind::RePlaceholder(..), TyKind::ReStatic) | (TyKind::ReStatic, TyKind::RePlaceholder(..))
+            ) {
+                fail(self, deferred);
+                return Ok(false);
+            }
             if is_region(kx) || is_region(ky) {
                 continue;
             }

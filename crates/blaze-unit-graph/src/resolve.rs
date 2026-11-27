@@ -131,6 +131,9 @@ pub struct Resolution<'l, 'a> {
     answers: AVec<'a, Answer<'a>>,
     /// Per package, per dependency entry: whether its platform holds on (target, host).
     holds: AVec<'a, AVec<'a, (bool, bool)>>,
+    /// Per package, per dependency entry: cached unambiguous target `LockId.0`, or `u32::MAX` to
+    /// run the full disambiguation path in [`Resolution::locked`].
+    cached_locked: AVec<'a, AVec<'a, u32>>,
     plant: Plant,
 }
 
@@ -141,11 +144,13 @@ impl<'l, 'a> Resolution<'l, 'a> {
         members.resize(n, false);
         let mut answers = Vec::with_capacity_in(n, alloc);
         let mut holds = Vec::with_capacity_in(n, alloc);
+        let mut cached_locked = Vec::with_capacity_in(n, alloc);
         for _ in 0..n {
             answers.push(Answer::Pending);
             holds.push(Vec::new_in(alloc));
+            cached_locked.push(Vec::new_in(alloc));
         }
-        Resolution { alloc, lock, target, host, ask, resolver, members, answers, holds, plant: Plant::None }
+        Resolution { alloc, lock, target, host, ask, resolver, members, answers, holds, cached_locked, plant: Plant::None }
     }
 
     #[cfg(test)]
@@ -184,6 +189,26 @@ impl<'l, 'a> Resolution<'l, 'a> {
                 }
             };
             holds.push(pair);
+        }
+        let me = self.lock.package(id);
+        let mut cached = Vec::with_capacity_in(package.deps.len(), self.alloc);
+        for dep in package.deps.iter() {
+            let mut found = u32::MAX;
+            let mut count = 0usize;
+            for &d in me.deps.iter() {
+                if self.lock.package(d).name == dep.package.as_str() {
+                    found = d.0;
+                    count += 1;
+                    if count > 1 {
+                        found = u32::MAX;
+                        break;
+                    }
+                }
+            }
+            cached.push(found);
+        }
+        if let Some(slot) = self.cached_locked.get_mut(id.index()) {
+            *slot = cached;
         }
         self.holds[id.index()] = holds;
         self.answers[id.index()] = Answer::Read(package);
@@ -256,6 +281,11 @@ impl<'l, 'a> Resolution<'l, 'a> {
 
     /// The locked package dependency entry `e` of `id` names.
     fn locked(&self, id: LockId, package: &Package<'a>, e: usize) -> Result<LockId, UnitError<'a>> {
+        if let Some(fast) = self.cached_locked.get(id.index()).and_then(|deps| deps.get(e)).copied()
+            && fast != u32::MAX
+        {
+            return Ok(LockId(fast));
+        }
         let dep = &package.deps[e];
         let me = self.lock.package(id);
         let mut found: Option<LockId> = None;
@@ -267,9 +297,10 @@ impl<'l, 'a> Resolution<'l, 'a> {
         }
         if count > 1 {
             // Several of the name: by the kind of source, then by the requirement.
-            let kind_fits = |d: LockId| match (&dep.source, &self.lock.package(d).source) {
+            let kind_fits = |d: LockId, allow_patched_path: bool| match (&dep.source, &self.lock.package(d).source) {
                 (DepSource::Path, source) => core::mem::discriminant(source) == core::mem::discriminant(&me.source),
                 (DepSource::Registry { .. }, LockSource::Registry { .. }) => true,
+                (DepSource::Registry { .. } | DepSource::Git { .. }, LockSource::Path) => allow_patched_path,
                 (DepSource::Git { url }, LockSource::Git { url: locked, .. }) => url.trim_end_matches(".git") == locked.trim_end_matches(".git"),
                 _ => false,
             };
@@ -283,9 +314,39 @@ impl<'l, 'a> Resolution<'l, 'a> {
             found = None;
             count = 0;
             for d in named() {
-                if kind_fits(d) && req.as_ref().is_none_or(|req| req.matches(&self.lock.package(d).version)) {
+                if kind_fits(d, false) && req.as_ref().is_none_or(|req| req.matches(&self.lock.package(d).version)) {
                     found = Some(d);
                     count += 1;
+                }
+            }
+            if count == 0 {
+                // A `[patch.*]` entry can replace a registry or git dependency with a checkout
+                // path package (`LockSource::Path`).
+                for d in named() {
+                    if kind_fits(d, true) && req.as_ref().is_none_or(|req| req.matches(&self.lock.package(d).version)) {
+                        found = Some(d);
+                        count += 1;
+                    }
+                }
+                if count > 1
+                    && let DepSource::Git { url } = &dep.source
+                {
+                    let want = url.trim_end_matches(".git");
+                    let mut narrowed = None;
+                    let mut narrowed_count = 0usize;
+                    for d in named() {
+                        if kind_fits(d, true)
+                            && let Some(Answer::Read(candidate)) = self.answers.get(d.index())
+                            && candidate.patched_from.iter().any(|src| src.trim_end_matches(".git") == want)
+                        {
+                            narrowed = Some(d);
+                            narrowed_count += 1;
+                        }
+                    }
+                    if narrowed_count == 1 {
+                        found = narrowed;
+                        count = 1;
+                    }
                 }
             }
         }
@@ -858,14 +919,20 @@ enum Kind {
 /// `runs_both_workspace_packages`).
 pub(crate) fn unit_cfg<'a>(desc: &TargetDesc<'a>, features: &[Text<'a>], test: bool, unwinds: bool, proc_macro: bool, alloc: Alloc<'a>) -> AVec<'a, CfgAtom<'a>> {
     let mut cfg = Vec::with_capacity_in(desc.cfg.len() + features.len() + 4, alloc);
+    for atom in desc.cfg.iter() {
+        if unwinds && atom.name.as_str() == PANIC_KEY {
+            continue;
+        }
+        cfg.push(CfgAtom {
+            name: own(atom.name.as_str(), alloc),
+            value: atom.value.as_deref().map(|v| own(v, alloc)),
+        });
+    }
     if unwinds {
-        cfg.extend(desc.cfg.iter().filter(|atom| atom.name.as_str() != PANIC_KEY).cloned());
         cfg.push(CfgAtom::pair(PANIC_KEY, "unwind", alloc));
-    } else {
-        cfg.extend(desc.cfg.iter().cloned());
     }
     for feature in features.iter() {
-        cfg.push(CfgAtom { name: own("feature", alloc), value: Some(feature.clone()) });
+        cfg.push(CfgAtom { name: own("feature", alloc), value: Some(own(feature.as_str(), alloc)) });
     }
     cfg.push(CfgAtom::flag("debug_assertions", alloc));
     if test {

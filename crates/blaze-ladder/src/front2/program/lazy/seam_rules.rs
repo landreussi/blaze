@@ -59,6 +59,44 @@ pub(in crate::front2::program) fn llvm_row(foreign: Option<&str>, link_name: Opt
     }))
 }
 
+/// Recognizes an IEEE-754 C `libm` ties-to-even rounding declaration (`roundevenf`/`roundeven`,
+/// `rintf`/`rint`, `nearbyintf`/`nearbyint`) with its exact scalar float signature and lowers
+/// direct calls in place to LIR `Op::Nearest` (`frintn` on ARM64) instead of linking a C symbol
+/// (macOS libSystem lacks C23 `roundevenf`/`roundeven`). The row keeps `FnKind::Foreign` and its
+/// C symbol so indirect uses keep their original ABI/symbol contract.
+pub(in crate::front2::program) fn libm_float_intrinsic(
+    abi: Abi,
+    symbol: &str,
+    head: &crate::front2::heads::FnHead<'_>,
+    tys: blaze_typeck::PTys<'_>,
+) -> Option<Intrinsic> {
+    use blaze_build::intrinsics::target::{
+        Target,
+        float::{FloatCall, FloatFn, Shape},
+    };
+    use blaze_typeck::{FloatTy, PNode};
+
+    if abi != Abi::C || head.parent != 0 || head.own != 0 || head.c_variadic || head.inputs.len() != 1 {
+        return None;
+    }
+    let name = symbol.strip_prefix('_').unwrap_or(symbol);
+    let (func, shape, want) = match name {
+        "roundevenf" => (FloatFn::Roundeven, Shape::F32, FloatTy::F32),
+        "roundeven" => (FloatFn::Roundeven, Shape::F64, FloatTy::F64),
+        "rintf" => (FloatFn::Rint, Shape::F32, FloatTy::F32),
+        "rint" => (FloatFn::Rint, Shape::F64, FloatTy::F64),
+        "nearbyintf" => (FloatFn::Nearbyint, Shape::F32, FloatTy::F32),
+        "nearbyint" => (FloatFn::Nearbyint, Shape::F64, FloatTy::F64),
+        _ => return None,
+    };
+    let input = tys.node(head.inputs[0]).ok()?;
+    let output = tys.node(head.output).ok()?;
+    if input != PNode::Float(want) || output != PNode::Float(want) {
+        return None;
+    }
+    Some(Intrinsic::Target(Target::Float(FloatCall { func, shape })))
+}
+
 /// A panic entry, allocator shim or std-internal declaration supplies the call's ABI.
 /// Its row has no outside symbol to link.
 pub(in crate::front2::program) fn bound_decl_row<'n, S: NamesSource<'n>>(
@@ -114,7 +152,7 @@ pub(in crate::front2::program) fn fn_abi<'n, S: NamesSource<'n>>(tabled: Option<
 /// The Reference, “The `track_caller` attribute”: “When applied to a function in a trait
 /// declaration, the attribute applies to all implementations.” This includes overrides of
 /// provided methods. An attribute on the impl method itself suffices independently.
-pub(in crate::front2::program) fn track_caller(keys: &Keys, store: &Store<'_>, key: ItemKey, own: impl Fn(ItemKey) -> Option<bool>) -> Option<bool> {
+pub(in crate::front2::program) fn track_caller<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'_>, key: ItemKey, own: impl Fn(ItemKey) -> Option<bool>) -> Option<bool> {
     if own(key)? {
         return Some(true);
     }
@@ -131,7 +169,10 @@ pub(in crate::front2::program) fn track_caller(keys: &Keys, store: &Store<'_>, k
             Some(crate::front2::keys::Origin::Item(lib)) => *lib,
             _ => store.fns.get(&key)?.lib,
         };
-        return store.maps.traits.contains_key(&lib).then_some(false);
+        if store.maps.traits.contains_key(&lib) || names.kind_of_item(lib) == Some(blaze_surface::ItemKind::Trait) {
+            return Some(false);
+        }
+        return None;
     };
     let Some(trait_) = imp.trait_ else {
         return Some(false);
@@ -140,48 +181,239 @@ pub(in crate::front2::program) fn track_caller(keys: &Keys, store: &Store<'_>, k
     own(declared)
 }
 
+/// The `(lib, text)` of function `k`'s signature for reading its attributes (`#[track_caller]`,
+/// `#[rustc_nounwind]`) when `k` has no tabled row yet.
+fn fn_sig_text<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, k: ItemKey) -> Option<(LibKey, &'n str)> {
+    if let Some(head) = store.fns.get(&k) {
+        Some((head.lib, head.text))
+    } else if let Some(crate::front2::keys::Origin::Member { container, kind: MemberKind::Fn, name }) = keys.origin(k) {
+        let lib = keys.library_in(names, *container)?;
+        let mut text = None;
+        let target = name.as_ref();
+        let listed = names.each_member_matching(
+            lib,
+            &mut |kind, mname| {
+                if kind == blaze_surface::ItemKind::Function && mname == Some(target) {
+                    crate::front2::source::MemberWant::WithText
+                } else {
+                    crate::front2::source::MemberWant::Skip
+                }
+            },
+            &mut |member| {
+                if member.kind == blaze_surface::ItemKind::Function && member.name == Some(target) {
+                    names.read_member_signature(member.key, member.written_by);
+                    text = Some(member.text);
+                }
+            },
+        );
+        if !listed {
+            return None;
+        }
+        Some((lib, text?))
+    } else if let Some(local) = store.locals.head(k) {
+        if local.kind != crate::front2::locals::LocalKind::Fn {
+            return None;
+        }
+        Some((local.lib, local.text))
+    } else {
+        let lib = keys.library_in(names, k)?;
+        if names.kind_of_item(lib)? != blaze_surface::ItemKind::Function {
+            return None;
+        }
+        Some((lib, names.text_of(lib)?.text))
+    }
+}
+
+/// Whether `key` is nounwind: from its tabled row when present, else from its head ABI and
+/// `#[rustc_nounwind]` signature attribute (matching `tabled.rs` and `fill.rs`).
+pub(in crate::front2::program) fn nounwind_from<'n, S: NamesSource<'n>>(
+    tabled: Option<bool>,
+    names: S,
+    keys: &Keys,
+    store: &Store<'n>,
+    key: ItemKey,
+) -> Option<bool> {
+    if let Some(nw) = tabled {
+        return Some(nw);
+    }
+    if store.ctors.contains_key(&key) {
+        return Some(false);
+    }
+    let own = crate::front2::program::head_abi::head_abi(names, store, key, Default::default).ok()?;
+    if own.nounwind {
+        return Some(true);
+    }
+    let (lib, text) = fn_sig_text(names, keys, store, key)?;
+    let symbols = symbols_of(names, lib, crate::front2::links::values_key(names, store, lib), text, "").ok()?;
+    Some(symbols.nounwind)
+}
+
 /// A function row already holds its own attribute. Without that row, use the function's
 /// signature text. In particular an impl head files its members' identities before making
 /// their signatures, and a trait declaration can supply the attribute without a body.
 pub(in crate::front2::program) fn track_caller_from<'n, S: NamesSource<'n>>(
     names: S, keys: &Keys, store: &Store<'n>, key: ItemKey, tabled: impl Fn(ItemKey) -> Option<bool>,
 ) -> Option<bool> {
-    track_caller(keys, store, key, |k| {
+    track_caller(names, keys, store, key, |k| {
         if let Some(tracked) = tabled(k) {
             return Some(tracked);
         }
         if store.ctors.contains_key(&k) {
             return Some(false);
         }
-        let (lib, text) = if let Some(head) = store.fns.get(&k) {
-            (head.lib, head.text)
-        } else if let Some(crate::front2::keys::Origin::Member { container, kind: MemberKind::Fn, name }) = keys.origin(k) {
-            let lib = keys.library_in(names, *container)?;
-            let mut text = None;
-            let listed = names.each_member(lib, &mut |member| {
-                if member.kind == blaze_surface::ItemKind::Function && member.name == Some(name.as_ref()) {
-                        names.read_member_signature(member.key, member.written_by);
-                    text = Some(member.text);
-                }
-            });
-            if !listed {
-                return None;
-            }
-            (lib, text?)
-        } else if let Some(local) = store.locals.head(k) {
-            if local.kind != crate::front2::locals::LocalKind::Fn {
-                return None;
-            }
-            (local.lib, local.text)
-        } else {
-            let lib = keys.library_in(names, k)?;
-            if names.kind_of_item(lib)? != blaze_surface::ItemKind::Function {
-                return None;
-            }
-            (lib, names.text_of(lib)?.text)
-        };
+        let (lib, text) = fn_sig_text(names, keys, store, k)?;
         symbols_of(names, lib, crate::front2::links::values_key(names, store, lib), text, "").ok().map(|symbols| symbols.track_caller)
     })
+}
+
+/// Per-program memoization cache for caller/definition site placement (macro expansion
+/// origins and per-owner anchor/placement results). Only `Ok` results are cached so any
+/// missing fact is re-queried after a retry fills more heads.
+pub(in crate::front2::program) struct SiteCache<'n> {
+    /// Cached resolution of `TextAt::Expansion(call)` -> outermost file-level invocation or
+    /// in-body call site. Avoids repeating `recorded_call_origin` + full-file `outline` +
+    /// `invoked_at` lexing across every expression and every method generated by one macro
+    /// invocation (e.g. `#[contract]` `__check_collision_*`).
+    call_placements: Map<(usize, LibKey), CallPlacement<'n>, Alloc<'n>>,
+    /// Cached per-owner `caller_site` base (`body_anchor` + `Anchor::placement` +
+    /// `local_position::key_at` + `file_shown`), independent of `expr_offset`.
+    caller_bases: Map<ItemKey, CallerSiteBase<'n>, Alloc<'n>>,
+    /// Cached per-item `def_site` result.
+    def_sites: Map<ItemKey, blaze_build::CallerSite<'n>, Alloc<'n>>,
+}
+
+impl<'n> SiteCache<'n> {
+    pub(in crate::front2::program) fn new_in(alloc: Alloc<'n>) -> Self {
+        Self {
+            call_placements: Map::new_in(alloc),
+            caller_bases: Map::new_in(alloc),
+            def_sites: Map::new_in(alloc),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CallPlacement<'n> {
+    FileInvocation { file: u32, byte: u32 },
+    InBody { body: Anchor<'n>, at: u32 },
+}
+
+#[derive(Clone, Copy)]
+enum CallerSiteBase<'n> {
+    /// Result is constant for every expression with a range in `owner` (e.g. a macro-generated
+    /// item or a body inside an expanded local declaration). When `check_add > 0`, `expr_offset`
+    /// is still checked against `u32` overflow to preserve `SiteGap::LocalOutsideEnclosing`.
+    Fixed { site: blaze_build::CallerSite<'n>, check_add: u32, local: Option<ItemKey> },
+    /// `point.offset = base_add + expr_offset`, final offset = `point.offset - sub`.
+    Linear { file: &'n str, item: ItemKey, base_add: u32, sub: u32, local: Option<ItemKey> },
+}
+
+impl<'n> CallerSiteBase<'n> {
+    fn resolve(self, owner: ItemKey, offset: u32) -> Result<blaze_build::CallerSite<'n>, SiteGap> {
+        match self {
+            Self::Fixed { site, check_add, local } => {
+                if check_add > 0 {
+                    check_add.checked_add(offset).ok_or(SiteGap::LocalOutsideEnclosing { local: local.unwrap_or(owner) })?;
+                }
+                Ok(site)
+            }
+            Self::Linear { file, item, base_add, sub, local } => {
+                let point_offset = base_add.checked_add(offset).ok_or(SiteGap::LocalOutsideEnclosing { local: local.unwrap_or(owner) })?;
+                let final_offset = point_offset.checked_sub(sub).ok_or(SiteGap::BeforeDeclaration { item: owner, offset: point_offset, first: sub })?;
+                Ok(blaze_build::CallerSite { file, item, offset: final_offset })
+            }
+        }
+    }
+}
+
+fn caller_site_base<'n, S: PositionSource<'n>>(
+    names: S,
+    keys: &Keys,
+    store: &Store<'n>,
+    owner: ItemKey,
+    cache: Option<&mut SiteCache<'n>>,
+) -> Result<CallerSiteBase<'n>, SiteGap> {
+    let asked = owner;
+    let mut cur = owner;
+    let mut base_add = 0u32;
+    let mut uses_offset = true;
+    let mut overflow_local = None;
+    let mut leaf: Option<(ItemKey, u32)> = None;
+    let anchor = 'anchor: {
+        for _ in 0..=store.locals.kept() {
+            if let Some(local) = store.locals.head(cur) {
+                let enclosing = store.fns.get(&local.enclosing).ok_or(SiteGap::NoEnclosingRow { local: cur, enclosing: local.enclosing })?.text;
+                let range = local.range;
+                let outside = SiteGap::LocalOutsideEnclosing { local: cur };
+                let start = usize::try_from(range.start).map_err(|_| outside)?;
+                let end = usize::try_from(range.end).map_err(|_| outside)?;
+                let written = enclosing.get(start..end).ok_or(outside)?;
+                if written == local.text {
+                    leaf.get_or_insert((cur, base_add));
+                    base_add = range.start.checked_add(base_add).ok_or(outside)?;
+                    overflow_local = Some(cur);
+                } else {
+                    leaf = None;
+                    base_add = range.start;
+                    uses_offset = false;
+                    overflow_local = None;
+                }
+                cur = local.enclosing;
+                continue;
+            }
+            let anchor = match keys.origin(cur) {
+                Some(crate::front2::keys::Origin::Member { .. }) => {
+                    let text = store.fns.get(&cur).ok_or(SiteGap::NoRow { item: cur })?.text;
+                    let (container, row) = keys.source_member(names, cur, text).ok_or(SiteGap::NoMemberRow { owner: cur })?;
+                    Anchor::Member { container, row }
+                }
+                _ => {
+                    let lib = keys.library_in(names, cur).ok_or(SiteGap::NoLibrary { owner: cur })?;
+                    Anchor::from_lib(names, lib).ok_or(SiteGap::NoAnchor { item: cur })?
+                }
+            };
+            break 'anchor anchor;
+        }
+        return Err(SiteGap::TooDeep { owner: asked, kept: store.locals.kept() });
+    };
+    let (krate, file, first) = anchor.placement_cached(names, store.tys.alloc(), cache).map_err(|gap| SiteGap::Placement { item: asked, gap })?;
+    let clash = |_| SiteGap::KeyClash { item: asked };
+    let base = match (first.is_invocation(), leaf) {
+        (true, _) => {
+            let item = keys.item(anchor.lib()).map_err(clash)?;
+            let file = names.file_shown(krate, file).ok_or(SiteGap::NoShownFile { item: asked, krate, file })?;
+            CallerSiteBase::Fixed {
+                site: blaze_build::CallerSite { file, item, offset: 0 },
+                check_add: if uses_offset { base_add } else { 0 },
+                local: overflow_local,
+            }
+        }
+        (false, Some((live, rel_base))) => {
+            let declaration = base_add.checked_sub(rel_base).ok_or(SiteGap::BeforeDeclaration { item: asked, offset: base_add, first: rel_base })?;
+            // The site counts from the declaration's first token (local_position.rs
+            // `first_token`: past a doc comment), as `source_position` and the cold reading
+            // read it.
+            let (source, first_tok) = local_position::key_at(names, krate, anchor, declaration, store.tys.alloc()).map_err(|gap| SiteGap::Placement { item: asked, gap })?;
+            let local = keys.file_source_local(source, live).map_err(|_| SiteGap::LocalKey { item: asked, declaration })?;
+            let file = names.file_shown(krate, file).ok_or(SiteGap::NoShownFile { item: asked, krate, file })?;
+            if uses_offset {
+                CallerSiteBase::Linear { file, item: local, base_add, sub: first_tok, local: overflow_local }
+            } else {
+                let off = base_add.checked_sub(first_tok).ok_or(SiteGap::BeforeDeclaration { item: asked, offset: base_add, first: first_tok })?;
+                CallerSiteBase::Fixed { site: blaze_build::CallerSite { file, item: local, offset: off }, check_add: 0, local: None }
+            }
+        }
+        (false, None) => {
+            let item = keys.item(anchor.lib()).map_err(clash)?;
+            let file = names.file_shown(krate, file).ok_or(SiteGap::NoShownFile { item: asked, krate, file })?;
+            if uses_offset {
+                CallerSiteBase::Linear { file, item, base_add, sub: 0, local: overflow_local }
+            } else {
+                CallerSiteBase::Fixed { site: blaze_build::CallerSite { file, item, offset: base_add }, check_add: 0, local: None }
+            }
+        }
+    };
+    Ok(base)
 }
 
 /// Keep the stable identity of the declaration that supplies the expression's
@@ -189,26 +421,24 @@ pub(in crate::front2::program) fn track_caller_from<'n, S: NamesSource<'n>>(
 /// its outermost invocation. For a whole generated item placement follows the
 /// item-producing invocation, so the byte within that invocation is zero.
 /// Each step that finds no fact is its own [`SiteGap`], named for `owner` (rule 19).
-pub(in crate::front2::program) fn caller_site<'n, S: PositionSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, owner: ItemKey, body: &Body<'_>, expr: ExprId) -> Result<blaze_build::CallerSite<'n>, SiteGap> {
+pub(in crate::front2::program) fn caller_site<'n, S: PositionSource<'n>>(
+    names: S,
+    keys: &Keys,
+    store: &Store<'n>,
+    owner: ItemKey,
+    body: &Body<'_>,
+    expr: ExprId,
+    mut cache: Option<&mut SiteCache<'n>>,
+) -> Result<blaze_build::CallerSite<'n>, SiteGap> {
     let offset = expr_offset(body, expr).ok_or(SiteGap::NoRange { owner, expr })?;
-    let point = body_anchor(names, keys, store, owner, offset)?;
-    let (krate, file, first) = point.anchor.placement(names, store.tys.alloc()).map_err(|gap| SiteGap::Placement { item: owner, gap })?;
-    let clash = |_| SiteGap::KeyClash { item: owner };
-    let (item, offset) = match (first, point.local) {
-        (Start::Invocation(_) | Start::MemberInvocation(..), _) => (keys.item(point.anchor.lib()).map_err(clash)?, 0),
-        (_, Some((live, relative))) => {
-            let declaration = point.offset.checked_sub(relative).ok_or(SiteGap::BeforeDeclaration { item: owner, offset: point.offset, first: relative })?;
-            // The site counts from the declaration's first token (local_position.rs
-            // `first_token`: past a doc comment), as `source_position` and the cold reading
-            // read it.
-            let (source, first) = local_position::key_at(names, krate, point.anchor, declaration, store.tys.alloc()).map_err(|gap| SiteGap::Placement { item: owner, gap })?;
-            let local = keys.file_source_local(source, live).map_err(|_| SiteGap::LocalKey { item: owner, declaration })?;
-            (local, point.offset.checked_sub(first).ok_or(SiteGap::BeforeDeclaration { item: owner, offset: point.offset, first })?)
-        }
-        (_, None) => (keys.item(point.anchor.lib()).map_err(clash)?, point.offset),
-    };
-    let file = names.file_shown(krate, file).ok_or(SiteGap::NoShownFile { item: owner, krate, file })?;
-    Ok(blaze_build::CallerSite { file, item, offset })
+    if let Some(&base) = cache.as_ref().and_then(|c| c.caller_bases.get(&owner)) {
+        return base.resolve(owner, offset);
+    }
+    let base = caller_site_base(names, keys, store, owner, cache.as_deref_mut())?;
+    if let Some(cache) = cache {
+        cache.caller_bases.insert(owner, base);
+    }
+    base.resolve(owner, offset)
 }
 
 /// THE DEFINITION-SITE RULE (blaze-build `Adts::def_site`): where fn `item` is defined, in
@@ -220,31 +450,45 @@ pub(in crate::front2::program) fn caller_site<'n, S: PositionSource<'n>>(names: 
 /// `#[doc]`), its visibility included. Counted as [`caller_site`] counts: from the item's
 /// text, or for a written local from its declaration's first token; a fn a macro call writes
 /// whole is placed at the call (byte 0), as [`caller_site`] places its expressions.
-pub(in crate::front2::program) fn def_site<'n, S: PositionSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, item: ItemKey) -> Result<blaze_build::CallerSite<'n>, SiteGap> {
+pub(in crate::front2::program) fn def_site<'n, S: PositionSource<'n>>(
+    names: S,
+    keys: &Keys,
+    store: &Store<'n>,
+    item: ItemKey,
+    mut cache: Option<&mut SiteCache<'n>>,
+) -> Result<blaze_build::CallerSite<'n>, SiteGap> {
+    if let Some(&site) = cache.as_ref().and_then(|c| c.def_sites.get(&item)) {
+        return Ok(site);
+    }
     let point = body_anchor(names, keys, store, item, 0)?;
-    let (krate, file, first) = point.anchor.placement(names, store.tys.alloc()).map_err(|gap| SiteGap::Placement { item, gap })?;
+    let (krate, file, first) = point.anchor.placement_cached(names, store.tys.alloc(), cache.as_deref_mut()).map_err(|gap| SiteGap::Placement { item, gap })?;
     let file = names.file_shown(krate, file).ok_or(SiteGap::NoShownFile { item, krate, file })?;
     let clash = |_| SiteGap::KeyClash { item };
-    if let Start::Invocation(_) | Start::MemberInvocation(..) = first {
-        return Ok(blaze_build::CallerSite { file, item: keys.item(point.anchor.lib()).map_err(clash)?, offset: 0 });
-    }
-    let text = point.anchor.text(names).ok_or(SiteGap::NoText { item })?;
-    let edition = names.edition_of(krate).ok_or(SiteGap::NoEdition { item, krate })?;
-    let alloc = store.tys.alloc();
-    let past = SiteGap::PastAttributes { item };
-    match point.local {
-        None => {
-            let at = past_outer_attributes(text, point.offset, edition, alloc).ok_or(past)?;
-            Ok(blaze_build::CallerSite { file, item: keys.item(point.anchor.lib()).map_err(clash)?, offset: at })
+    let site = if first.is_invocation() {
+        blaze_build::CallerSite { file, item: keys.item(point.anchor.lib()).map_err(clash)?, offset: 0 }
+    } else {
+        let text = point.anchor.text(names).ok_or(SiteGap::NoText { item })?;
+        let edition = names.edition_of(krate).ok_or(SiteGap::NoEdition { item, krate })?;
+        let alloc = store.tys.alloc();
+        let past = SiteGap::PastAttributes { item };
+        match point.local {
+            None => {
+                let at = past_outer_attributes(text, point.offset, edition, alloc).ok_or(past)?;
+                blaze_build::CallerSite { file, item: keys.item(point.anchor.lib()).map_err(clash)?, offset: at }
+            }
+            Some((live, relative)) => {
+                let declaration = point.offset.checked_sub(relative).ok_or(SiteGap::BeforeDeclaration { item, offset: point.offset, first: relative })?;
+                let (source, first) = local_position::key_at(names, krate, point.anchor, declaration, alloc).map_err(|gap| SiteGap::Placement { item, gap })?;
+                let at = past_outer_attributes(text, first, edition, alloc).ok_or(past)?;
+                let local = keys.file_source_local(source, live).map_err(|_| SiteGap::LocalKey { item, declaration })?;
+                blaze_build::CallerSite { file, item: local, offset: at.checked_sub(first).ok_or(SiteGap::BeforeDeclaration { item, offset: at, first })? }
+            }
         }
-        Some((live, relative)) => {
-            let declaration = point.offset.checked_sub(relative).ok_or(SiteGap::BeforeDeclaration { item, offset: point.offset, first: relative })?;
-            let (source, first) = local_position::key_at(names, krate, point.anchor, declaration, alloc).map_err(|gap| SiteGap::Placement { item, gap })?;
-            let at = past_outer_attributes(text, first, edition, alloc).ok_or(past)?;
-            let local = keys.file_source_local(source, live).map_err(|_| SiteGap::LocalKey { item, declaration })?;
-            Ok(blaze_build::CallerSite { file, item: local, offset: at.checked_sub(first).ok_or(SiteGap::BeforeDeclaration { item, offset: at, first })? })
-        }
+    };
+    if let Some(cache) = cache {
+        cache.def_sites.insert(item, site);
     }
+    Ok(site)
 }
 
 /// The first byte of the first token at or after byte `from` of `text` that is not in an
@@ -275,6 +519,9 @@ fn past_outer_attributes(text: &str, from: u32, edition: blaze_surface::Edition,
 /// needs no shown path, so a toolchain crate's body (core's `AlignmentEnum` copy) keeps its
 /// trap's site; the report places it by the item. `None`: the expression has no range.
 pub(in crate::front2::program) fn expr_offset(body: &Body<'_>, expr: ExprId) -> Option<u32> {
+    if body.expanded_text.is_some() {
+        return Some(0);
+    }
     let view = body.lowered.view();
     Some(view.site(view.expr_range(expr).ok()?).ok()?.start)
 }
@@ -312,27 +559,47 @@ impl<'n> Anchor<'n> {
     /// itself has an item row (or an unnamed member row). Derives and attributes
     /// describe their invoking outline entry in the expansion origins.
     fn placement<S: PositionSource<'n>>(self, names: S, alloc: Alloc<'_>) -> Result<(usize, u32, Start<'n>), PositionGap> {
+        self.placement_cached(names, alloc, None)
+    }
+
+    fn placement_cached<S: PositionSource<'n>>(
+        self,
+        names: S,
+        alloc: Alloc<'_>,
+        mut cache: Option<&mut SiteCache<'n>>,
+    ) -> Result<(usize, u32, Start<'n>), PositionGap> {
         /// The first byte, in the calling text, of the call site rustc places a `Location` of
         /// an attribute or derive call's expansion at. rustc_const_eval
         /// `location_triple_for_span`: "`span.ctxt().outer_expn().expansion_cause()`", the
         /// outermost expansion's `call_site`, and its `lo()`; rustc_expand `Invocation::span`:
-        /// an attribute macro's call site is `attr.span` (the whole attribute, from its `#`), a
-        /// derive's is `path.span` (its path in the `derive(..)` list). `origin.entry` is the
-        /// calling item's whole outline entry, doc comments and outer attributes first: the
-        /// attribute or the path is found among them by its tokens against the macro's path as
-        /// written (`CallView::macro_name`: `::` kept, spaces skipped). A function-like call's
-        /// site is its `span` (`InvocationKind::Bang`: the call from its path, the attributes
-        /// and doc comments on the call not in it): the first token after them. An implicit
-        /// attribute's, which no text writes (D104), is the entry's start. An attribute or
-        /// derive not found: refused (`NoItem`), never the entry's start in its place (rule 3).
-        fn invoked_at(origin: &crate::front2::expansion_origin::CallOrigin<'_>, alloc: Alloc<'_>) -> Result<u32, PositionGap> {
+        /// a direct outer attribute macro's call site is `attr.span` (the whole attribute, from
+        /// its `#`), an attribute macro unwrapped from a `#[cfg_attr(pred, ..)]` starts at that
+        /// inner attribute's first token (as rustc's `cfg_attr` expansion spans the emitted
+        /// attribute), and a derive's is `path.span` (its path in the `derive(..)` list).
+        /// `origin.entry` is the calling item's whole outline entry, doc comments and outer
+        /// attributes first: active `cfg_attr` predicates are evaluated against the crate's cfg
+        /// (blaze-scope `Cfg::eval`) and each attribute or derive path is matched by its tokens
+        /// against `target.0` (`CallView::macro_name`: `::` kept, spaces skipped). A
+        /// function-like call's site is its `span` (`InvocationKind::Bang`: the call from its
+        /// path, the attributes and doc comments on the call not in it): the first token after
+        /// them. An implicit attribute's, which no text writes (D104), is the entry's start. An
+        /// attribute or derive not found: refused (`NoItem`), never the entry's start in its
+        /// place (rule 3).
+        fn invoked_at<'n, S: PositionSource<'n>>(
+            names: S,
+            krate: usize,
+            origin: &crate::front2::expansion_origin::CallOrigin<'_>,
+            target: (&str, blaze_expand::origin_column::InputShape, bool),
+            alloc: Alloc<'_>,
+        ) -> Result<u32, PositionGap> {
             use blaze_expand::origin_column::{InputShape, input_places};
             use blaze_expand::{Delim, TokenKind};
+            let (macro_name, shape, implicit) = target;
             let (start, end) = origin.entry;
-            if origin.view.implicit {
+            if implicit {
                 return Ok(start);
             }
-            let fn_like = origin.view.shape == InputShape::Inside;
+            let fn_like = shape == InputShape::Inside;
             let entry = origin.text.get(start as usize..end as usize).ok_or(PositionGap::PastText)?;
             let tokens = blaze_expand::lex(entry, origin.edition, alloc).map_err(|_| PositionGap::NoItem)?;
             let places = input_places(entry, InputShape::Whole, origin.edition, alloc).map_err(|_| PositionGap::NoItem)?;
@@ -342,11 +609,12 @@ impl<'n> Anchor<'n> {
             }
             let kind = |i: usize| list.get(i).map(|t| t.kind);
             let punct = |i: usize, c: char| matches!(kind(i), Some(TokenKind::Punct { char, .. }) if char == c);
-            // The token after the path written from token `i`, when that path is the macro's.
-            let path_end = |i: usize| -> Option<usize> {
-                let mut rest = origin.view.macro_name;
+            // The token after the path written from token `i` (within `limit`), when that path
+            // is the macro's.
+            let path_end = |i: usize, limit: usize| -> Option<usize> {
+                let mut rest = macro_name;
                 let mut j = i;
-                loop {
+                while j < limit {
                     let word = match kind(j) {
                         Some(TokenKind::Ident { .. }) => tokens.text_at(j),
                         Some(TokenKind::Punct { char: ':', .. }) => ":",
@@ -357,10 +625,42 @@ impl<'n> Anchor<'n> {
                 }
                 (j > i && rest.trim_start().is_empty()).then_some(j)
             };
+            // The token after any Rust path starting at `i` (within `limit`), for reading
+            // built-in wrapper attributes (`cfg_attr`, `derive`, `derive_const`, `unsafe`).
+            let any_path_end = |i: usize, limit: usize| -> Option<usize> {
+                let mut j = i;
+                while j < limit {
+                    match kind(j) {
+                        Some(TokenKind::Ident { .. }) | Some(TokenKind::Punct { char: ':', .. }) => j += 1,
+                        _ => break,
+                    }
+                }
+                (j > i).then_some(j)
+            };
+            let span_text = |lo: usize, hi: usize| -> Option<&str> {
+                let a = usize::try_from(places.get(lo)?.0).ok()?;
+                let b = usize::try_from(places.get(hi)?.1).ok()?;
+                entry.get(a..b)
+            };
             let first_byte = |i: usize| -> Result<u32, PositionGap> {
                 let at = places.get(i).ok_or(PositionGap::NoItem)?.0;
                 start.checked_add(at).ok_or(PositionGap::PastText)
             };
+            let mut cfg: Option<blaze_scope::task::Cfg<'n, '_>> = None;
+            let mut eval_cfg = |pred: &str| -> Result<bool, PositionGap> {
+                let cfg = match &cfg {
+                    Some(cfg) => cfg,
+                    None => {
+                        let atoms = names.cfg_atoms(krate).ok_or(PositionGap::NoFile)?;
+                        cfg.insert(blaze_scope::task::Cfg::from_atoms(atoms, alloc))
+                    }
+                };
+                Ok(cfg.eval(pred) == Some(true))
+            };
+            // Iterative meta-item stack: `(meta_start, meta_end, direct_hash)`.
+            // `Some(hash)` for a top-level `#[meta]` (rustc starts at `#`); `None` for an inner
+            // meta unwrapped from `cfg_attr(..)` (rustc starts at the meta item's first token).
+            let mut metas: AVec<'_, (usize, usize, Option<usize>)> = AVec::new_in(alloc);
             let mut at = 0usize;
             while punct(at, '#') && matches!(kind(at + 1), Some(TokenKind::Open(Delim::Bracket))) {
                 let close = tokens.close_of(at + 1).ok_or(PositionGap::NoItem)?;
@@ -368,41 +668,88 @@ impl<'n> Anchor<'n> {
                     at = close + 1;
                     continue;
                 }
-                // `#[path]`, `#[path(..)]` or `#[path = ..]`: the attribute macro's own call.
-                if let Some(after) = path_end(at + 2)
-                    && (after == close || punct(after, '=') || matches!(kind(after), Some(TokenKind::Open(_))))
-                {
-                    return first_byte(at);
-                }
-                // A path of a `derive(..)` list anywhere in the attribute: a `cfg_attr` keeps
-                // its tokens where they are written.
-                let mut j = at + 2;
-                while j < close {
-                    let derive = matches!(kind(j), Some(TokenKind::Ident { .. }))
-                        && matches!(tokens.text_at(j), "derive" | "derive_const")
-                        && matches!(kind(j + 1), Some(TokenKind::Open(Delim::Paren)));
-                    if !derive {
-                        j += 1;
+                metas.clear();
+                metas.push((at + 2, close, Some(at)));
+                while let Some((m_start, m_end, direct_hash)) = metas.pop() {
+                    if m_start >= m_end {
                         continue;
                     }
-                    let group = tokens.close_of(j + 1).ok_or(PositionGap::NoItem)?;
-                    let mut k = j + 2;
-                    while k < group {
-                        if let Some(after) = path_end(k)
-                            && (after == group || punct(after, ','))
-                        {
-                            return first_byte(k);
-                        }
-                        // The list's next path: past this one's `,`, a group skipped whole.
-                        while k < group && !punct(k, ',') {
-                            k = match kind(k) {
-                                Some(TokenKind::Open(_)) => tokens.close_of(k).ok_or(PositionGap::NoItem)? + 1,
-                                _ => k + 1,
-                            };
-                        }
-                        k += 1;
+                    // `#[path]`, `#[path(..)]` or `#[path = ..]` (direct or inside `cfg_attr`):
+                    // the attribute macro's own call.
+                    if let Some(after) = path_end(m_start, m_end)
+                        && (after == m_end || punct(after, '=') || matches!(kind(after), Some(TokenKind::Open(_))))
+                    {
+                        return first_byte(direct_hash.unwrap_or(m_start));
                     }
-                    j = group + 1;
+                    let Some(p_end) = any_path_end(m_start, m_end) else { continue };
+                    if !matches!(kind(p_end), Some(TokenKind::Open(Delim::Paren))) {
+                        continue;
+                    }
+                    let group = tokens.close_of(p_end).ok_or(PositionGap::NoItem)?;
+                    if group >= m_end {
+                        continue;
+                    }
+                    let Some(path_str) = span_text(m_start, p_end - 1) else { continue };
+                    match blaze_scope::task::prelude_attr(path_str) {
+                        "derive" | "derive_const" => {
+                            let mut k = p_end + 1;
+                            while k < group {
+                                if let Some(after) = path_end(k, group)
+                                    && (after == group || punct(after, ','))
+                                {
+                                    return first_byte(k);
+                                }
+                                // The list's next path: past this one's `,`, a group skipped whole.
+                                while k < group && !punct(k, ',') {
+                                    k = match kind(k) {
+                                        Some(TokenKind::Open(_)) => tokens.close_of(k).ok_or(PositionGap::NoItem)? + 1,
+                                        _ => k + 1,
+                                    };
+                                }
+                                k += 1;
+                            }
+                        }
+                        "cfg_attr" => {
+                            let pred_start = p_end + 1;
+                            let mut k = pred_start;
+                            while k < group && !punct(k, ',') {
+                                k = match kind(k) {
+                                    Some(TokenKind::Open(_)) => tokens.close_of(k).ok_or(PositionGap::NoItem)? + 1,
+                                    _ => k + 1,
+                                };
+                            }
+                            if k >= group || k == pred_start {
+                                continue;
+                            }
+                            let pred_text = span_text(pred_start, k - 1).ok_or(PositionGap::PastText)?;
+                            if !eval_cfg(pred_text)? {
+                                continue;
+                            }
+                            // Push each inner meta item in reverse so they are visited in written order.
+                            let stack_base = metas.len();
+                            let mut item_start = k + 1;
+                            while item_start < group {
+                                let mut item_end = item_start;
+                                while item_end < group && !punct(item_end, ',') {
+                                    item_end = match kind(item_end) {
+                                        Some(TokenKind::Open(_)) => tokens.close_of(item_end).ok_or(PositionGap::NoItem)? + 1,
+                                        _ => item_end + 1,
+                                    };
+                                }
+                                if item_end > item_start {
+                                    metas.push((item_start, item_end, None));
+                                }
+                                item_start = item_end + 1;
+                            }
+                            if let Some(tail) = metas.get_mut(stack_base..) {
+                                tail.reverse();
+                            }
+                        }
+                        "unsafe" => {
+                            metas.push((p_end + 1, group, direct_hash));
+                        }
+                        _ => {}
+                    }
                 }
                 at = close + 1;
             }
@@ -451,7 +798,7 @@ impl<'n> Anchor<'n> {
                         let first = start.byte(names, krate, text, alloc)?;
                         return Ok((krate, file, Start::Invocation(first.checked_add(at).ok_or(PositionGap::PastText)?)));
                     }
-                    return Ok((krate, file, if expanded { start.invocation() } else { start }));
+                    return Ok((krate, file, if expanded { start.invocation(anchor.lib()) } else { start }));
                 }
                 TextAt::Expansion(call) => call,
             };
@@ -466,29 +813,78 @@ impl<'n> Anchor<'n> {
                 anchor = parent;
                 continue;
             } else {
-                let mut call = call;
-                let mut in_body = None;
-                for _ in 0..crate::front2::expansion_origin::MOST_LEVELS {
-                    let origin = names.call_origin(krate, call).map_err(|_| PositionGap::NoFile)?;
-                    match origin.view.text {
-                        TextAt::File(file) => return Ok((krate, file, Start::Invocation(invoked_at(&origin, alloc)?))),
-                        // A call written in a block of a body is in the module text of the
-                        // body's blocks, which no call wrote (it has no origins): its site is
-                        // placed in the body's own text, and the body is placed as any item.
-                        TextAt::Expansion(parent) => match local_position::block_call_site(names, krate, parent, origin.text, || invoked_at(&origin, alloc), alloc)? {
-                            Some(site) => {
-                                in_body = Some(site);
+                let resolved = if let Some(&hit) = cache.as_ref().and_then(|c| c.call_placements.get(&(krate, call))) {
+                    hit
+                } else {
+                    let mut cur_call = call;
+                    let mut found = None;
+                    // A keep call (`resolve.rs keep_item`, `macro_name == "derive"`) stages a
+                    // derived item verbatim across helper-attribute checks and is not itself a
+                    // macro invocation: carry the inner call's `(macro_name, shape, implicit)`
+                    // across any chain of keep calls so `invoked_at` locates the real derive or
+                    // attribute macro, not `"derive"`.
+                    let mut carried: Option<(&'n str, blaze_expand::origin_column::InputShape, bool, &'n str)> = None;
+                    for _ in 0..crate::front2::expansion_origin::MOST_LEVELS {
+                        let origin = names.call_origin(krate, cur_call).map_err(|_| PositionGap::NoFile)?;
+                        let is_keep = !origin.view.implicit
+                            && origin.view.shape == blaze_expand::origin_column::InputShape::Whole
+                            && origin.view.macro_name == "derive"
+                            && carried.is_some_and(|(_, _, _, inner_text)| {
+                                let entry = usize::try_from(origin.entry.0)
+                                    .ok()
+                                    .zip(usize::try_from(origin.entry.1).ok())
+                                    .and_then(|(a, b)| origin.text.get(a..b));
+                                entry == Some(inner_text)
+                            });
+                        let target = match (is_keep, carried) {
+                            (true, Some((macro_name, shape, implicit, _))) => (macro_name, shape, implicit),
+                            _ => (origin.view.macro_name, origin.view.shape, origin.view.implicit),
+                        };
+                        match origin.view.text {
+                            TextAt::File(file) => {
+                                let byte = invoked_at(names, krate, &origin, target, alloc)?;
+                                found = Some(CallPlacement::FileInvocation { file, byte });
                                 break;
                             }
-                            None => call = parent,
-                        },
+                            // A call written in a block of a body is in the module text of the
+                            // body's blocks, which no call wrote (it has no origins): its site is
+                            // placed in the body's own text, and the body is placed as any item.
+                            TextAt::Expansion(parent) => match local_position::block_call_site(
+                                names,
+                                krate,
+                                parent,
+                                origin.text,
+                                || invoked_at(names, krate, &origin, target, alloc),
+                                alloc,
+                            )? {
+                                Some((body, at)) => {
+                                    found = Some(CallPlacement::InBody { body, at });
+                                    break;
+                                }
+                                None => {
+                                    carried = Some((target.0, target.1, target.2, origin.text));
+                                    cur_call = parent;
+                                }
+                            },
+                        }
+                    }
+                    let res = found.ok_or(PositionGap::NoFile)?;
+                    if let Some(cache) = cache.as_deref_mut() {
+                        cache.call_placements.insert((krate, call), res);
+                    }
+                    res
+                };
+                match resolved {
+                    CallPlacement::FileInvocation { file, byte } => {
+                        return Ok((krate, file, Start::Invocation(byte)));
+                    }
+                    CallPlacement::InBody { body, at } => {
+                        anchor = body;
+                        invoked = Some(at);
+                        copied.clear();
+                        continue;
                     }
                 }
-                let (body, at) = in_body.ok_or(PositionGap::NoFile)?;
-                anchor = body;
-                invoked = Some(at);
-                copied.clear();
-                continue;
             }
             copied.clear();
             expanded = true;
@@ -522,13 +918,20 @@ enum Start<'n> {
     Copied(u32, &'n str),
     Entry(blaze_surface::ItemIndex, &'n str),
     Invocation(u32),
+    CallItem(u32, LibKey),
+    CopiedCall(u32, &'n str),
     MemberInvocation(blaze_surface::ItemIndex, &'n str),
 }
 
 impl<'n> Start<'n> {
-    fn invocation(self) -> Self {
+    fn is_invocation(self) -> bool {
+        matches!(self, Self::Invocation(_) | Self::CallItem(..) | Self::CopiedCall(..) | Self::MemberInvocation(..))
+    }
+
+    fn invocation(self, lib: LibKey) -> Self {
         match self {
-            Self::Byte(at) | Self::Copied(at, _) => Self::Invocation(at),
+            Self::Byte(at) => Self::CallItem(at, lib),
+            Self::Copied(at, body) => Self::CopiedCall(at, body),
             Self::Entry(i, text) => Self::MemberInvocation(i, text),
             other => other,
         }
@@ -588,9 +991,15 @@ fn body_anchor<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>,
 }
 
 /// The file of a trap row's body owner. The trap always keeps a body-relative offset.
-pub(in crate::front2::program) fn item_file<'n, S: PositionSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, item: ItemKey) -> Option<&'n str> {
+pub(in crate::front2::program) fn item_file<'n, S: PositionSource<'n>>(
+    names: S,
+    keys: &Keys,
+    store: &Store<'n>,
+    item: ItemKey,
+    cache: Option<&mut SiteCache<'n>>,
+) -> Option<&'n str> {
     let point = body_anchor(names, keys, store, item, 0).ok()?;
-    let (krate, file, _) = point.anchor.placement(names, store.tys.alloc()).ok()?;
+    let (krate, file, _) = point.anchor.placement_cached(names, store.tys.alloc(), cache).ok()?;
     names.file_shown(krate, file)
 }
 
@@ -599,7 +1008,14 @@ pub(in crate::front2::program) fn item_file<'n, S: PositionSource<'n>>(names: S,
 /// today's text of its file (`NamesSource::file_text`), counted there. What a `#[track_caller]`
 /// `Location`'s line and column are when the program is placed: the code record holds only
 /// `item` and `site` (rule 71).
-pub(in crate::front2::program) fn source_position<'n, S: PositionSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, item: ItemKey, site: u32) -> Result<(u32, u32), PositionGap> {
+pub(in crate::front2::program) fn source_position<'n, S: PositionSource<'n>>(
+    names: S,
+    keys: &Keys,
+    store: &Store<'n>,
+    item: ItemKey,
+    site: u32,
+    cache: Option<&mut SiteCache<'n>>,
+) -> Result<(u32, u32), PositionGap> {
     if keys.origin(item).is_none() {
         return position_of_source_key(names, item, site, store.tys.alloc());
     }
@@ -612,10 +1028,10 @@ pub(in crate::front2::program) fn source_position<'n, S: PositionSource<'n>>(nam
         let declaration = point.offset.checked_sub(relative).ok_or(PositionGap::NoItem)?;
         let text = point.anchor.text(names).ok_or(PositionGap::NoItem)?;
         let first = local_position::first_token(text, declaration).ok_or(PositionGap::PastText)?;
-        return position_in_file(names, point.anchor, first.checked_add(site).ok_or(PositionGap::PastText)?, store.tys.alloc());
+        return position_in_file_cached(names, point.anchor, first.checked_add(site).ok_or(PositionGap::PastText)?, store.tys.alloc(), cache);
     }
     let point = body_anchor(names, keys, store, item, site).map_err(|_| PositionGap::NoItem)?;
-    position_in_file(names, point.anchor, point.offset, store.tys.alloc())
+    position_in_file_cached(names, point.anchor, point.offset, store.tys.alloc(), cache)
 }
 
 impl<'n> crate::front2::source::Records<'n> {
@@ -650,8 +1066,8 @@ impl<'n> crate::front2::source::Records<'n> {
                     let entry = self.text_of(row.key).ok_or(Unmapped::NoText { call })?;
                     let current = blaze_file_items::outline_item(entry.text, edition, alloc);
                     let item = current.items().first().ok_or(Unmapped::Input { call })?;
-                    let pieces = record.pieces_at(i).map_err(|_| Unmapped::Input { call })?;
-                    if item.hash != pieces.body {
+                    let body_hash = record.file_body_hash(file, row.outline).map_err(|_| Unmapped::Input { call })?;
+                    if item.hash != body_hash {
                         return Err(Unmapped::Input { call });
                     }
                     // The item hash proves its tokens. Trivia can still change
@@ -711,18 +1127,40 @@ impl<'n> Start<'n> {
     fn byte<S: NamesSource<'n>>(self, names: S, krate: usize, text: &str, alloc: Alloc<'_>) -> Result<u32, PositionGap> {
         match self {
             Start::Byte(at) | Start::Copied(at, _) | Start::Invocation(at) => Ok(at),
+            Start::CallItem(at, lib) => {
+                let item = names.text_of(lib).ok_or(PositionGap::NoItem)?.text;
+                let edition = names.edition_of(krate).ok_or(PositionGap::NoFile)?;
+                let past = past_outer_attributes(item, 0, edition, alloc).ok_or(PositionGap::NoItem)?;
+                at.checked_add(past).ok_or(PositionGap::PastText)
+            }
+            Start::CopiedCall(at, body) => {
+                let edition = names.edition_of(krate).ok_or(PositionGap::NoFile)?;
+                let past = past_outer_attributes(body, 0, edition, alloc).ok_or(PositionGap::NoItem)?;
+                at.checked_add(past).ok_or(PositionGap::PastText)
+            }
             Start::Entry(index, part) | Start::MemberInvocation(index, part) => {
                 // The member row already has today's outline index. A loader may hand
                 // back independent buffers for the file and the member's text.
-                if let Some(at) = blaze_scope::expansion_origins::offset_in(text, part) {
-                    return Ok(at);
+                let start = if let Some(at) = blaze_scope::expansion_origins::offset_in(text, part) {
+                    at
+                } else {
+                    let outline = blaze_file_items::outline(text, names.edition_of(krate).ok_or(PositionGap::NoFile)?, alloc);
+                    let ix = usize::try_from(index.0).map_err(|_| PositionGap::NoItem)?;
+                    let range = outline.items().get(ix).ok_or(PositionGap::NoItem)?.range;
+                    let lo = usize::try_from(range.start).map_err(|_| PositionGap::NoItem)?;
+                    let hi = usize::try_from(range.end).map_err(|_| PositionGap::NoItem)?;
+                    if text.get(lo..hi) != Some(part) {
+                        return Err(PositionGap::NoItem);
+                    }
+                    range.start
+                };
+                if matches!(self, Start::MemberInvocation(..)) {
+                    let edition = names.edition_of(krate).ok_or(PositionGap::NoFile)?;
+                    let past = past_outer_attributes(part, 0, edition, alloc).ok_or(PositionGap::NoItem)?;
+                    start.checked_add(past).ok_or(PositionGap::PastText)
+                } else {
+                    Ok(start)
                 }
-                let outline = blaze_file_items::outline(text, names.edition_of(krate).ok_or(PositionGap::NoFile)?, alloc);
-                let range = outline.items().get(index.0 as usize).ok_or(PositionGap::NoItem)?.range;
-                if text.get(range.start as usize..range.end as usize) != Some(part) {
-                    return Err(PositionGap::NoItem);
-                }
-                Ok(range.start)
             }
         }
     }
@@ -742,19 +1180,26 @@ pub fn body_place<'n, S: PositionSource<'n>>(names: S, lib: LibKey, alloc: Alloc
     let (krate, file, start) = Anchor::from_lib(names, lib).ok_or(PositionGap::NoItem)?.placement(names, alloc)?;
     let text = names.file_text(krate, file).ok_or(PositionGap::NoFile)?;
     let at = start.byte(names, krate, text, alloc)?;
-    Ok((krate, text, at, matches!(start, Start::Invocation(_) | Start::MemberInvocation(..))))
+    Ok((krate, text, at, start.is_invocation()))
 }
 
 fn position_in_file<'n, S: PositionSource<'n>>(names: S, anchor: Anchor<'n>, site: u32, alloc: Alloc<'_>) -> Result<(u32, u32), PositionGap> {
-    position_at(names, anchor.placement(names, alloc)?, site, alloc)
+    position_in_file_cached(names, anchor, site, alloc, None)
+}
+
+fn position_in_file_cached<'n, S: PositionSource<'n>>(
+    names: S,
+    anchor: Anchor<'n>,
+    site: u32,
+    alloc: Alloc<'_>,
+    cache: Option<&mut SiteCache<'n>>,
+) -> Result<(u32, u32), PositionGap> {
+    position_at(names, anchor.placement_cached(names, alloc, cache)?, site, alloc)
 }
 
 fn position_at<'n, S: NamesSource<'n>>(names: S, (krate, i, start): (usize, u32, Start<'n>), site: u32, alloc: Alloc<'_>) -> Result<(u32, u32), PositionGap> {
     let text = names.file_text(krate, i).ok_or(PositionGap::NoFile)?;
-    let site = match start {
-        Start::Invocation(_) | Start::MemberInvocation(..) => 0,
-        _ => site,
-    };
+    let site = if start.is_invocation() { 0 } else { site };
     line_and_column(text, start.byte(names, krate, text, alloc)?, site)
 }
 

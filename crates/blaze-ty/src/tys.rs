@@ -225,6 +225,32 @@ impl FnHeader {
     pub const fn bound_vars(self) -> u16 {
         Cast::<u32, u16>::truncate(self.0 >> 16)
     }
+
+    /// Attaches an explicit Blaze effect list (`expect(..)`) into header bits `10..15`.
+    /// Bit 10 marks an explicit list; bits 11..14 store the 4-bit [`crate::effect_ty::EffectSet`].
+    pub const fn with_effects(self, effects: crate::effect_ty::EffectSet) -> FnHeader {
+        let cleared = self.0 & !(0b1_1111 << 10);
+        let mask = (1u32 << 10) | (Cast::<u8, u32>::widen(effects.bits()) << 11);
+        FnHeader(cleared | mask)
+    }
+
+    /// Explicitly declared Blaze effect set, or `None` for an unmarked Rust function pointer.
+    pub const fn declared_effects(self) -> Option<crate::effect_ty::EffectSet> {
+        if self.0 & (1 << 10) == 0 {
+            None
+        } else {
+            let bits = Cast::<u32, u8>::truncate((self.0 >> 11) & 0b1111);
+            Some(crate::effect_ty::EffectSet::from_bits(bits))
+        }
+    }
+
+    /// Effective effects of this function pointer (`EffectSet::ALL` when unmarked).
+    pub const fn effective_effects(self) -> crate::effect_ty::EffectSet {
+        match self.declared_effects() {
+            Some(e) => e,
+            None => crate::effect_ty::EffectSet::ALL,
+        }
+    }
 }
 
 /// A type, read back (rustc_type_ir/src/ty_kind.rs, `TyKind`).
@@ -255,6 +281,8 @@ pub enum TyKind {
     Coroutine(Def, List),
     CoroutineWitness(Def, List),
     Tuple(List),
+    Record(u64, List),
+    Union(List),
     Alias { kind: AliasKind, rigid: bool, def: Def, args: List },
     Param(u32),
     Bound(u32, u32),
@@ -810,6 +838,11 @@ impl<'a> Tys<'a> {
             ty::COROUTINE => TyKind::Coroutine(Def(a), nb.list()),
             ty::CORO_WITNESS => TyKind::CoroutineWitness(Def(a), nb.list()),
             ty::TUPLE => TyKind::Tuple(na.list()),
+            ty::RECORD => {
+                let [b0, b1, b2, b3, b4, b5, b6, b7, ..] = self.scalar_value(b).to_le_bytes();
+                TyKind::Record(u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7]), na.list())
+            }
+            ty::UNION => TyKind::Union(na.list()),
             ty::PARAM => TyKind::Param(a),
             ty::BOUND => TyKind::Bound(a, b),
             ty::CANONICAL => TyKind::Canonical(a),
@@ -975,6 +1008,17 @@ impl<'a> Tys<'a> {
     /// A tuple of the list's types (the list must hold types only).
     pub fn tuple(&mut self, fields: List) -> Ty {
         self.intern_ty(ty::TUPLE, fields.node().bits(), 0)
+    }
+
+    /// A structural record of canonical schema hash `schema` and sorted field types `fields`.
+    pub fn record(&mut self, schema: u64, fields: List) -> Ty {
+        let s = self.scalar(u128::from(schema));
+        self.intern_ty(ty::RECORD, fields.node().bits(), s)
+    }
+
+    /// A structural tagged union of canonical member types `members`.
+    pub fn union(&mut self, members: List) -> Ty {
+        self.intern_ty(ty::UNION, members.node().bits(), 0)
     }
 
     pub fn tuple_of(&mut self, fields: &[Ty]) -> Ty {

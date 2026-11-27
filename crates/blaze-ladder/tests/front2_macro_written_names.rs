@@ -150,6 +150,7 @@ struct Held<'a> {
     items: &'a [u8],
     file: &'a str,
     expansions: &'a Split<'a>,
+    bump: blaze_own::Bump<'a>,
 }
 
 impl<'a> Held<'a> {
@@ -157,7 +158,7 @@ impl<'a> Held<'a> {
         let directory = Directory::open(&self.expansions.directory).expect("open the expansion directory");
         let entry = directory.entry(key).expect("read the expansion entry")?;
         let row = self.expansions.records.iter().find(|r| r.key == entry.record).expect("stored expansion bytes");
-        let record = ExpansionRecord::open(&row.bytes).expect("open the expansion record");
+        let record = ExpansionRecord::open_in(&row.bytes, self.bump).expect("open the expansion record");
         Some((entry, record))
     }
 }
@@ -179,13 +180,16 @@ impl<'a> Load<'a> for Kept<'a> {
 }
 
 fn keep<'a>(names: &Names<'_>, frame: &'a Frame, alloc: Alloc<'a>) -> Kept<'a> {
+    let erased = frame.alloc(blaze_own::Erased::new(frame));
+    let bump = erased.bump();
     Kept(names.crates().iter().map(|c| {
         let [file] = c.files.as_slice() else { panic!("expected one file in {}", c.name) };
         Held {
-            names: aligned(&names_record::encode(c, alloc).expect("encode names"), alloc),
-            items: aligned(&items_record::encode_with(c, names, alloc).expect("encode items"), alloc),
+            names: aligned(&names_record::encode(c, alloc).expect("encode names"), blaze_own::testing::bump()),
+            items: aligned(&items_record::encode_with(c, names, alloc).expect("encode items"), blaze_own::testing::bump()),
             file: frame.alloc_str(file.text),
             expansions: frame.alloc(expansion_records::write(c, alloc).expect("encode expansions")),
+            bump,
         }
     }).collect())
 }
@@ -225,7 +229,7 @@ fn check_recording_captures(body: &Body<'_>) {
 
 fn check<'n, S: NamesSource<'n>>(front: &mut Front2<'n, S>, cases: &[Case], source: &str, host: &'n dyn BodySources) {
     let alloc = blaze_own::testing::heap().alloc();
-    let prepared = Prepares::new_in(alloc);
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
     store.sources = Some(host);
     for case in cases {
@@ -289,7 +293,7 @@ fn both(files: Files<'_>, feature: bool, cases: &[Case]) {
     let records_alloc = records_memory.handle();
     let kept = {
         let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("solved body frame");
-        let names = resolve_crates(&inputs, Sysroot::default(), &files, &Serial, alloc).expect("solve the fixture");
+        let names = resolve_crates(&inputs, Sysroot::default(), &files, &Serial, blaze_own::testing::bump()).expect("solve the fixture");
         let mut front = Front2::new(&names, &frame, &[], alloc).expect("front end over solved names");
         check(&mut front, cases, "names", &host);
         keep(&names, &records_frame, records_alloc)

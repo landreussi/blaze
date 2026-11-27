@@ -139,16 +139,27 @@ pub fn pinned_setting<'a>(host: &str, text: &UserlandText<'_>, alloc: Alloc<'a>)
     Ok(SpawnSetting::facts_only(FactPins::from_owned(&pins)))
 }
 
+/// The spawn setting with the derived facts' pins for Linux scripts whose guest is `host`, from
+/// the clang pin table ([`CLANG_JSON`], at `pins/clang.json`).
+pub fn linux_pinned_setting<'a>(host: &str, alloc: Alloc<'a>) -> Result<SpawnSetting, CommandPinsError<'a>> {
+    let pins = fact_pins::linux_fact_pins(CLANG_JSON, host, CLANG_GUEST_DIR, alloc).map_err(|e| owned_pin(e, alloc))?;
+    Ok(SpawnSetting::facts_only(FactPins::from_owned(&pins)))
+}
+
 /// The command's spawn setting (chosen once per command beside its executor): for a macOS host,
-/// the derived facts' pins from the host's userland, read here; a read or a pin that fails stops
-/// the command naming it. Any other host declares no Apple userland (READINESS Q1 is open), so it
-/// gets [`SpawnSetting::off`] and each fact is refused by name at its spawn.
+/// the derived facts' pins from the host's userland, read here; for a pinned Linux host, the
+/// derived facts' pins from `pins/clang.json` (no Apple userland); a read or a pin that fails stops
+/// the command naming it. Any other host gets [`SpawnSetting::off`] and each fact is refused by
+/// name at its spawn.
 pub fn command_spawn_setting<'a>(host: &str, alloc: Alloc<'a>) -> Result<SpawnSetting, CommandPinsError<'a>> {
-    if !host.ends_with("-apple-darwin") {
-        return Ok(SpawnSetting::off());
+    if host.ends_with("-apple-darwin") {
+        let text = read_apple_userland(alloc)?;
+        return pinned_setting(host, &text, alloc);
     }
-    let text = read_apple_userland(alloc)?;
-    pinned_setting(host, &text, alloc)
+    if host == "aarch64-unknown-linux-gnu" {
+        return linux_pinned_setting(host, alloc);
+    }
+    Ok(SpawnSetting::off())
 }
 
 /// What a read subject says now, when it is a derived fact's.
@@ -164,12 +175,47 @@ pub enum FactNow {
 }
 
 /// `subject` ([`facts::subject`]'s form: the program's word, then one argument per line, or a
-/// missing program's `absent-program\n<host>\n<name>`) answered now with `pins`.
-pub fn fact_now(subject: &str, pins: Option<&FactPins>, alloc: Alloc<'_>) -> FactNow {
+/// missing program's `absent-program\n<host>\n<name>`, or a compiler probe's
+/// `cc-probe\n<answerer>\n<clang>\n<key>`) answered now with `pins` and optional active
+/// [`crate::probe_clang::CScriptProbes`]. Fallible because computing a live C-probe runtime
+/// closure identity can fail on host filesystem/deadline errors and must propagate rather than
+/// downgrading into cache invalidation.
+pub fn fact_now_with_probes<'a>(
+    subject: &str,
+    pins: Option<&FactPins>,
+    c_probes: Option<&crate::probe_clang::CScriptProbes>,
+    alloc: Alloc<'a>,
+) -> Result<FactNow, blaze_own::AString<'a>> {
     // A program found missing (spawn_route.rs `ABSENT_HEAD`, D192): a fact of the pinned base
     // tool set's names and blaze's answered list, not of these pins, so answered with none.
     if let Some(now) = crate::spawn_route::absent_now(subject, alloc) {
+        return Ok(FactNow::Answer(now));
+    }
+    if facts::parse_cc_probe_subject(subject).is_some() {
+        let Some(probes) = c_probes else {
+            return Ok(FactNow::NoPins);
+        };
+        let active_answerer = probes.answerer.id(alloc)?;
+        let now = crate::probe_clang::c_probe_reply_now(
+            subject,
+            &active_answerer,
+            &probes.clang_sha256,
+            &probes.sdk_digest,
+            Some(&*probes.records),
+            alloc,
+        )?
+        .flatten();
+        return Ok(FactNow::Answer(now));
+    }
+    Ok(fact_now_pinned(subject, pins, alloc))
+}
+
+fn fact_now_pinned(subject: &str, pins: Option<&FactPins>, alloc: Alloc<'_>) -> FactNow {
+    if let Some(now) = crate::spawn_route::absent_now(subject, alloc) {
         return FactNow::Answer(now);
+    }
+    if facts::parse_cc_probe_subject(subject).is_some() {
+        return FactNow::NoPins;
     }
     let mut lines = subject.split('\n');
     let head = lines.next().unwrap_or("");
@@ -195,6 +241,12 @@ pub fn fact_now(subject: &str, pins: Option<&FactPins>, alloc: Alloc<'_>) -> Fac
         Ok(answer) => FactNow::Answer(Some(reply_digest(answer.code, answer.stdout.as_bytes(), answer.stderr.as_bytes()))),
         Err(_) => FactNow::Answer(None),
     }
+}
+
+/// `subject` answered now with `pins` (no C probe store: `cc-probe` subjects return
+/// [`FactNow::NoPins`]).
+pub fn fact_now(subject: &str, pins: Option<&FactPins>, alloc: Alloc<'_>) -> FactNow {
+    fact_now_pinned(subject, pins, alloc)
 }
 
 /// What the read `subject` is now for a record's lookup: a fact answered with `pins`

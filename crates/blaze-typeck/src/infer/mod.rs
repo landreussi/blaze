@@ -29,7 +29,7 @@ pub use facts::{FactCache, assoc_def};
 pub use terms::{Terms, def_of, item_key, var_index, var_of_index};
 pub use crate::ty::TyFlags;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, HashMap, Map, MapOpts};
 use blaze_own::{Alloc, Vec};
 use blaze_solve::eval::Answer;
 use blaze_solve::fulfill::{Fulfill, State, Wake};
@@ -38,7 +38,7 @@ use blaze_solve::{Clause, EnvId, Goal as SGoal, Solver, Tys as _};
 use blaze_ty::{AliasKind, ConstKind, FnHeader, Node, Region, TyKind};
 
 use crate::error::{CheckError, Stop};
-use crate::ids::{ExprId, ItemKey, Name};
+use crate::ids::{ExprId, ItemKey, Name, RecordSchema};
 use crate::ty::{FulfillError, FulfillErrorKind, Goal, Normalized, Obligation, Ty, TyList, TyView, TypeCtx, Var, VarKind};
 use crate::world::{Reads, World};
 
@@ -47,11 +47,42 @@ use crate::world::{Reads, World};
 /// nothing mid-step (`stop_for_facts`) takes a round; the pull answers every question in place.
 const MAX_FILLS: u32 = 1 << 16;
 
-/// The real type context of one body's check.
-pub struct InferCtx<'a> {
+/// Per-trait stack-maintained index of 2-arg `Goal::Trait`/`Goal::Projection` obligation indices,
+/// enabling O(1) amortized `closure_hint` lookups.
+struct TraitObs<'a> {
+    indices: Vec<u32, Alloc<'a>>,
+    /// Prefix cursor: entries in `indices[..first_active]` were either no longer `State::Pending`
+    /// or had a non-`Infer` self type under `epoch`.
+    first_active: usize,
+    epoch: u64,
+}
+
+/// Incremental cache of obligations whose resolved self type is a local `TyView::Closure(e, _)`,
+/// enabling O(1) per-closure `closure_used_only_once` lookups during `analyze_closures`.
+struct ClosureObsCache<'a> {
+    valid: bool,
+    scanned: usize,
+    by_closure: Map<ExprId, Vec<ItemKey, Alloc<'a>>, FixedState, Alloc<'a>>,
+    unresolved: Vec<u32, Alloc<'a>>,
+}
+
+impl<'a> ClosureObsCache<'a> {
+    fn new_in(alloc: Alloc<'a>) -> Self {
+        ClosureObsCache {
+            valid: false,
+            scanned: 0,
+            by_closure: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
+            unresolved: Vec::new_in(alloc),
+        }
+    }
+}
+
+/// The real type context of one body's check, with an independent lifetime `'f` for its
+/// [`FactCache<'f>`] so a stretch-reused fact cache can outlive a per-round scratch frame `'a`.
+pub struct InferCtxIn<'a, 'f> {
     alloc: Alloc<'a>,
     pub terms: Terms<'a>,
-    pub facts: FactCache<'a>,
+    pub facts: FactCache<'f>,
     solver: Solver<'a>,
     env_clauses: Vec<Clause, Alloc<'a>>,
     env: Option<EnvId>,
@@ -59,6 +90,13 @@ pub struct InferCtx<'a> {
     obs: Vec<Obligation, Alloc<'a>>,
     preds: Vec<Pred, Alloc<'a>>,
     state: Vec<State, Alloc<'a>>,
+    /// Stack-maintained index of 2-arg `Trait`/`Projection` obligations by trait, for `closure_hint`.
+    obs_2arg_by_trait: Map<ItemKey, TraitObs<'a>, FixedState, Alloc<'a>>,
+    /// Incremented on rollbacks that undo state changes or unification bindings, invalidating
+    /// `TraitObs::first_active` cursors in O(1).
+    obs_rollback_epoch: u64,
+    /// Incremental cache of closure self-type trait obligations, for `closure_used_only_once`.
+    closure_obs: ClosureObsCache<'a>,
     /// `(obligation, previous state)` for every state change, for rollback.
     undo: Vec<(u32, State), Alloc<'a>>,
     errors: Vec<FulfillError, Alloc<'a>>,
@@ -69,6 +107,17 @@ pub struct InferCtx<'a> {
     /// Solver reads (the solver's own log; the body's read list is `Reads`): emptied after each
     /// call, as nothing here reads it (it grew for the whole body before).
     solver_reads: Vec<blaze_solve::Read, Alloc<'a>>,
+    /// Persistent `Fulfill<Wake>` carrying wake lists, binding cursor, and retained buffer
+    /// capacities across `select()` calls so repeated `select()` calls cost O(delta) with zero
+    /// per-call bump-frame allocations. Cleared in place whenever `env` changes or `rollback_to`
+    /// undoes obligations/bindings already seen by `fulfill`.
+    fulfill: Option<Fulfill<'a, Wake>>,
+    fulfill_env: Option<EnvId>,
+    fulfill_obs: Vec<usize, Alloc<'a>>,
+    fulfill_registered: usize,
+    fulfill_undo: usize,
+    fulfill_bindings: u32,
+    fulfill_dirty: bool,
     /// Solver calls repeated after a fact was filled: the Need rounds inside the context.
     pub need_rounds: u64,
     /// How many `Specializes` questions this context is answering for the contexts above it
@@ -87,6 +136,10 @@ pub struct InferCtx<'a> {
     #[cfg(test)]
     pub(crate) stop_for_facts: bool,
 }
+
+/// The real type context of one body's check when its scratch arena and fact cache share one
+/// lifetime `'a`.
+pub type InferCtx<'a> = InferCtxIn<'a, 'a>;
 
 /// The deepest chain of `Specializes` questions asked while one is answered (an impl's
 /// where-clause whose own selection weighs two impls that specialize). Past it the check stops
@@ -181,9 +234,9 @@ impl<'a> BodyRows<'a> {
 /// A shared view of a body's terms: the reads `TypeCtx::view` makes, written once, for the
 /// context ([`InferCtx`]) and for [`Exporter`] alike (rule 30).
 #[derive(Clone, Copy)]
-pub(crate) struct Seen<'x, 'a> {
+pub(crate) struct Seen<'x, 'a, 'f> {
     terms: &'x Terms<'a>,
-    facts: &'x FactCache<'a>,
+    facts: &'x FactCache<'f>,
     rows: &'x BodyRows<'a>,
 }
 
@@ -192,9 +245,9 @@ pub(crate) struct Seen<'x, 'a> {
 /// read only, the body rows. Built by `InferCtx::exporter`, or in `Pull::fill` from the terms
 /// the solver hands it and the pull's own borrows, so a `where const` condition is answered
 /// where the solver meets it (no evaluation asked again from its root, D161 loop 3).
-pub(crate) struct Exporter<'x, 'a> {
+pub(crate) struct Exporter<'x, 'a, 'f> {
     terms: &'x mut Terms<'a>,
-    facts: &'x FactCache<'a>,
+    facts: &'x FactCache<'f>,
     rows: &'x mut BodyRows<'a>,
     alloc: Alloc<'a>,
 }
@@ -228,8 +281,8 @@ fn solve_err(e: blaze_solve::Stop) -> Result<(), CheckError> {
 /// `fill` and this pull's borrows of the facts and the body rows ([`fill_const_holds`]). So the
 /// caller's fill loops (`InferCtx::env`, `evaluate`, `select`) meet `Stop::Need` only under
 /// the test strategy that fills nothing (`stop_for_facts`); `Solve::refills` is 0 otherwise.
-struct Pull<'x, 'a, 'w, 'r, W: World> {
-    facts: &'x mut FactCache<'a>,
+struct Pull<'x, 'a, 'f, 'w, 'r, W: World> {
+    facts: &'x mut FactCache<'f>,
     rows: &'x mut BodyRows<'a>,
     reads: &'x mut Reads<'w, 'r, W>,
     alloc: Alloc<'a>,
@@ -246,8 +299,8 @@ struct Pull<'x, 'a, 'w, 'r, W: World> {
     stop: bool,
 }
 
-impl<'x, 'a, 'w, 'r, W: World> Pull<'x, 'a, 'w, 'r, W> {
-    fn new(facts: &'x mut FactCache<'a>, rows: &'x mut BodyRows<'a>, reads: &'x mut Reads<'w, 'r, W>, alloc: Alloc<'a>, spec_depth: u8) -> Self {
+impl<'x, 'a, 'f, 'w, 'r, W: World> Pull<'x, 'a, 'f, 'w, 'r, W> {
+    fn new(facts: &'x mut FactCache<'f>, rows: &'x mut BodyRows<'a>, reads: &'x mut Reads<'w, 'r, W>, alloc: Alloc<'a>, spec_depth: u8) -> Self {
         Pull {
             facts,
             rows,
@@ -263,11 +316,11 @@ impl<'x, 'a, 'w, 'r, W: World> Pull<'x, 'a, 'w, 'r, W> {
     }
 }
 
-impl<'a, W: World> blaze_solve::Source<Terms<'a>> for Pull<'_, 'a, '_, '_, W> {
-    type Facts = FactCache<'a>;
+impl<'a, 'f, W: World> blaze_solve::Source<Terms<'a>> for Pull<'_, 'a, 'f, '_, '_, W> {
+    type Facts = FactCache<'f>;
     const PULLS: bool = true;
 
-    fn facts(&self) -> &FactCache<'a> {
+    fn facts(&self) -> &FactCache<'f> {
         &*self.facts
     }
 
@@ -331,6 +384,13 @@ fn fill_specializes<W: World>(
     let Some(trait_) = ha.trait_ else {
         return Err(CheckError::Malformed(crate::error::Malformed::NoRecord(crate::world::Question::ImplHeader(ka))).into());
     };
+    if let Some(hb) = reads.impl_header(kb)?
+        && hb.trait_ == Some(trait_)
+        && !may_specialize_headers(&ha, &hb)
+    {
+        facts.keep_specializes(a, b, false);
+        return Ok(());
+    }
     // A fact of two impls, asked of their headers alone (no body's opaque in it).
     let mut inner = InferCtx::analysis_in(alloc);
     inner.spec_depth = spec_depth + 1;
@@ -353,14 +413,85 @@ fn fill_specializes<W: World>(
     Ok(())
 }
 
+/// Fast sound pre-filter for `specializes(a, b)`: returns `false` only when rigid top-level
+/// constructors in `hb` (general) and `ha` (specific, with `Param` rigid) definitely cannot unify,
+/// skipping full `InferCtx` allocation for disjoint impl pairs (e.g. `impl Add<u8> for u8` vs
+/// `impl Add<i32> for i32`). Returns `true` conservatively on any alias, opaque, error, or param
+/// in `hb`.
+fn may_specialize_headers(ha: &crate::world::ImplHeader<'_>, hb: &crate::world::ImplHeader<'_>) -> bool {
+    if !may_specialize_ty(ha.types, ha.self_ty, hb.types, hb.self_ty) {
+        return false;
+    }
+    let Ok(a_rest) = ha.types.list(ha.trait_args.list()) else { return true };
+    let Ok(b_rest) = hb.types.list(hb.trait_args.list()) else { return true };
+    if a_rest.len() != b_rest.len() {
+        return false;
+    }
+    for (&at, &bt) in a_rest.iter().zip(b_rest.iter()) {
+        if !may_specialize_ty(ha.types, at, hb.types, bt) {
+            return false;
+        }
+    }
+    true
+}
+
+fn may_specialize_ty(
+    a_tys: crate::portable::PTys<'_>,
+    at: crate::portable::PTy,
+    b_tys: crate::portable::PTys<'_>,
+    bt: crate::portable::PTy,
+) -> bool {
+    use crate::portable::PNode as N;
+    let (Ok(na), Ok(nb)) = (a_tys.node(at), b_tys.node(bt)) else { return true };
+    match nb {
+        // `b`'s parameters become fresh inference vars, and aliases/opaques/errors may normalize.
+        N::Param(_) | N::ConstParam(_) | N::Alias { .. } | N::Opaque(..) | N::Infer | N::Error => return true,
+        _ => {}
+    }
+    match na {
+        // `a`'s aliases/opaques/errors may normalize to `b`'s head.
+        N::Alias { .. } | N::Opaque(..) | N::Infer | N::Error => return true,
+        // `a`'s rigid `Param`/`ConstParam` cannot unify with a non-param rigid constructor in `b`.
+        N::Param(_) | N::ConstParam(_) => return false,
+        _ => {}
+    }
+    match (na, nb) {
+        (N::Bool, N::Bool) | (N::Char, N::Char) | (N::Str, N::Str) | (N::Never, N::Never) => true,
+        (N::Int(x), N::Int(y)) => x == y,
+        (N::Uint(x), N::Uint(y)) => x == y,
+        (N::Float(x), N::Float(y)) => x == y,
+        (N::Adt(x, _), N::Adt(y, _)) => x == y,
+        (N::FnDef(x, _), N::FnDef(y, _)) => x == y,
+        (N::Foreign(x), N::Foreign(y)) => x == y,
+        (N::Ref(x, _), N::Ref(y, _)) => x == y,
+        (N::Ptr(x, _), N::Ptr(y, _)) => x == y,
+        (N::Tuple(x), N::Tuple(y)) => x.len == y.len,
+        (N::Record(sx, lx), N::Record(sy, ly)) => sx == sy && lx.len == ly.len,
+        (N::Union(x), N::Union(y)) => x.len == y.len,
+        (N::Array(..), N::Array(..))
+        | (N::Slice(_), N::Slice(_))
+        | (N::Pat(..), N::Pat(..))
+        | (N::FnPtr(..), N::FnPtr(..))
+        | (N::Closure { .. }, N::Closure { .. })
+        | (N::Future(..), N::Future(..))
+        | (N::Coroutine { .. }, N::Coroutine { .. })
+        | (N::ConstValue { .. }, N::ConstValue { .. })
+        | (N::Dynamic(_), N::Dynamic(_))
+        | (N::ExTrait(..), N::ExTrait(..))
+        | (N::ExProj { .. }, N::ExProj { .. })
+        | (N::ExAuto(_), N::ExAuto(_)) => true,
+        _ => false,
+    }
+}
+
 /// Answers the solver's `ConstHolds(cond, list)` (a `where const` condition, blaze's
 /// extension): the arguments, terms of this context, exported as a ground table through an
 /// [`Exporter`] over `terms`, `facts` and `rows`, which names the condition's record; the answer
 /// kept in `facts`. The one body of the answer, for the pull (`Pull::fill`, mid-step) and the
 /// test strategy's stop (`InferCtx::fill`).
-fn fill_const_holds<'a, W: World>(
+fn fill_const_holds<'a, 'f, W: World>(
     terms: &mut Terms<'a>,
-    facts: &mut FactCache<'a>,
+    facts: &mut FactCache<'f>,
     rows: &mut BodyRows<'a>,
     reads: &mut Reads<'_, '_, W>,
     alloc: Alloc<'a>,
@@ -467,7 +598,7 @@ impl<W: World> crate::instance::Asked<'_, '_, '_, W> {
     /// A nominal coroutine carries the defining item's arguments. Its output and
     /// stored types come from the same read used to lower that type in a body.
     pub(crate) fn import_coroutine(
-        &mut self, cx: &mut InferCtx<'_>, owner: ItemKey, ordinal: u32, args: TyList, depth: u32,
+        &mut self, cx: &mut InferCtxIn<'_, '_>, owner: ItemKey, ordinal: u32, args: TyList, depth: u32,
     ) -> Result<Ty, Stop> {
         let q = crate::world::Question::Coroutine(owner, ordinal);
         let facts = self.reads.coroutine(owner, ordinal)?
@@ -490,7 +621,7 @@ impl<W: World> crate::instance::Asked<'_, '_, '_, W> {
     }
 }
 
-impl<'a> InferCtx<'a> {
+impl<'a, 'f> InferCtxIn<'a, 'f> {
     /// The allocator the check's caller handed in (D102): what this check's scratch lives in.
     pub(crate) fn alloc(&self) -> Alloc<'a> {
         self.alloc
@@ -517,27 +648,6 @@ impl<'a> InferCtx<'a> {
         self.mk_list(&args)
     }
 
-    /// Imports a future from the body currently being written back. Use its nominal
-    /// identity here so exporting the selected impl's arguments never exports a local
-    /// expression id. The output and interior are types of this same body.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn import_instance_future<S: crate::instance::ClosureSource>(
-        &mut self, source: &mut S,
-        body: &crate::body::BodyView<'_>, block: ExprId, owner_args: TyList,
-        types: crate::portable::PTys<'_>, output: crate::portable::PTy, interior: crate::portable::PTy,
-        subst: &[Ty], depth: u32,
-    ) -> Result<Ty, S::Error> {
-        let Some(ordinal) = crate::coroutine_id::coroutine_ordinal(body, block) else {
-            let at = if (block.0 as usize) < body.exprs.len() { block } else { body.root };
-            return Err(CheckError::Malformed(crate::error::Malformed::FutureIdentity {
-                owner: body.owner, block, at: body.expr_range(at),
-            }).into());
-        };
-        let output = crate::instance::import(self, source, types, output, subst, depth)?;
-        let interior = crate::instance::import(self, source, types, interior, subst, depth)?;
-        Ok(self.imported_coroutine(body.owner, ordinal, owner_args, output, interior)?)
-    }
-
     /// The solver term for a portable coroutine instance. Its bounds use the first
     /// two elements. Unification includes every owner argument, even when absent
     /// from the stored state and output. (`pub(crate)`: stalled.rs imports another fn's
@@ -561,12 +671,35 @@ impl<'a> InferCtx<'a> {
         Ok(Ty(made.node().bits()))
     }
 
+    /// Imports a future from the body currently being written back. Use its nominal
+    /// identity here so exporting the selected impl's arguments never exports a local
+    /// expression id. The output and interior are types of this same body.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn import_instance_future<S: crate::instance::ClosureSource>(
+        &mut self, source: &mut S,
+        body: &crate::body::BodyView<'_>, block: ExprId, owner_args: TyList,
+        types: crate::portable::PTys<'_>, output: crate::portable::PTy, interior: crate::portable::PTy,
+        subst: &[Ty], depth: u32,
+    ) -> Result<Ty, S::Error> {
+        let Some(ordinal) = crate::coroutine_id::coroutine_ordinal(body, block) else {
+            let at = if (block.0 as usize) < body.exprs.len() { block } else { body.root };
+            return Err(CheckError::Malformed(crate::error::Malformed::FutureIdentity {
+                owner: body.owner, block, at: body.expr_range(at),
+            }).into());
+        };
+        let output = crate::instance::import(self, source, types, output, subst, depth)?;
+        let interior = crate::instance::import(self, source, types, interior, subst, depth)?;
+        Ok(self.imported_coroutine(body.owner, ordinal, owner_args, output, interior)?)
+    }
+}
+
+impl<'a> InferCtxIn<'a, 'a> {
     /// A context that checks a body, or answers a question asked while bodies are checked
     /// (`TypingMode::Analysis`): an opaque type outside its defining body is rigid, only its
     /// item bounds usable (the Reference, "Impl trait", "Abstract return types"); an auto
     /// trait still sees its hidden type (blaze-solve structural.rs).
     pub fn analysis_in(alloc: Alloc<'a>) -> InferCtx<'a> {
-        InferCtx::in_mode(alloc, TypingMode::Analysis)
+        InferCtxIn::in_mode(alloc, FactCache::new_in(alloc), TypingMode::Analysis)
     }
 
     /// A context that answers a question AFTER type checking, at an instance's ground
@@ -577,33 +710,58 @@ impl<'a> InferCtx<'a> {
     /// `<F as FnOnce<()>>::Output == U` with `F` a fn returning `impl Trait` and `U` that
     /// opaque's hidden type holds only so (suite/opaque_hidden_closure.rs).
     pub fn post_analysis_in(alloc: Alloc<'a>) -> InferCtx<'a> {
-        InferCtx::in_mode(alloc, TypingMode::PostAnalysis)
+        InferCtxIn::in_mode(alloc, FactCache::new_in(alloc), TypingMode::PostAnalysis)
     }
 
     /// [`InferCtx::analysis_in`] under its old name, for the callers outside this crate's
     /// writer's files until the one rewrite of every site (`InferCtx::new_in($A)` to
     /// `InferCtx::analysis_in($A)`) removes it: a new caller names its mode.
     pub fn new_in(alloc: Alloc<'a>) -> InferCtx<'a> {
-        InferCtx::in_mode(alloc, TypingMode::Analysis)
+        InferCtxIn::in_mode(alloc, FactCache::new_in(alloc), TypingMode::Analysis)
+    }
+}
+
+impl<'a, 'f> InferCtxIn<'a, 'f> {
+    /// A context for checking a body using a caller-owned [`FactCache<'f>`] whose lifetime `'f`
+    /// is independent of this round's scratch allocator `alloc` (`'a`), so the caller can reclaim
+    /// the round's entire scratch frame between check rounds while keeping a stretch-reused
+    /// fact cache alive.
+    pub fn analysis_with_facts_in(alloc: Alloc<'a>, facts: FactCache<'f>) -> InferCtxIn<'a, 'f> {
+        InferCtxIn::in_mode(alloc, facts, TypingMode::Analysis)
     }
 
-    fn in_mode(alloc: Alloc<'a>, mode: TypingMode) -> InferCtx<'a> {
-        InferCtx {
+    /// Returns the owned [`FactCache<'f>`], dropping the round's scratch tables.
+    pub fn into_facts(self) -> FactCache<'f> {
+        self.facts
+    }
+
+    fn in_mode(alloc: Alloc<'a>, facts: FactCache<'f>, mode: TypingMode) -> InferCtxIn<'a, 'f> {
+        InferCtxIn {
             mode,
             alloc,
             terms: Terms::new_in(alloc),
-            facts: FactCache::new_in(alloc),
+            facts,
             solver: Solver::new_in(alloc),
             env_clauses: Vec::new_in(alloc),
             env: None,
             obs: Vec::new_in(alloc),
             preds: Vec::new_in(alloc),
             state: Vec::new_in(alloc),
+            obs_2arg_by_trait: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
+            obs_rollback_epoch: 0,
+            closure_obs: ClosureObsCache::new_in(alloc),
             undo: Vec::new_in(alloc),
             errors: Vec::new_in(alloc),
             error_at: 0,
             rows: BodyRows::new_in(alloc),
             solver_reads: Vec::new_in(alloc),
+            fulfill: Some(Fulfill::new_in(alloc)),
+            fulfill_env: None,
+            fulfill_obs: Vec::new_in(alloc),
+            fulfill_registered: 0,
+            fulfill_undo: 0,
+            fulfill_bindings: 0,
+            fulfill_dirty: true,
             need_rounds: 0,
             spec_depth: 0,
             #[cfg(test)]
@@ -621,12 +779,12 @@ impl<'a> InferCtx<'a> {
     }
 
     /// The shared view of this context's terms ([`Seen`]).
-    fn seen(&self) -> Seen<'_, 'a> {
+    fn seen(&self) -> Seen<'_, 'a, 'f> {
         Seen { terms: &self.terms, facts: &self.facts, rows: &self.rows }
     }
 
     /// The parts of this context a ground export reads and adopts into ([`Exporter`]).
-    pub(crate) fn exporter(&mut self) -> Exporter<'_, 'a> {
+    pub(crate) fn exporter(&mut self) -> Exporter<'_, 'a, 'f> {
         Exporter { terms: &mut self.terms, facts: &self.facts, rows: &mut self.rows, alloc: self.alloc }
     }
 
@@ -697,6 +855,57 @@ impl<'a> InferCtx<'a> {
         self.solver.take_trace()
     }
 
+    /// Interns a canonical finite const value-set pattern type (`base is in CONST_SLICE`) in this
+    /// inference context, mirroring [`crate::portable::PortableTys::pattern_const_set`].
+    pub fn mk_pattern_const_set(&mut self, base: Ty, member_digests: &[u128]) -> Result<Ty, CheckError> {
+        let (digests, n) = crate::portable::canonical_const_set(member_digests)?;
+        let tag = self.mk(TyView::Never)?;
+        let u128_ty = self.mk(TyView::Uint(crate::ids::UintTy::U128))?;
+        let mut terms = [Ty(0); 1 + crate::portable::MAX_PATTERN_SET_MEMBERS];
+        terms[0] = tag;
+        for (i, digest) in digests[..n].iter().copied().enumerate() {
+            terms[1 + i] = self.mk(TyView::ConstValue { ty: u128_ty, bits: digest })?;
+        }
+        let list = self.mk_list(&terms[..1 + n])?;
+        self.mk(TyView::Pat(base, list))
+    }
+
+    fn const_set_parts(
+        &mut self,
+        pat: Ty,
+    ) -> Option<(Ty, [u128; crate::portable::MAX_PATTERN_SET_MEMBERS], usize)> {
+        let pat = self.shallow_resolve(pat);
+        let TyView::Pat(base, list) = self.view(pat) else { return None };
+        let len = self.list_len(list) as usize;
+        if len < 2 || len - 1 > crate::portable::MAX_PATTERN_SET_MEMBERS {
+            return None;
+        }
+        if !matches!(self.view(self.list_get(list, 0)), TyView::Never) {
+            return None;
+        }
+        let mut out = [0u128; crate::portable::MAX_PATTERN_SET_MEMBERS];
+        let n = len - 1;
+        for i in 0..n {
+            let elem = self.list_get(list, (1 + i) as u32);
+            let TyView::ConstValue { ty, bits } = self.view(elem) else { return None };
+            if !matches!(self.view(ty), TyView::Uint(crate::ids::UintTy::U128)) {
+                return None;
+            }
+            out[i] = bits;
+        }
+        Some((base, out, n))
+    }
+
+    /// Whether `sub` and `sup` are canonical finite const value-set pattern types over the same
+    /// base type with `members(sub) ⊆ members(sup)` (`(SemVer is in OLD) <: (SemVer is in ALL)`).
+    pub fn const_set_is_subset(&mut self, sub: Ty, sup: Ty) -> bool {
+        let Some((sub_base, sub_digests, sub_n)) = self.const_set_parts(sub) else { return false };
+        let Some((sup_base, sup_digests, sup_n)) = self.const_set_parts(sup) else { return false };
+        let (sb, pb) = (self.shallow_resolve(sub_base), self.shallow_resolve(sup_base));
+        let same_base = sb == pb || matches!((self.resolve(sb), self.resolve(pb)), (Ok(x), Ok(y)) if x == y);
+        same_base && crate::portable::sorted_digests_is_subset(&sub_digests[..sub_n], &sup_digests[..sup_n])
+    }
+
     pub(crate) fn imported_closure(
         &mut self, owner: ItemKey, ordinal: u32, args: TyList, sig: Ty, kind: crate::ty::ClosureKind, upvars: Option<Ty>,
     ) -> Result<Ty, CheckError> {
@@ -743,7 +952,7 @@ impl<'a> InferCtx<'a> {
     }
 }
 
-impl<'x, 'a> Seen<'x, 'a> {
+impl<'x, 'a, 'f> Seen<'x, 'a, 'f> {
     /// Notes that handle `node` could not be read (`what`), keeping the first such note, and
     /// gives `stand_in` (`InferCtx::unreadable`).
     fn unreadable<T>(self, node: u32, what: crate::error::Unreadable, stand_in: T) -> T {
@@ -834,6 +1043,8 @@ impl<'x, 'a> Seen<'x, 'a> {
             TyKind::Str => TyView::Str,
             TyKind::Never => TyView::Never,
             TyKind::Tuple(l) => TyView::Tuple(list(l)),
+            TyKind::Record(s, l) => TyView::Record(RecordSchema(s), list(l)),
+            TyKind::Union(l) => TyView::Union(list(l)),
             TyKind::Ref(_, p, m) => TyView::Ref(mutbl(m), ty(p)),
             TyKind::RawPtr(p, m) => TyView::Ptr(mutbl(m), ty(p)),
             TyKind::Array(e, n) => TyView::Array(ty(e), Ty(n.node().bits())),
@@ -910,8 +1121,8 @@ impl<'x, 'a> Seen<'x, 'a> {
     }
 }
 
-impl<'x, 'a> Exporter<'x, 'a> {
-    fn seen(&self) -> Seen<'_, 'a> {
+impl<'x, 'a, 'f> Exporter<'x, 'a, 'f> {
+    fn seen(&self) -> Seen<'_, 'a, 'f> {
         Seen { terms: &*self.terms, facts: self.facts, rows: &*self.rows }
     }
 
@@ -956,12 +1167,19 @@ impl<'x, 'a> Exporter<'x, 'a> {
         match self.terms.cx.tys.ty_kind(made) {
             TyKind::Closure(d, l) => {
                 let k = def_of(self.terms.cx.tys.item_key(d));
-                if self.rows.closures.contains_key(&k) || self.rows.foreign.iter().any(|f| f.made == made) || self.seen().foreign_resolved(d, l).is_some() {
+                if self.rows.closures.contains_key(&k) || self.rows.foreign.iter().any(|f| f.made == made) {
                     return Ok(());
                 }
-                let Some(&facts::HiddenBody { owner, ordinal, args: n }) = self.facts.hidden_bodies.get(&k) else {
-                    return Err(unseen());
-                };
+                // A newly resolved instance of a term we imported has the same
+                // definition even when one of its arguments has since been bound
+                // or an opaque inside it revealed.
+                let seen = self.seen();
+                let identity = self.facts.hidden_bodies.get(&k).map(|f| (f.owner, f.ordinal, f.args))
+                    .or_else(|| seen.rows.foreign.iter().find_map(|f| {
+                        matches!(seen.terms.cx.tys.ty_kind(f.made), TyKind::Closure(original, _) if original == d)
+                            .then(|| (f.owner, f.ordinal, seen.list_len(f.args)))
+                    }));
+                let (owner, ordinal, n) = identity.ok_or_else(unseen)?;
                 let tys = &mut self.terms.cx.tys;
                 if tys.list_len(l) != n + 3 {
                     return Err(unseen());
@@ -1033,7 +1251,7 @@ impl<'x, 'a> Exporter<'x, 'a> {
     }
 }
 
-impl<'a> InferCtx<'a> {
+impl<'a, 'f> InferCtxIn<'a, 'f> {
     /// A closure's signature (a `FnPtr`, inputs then output) in the solver's "rust-call" form:
     /// its one input the tuple of the closure's inputs (blaze-solve builtin.rs `callable`).
     fn rust_call_sig(&mut self, sig: Ty) -> Result<blaze_ty::Ty, CheckError> {
@@ -1072,6 +1290,11 @@ impl<'a> InferCtx<'a> {
             }
             Goal::WellFormed(t) => Pred::WellFormed(STy(self.bty(t).node().bits())),
             Goal::ConstHolds { cond, args } => Pred::ConstHolds { cond: SDef(cond.0), args: self.slist(args) },
+            Goal::ForFields { container, trait_, args } => Pred::ForFields {
+                container: STy(self.bty(container).node().bits()),
+                trait_: SDef(trait_.0),
+                args_after_self: self.slist(args),
+            },
         }
     }
 
@@ -1105,7 +1328,7 @@ impl<'a> InferCtx<'a> {
     fn pulled<W: World, R>(
         &mut self,
         reads: &mut Reads<'_, '_, W>,
-        solve: impl FnOnce(&mut Solver<'a>, &mut Terms<'a>, &mut Pull<'_, 'a, '_, '_, W>, &mut Vec<blaze_solve::Read, Alloc<'a>>) -> Result<R, blaze_solve::Stop>,
+        solve: impl FnOnce(&mut Solver<'a>, &mut Terms<'a>, &mut Pull<'_, 'a, 'f, '_, '_, W>, &mut Vec<blaze_solve::Read, Alloc<'a>>) -> Result<R, blaze_solve::Stop>,
     ) -> Result<Result<R, blaze_solve::Stop>, Stop> {
         let at = reads.stamp();
         let mut src = Pull::new(&mut self.facts, &mut self.rows, reads, self.alloc, self.spec_depth);
@@ -1199,7 +1422,7 @@ impl<'a> InferCtx<'a> {
         let mode = self.mode;
         for _ in 0..MAX_FILLS {
             let g = SGoal { env, pred, bound: 0 };
-            let r = self.pulled(reads, |solver, terms, src, sr| solver.evaluate_from(terms, src, mode, g, sr));
+            let r = self.pulled(reads, |solver, terms, src, _| solver.evaluate_from_quiet(terms, src, mode, g));
             match r? {
                 Ok(a) => return Ok(a),
                 Err(blaze_solve::Stop::Need(q)) => {
@@ -1539,26 +1762,72 @@ impl<'a> InferCtx<'a> {
         }
     }
 
+    fn invalidate_fulfill(&mut self) {
+        if let Some(f) = self.fulfill.as_mut() {
+            f.clear();
+        }
+        self.fulfill_env = None;
+        self.fulfill_obs.clear();
+        self.fulfill_registered = 0;
+        self.fulfill_undo = 0;
+        self.fulfill_bindings = 0;
+        self.fulfill_dirty = true;
+    }
+
     fn select<W: World>(&mut self, reads: &mut Reads<'_, '_, W>) -> Result<(), Stop> {
         let env = self.env(reads)?;
         let mode = self.mode;
+        if self.fulfill_env != Some(env) {
+            self.invalidate_fulfill();
+        }
         for _ in 0..MAX_FILLS {
-            let mut f: Fulfill<'a, Wake> = Fulfill::new_in(self.alloc);
-            let mut ids: Vec<usize, Alloc<'a>> = Vec::new_in(self.alloc);
-            for i in 0..self.obs.len() {
-                if self.state[i] == State::Pending {
-                    f.register(SGoal { env, pred: self.preds[i], bound: 0 }).map_err(CheckError::Solve)?;
-                    ids.push(i);
-                }
+            let mut f = self.fulfill.take().unwrap_or_else(|| Fulfill::new_in(self.alloc));
+            if self.fulfill_dirty {
+                f.clear();
+                self.fulfill_obs.clear();
+                self.fulfill_registered = 0;
+                self.fulfill_dirty = false;
             }
-            if ids.is_empty() {
+            let reg_res = (|| -> Result<(), Stop> {
+                for i in self.fulfill_registered..self.obs.len() {
+                    if self.state[i] == State::Pending {
+                        f.register(SGoal { env, pred: self.preds[i], bound: 0 }).map_err(CheckError::Solve)?;
+                        self.fulfill_obs.push(i);
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(e) = reg_res {
+                self.fulfill = Some(f);
+                self.invalidate_fulfill();
+                return Err(e);
+            }
+            self.fulfill_registered = self.obs.len();
+            if self.fulfill_obs.is_empty() {
+                self.fulfill_env = Some(env);
+                self.fulfill_undo = self.undo.len();
+                self.fulfill_bindings = self.terms.bindings_len();
+                self.fulfill = Some(f);
                 return Ok(());
             }
+            f.resolved.clear();
             // A fact a goal lacks is pulled where it is met (`Pull`): the obligations are
             // registered once, and again only under the test strategy's stop.
-            let r = self.pulled(reads, |solver, terms, src, sr| f.select_from(solver, terms, src, mode, sr))?;
-            for (j, &i) in ids.iter().enumerate() {
-                let s = f.state[j];
+            let pulled_res = self.pulled(reads, |solver, terms, src, _| f.select_from_quiet(solver, terms, src, mode));
+            let r = match pulled_res {
+                Ok(r) => r,
+                Err(e) => {
+                    self.fulfill = Some(f);
+                    self.invalidate_fulfill();
+                    return Err(e);
+                }
+            };
+            // Sync in obligation registration order so `pull` and `stop_for_facts` emit identical
+            // diagnostic ordering regardless of which wake pass resolved each obligation.
+            f.resolved.sort_unstable();
+            for &j in f.resolved.iter() {
+                let i = self.fulfill_obs[j as usize];
+                let s = f.state[j as usize];
                 if s == State::Fails && self.state[i] == State::Pending {
                     let kind = match self.obs[i].goal {
                         Goal::Projection { .. } => FulfillErrorKind::Mismatch,
@@ -1573,16 +1842,62 @@ impl<'a> InferCtx<'a> {
                 }
                 self.set_state(i, s);
             }
+            f.resolved.clear();
             match r {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.fulfill_env = Some(env);
+                    self.fulfill_undo = self.undo.len();
+                    self.fulfill_bindings = self.terms.bindings_len();
+                    self.fulfill = Some(f);
+                    return Ok(());
+                }
                 Err(blaze_solve::Stop::Need(q)) => {
+                    // `select_from_quiet` stopped mid-batch; keep capacity and rebuild wake state.
+                    self.fulfill = Some(f);
+                    self.invalidate_fulfill();
                     self.fill(q, reads)?;
                     self.need_rounds += 1;
                 }
-                Err(e) => solve_err(e)?,
+                Err(e) => {
+                    self.fulfill = Some(f);
+                    self.invalidate_fulfill();
+                    solve_err(e)?;
+                }
             }
         }
         Err(CheckError::Limit(crate::error::Limit::Solver).into())
+    }
+
+    pub(crate) fn prefilter_impls<W: World>(
+        &mut self,
+        trait_: ItemKey,
+        shape: crate::world::Shape,
+        bucket: &[ItemKey],
+        goal_args: TyList,
+        reads: &mut Reads<'_, '_, W>,
+        out: &mut Vec<ItemKey, Alloc<'_>>,
+    ) -> Result<(), crate::instance::ResolveError> {
+        let s_args = self.slist(goal_args);
+        self.facts.prefilter_impls(trait_, shape, bucket, &self.terms, s_args, reads, out)
+    }
+
+    fn push_ob(&mut self, ob: Obligation, pred: Pred) {
+        let idx = self.obs.len() as u32;
+        if let Goal::Trait { trait_, args } | Goal::Projection { trait_, args, .. } = ob.goal
+            && self.list_len(args) == 2
+        {
+            let alloc = self.alloc;
+            let epoch = self.obs_rollback_epoch;
+            let entry = self.obs_2arg_by_trait.entry(trait_).or_insert_with(|| TraitObs {
+                indices: Vec::new_in(alloc),
+                first_active: 0,
+                epoch,
+            });
+            entry.indices.push(idx);
+        }
+        self.obs.push(ob);
+        self.preds.push(pred);
+        self.state.push(State::Pending);
     }
 
     /// Registers the projection goals relating emitted, each an obligation of `cause` (the
@@ -1598,9 +1913,7 @@ impl<'a> InferCtx<'a> {
                 // Const and opaque aliases have no associated-type name in a typeck goal.
                 Goal::WellFormed(ty)
             };
-            self.obs.push(Obligation { goal, cause });
-            self.preds.push(Pred::Projection { alias, term });
-            self.state.push(State::Pending);
+            self.push_ob(Obligation { goal, cause }, Pred::Projection { alias, term });
         }
     }
 }
@@ -1618,7 +1931,7 @@ fn why_cand(c: blaze_solve::witness::Choice) -> crate::diag::WhyCand {
     }
 }
 
-impl<'a> TypeCtx for InferCtx<'a> {
+impl<'a, 'f> TypeCtx for InferCtxIn<'a, 'f> {
     type Snapshot = InferSnapshot;
 
     fn mk(&mut self, v: TyView) -> Result<Ty, CheckError> {
@@ -1634,6 +1947,14 @@ impl<'a> TypeCtx for InferCtx<'a> {
             TyView::Tuple(l) => {
                 let l = self.blist(l);
                 self.terms.cx.tys.tuple(l)
+            }
+            TyView::Record(s, l) => {
+                let l = self.blist(l);
+                self.terms.cx.tys.record(s.0, l)
+            }
+            TyView::Union(l) => {
+                let l = self.blist(l);
+                self.terms.cx.tys.union(l)
             }
             TyView::Ref(m, t) => {
                 let t = self.bty(t);
@@ -1957,12 +2278,34 @@ impl<'a> TypeCtx for InferCtx<'a> {
     }
 
     fn rollback_to(&mut self, s: InferSnapshot) {
+        let bindings_before = self.terms.bindings_len();
         self.terms.cx.rollback_to(s.cx);
+        let state_undone = self.undo.len() > s.undo;
         while self.undo.len() > s.undo {
             let Some((i, old)) = self.undo.pop() else { break };
             if (i as usize) < self.state.len() {
                 self.state[i as usize] = old;
             }
+        }
+        let obs_truncated = self.obs.len() > s.obs;
+        if obs_truncated {
+            for i in (s.obs..self.obs.len()).rev() {
+                if let Goal::Trait { trait_, args } | Goal::Projection { trait_, args, .. } = self.obs[i].goal
+                    && self.list_len(args) == 2
+                    && let Some(entry) = self.obs_2arg_by_trait.get_mut(&trait_)
+                {
+                    entry.indices.pop();
+                    if entry.first_active > entry.indices.len() {
+                        entry.first_active = entry.indices.len();
+                    }
+                }
+            }
+        }
+        if state_undone || self.terms.bindings_len() < bindings_before {
+            self.obs_rollback_epoch = self.obs_rollback_epoch.wrapping_add(1);
+        }
+        if self.closure_obs.valid && (obs_truncated || self.terms.bindings_len() < bindings_before) {
+            self.closure_obs.valid = false;
         }
         self.obs.truncate(s.obs);
         self.preds.truncate(s.obs);
@@ -1971,6 +2314,14 @@ impl<'a> TypeCtx for InferCtx<'a> {
         self.error_at = s.error_at;
         self.env_clauses.truncate(s.env_clauses);
         self.env = s.env;
+        if self.fulfill.is_some()
+            && (s.obs < self.fulfill_registered
+                || s.undo < self.fulfill_undo
+                || self.fulfill_env != self.env
+                || self.terms.bindings_len() < self.fulfill_bindings)
+        {
+            self.invalidate_fulfill();
+        }
     }
 
     fn commit(&mut self, s: InferSnapshot) {
@@ -1986,9 +2337,7 @@ impl<'a> TypeCtx for InferCtx<'a> {
 
     fn register(&mut self, ob: Obligation) -> Result<(), CheckError> {
         let p = self.pred(ob.goal);
-        self.obs.push(ob);
-        self.preds.push(p);
-        self.state.push(State::Pending);
+        self.push_ob(ob, p);
         Ok(())
     }
 
@@ -2089,13 +2438,15 @@ impl<'a> TypeCtx for InferCtx<'a> {
             // Selected, with a nested goal undecided: the answer's constraints are applied, so
             // the term is the answer when they decided it (`Normalized::Ambiguous`). An
             // overflow's constraints are not kept (rustc's `MaybeCause::Overflow { keep_constraints:
-            // false }` in the root), nor a term still a bare variable (two candidates left).
+            // false }` in the root), nor an unconstrained fresh variable (two candidates left).
+            // A fresh `var` unified with another variable (e.g. `<Arc<?T, ?A> as Deref>::Target
+            // = ?T` while `?A: Allocator` is still undecided) is NOT a singleton and must be kept.
             Ok(Answer::Maybe(blaze_solve::term::Certainty::Ambiguous)) => {
-                let r = Ty(self.terms.cx.resolve_ty(var).node().bits());
-                if matches!(self.view(r), TyView::Infer(_)) {
+                if self.terms.cx.is_singleton_ty_var(var) {
                     self.rollback_to(s);
                     return Ok(None);
                 }
+                let r = Ty(self.terms.cx.resolve_ty(var).node().bits());
                 self.commit(s);
                 Ok(Some(Normalized::Ambiguous(r)))
             }
@@ -2112,7 +2463,10 @@ impl<'a> TypeCtx for InferCtx<'a> {
 
     fn settle_closure(&mut self, closure: ExprId, kind: crate::ty::ClosureKind, upvars: Option<Ty>) -> Result<(), CheckError> {
         use blaze_solve::term::{CLOSURE_FN, CLOSURE_FN_MUT, CLOSURE_FN_ONCE};
-        let Some((&id, &row)) = self.rows.closures.iter().find(|(_, r)| r.expr == closure) else {
+        let mut h = crate::hash::StableHasher::new("blaze-typeck closure def");
+        h.u32(closure.0);
+        let id = u128::from(h.finish());
+        let Some(&row) = self.rows.closures.get(&id) else {
             return Err(CheckError::Malformed(crate::error::Malformed::ClosureNotMade(closure)));
         };
         let v = match kind {
@@ -2143,24 +2497,69 @@ impl<'a> TypeCtx for InferCtx<'a> {
 
     fn closure_hint(&mut self, var: Ty, fn_traits: [ItemKey; 3], output: Name) -> Result<Option<((TyList, crate::ty::Cause), Option<(Ty, crate::ty::Cause)>)>, CheckError> {
         let v = self.shallow_resolve(var);
-        let mut found = None;
-        for i in 0..self.obs.len() {
-            if self.state[i] == State::Pending
-                && let Goal::Trait { trait_, args } = self.obs[i].goal
-                && fn_traits.contains(&trait_)
-                && self.list_len(args) == 2
-                && self.shallow_resolve(self.list_get(args, 0)) == v
-            {
-                let tuple = self.shallow_resolve(self.list_get(args, 1));
-                if let TyView::Tuple(l) = self.view(tuple) {
-                    // Where the expectation came from (D148): the obligation's cause, a
-                    // clause of a use (`Cause::Clause`) when a declared bound filed it.
-                    found = Some((l, self.obs[i].cause));
+        let v_is_infer = matches!(self.view(v), TyView::Infer(_));
+        let epoch = self.obs_rollback_epoch;
+        let mut best: Option<(usize, TyList, crate::ty::Cause)> = None;
+        for (ti, &want_trait) in fn_traits.iter().enumerate() {
+            if fn_traits[..ti].contains(&want_trait) {
+                continue;
+            }
+            let Some(len) = self.obs_2arg_by_trait.get(&want_trait).map(|e| e.indices.len()) else {
+                continue;
+            };
+            let start = if v_is_infer {
+                let Some(entry) = self.obs_2arg_by_trait.get_mut(&want_trait) else { continue };
+                if entry.epoch != epoch {
+                    entry.first_active = 0;
+                    entry.epoch = epoch;
+                }
+                entry.first_active
+            } else {
+                0
+            };
+            let mut new_active = start;
+            let mut prefix_dead = v_is_infer;
+            for pos in start..len {
+                let i = self.obs_2arg_by_trait[&want_trait].indices[pos] as usize;
+                if let Some((best_i, _, _)) = best
+                    && i >= best_i
+                {
                     break;
                 }
+                if self.state[i] != State::Pending {
+                    if prefix_dead {
+                        new_active = pos + 1;
+                    }
+                    continue;
+                }
+                let (is_trait, args) = match self.obs[i].goal {
+                    Goal::Trait { args, .. } => (true, args),
+                    Goal::Projection { args, .. } => (false, args),
+                    _ => continue,
+                };
+                let self_ty = self.shallow_resolve(self.list_get(args, 0));
+                if prefix_dead && !matches!(self.view(self_ty), TyView::Infer(_)) {
+                    new_active = pos + 1;
+                    continue;
+                }
+                prefix_dead = false;
+                if is_trait && self_ty == v {
+                    let tuple = self.shallow_resolve(self.list_get(args, 1));
+                    if let TyView::Tuple(l) = self.view(tuple) {
+                        // Where the expectation came from (D148): the obligation's cause, a
+                        // clause of a use (`Cause::Clause`) when a declared bound filed it.
+                        best = Some((i, l, self.obs[i].cause));
+                        break;
+                    }
+                }
+            }
+            if v_is_infer && new_active > start
+                && let Some(entry) = self.obs_2arg_by_trait.get_mut(&want_trait)
+            {
+                entry.first_active = new_active;
             }
         }
-        let Some((inputs, cause)) = found else { return Ok(None) };
+        let Some((_, inputs, cause)) = best else { return Ok(None) };
         // Output belongs to the Once supertrait at these same arguments. Another bound on
         // this variable may project a different Output, and may precede the callable bound:
         // a projection whose `Args` cannot equal the inputs is another bound's. "Can equal",
@@ -2171,31 +2570,122 @@ impl<'a> TypeCtx for InferCtx<'a> {
         // in the projection. Compared as lists, the output was lost there and the closure's
         // return type was left to its body: tempo's crates/zones/node/tests/it/utils.rs:2658.
         let inputs_tuple = self.mk(TyView::Tuple(inputs))?;
-        for i in 0..self.obs.len() {
-            if self.state[i] == State::Pending
-                && let Goal::Projection { trait_, args, name, term } = self.obs[i].goal
-                && trait_ == fn_traits[2] && name == output && self.list_len(args) == 2
-                && self.shallow_resolve(self.list_get(args, 0)) == v
-            {
-                let tuple = self.shallow_resolve(self.list_get(args, 1));
-                let TyView::Tuple(l) = self.view(tuple) else { continue };
-                let same = if l == inputs {
-                    true
-                } else if self.list_len(l) != self.list_len(inputs) {
-                    false
-                } else {
-                    let s = self.snapshot();
-                    let can = self.unify(tuple, inputs_tuple);
-                    self.rollback_to(s);
-                    can?
-                };
-                if same {
-                    let ob_cause = self.obs[i].cause;
-                    return Ok(Some(((inputs, cause), Some((term, ob_cause)))));
+        let once_trait = fn_traits[2];
+        if let Some(len) = self.obs_2arg_by_trait.get(&once_trait).map(|e| e.indices.len()) {
+            let start = if v_is_infer {
+                let entry = self.obs_2arg_by_trait.get_mut(&once_trait).unwrap();
+                if entry.epoch != epoch {
+                    entry.first_active = 0;
+                    entry.epoch = epoch;
+                }
+                entry.first_active
+            } else {
+                0
+            };
+            for pos in start..len {
+                let i = self.obs_2arg_by_trait[&once_trait].indices[pos] as usize;
+                if self.state[i] == State::Pending
+                    && let Goal::Projection { trait_, args, name, term } = self.obs[i].goal
+                    && trait_ == once_trait
+                    && name == output
+                    && self.shallow_resolve(self.list_get(args, 0)) == v
+                {
+                    let tuple = self.shallow_resolve(self.list_get(args, 1));
+                    let TyView::Tuple(l) = self.view(tuple) else { continue };
+                    let same = if l == inputs {
+                        true
+                    } else if self.list_len(l) != self.list_len(inputs) {
+                        false
+                    } else {
+                        let s = self.snapshot();
+                        let can = self.unify(tuple, inputs_tuple);
+                        self.rollback_to(s);
+                        can?
+                    };
+                    if same {
+                        let ob_cause = self.obs[i].cause;
+                        return Ok(Some(((inputs, cause), Some((term, ob_cause)))));
+                    }
                 }
             }
         }
         Ok(Some(((inputs, cause), None)))
+    }
+
+    fn closure_used_only_once(
+        &mut self,
+        closure: ExprId,
+        once_traits: [Option<ItemKey>; 2],
+        ref_traits: [Option<ItemKey>; 4],
+    ) -> bool {
+        if !self.closure_obs.valid {
+            self.closure_obs.by_closure.clear();
+            self.closure_obs.unresolved.clear();
+            self.closure_obs.scanned = 0;
+            self.closure_obs.valid = true;
+        }
+        let alloc = self.alloc;
+        let obs_len = self.obs.len();
+        let scanned = self.closure_obs.scanned;
+        for i in scanned..obs_len {
+            let (trait_, args) = match self.obs[i].goal {
+                Goal::Trait { trait_, args } | Goal::Projection { trait_, args, .. } => (trait_, args),
+                _ => continue,
+            };
+            if self.list_len(args) == 0 {
+                continue;
+            }
+            let self_ty = self.shallow_resolve(self.list_get(args, 0));
+            match self.view(self_ty) {
+                TyView::Closure(e, _) => {
+                    let list = self.closure_obs.by_closure.entry(e).or_insert_with(|| Vec::new_in(alloc));
+                    if list.scan_for(&trait_).is_none() {
+                        list.push(trait_);
+                    }
+                }
+                TyView::Infer(_) => self.closure_obs.unresolved.push(i as u32),
+                _ => {}
+            }
+        }
+        self.closure_obs.scanned = obs_len;
+        let mut keep = 0usize;
+        let unresolved_len = self.closure_obs.unresolved.len();
+        for pos in 0..unresolved_len {
+            let idx = self.closure_obs.unresolved[pos];
+            let i = idx as usize;
+            let (trait_, args) = match self.obs[i].goal {
+                Goal::Trait { trait_, args } | Goal::Projection { trait_, args, .. } => (trait_, args),
+                _ => continue,
+            };
+            let self_ty = self.shallow_resolve(self.list_get(args, 0));
+            match self.view(self_ty) {
+                TyView::Closure(e, _) => {
+                    let list = self.closure_obs.by_closure.entry(e).or_insert_with(|| Vec::new_in(alloc));
+                    if list.scan_for(&trait_).is_none() {
+                        list.push(trait_);
+                    }
+                }
+                TyView::Infer(_) => {
+                    self.closure_obs.unresolved[keep] = idx;
+                    keep += 1;
+                }
+                _ => {}
+            }
+        }
+        self.closure_obs.unresolved.truncate(keep);
+        let Some(traits) = self.closure_obs.by_closure.get(&closure) else {
+            return false;
+        };
+        let mut saw_once = false;
+        let mut saw_ref = false;
+        for &trait_ in traits.iter() {
+            if ref_traits.contains(&Some(trait_)) {
+                saw_ref = true;
+            } else if once_traits.contains(&Some(trait_)) {
+                saw_once = true;
+            }
+        }
+        saw_once && !saw_ref
     }
 }
 

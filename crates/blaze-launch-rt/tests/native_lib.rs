@@ -55,7 +55,7 @@ impl Memory for FakeMemory {
     fn thunk(&self, slot: SlotId) -> u64 {
         thunk_of(slot)
     }
-    fn outside(&mut self, _record: RecordId, symbol: CodeSymbol, _name: &str) -> Result<Outside, RunModeError> {
+    fn outside(&mut self, _record: RecordId, symbol: CodeSymbol, _name: &str, _weak: bool) -> Result<Outside, RunModeError> {
         Err(RunModeError::NoNativeLibrary { symbol })
     }
     fn reserve(&mut self, _len: usize, _align: usize) -> Result<u64, RunModeError> {
@@ -127,14 +127,19 @@ fn fake(descriptor: Descriptor, rows: &'static [PointerRow]) -> FakeNatives {
     FakeNatives { descriptor, rows, opened: 0, writes: Vec::new_in(alloc()), names: &[("write", 0x1234_5678)] }
 }
 
+/// Encodes one `Down` frame into `out` and delivers it to `mode`.
+fn send_down(mode: &mut RunMode<'static>, id: u64, down: Down<'_>, acts: &mut AVec<'static, Act>) {
+    let mut frame = std::vec::Vec::new();
+    down.encode(id, &mut frame).expect("Down encodes");
+    mode.on(Event::Frame(&frame), acts).expect("Down is read");
+}
+
 /// A run mode with the entry numbered (slot 0) and the parent's `Native { LIBRARY, pairs }`
 /// read: the acts it gave.
 fn declared(mode: &mut RunMode<'static>, pairs: &[Declared]) -> AVec<'static, Act> {
     let mut acts: AVec<'static, Act> = Vec::new_in(alloc());
     mode.start(ENTRY, &mut acts).expect("the entry is numbered");
-    let mut frame = std::vec::Vec::new();
-    Down::Native { library: LIBRARY, words: List::of(pairs) }.encode(1, &mut frame).expect("Native encodes");
-    mode.on(Event::Frame(&frame), &mut acts).expect("Native is read");
+    send_down(mode, 1, Down::Native { library: LIBRARY, words: List::of(pairs) }, &mut acts);
     acts
 }
 
@@ -222,14 +227,18 @@ fn refuses_word_count_mismatch() {
 #[test]
 fn outside_before_native_refused() {
     let symbol = CodeSymbol([0x33; 32]);
-    let before = native_lib::bind::<FakeNatives>(None, LIBRARY, symbol, "write");
+    let before = native_lib::bind::<FakeNatives>(None, LIBRARY, symbol, "write", false);
     assert_eq!(before, Err(RunModeError::NoNativeLibrary { symbol }));
     let mut natives = fake(descriptor(0, 0), &[]);
-    let found = native_lib::bind(Some(&mut natives), LIBRARY, symbol, "write");
+    let found = native_lib::bind(Some(&mut natives), LIBRARY, symbol, "write", false);
     assert_eq!(found, Ok(0x1234_5678));
-    let lacks = native_lib::bind(Some(&mut natives), LIBRARY, symbol, "not_there");
+    let weak_found = native_lib::bind(Some(&mut natives), LIBRARY, symbol, "write", true);
+    assert_eq!(weak_found, Ok(0x1234_5678));
+    let lacks = native_lib::bind(Some(&mut natives), LIBRARY, symbol, "not_there", false);
     assert!(matches!(lacks, Err(RunModeError::Outside { record: LIBRARY, .. })), "the refusal names the record: {lacks:?}");
-    let nul = native_lib::bind(Some(&mut natives), LIBRARY, symbol, "a\0b");
+    let weak_lacks = native_lib::bind(Some(&mut natives), LIBRARY, symbol, "not_there", true);
+    assert_eq!(weak_lacks, Ok(0), "missing weak symbol binds to 0");
+    let nul = native_lib::bind(Some(&mut natives), LIBRARY, symbol, "a\0b", false);
     assert!(matches!(nul, Err(RunModeError::Outside { .. })), "{nul:?}");
     println!("native_lib: NoNativeLibrary before the library; `write` at {:#x} after; a name it lacks is Outside", 0x1234_5678);
 }
@@ -260,4 +269,55 @@ fn ns_get_args_exist() {
     let (argc, argv, envp) = unsafe { (*libc::_NSGetArgc(), *libc::_NSGetArgv(), *libc::_NSGetEnviron()) };
     assert!(argc >= 1 && !argv.is_null() && !envp.is_null());
     println!("native_lib: _NSGetArgc/_NSGetArgv/_NSGetEnviron answer (argc >= 1)");
+}
+
+/// Lazy mid-run `Down::Native`: a word slot already declared before `Down::Native` must NOT be
+/// re-stubbed (preserving its published body), while a newly declared word slot IS stubbed, and
+/// both words plus pointer rows receive their slots' thunks.
+#[test]
+fn lazy_native_preserves_already_declared_slots_without_restubbing() {
+    let mut mode = RunMode::new(alloc());
+    let mut acts: AVec<'static, Act> = Vec::new_in(alloc());
+    mode.start(ENTRY, &mut acts).expect("entry numbered");
+
+    // Declare A ahead of `Down::Native` (simulating a pure Rust call to an exported fn).
+    let pre = [Declared { symbol: A, slot: Slot(5) }];
+    acts.clear();
+    send_down(&mut mode, 1, Down::Declare { pairs: List::of(&pre) }, &mut acts);
+    assert_eq!(acts.as_slice(), &[Act::Stub { slot: SlotId(1) }], "A is stubbed on Declare");
+
+    // Now send `Down::Native` carrying [A (existing slot 5), B (new slot 9)].
+    let pairs = [Declared { symbol: A, slot: Slot(5) }, Declared { symbol: B, slot: Slot(9) }];
+    acts.clear();
+    send_down(&mut mode, 2, Down::Native { library: LIBRARY, words: List::of(&pairs) }, &mut acts);
+    assert_eq!(acts.last(), Some(&Act::Native { record: LIBRARY }));
+
+    static ROWS: [PointerRow; 1] = [PointerRow { at: 0x9000, word: 0, pad: 0 }];
+    let mut natives = fake(descriptor(2, 1), &ROWS);
+    let mut memory = FakeMemory { stubbed: Vec::new_in(alloc()) };
+    let loaded = mode.load_native(&mut natives, &mut memory).expect("lazy native loads");
+    assert_eq!(loaded.record, LIBRARY);
+    assert_eq!(memory.stubbed.get(1).copied().unwrap_or(false), false, "already-declared slot A must NOT be re-stubbed");
+    assert_eq!(memory.stubbed.get(2).copied().unwrap_or(false), true, "newly declared slot B must be stubbed");
+    assert_eq!(
+        natives.writes.as_slice(),
+        [(BASE + 0x8000, thunk_of(SlotId(1))), (BASE + 0x8008, thunk_of(SlotId(2))), (BASE + 0x9000, thunk_of(SlotId(1)))],
+        "both existing and new word slots get their thunks"
+    );
+}
+
+#[test]
+fn parse_native_start_distinguishes_eager_and_lazy() {
+    use blaze_launch_rt::run_mode::{NativeStart, parse_native_start};
+
+    let hex = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let expected = RecordId([
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+    ]);
+    assert_eq!(parse_native_start(hex), Ok(NativeStart::Eager(expected)));
+    let lazy = b"lazy:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    assert_eq!(parse_native_start(lazy), Ok(NativeStart::Lazy(expected)));
+    assert!(parse_native_start(b"lazy:short").is_err());
+    assert!(parse_native_start(b"bogus").is_err());
 }

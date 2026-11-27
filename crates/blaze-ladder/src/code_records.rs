@@ -86,7 +86,10 @@ pub mod statics;
 /// 8: the instance names an entry declares are symbols.rs' form 2 (a shared forest, each
 /// distinct type once), never form 1's trees: an entry of 7 is refused by its form, never
 /// listed by `body_ids::each_item` as a forest.
-pub const ENTRY_FORM: u32 = 8;
+/// 9: a static's entry carries the datum of each vtable its datum names (`statics`).
+/// 10: call targets and vtable entries canonicalize polymorphizable generic instances via
+/// `front2::poly_canon`, guarded by `ReadKind::PolyBodyText`.
+pub const ENTRY_FORM: u32 = 10;
 
 /// One vtable a code record names, as the entry carries it (run.md, "Statics in the run": a
 /// vtable is data the child places before the record, as a static's datum is): its symbol
@@ -354,6 +357,15 @@ pub enum Callee<'n> {
     C(&'n str),
 }
 
+/// One foreign (`extern`) static referenced by a function: its item key, its C symbol name, and
+/// whether it carries `#[linkage = "extern_weak"]` (resolves to null when undefined).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ForeignStatic<'n> {
+    pub item: ItemKey,
+    pub name: &'n str,
+    pub weak: bool,
+}
+
 /// The names of what one built instance references, by reference place (blaze-build's
 /// `Built::refs`, `statics`, `vtables`, `thread_locals`): `blaze_emit::Names` over the run's
 /// tables, replacing `Target::Slot` and the `via` table.
@@ -363,10 +375,10 @@ pub struct InstanceNames<'n> {
     /// declared by the entry, so the run's parent can send it before the record.
     pub statics: &'n [ItemKey],
     /// The statics among `statics` an `extern` block declares, each with its C symbol (its
-    /// `#[link_name]`, else its name): its place is that symbol (bound as a foreign fn is,
-    /// blaze-emit record.rs `target_of`), and the entry does not declare it, since it has no
-    /// record of its own (the Reference, "External blocks", "Statics": no initializer).
-    pub c_statics: &'n [(ItemKey, &'n str)],
+    /// `#[link_name]`, else its name) and weak flag: its place is that symbol (bound as a foreign
+    /// fn is, blaze-emit record.rs `target_of`), and the entry does not declare it, since it has
+    /// no record of its own (the Reference, "External blocks", "Statics": no initializer).
+    pub c_statics: &'n [ForeignStatic<'n>],
     pub vtables: &'n [Symbol],
     /// The thread-locals, by item key: each is named by its symbol (symbols.rs `tls_symbol`)
     /// and declared by the entry, so the run's parent can send its template before the record.
@@ -381,8 +393,9 @@ impl Names for InstanceNames<'_> {
                 Callee::Symbol(symbol) => Named::Symbol(symbol),
                 Callee::C(name) => Named::C(name),
             }),
-            Outside::Static(place) => self.statics.get(at(place)).map(|&s| match self.c_statics.iter().find(|(k, _)| *k == s) {
-                Some(&(_, c)) => Named::C(c),
+            Outside::Static(place) => self.statics.get(at(place)).map(|&s| match self.c_statics.iter().find(|cs| cs.item == s) {
+                Some(cs) if cs.weak => Named::WeakC(cs.name),
+                Some(cs) => Named::C(cs.name),
                 None => Named::Symbol(static_symbol(s)),
             }),
             Outside::Vtable(place) => self.vtables.get(at(place)).map(|&s| Named::Symbol(s)),
@@ -510,7 +523,7 @@ pub fn make_entry<'a, 'd>(
     isa: Isa,
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, u8>, CodeRecordError> {
-    make_entry_reading(func, names, routines, declared, &ReadList::empty(), isa, alloc)
+    make_entry_reading(func, names, routines, declared, &ReadList::empty(alloc), isa, alloc)
 }
 
 /// [`make_entry`] with the build's read list `reads` ([`reads::ReadLog::seal`]).
@@ -519,7 +532,7 @@ pub fn make_entry_reading<'a, 'd>(
     names: &InstanceNames<'_>,
     routines: crate::front2::builtins_shim::Routines<'d>,
     declared: &mut AVec<'_, Declared<'d>>,
-    reads: &ReadList,
+    reads: &ReadList<'_>,
     isa: Isa,
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, u8>, CodeRecordError> {
@@ -539,7 +552,7 @@ pub fn make_entry_with_vtables<'a, 'd>(
     vtables: &mut AVec<'_, VtableDatum<'_>>,
     routines: crate::front2::builtins_shim::Routines<'d>,
     declared: &mut AVec<'_, Declared<'d>>,
-    reads: &ReadList,
+    reads: &ReadList<'_>,
     traps: &[TrapSource],
     isa: Isa,
     alloc: Alloc<'a>,
@@ -572,7 +585,7 @@ pub fn make_entry_with_vtables<'a, 'd>(
     }
     // A foreign static has no entry to send (its place is its C symbol): not declared.
     let mut own: AVec<'_, ItemKey> = Vec::with_capacity_in(names.statics.len(), alloc);
-    own.extend(names.statics.iter().copied().filter(|s| !names.c_statics.iter().any(|(k, _)| k == s)));
+    own.extend(names.statics.iter().copied().filter(|s| !names.c_statics.iter().any(|cs| cs.item == *s)));
     put_statics(&own, &mut out, alloc).map_err(|what| CodeRecordError::Seal(RecordError::TooLarge { what }))?;
     // Form 5: the thread-locals, in the same keys form (each one's template is sent before the
     // record, as a static is).
@@ -594,6 +607,97 @@ pub fn make_entry_with_vtables<'a, 'd>(
         out.extend_from_slice(&answer.0);
     }
     Ok(out)
+}
+
+/// Target [`blaze_tier::Machine`] for `blaze export` on `isa`: starts from `isa`'s baseline
+/// features (`LSE`, plus `DOTPROD | CRC32` on `Os::MacOs`), and on macOS arm64 probes `sysctlbyname`
+/// (via safe `blaze_sys::macos::sysctl_u32`) for `FEAT_SME`, `FEAT_SME2`, `FEAT_CSSC`, and
+/// `FEAT_SHA3` so exported binaries use the host CPU's full native ISA.
+pub fn export_machine(isa: Isa) -> blaze_tier::Machine {
+    use blaze_tier::{Arch, Machine, Os as TierOs};
+    let os = match isa.os {
+        Os::MacOs => TierOs::MacOs,
+        Os::Linux => TierOs::Linux,
+    };
+    let mut features = (if isa.lse { Machine::LSE } else { 0 })
+        | (if isa.os == Os::MacOs { Machine::DOTPROD | Machine::CRC32 } else { 0 });
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if isa.os == Os::MacOs {
+        const PROBES: [(&core::ffi::CStr, u64); 4] = [
+            (c"hw.optional.arm.FEAT_SME", Machine::SME),
+            (c"hw.optional.arm.FEAT_SME2", Machine::SME2),
+            (c"hw.optional.arm.FEAT_CSSC", Machine::CSSC),
+            (c"hw.optional.arm.FEAT_SHA3", Machine::SHA3),
+        ];
+        for (name, bit) in PROBES {
+            if matches!(blaze_sys::macos::sysctl_u32(name), Ok(Some(v)) if v != 0) {
+                features |= bit;
+            }
+        }
+    }
+    Machine { arch: Arch::Arm64, os, features }
+}
+
+/// Emits a sealed canonical `CodeRecord` for `func` targeting explicit host `machine` features
+/// (e.g. `Machine::SME2 | Machine::CSSC | Machine::SHA3` from [`export_machine`]), returning the
+/// encoded `CodeRecord` bytes and any `SoftFloat` routines that legalization called.
+///
+/// Unlike [`make_entry_with_vtables`], this produces raw `CodeRecord` bytes (not an `ENTRY`
+/// wrapper for `CodeStore`) so host-specific LTO records stay ephemeral in the export buffer and
+/// never pollute portable cached store entries (Rule 25).
+pub fn emit_code_record_for_machine<'a, 'd>(
+    func: Verified<'_>,
+    names: &InstanceNames<'_>,
+    routines: crate::front2::builtins_shim::Routines<'d>,
+    traps: &[TrapSource],
+    machine: blaze_tier::Machine,
+    alloc: Alloc<'a>,
+) -> Result<(AVec<'a, u8>, AVec<'a, Declared<'d>>), CodeRecordError> {
+    let (code, extra_declared, _clobbers) = emit_code_record_for_machine_with_abi(
+        func,
+        names,
+        routines,
+        traps,
+        blaze_emit::SotaRecordAbiOpts::for_machine(machine),
+        alloc,
+    )?;
+    Ok((code, extra_declared))
+}
+
+/// Emits a sealed canonical `CodeRecord` for `func` with explicit Zero-ABI, bottom-up IPRA, and
+/// 2-tier hot/cold options ([`blaze_emit::SotaRecordAbiOpts`]), returning the encoded `CodeRecord`
+/// bytes, any `SoftFloat` routines called by legalization, and the emitted function's exact
+/// [`blaze_tier::CallClobbers`] summary for downstream callers.
+///
+/// Unlike [`make_entry_with_vtables`], this produces raw `CodeRecord` bytes (not an `ENTRY`
+/// wrapper for `CodeStore`) so host-specific LTO records stay ephemeral in the export buffer and
+/// never pollute portable cached store entries (Rule 25).
+pub fn emit_code_record_for_machine_with_abi<'a, 'd>(
+    func: Verified<'_>,
+    names: &InstanceNames<'_>,
+    routines: crate::front2::builtins_shim::Routines<'d>,
+    traps: &[TrapSource],
+    abi_opts: blaze_emit::SotaRecordAbiOpts<'_>,
+    alloc: Alloc<'a>,
+) -> Result<(AVec<'a, u8>, AVec<'a, Declared<'d>>, blaze_tier::CallClobbers), CodeRecordError> {
+    let (record, _insts, called, clobbers) =
+        blaze_emit::emit_sota_record_for_machine_with_abi(
+            func,
+            names,
+            routines.places(),
+            abi_opts,
+            traps,
+            alloc,
+        )
+        .map_err(|why| routines.refusal(why))?;
+    let mut extra_declared: AVec<'a, Declared<'d>> = Vec::new_in(alloc);
+    for r in called.iter() {
+        extra_declared.push(routines.declared(r)?);
+    }
+    let sealed = record.seal().map_err(CodeRecordError::Seal)?;
+    let mut code: AVec<'a, u8> = Vec::new_in(alloc);
+    sealed.encode(&mut code);
+    Ok((code, extra_declared, clobbers))
 }
 
 /// The declared statics block onto `out`: their count (4), then each item key (16), ascending
@@ -1001,7 +1105,6 @@ impl CodeStore for MemoryStore<'_> {
                 let mut value = Vec::new_in(self.alloc);
                 value.extend_from_slice(bytes);
                 self.rows.insert_shift(at, (key, value));
-                self.puts += 1;
                 Ok(())
             }
         }
@@ -1013,9 +1116,14 @@ impl CodeStore for MemoryStore<'_> {
 
     fn point(&mut self, _class: CodeClass, key: CodeKey, content: CodeKey) -> Result<(), StoreError> {
         match self.pointers.binary_search_by(|row| row.0.cmp(&key)) {
-            Ok(at) => self.pointers[at].1 = content,
+            Ok(at) if self.pointers[at].1 == content => {}
+            Ok(at) => {
+                self.pointers[at].1 = content;
+                self.puts += 1;
+            }
             Err(at) => {
                 self.pointers.insert_shift(at, (key, content));
+                self.puts += 1;
             }
         }
         Ok(())
@@ -1078,7 +1186,7 @@ pub fn instance_declares(
             d.instance(row.tabled, row.name).map_err(large)?;
         }
     }
-    for &s in names.statics.iter().filter(|s| !names.c_statics.iter().any(|(k, _)| k == *s)) {
+    for &s in names.statics.iter().filter(|s| !names.c_statics.iter().any(|cs| cs.item == **s)) {
         d.static_item(s).map_err(large)?;
     }
     let mut trees: AVec<'_, u8> = Vec::new_in(alloc);

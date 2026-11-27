@@ -64,7 +64,7 @@ use blaze_own::Vec;
 use crate::{
     Block, Func, Op, Ty, View,
     func::{BlockKind, Ext, NONE, ParamKind, ParamRec, SigRec, SlotKind, SlotRec},
-    op::{Field, Layout, Word, walk},
+    op::{Field, Layout, RewriteSink, Word, rewrite_fields, walk},
     verify::{VerifyError, verify},
 };
 
@@ -138,7 +138,7 @@ impl core::error::Error for LoopEntryError {}
 
 /// The variant of `view` entered at `header` with the words of `live` (the module's "The
 /// convention"), every buffer in `alloc`. `view` must be verified (`crate::verify`).
-pub fn entry_variant<A: Allocator + Clone>(
+pub fn entry_variant<A: Allocator + Copy>(
     view: View<'_>,
     header: Block,
     live: &[LiveKey],
@@ -148,7 +148,7 @@ pub fn entry_variant<A: Allocator + Clone>(
 }
 
 /// [`entry_variant`] with a planted bug, which only test builds act on.
-pub fn entry_variant_planted<A: Allocator + Clone>(
+pub fn entry_variant_planted<A: Allocator + Copy>(
     view: View<'_>,
     header: Block,
     live: &[LiveKey],
@@ -204,7 +204,7 @@ pub fn entry_variant_planted<A: Allocator + Clone>(
         }
     }
 
-    let mut func = view.to_func_in(alloc.clone());
+    let mut func = view.to_func_in(alloc);
     func.ops.clear();
     func.flags.clear();
     func.tys.clear();
@@ -275,7 +275,7 @@ pub fn entry_variant_planted<A: Allocator + Clone>(
         current: NONE,
         fetched: filled(values, NONE, &alloc),
         fetched_in: filled(values, NONE, &alloc),
-        fixups: Vec::new_in(alloc.clone()),
+        fixups: Vec::new_in(alloc),
     };
     for at in 0..values {
         e.def_block[at] = block_of[at];
@@ -288,7 +288,7 @@ pub fn entry_variant_planted<A: Allocator + Clone>(
 
     // ---- the head ----
     e.begin(BlockKind::Normal);
-    let mut words = Vec::with_capacity_in(rows.len(), alloc.clone());
+    let mut words = Vec::with_capacity_in(rows.len(), alloc);
     for _ in 0..rows.len() {
         words.push(e.raw(Op::Param, 0, word, 0, 0, 0));
     }
@@ -313,8 +313,8 @@ pub fn entry_variant_planted<A: Allocator + Clone>(
         }
     }
     // The header's parameters: the head's value of each listed one, `uninit` for another.
-    let mut args = Vec::with_capacity_in(header_params.len(), alloc.clone());
-    for at in header_params.clone() {
+    let mut args = Vec::with_capacity_in(header_params.len(), alloc);
+    for at in header_params.start..header_params.end {
         let arg = match listed[at] {
             true => e.map[at],
             false => e.push(Op::Uninit, Ty(view.tys[at]), &[]),
@@ -327,7 +327,7 @@ pub fn entry_variant_planted<A: Allocator + Clone>(
     e.func.extra.extend_from_slice(&args[..]);
     e.raw(Op::Jump, 0, Ty::NONE, start, 0, 0);
     // The header's parameters are the header's own from here on.
-    for at in header_params.clone() {
+    for at in header_params.start..header_params.end {
         e.map[at] = NONE;
     }
 
@@ -337,10 +337,10 @@ pub fn entry_variant_planted<A: Allocator + Clone>(
         e.begin(view.block_kind(block));
         e.current = b as u32;
         let params = view.params(block);
-        for at in params.clone() {
+        for at in params.start..params.end {
             e.map[at] = e.raw(Op::Param, view.flags[at], Ty(view.tys[at]), 0, view.attrs[at], view.locs[at]);
         }
-        for at in params.clone() {
+        for at in params.start..params.end {
             e.spill(at);
         }
         if invoked[b] != NONE {
@@ -368,7 +368,7 @@ pub fn entry_variant_planted<A: Allocator + Clone>(
         return Err(LoopEntryError::TooLarge);
     }
     if cfg!(debug_assertions) {
-        verify(func.view()).map_err(LoopEntryError::Output)?;
+        crate::verify::verify_in(func.view(), func.allocator()).map_err(LoopEntryError::Output)?;
     }
     Ok(func)
 }
@@ -380,14 +380,14 @@ enum Row {
     Slot(u32),
 }
 
-fn filled<T: Clone, A: Allocator + Clone>(len: usize, item: T, alloc: &A) -> Vec<T, A> {
-    Vec::from_elem_in(item, len, alloc.clone())
+fn filled<T: Clone, A: Allocator + Copy>(len: usize, item: T, alloc: &A) -> Vec<T, A> {
+    Vec::from_elem_in(item, len, *alloc)
 }
 
 /// The keys read into rows: sorted, each once, each a value of a type with a word or a slot.
-fn rows<A: Allocator + Clone>(view: &View<'_>, live: &[LiveKey], alloc: &A) -> Result<Vec<Row, A>, LoopEntryError> {
+fn rows<A: Allocator + Copy>(view: &View<'_>, live: &[LiveKey], alloc: &A) -> Result<Vec<Row, A>, LoopEntryError> {
     let values = view.len();
-    let mut rows = Vec::with_capacity_in(live.len(), alloc.clone());
+    let mut rows = Vec::with_capacity_in(live.len(), *alloc);
     let mut last: Option<u32> = None;
     for &LiveKey(key) in live {
         if last.is_some_and(|it| it >= key) {
@@ -441,7 +441,7 @@ fn word_form(ty: Ty, ptr_bits: u32) -> Option<WordForm> {
 }
 
 /// Per instruction, its block.
-fn block_of<A: Allocator + Clone>(view: &View<'_>, alloc: &A) -> Vec<u32, A> {
+fn block_of<A: Allocator + Copy>(view: &View<'_>, alloc: &A) -> Vec<u32, A> {
     let mut of = filled(view.len(), NONE, alloc);
     for b in 0..view.blocks() {
         for at in view.block(Block(b as u32)) {
@@ -466,9 +466,9 @@ fn successors(view: &View<'_>, at: usize, mut f: impl FnMut(u32)) {
 }
 
 /// The blocks reached from `from`, itself included.
-fn reach<A: Allocator + Clone>(view: &View<'_>, from: u32, alloc: &A) -> Vec<bool, A> {
+fn reach<A: Allocator + Copy>(view: &View<'_>, from: u32, alloc: &A) -> Vec<bool, A> {
     let mut seen = filled(view.blocks(), false, alloc);
-    let mut work = Vec::new_in(alloc.clone());
+    let mut work = Vec::new_in(*alloc);
     seen[from as usize] = true;
     work.push(from);
     while let Some(b) = work.pop() {
@@ -486,7 +486,7 @@ fn reach<A: Allocator + Clone>(view: &View<'_>, from: u32, alloc: &A) -> Vec<boo
     seen
 }
 
-struct Emit<'v, A: Allocator + Clone> {
+struct Emit<'v, A: Allocator + Copy> {
     view: View<'v>,
     plant: Plant,
     func: Func<A>,
@@ -513,7 +513,7 @@ struct Emit<'v, A: Allocator + Clone> {
     fixups: Vec<(u32, bool), A>,
 }
 
-impl<A: Allocator + Clone> Emit<'_, A> {
+impl<A: Allocator + Copy> Emit<'_, A> {
     fn begin(&mut self, kind: BlockKind) {
         self.func.block_starts.push(self.func.ops.len() as u32);
         self.func.block_kinds.push(kind as u8);
@@ -624,122 +624,13 @@ impl<A: Allocator + Clone> Emit<'_, A> {
         self.fetched_in[at] = self.current;
     }
 
-    fn put_value(&mut self, value: u32) {
-        if self.fetched_in[value as usize] == self.current {
-            self.func.extra.push(self.fetched[value as usize]);
-        } else {
-            self.fixups.push((self.func.extra.len() as u32, false));
-            self.func.extra.push(value);
-        }
-    }
-
-    fn put_block(&mut self, block: u32) {
-        // Every block a copied block names is reached from the header, so it is copied.
-        self.func.extra.push(self.block_map[block as usize]);
-    }
-
-    fn put_slot(&mut self, slot: u32, inst: usize) -> Result<(), LoopEntryError> {
-        let row = self.slot_row[slot as usize];
-        if row == NONE {
-            return Err(LoopEntryError::RowSlotOperand { inst: inst as u32 });
-        }
-        self.func.extra.push(row);
-        Ok(())
-    }
-
-    /// Appends the target at `words[at..]` (a block, a count, the arguments); where its words
-    /// end.
-    fn put_target(&mut self, words: &[u32], mut at: usize) -> usize {
-        self.put_block(words[at]);
-        let n = words[at + 1] as usize;
-        self.func.extra.push(n as u32);
-        at += 2;
-        for _ in 0..n {
-            self.put_value(words[at]);
-            at += 1;
-        }
-        at
-    }
-
     /// Appends the operands `fields` of instruction `inst` to `extra`, each value, block and
-    /// slot as the variant names it. The mirror of [`walk`] (which hands no list's count), on a
-    /// verified function, as coroutine.rs `Emit::rewrite` is.
+    /// slot as the variant names it.
     fn rewrite(&mut self, inst: usize, fields: &'static [Field]) -> Result<(), LoopEntryError> {
         let view = self.view;
-        let words: &[u32] = &view.extra[view.data[inst] as usize..];
+        let words = &view.extra[view.data[inst] as usize..];
         let ty = Ty(view.tys[inst]);
-        let mut at = 0;
-        let mut scrutinee = None;
-        for &field in fields {
-            match field {
-                Field::Value => {
-                    scrutinee = Some(words[at]);
-                    self.put_value(words[at]);
-                    at += 1;
-                }
-                Field::Block => {
-                    self.put_block(words[at]);
-                    at += 1;
-                }
-                Field::Slot => {
-                    self.put_slot(words[at], inst)?;
-                    at += 1;
-                }
-                Field::Imm
-                | Field::Offset
-                | Field::IntCond
-                | Field::FloatCond
-                | Field::Rmw
-                | Field::Ref
-                | Field::Sig
-                | Field::Intrinsic
-                | Field::Asm => {
-                    self.func.extra.push(words[at]);
-                    at += 1;
-                }
-                Field::Target => at = self.put_target(words, at),
-                Field::Values => {
-                    let n = words[at] as usize;
-                    self.func.extra.push(n as u32);
-                    at += 1;
-                    for _ in 0..n {
-                        self.put_value(words[at]);
-                        at += 1;
-                    }
-                }
-                Field::Blocks => {
-                    let n = words[at] as usize;
-                    self.func.extra.push(n as u32);
-                    at += 1;
-                    for _ in 0..n {
-                        self.put_block(words[at]);
-                        at += 1;
-                    }
-                }
-                Field::Mask => {
-                    let n = words[at] as usize;
-                    self.func.extra.extend_from_slice(&words[at..at + 1 + n]);
-                    at += 1 + n;
-                }
-                Field::Const => {
-                    let n = ty.const_words() as usize;
-                    self.func.extra.extend_from_slice(&words[at..at + n]);
-                    at += n;
-                }
-                Field::Cases => {
-                    let width = scrutinee.map_or(0, |it: u32| Ty(view.tys[it as usize]).const_words()) as usize;
-                    let n = words[at] as usize;
-                    self.func.extra.push(n as u32);
-                    at += 1;
-                    for _ in 0..n {
-                        self.func.extra.extend_from_slice(&words[at..at + width]);
-                        at += width;
-                        at = self.put_target(words, at);
-                    }
-                }
-            }
-        }
-        Ok(())
+        rewrite_fields(words, fields, ty, view.tys, &mut LoopRewrite { emit: self, inst })
     }
 
     /// Copies instruction `at`, its operands as the variant names them.
@@ -799,6 +690,47 @@ impl<A: Allocator + Clone> Emit<'_, A> {
             self.spill(at);
         }
         Ok(())
+    }
+}
+
+struct LoopRewrite<'e, 'v, A: Allocator + Copy> {
+    emit: &'e mut Emit<'v, A>,
+    inst: usize,
+}
+
+impl<A: Allocator + Copy> RewriteSink for LoopRewrite<'_, '_, A> {
+    type Error = LoopEntryError;
+
+    fn put_value(&mut self, value: u32) {
+        let e = &mut *self.emit;
+        if e.fetched_in[value as usize] == e.current {
+            e.func.extra.push(e.fetched[value as usize]);
+        } else {
+            e.fixups.push((e.func.extra.len() as u32, false));
+            e.func.extra.push(value);
+        }
+    }
+
+    fn put_block(&mut self, block: u32) {
+        // Every block a copied block names is reached from the header, so it is copied.
+        self.emit.func.extra.push(self.emit.block_map[block as usize]);
+    }
+
+    fn put_slot(&mut self, slot: u32) -> Result<(), LoopEntryError> {
+        let row = self.emit.slot_row[slot as usize];
+        if row == NONE {
+            return Err(LoopEntryError::RowSlotOperand { inst: self.inst as u32 });
+        }
+        self.emit.func.extra.push(row);
+        Ok(())
+    }
+
+    fn push_word(&mut self, word: u32) {
+        self.emit.func.extra.push(word);
+    }
+
+    fn push_words(&mut self, words: &[u32]) {
+        self.emit.func.extra.extend_from_slice(words);
     }
 }
 

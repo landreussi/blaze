@@ -111,7 +111,16 @@ impl Loaded {
         let (_, _, place) = self.texts.roots.get(krate)?;
         match place {
             Place::Disk(dir) => std::fs::read(dir.join(path)).ok().map(|b| &*Box::leak(b.into_boxed_slice())),
-            Place::Pack(view, dir) => view.find(&format!("{dir}{path}")).map(|file| file.bytes),
+            Place::Pack(view, dir) => {
+                let mut full = blaze_own::String::with_capacity_in(dir.len() + path.len(), self.texts.alloc);
+                full.push_str(dir);
+                full.push_str(path);
+                let file = view.read(full.as_str(), self.texts.alloc).ok()??;
+                Some(match file.bytes {
+                    blaze_fetch::FileBytes::Borrowed(b) => b,
+                    blaze_fetch::FileBytes::Owned(v) => v.leak_static(),
+                })
+            }
         }
     }
 }
@@ -128,6 +137,8 @@ pub enum LoadError {
     Names(String),
     /// The proc-macro runner could not be made: what and where.
     Procs(String),
+    /// The infer frame could not be made.
+    Frame(blaze_mem::MemError),
 }
 
 impl std::fmt::Display for LoadError {
@@ -141,6 +152,7 @@ impl std::fmt::Display for LoadError {
             LoadError::Crates(e) => write!(f, "the workspace's crates: {e}"),
             LoadError::Names(e) => write!(f, "the names: {e}"),
             LoadError::Procs(e) => write!(f, "the proc-macro runner: {e}"),
+            LoadError::Frame(e) => write!(f, "the infer frame: {e:?}"),
         }
     }
 }
@@ -254,6 +266,7 @@ struct Texts {
     /// By crate index: the environment `env!` reads in its items and bodies alike
     /// (`UnitCrates::env_of`, after the scripts' records are joined).
     envs: Vec<blaze_scope::crate_env::CrateEnv<'static>>,
+    alloc: blaze_own::SharedAlloc<'static>,
 }
 
 /// The source root of the workspace at `root` (decision D60): the nearest folder at or above it
@@ -395,7 +408,7 @@ fn procs_of(
                 let member = blaze_proc_macro::script_sandbox::ScriptRoot::member(rel).map_err(|e| LoadError::Procs(format!("crate {}: {e}", c.name)))?;
                 blaze_proc_macro::sandbox::Files::Member { workspace: root.to_path_buf(), root: member }
             }
-            (Some(_), Place::Pack(view, dir)) => sandbox_files(PackageAt::Pack { view: *view, dir: dir.as_str() }),
+            (Some(_), Place::Pack(view, dir)) => sandbox_files(PackageAt::Pack { view: *view, dir: dir.as_str(), alloc: heap.shared() }),
         };
         let env = unit_env(package, version, c.name, files.seen());
         let unknown: Vec<String> = CARGO_SET.iter().filter(|name| !env.iter().any(|(set, _)| set == *name)).map(|name| (*name).to_string()).collect();
@@ -429,7 +442,16 @@ impl Texts {
         let rest = path.strip_prefix(prefix.as_str())?;
         match place {
             Place::Disk(dir) => std::fs::read(dir.join(rest)).ok().map(|b| &*Box::leak(b.into_boxed_slice())),
-            Place::Pack(view, dir) => view.find(&format!("{dir}{rest}")).map(|file| file.bytes),
+            Place::Pack(view, dir) => {
+                let mut full = blaze_own::String::with_capacity_in(dir.len() + rest.len(), self.alloc);
+                full.push_str(dir);
+                full.push_str(rest);
+                let file = view.read(full.as_str(), self.alloc).ok()??;
+                Some(match file.bytes {
+                    blaze_fetch::FileBytes::Borrowed(b) => b,
+                    blaze_fetch::FileBytes::Owned(v) => v.leak_static(),
+                })
+            }
         }
     }
 }
@@ -461,8 +483,15 @@ impl SourceTexts<'static> for Texts {
         match place {
             Place::Disk(dir) => std::fs::read_to_string(dir.join(rest)).ok().map(leak_str),
             Place::Pack(view, dir) => {
-                let file = view.find(&format!("{dir}{rest}"))?;
-                core::str::from_utf8(file.bytes).ok()
+                let mut full = blaze_own::String::with_capacity_in(dir.len() + rest.len(), self.alloc);
+                full.push_str(dir);
+                full.push_str(rest);
+                let file = view.read(full.as_str(), self.alloc).ok()??;
+                let bytes = match file.bytes {
+                    blaze_fetch::FileBytes::Borrowed(b) => b,
+                    blaze_fetch::FileBytes::Owned(v) => v.leak_static(),
+                };
+                core::str::from_utf8(bytes).ok()
             }
         }
     }
@@ -605,18 +634,20 @@ pub fn load(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scripts:
         }
         None => None,
     };
+    let frame: &'static blaze_mem::Frame = leak(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).map_err(LoadError::Frame)?);
+    let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
     let mut envs = Vec::with_capacity(crates.crates.len());
     for at in 0..crates.crates.len() {
-        envs.push(crates.env_of(at, graph, alloc).map_err(|e| LoadError::Crates(e.to_string()))?);
+        envs.push(crates.env_of(at, graph, bump).map_err(|e| LoadError::Crates(e.to_string()))?);
     }
-    let texts: &'static Texts = leak(Texts { places, roots: read_roots, procs, envs });
+    let texts: &'static Texts = leak(Texts { places, roots: read_roots, procs, envs, alloc: heap.shared() });
     // `inputs` carries each joined record (`UnitCrates::join_scripts`, above).
     let scripts = script_list;
     // A refused crate (a member proc macro the shelf has no wasm32-wasip1 side for) is never
     // resolved with no dependencies (rule 3): the load stops, naming it and the fix.
     let inputs = leak(crates.checked_inputs().map_err(|refused| LoadError::Crates(refused.why.to_string()))?);
     let start = Instant::now();
-    let names = resolve_crates(inputs, crates.sysroot, texts, &Serial, alloc).map_err(|e| LoadError::Names(e.to_string()))?;
+    let names = resolve_crates(inputs, crates.sysroot, texts, &Serial, bump).map_err(|e| LoadError::Names(e.to_string()))?;
     let resolve_ms = start.elapsed().as_secs_f64() * 1e3;
     Ok(Loaded { names: leak(names), crates, member, resolve_ms, procs, scripts, graph, texts })
 }

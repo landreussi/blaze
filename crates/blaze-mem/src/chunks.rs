@@ -49,15 +49,14 @@ pub const MAX_NODES: u32 = 16;
 
 const COUNT: u32 = (SPACE_BYTES / CHUNK) as u32;
 
-/// The warm chunks a space keeps after its cache passed [`WARM_MOST`]: 512 MiB a place, 16 for
-/// each of 16 workers (a worker's frames shelve 8 of their own, `frame::SHELF`, before they
-/// give to the space). coord-102 (B5): with no bound, 3.3 GiB of the 4.72 GiB of frames a
-/// build's peak held stayed resident as warm chunks to the end, with nothing to take them.
-pub const WARM_KEEP: u32 = 256;
+/// The warm chunks a space keeps after its cache passed [`WARM_MOST`]: 48 MiB a place (a worker's
+/// frames shelve their own warm chunks, `frame::SHELF`, before giving back to the space). Balances
+/// bounded idle dirty RAM against avoiding intra-wave madvise/re-fault thrashing on 18+ cores.
+pub const WARM_KEEP: u32 = 24;
 
-/// The warm chunks past which a give trims the space's cache down to [`WARM_KEEP`]: twice it,
-/// so a trim purges at least [`WARM_KEEP`] chunks at once, and a working set that swings under
-/// this purges none.
+/// The warm chunks past which a give trims the space's cache down to [`WARM_KEEP`]: twice it
+/// (48 chunks = 96 MiB a place), so a trim purges at least [`WARM_KEEP`] chunks at once, and a
+/// working set that swings under this purges none.
 pub const WARM_MOST: u32 = 2 * WARM_KEEP;
 
 /// Bits of a chunk's index that number it within its space; the bits above name the place.
@@ -87,19 +86,19 @@ const SEGMENTS: usize = COUNT.div_ceil(SEGMENT_CHUNKS) as usize;
 /// A space's address space: segments of `per` chunks, each reserved when its first chunk is
 /// carved. A chunk's segment and offset follow from its local index, so a chunk never moves
 /// and the stacks and links keep numbering chunks as one space.
-struct Segments {
+struct Segments<const N: usize = SEGMENTS> {
     per: u32,
     /// The chunks the space holds, at most: past them a carve is `Exhausted`.
     count: u32,
     /// The NUMA node each segment is reserved on, if any.
     node: Option<u32>,
     tag: Tag,
-    regions: [OnceLock<Result<Region, String>>; SEGMENTS],
+    regions: [OnceLock<Result<Region, String>>; N],
 }
 
-impl Segments {
-    const fn new(per: u32, count: u32, node: Option<u32>, tag: Tag) -> Segments {
-        Segments { per, count, node, tag, regions: [const { OnceLock::new() }; SEGMENTS] }
+impl<const N: usize> Segments<N> {
+    const fn new(per: u32, count: u32, node: Option<u32>, tag: Tag) -> Segments<N> {
+        Segments { per, count, node, tag, regions: [const { OnceLock::new() }; N] }
     }
 
     fn split(&self, local: u32) -> (usize, usize) {
@@ -158,8 +157,8 @@ impl Segments {
     }
 }
 
-struct Space {
-    segments: Segments,
+struct Space<const N: usize = SEGMENTS> {
+    segments: Segments<N>,
     links: LinkTable,
     carved: AtomicU32,
     /// Chunks given back, their pages resident: at most `most`, about.
@@ -296,7 +295,7 @@ pub(crate) fn take(owner: Tag) -> Result<Chunk, MemError> {
 }
 
 #[cold]
-fn carve(space: &Space) -> Result<u32, MemError> {
+fn carve<const N: usize>(space: &Space<N>) -> Result<u32, MemError> {
     let local = space.carved.fetch_add(1, Ordering::Relaxed);
     let count = space.segments.count;
     if local >= count {
@@ -407,7 +406,7 @@ pub fn carved_on(node: Option<u32>) -> usize {
     SPACES[place].get().and_then(|space| space.as_ref().ok()).map_or(0, Space::carved_bytes)
 }
 
-impl Space {
+impl<const N: usize> Space<N> {
     fn carved_bytes(&self) -> usize {
         self.carved.load(Ordering::Relaxed).min(COUNT) as usize * CHUNK
     }
@@ -519,8 +518,8 @@ mod tests {
     #[test]
     fn a_space_trims_its_warm_chunks_to_keep_once_they_pass_most() {
         const CHUNKS: u32 = 8;
-        let space = Space {
-            segments: Segments::new(CHUNKS, CHUNKS, None, Tag::Solver),
+        let space: Space<1> = Space {
+            segments: Segments::<1>::new(CHUNKS, CHUNKS, None, Tag::Solver),
             links: LinkTable::new(CHUNKS, Tag::Solver).expect("its links"),
             carved: AtomicU32::new(0),
             warm: Stack::new(),
@@ -571,8 +570,8 @@ mod tests {
     fn a_space_reserves_only_the_segments_its_chunks_are_in() {
         const PER: u32 = 4;
         const CHUNKS: u32 = 2 * PER;
-        let space = Space {
-            segments: Segments::new(PER, CHUNKS, None, Tag::Solver),
+        let space: Space<2> = Space {
+            segments: Segments::<2>::new(PER, CHUNKS, None, Tag::Solver),
             links: LinkTable::new(CHUNKS, Tag::Solver).expect("its links"),
             carved: AtomicU32::new(0),
             warm: Stack::new(),
@@ -611,8 +610,8 @@ mod tests {
     #[test]
     fn a_chunk_whose_purge_gave_nothing_back_stays_warm_and_in_the_footprint() {
         const CHUNKS: u32 = 4;
-        let space = Space {
-            segments: Segments::new(CHUNKS, CHUNKS, None, Tag::Solver),
+        let space: Space<1> = Space {
+            segments: Segments::<1>::new(CHUNKS, CHUNKS, None, Tag::Solver),
             links: LinkTable::new(CHUNKS, Tag::Solver).expect("its links"),
             carved: AtomicU32::new(0),
             warm: Stack::new(),

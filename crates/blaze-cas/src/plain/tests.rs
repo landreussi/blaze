@@ -1833,7 +1833,7 @@ fn a_previous_layout_is_refused_by_name() {
     };
     let old = refused(b"BLZHEAD\x03 a content-addressed store's head".to_vec());
     assert_eq!(old, StoreError::Head { what: format::HEAD_FOREIGN, at: format::SLOT_AT[0] });
-    for (format, at) in [(4u32, 0usize), (4, 1), (3, 0), (3, 1), (2, 0), (2, 1), (1, 0), (1, 1), (0, 0)] {
+    for (format, at) in [(5u32, 0usize), (5, 1), (4, 0), (4, 1), (3, 0), (3, 1), (2, 0), (2, 1), (1, 0), (1, 1), (0, 0)] {
         let slot = Slot { generation: 2 + at as u64, log: 7, manifest_at: 0, manifest_len: 64, manifest_crc: 0 }.encode_as(format);
         let mut head = vec![0u8; format::HEAD_LEN];
         let start = format::SLOT_AT[at] as usize;
@@ -1841,14 +1841,16 @@ fn a_previous_layout_is_refused_by_name() {
         assert_eq!(refused(head), StoreError::Format { what: format::HEAD_SLOT, found: format, wanted: FORMAT }, "slot {at} of format {format}");
     }
 
-    // Manifests of formats 2, 3 and 4 (3: before the sealed flag; 4: before root expiry and
-    // leases): this format's bytes with only the format word changed.
-    for old in [2u32, 3, 4] {
+    // Manifests of formats 2, 3, 4 and 5 (3: before the sealed flag; 4: before root expiry and
+    // leases; 5: before lease boot/pid fields): this format's bytes with only the format word
+    // changed.
+    for old in [2u32, 3, 4, 5] {
         let mut manifest = format::Manifest::default().encode(SEGMENT_MOST).expect("an empty manifest encodes");
         manifest[4..8].copy_from_slice(&old.to_le_bytes());
         assert_eq!(format::Manifest::decode(&manifest, SEGMENT_MOST), Err(StoreError::Format { what: "a plain store's manifest", found: old, wanted: FORMAT }));
     }
-    // This format's retired rows, marked and not, decode to what was encoded.
+    // This format's retired rows, marked and not, and lease rows (with boot + pid) decode to what
+    // was encoded; non-zero reserved bits in a lease row are refused.
     let marked = format::Manifest {
         generation: 4,
         segments: Vec::new_in(Global),
@@ -1856,7 +1858,7 @@ fn a_previous_layout_is_refused_by_name() {
             format::Root { name: "kept".to_owned(), key: key(1).0, generation: 3, expires_ns: format::NEVER },
             format::Root { name: "a checkout's answer".to_owned(), key: key(2).0, generation: 4, expires_ns: 99 },
         ],
-        leases: vec![format::Lease { holder: 7, since: 4, opened_ns: 5, expires_ns: 6 }],
+        leases: vec![format::Lease { holder: 7, since: 4, opened_ns: 5, expires_ns: 6, boot: 11, pid: 4242 }],
         retired: vec![
             format::Retired { id: 1, log: false, since_ns: 10, lost: None },
             format::Retired { id: 2, log: true, since_ns: 11, lost: None },
@@ -1865,7 +1867,12 @@ fn a_previous_layout_is_refused_by_name() {
             format::Retired { id: 5, log: false, since_ns: 14, lost: Some(format::LostMark { kind: format::LostKind::Gone, records: Some(0) }) },
         ],
     };
-    assert_eq!(format::Manifest::decode(&marked.encode(SEGMENT_MOST).expect("rows of no segment encode"), SEGMENT_MOST), Ok(marked));
+    let encoded_marked = marked.encode(SEGMENT_MOST).expect("rows of no segment encode");
+    assert_eq!(format::Manifest::decode(&encoded_marked, SEGMENT_MOST), Ok(marked));
+    let mut bad_lease_reserved = encoded_marked;
+    // Lease row starts at header (32) + retired (5 * 24 = 120) = 152; reserved u32 is at +44 = 196.
+    bad_lease_reserved[196..200].copy_from_slice(&1u32.to_le_bytes());
+    assert!(matches!(format::Manifest::decode(&bad_lease_reserved, SEGMENT_MOST), Err(StoreError::Manifest { .. })));
 
     // A segment of format 1: the bytes of a whole segment of this format with only its format
     // word changed (its digest then fails too; the format is named first).
@@ -1899,7 +1906,7 @@ fn every_store_format_names_the_place() {
     for not in ["", "f5", "s2f5", "f05s2", "f5s2x", "f5s", "fs2", "seg-0000000000000001", "head", "f99999999999s2"] {
         assert_eq!(format::PlaceName::parse(not), None, "{not:?} read as a store's folder");
     }
-    for leaf in ["head", "flip", "seg-0000000000000001", "manifests-00000000000000ff"] {
+    for leaf in ["head", "flip", "bloom", "seg-0000000000000001", "manifests-00000000000000ff"] {
         assert!(super::store_leaf(leaf), "{leaf}");
     }
     for leaf in ["CACHEDIR.TAG", "f5s2", "seg-1", "notes"] {
@@ -4140,4 +4147,459 @@ fn a_startup_image_round_trips_and_reads_in_place_order() {
     }
     let segments: BTreeSet<[u8; 32]> = reads.iter().map(|it| it.1.segment.0).collect();
     assert_eq!(segments.len(), 2, "two commits, two segments");
+}
+
+/// Resident daemon lease lifecycle: `release_lease` drops the lease to 0 while idle (never
+/// blocking `blaze gc`), and `rearm_lease` lets the next request acquire a fresh lease.
+#[test]
+fn daemon_rearm_lease_reacquires_after_idle_zero_leases() {
+    use super::lent::Lent;
+    let root = test_root();
+    let mut c = cfg(0, 1, false, &root);
+    c.liveness = super::core::Liveness::Reached;
+    let store = super::driven::Driven::with(Sim::new(71, Faults::default()), Path::new("/sim"), c, &root).unwrap();
+    let lent = Lent::new(store, &root);
+    lent.map_all().unwrap();
+
+    // Request 1: multi-phase write acquires a lease on its first segment commit.
+    lent.put(&key(1), Namespace::LOCAL, TAG, &value(1)).unwrap();
+    lent.commit().unwrap();
+    assert_eq!(lent.leases_len(), 1, "active request must hold a lease");
+
+    // Request 1 finishes: releases lease and commits final root -> 0 leases while idle.
+    lent.root("ans.req1", &[key(1)]).unwrap();
+    lent.release_lease();
+    lent.commit().unwrap();
+    assert_eq!(lent.leases_len(), 0, "idle daemon must hold 0 leases");
+
+    // Without rearm_lease, subsequent writes stay unleased (legacy one-shot command behavior).
+    lent.put(&key(2), Namespace::LOCAL, TAG, &value(2)).unwrap();
+    lent.commit().unwrap();
+    assert_eq!(lent.leases_len(), 0, "without rearm_lease, released stays true");
+
+    // Request 2 starts: rearm_lease re-enables lease acquisition for the new request.
+    let gen_before_req2 = lent.generation();
+    lent.rearm_lease();
+    lent.put(&key(3), Namespace::LOCAL, TAG, &value(3)).unwrap();
+    lent.commit().unwrap();
+    assert_eq!(lent.leases_len(), 1, "rearm_lease must allow Request 2 to acquire a fresh lease");
+
+    // Calling rearm_lease while a lease is already held is a no-op and keeps the lease intact.
+    lent.rearm_lease();
+    assert_eq!(lent.leases_len(), 1);
+    assert!(lent.generation() > gen_before_req2);
+
+    // Request 2 finishes: releases lease -> back to 0 leases while idle.
+    lent.root("ans.req2", &[key(3)]).unwrap();
+    lent.release_lease();
+    lent.commit().unwrap();
+    assert_eq!(lent.leases_len(), 0, "idle daemon after Request 2 must hold 0 leases");
+}
+
+/// Resident daemon arena reclamation: `reclaim_between_requests(&mut lent)` drops `kept_arenas`
+/// (in `InArena` mode) and kept lent chunks (in `AfterCommit` mode) once all `Lend` borrows end,
+/// while keeping mapped segments warm and all committed records readable.
+#[test]
+fn daemon_reclaim_between_requests_drops_kept_arenas_and_preserves_mapped_segments() {
+    use super::arena::Visibility;
+    use super::lent::Lent;
+
+    // 1. Visibility::InArena (shared arenas accumulated in kept_arenas).
+    let root = test_root();
+    let store = super::driven::Driven::with(Sim::new(72, Faults::default()), Path::new("/sim"), cfg(0, 1, false, &root), &root).unwrap();
+    let mut lent = Lent::with_visibility(store, &root, Visibility::InArena { shared: blaze_mem::Kept(blaze_mem::Tag::Store) });
+    lent.map_all().unwrap();
+
+    // Two commits where own puts are borrowed via `get` before commit -> 2 kept_arenas.
+    lent.put(&key(10), Namespace::LOCAL, TAG, &value(10)).unwrap();
+    {
+        let lend = lent.get(&key(10)).unwrap().expect("own put readable");
+        assert!(lend.own && lend.shared);
+        assert_eq!(lend.bytes, value(10).as_slice());
+        lent.commit().unwrap();
+    }
+    lent.put(&key(11), Namespace::LOCAL, TAG, &value(11)).unwrap();
+    {
+        let lend = lent.get(&key(11)).unwrap().expect("own put readable");
+        assert_eq!(lend.bytes, value(11).as_slice());
+        lent.commit().unwrap();
+    }
+    assert!(lent.counts().held_bytes > 0, "lent shared arenas stay held until reclaim");
+
+    // Uncommitted put prevents reclamation so live uncommitted data is never dropped.
+    lent.put(&key(12), Namespace::LOCAL, TAG, &value(12)).unwrap();
+    assert_eq!(lent.reclaim_between_requests(), 0, "must not reclaim while uncommitted puts exist");
+    assert_eq!(lent.get(&key(12)).unwrap().expect("uncommitted put intact").bytes, value(12).as_slice());
+    lent.commit().unwrap();
+
+    // All borrows ended and uncommitted_bytes == 0 -> reclaim drops all 3 kept_arenas.
+    let (mapped_before, named_before) = lent.mapped_of_named();
+    assert_eq!((mapped_before, named_before), (3, 3));
+    let reclaimed = lent.reclaim_between_requests();
+    assert_eq!(reclaimed, 3, "expected 3 kept shared arenas reclaimed");
+    assert_eq!(lent.counts().held_bytes, 0, "held_bytes must be 0 after reclaim");
+    assert_eq!(lent.reclaim_between_requests(), 0, "second reclaim is a no-op");
+
+    // Mapped segments stayed open and all committed records remain readable in place.
+    assert_eq!(lent.mapped_of_named(), (3, 3));
+    for n in [10u32, 11, 12] {
+        let lend = lent.get(&key(n)).unwrap().expect("committed record readable after reclaim");
+        assert!(!lend.own);
+        assert_eq!(lend.bytes, value(n).as_slice());
+    }
+
+    // 2. Visibility::AfterCommit (private lent chunks).
+    let store2 = super::driven::Driven::with(Sim::new(73, Faults::default()), Path::new("/sim"), cfg(1, 1, false, &root), &root).unwrap();
+    let mut lent2 = Lent::new(store2, &root);
+    lent2.map_all().unwrap();
+    lent2.put(&key(20), Namespace::LOCAL, TAG, &value(20)).unwrap();
+    {
+        let lend = lent2.get(&key(20)).unwrap().expect("own private put readable");
+        assert!(lend.own && !lend.shared);
+        lent2.commit().unwrap();
+    }
+    assert!(lent2.counts().held_bytes > 0);
+    assert_eq!(lent2.reclaim_between_requests(), 1, "expected 1 private lent chunk reclaimed");
+    assert_eq!(lent2.counts().held_bytes, 0);
+    assert_eq!(lent2.get(&key(20)).unwrap().expect("committed record readable").bytes, value(20).as_slice());
+}
+
+/// `head_generation_on_disk` reads only the head file in O(1), matching `generation()` before
+/// external writes and immediately detecting external commits and store wipes.
+#[test]
+fn daemon_head_generation_on_disk_catches_external_commits() {
+    use super::lent::Lent;
+    use super::settings::Settings;
+
+    let dir = std::env::temp_dir().join(format!("blaze-cas-daemon-head-gen-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let root = test_root();
+    let settings = Settings { durable: false, ..Settings::default() };
+
+    let store1 = super::driven::Driven::open(&dir, &settings, &root).unwrap();
+    let lent = Lent::new(store1, &root);
+    lent.map_all().unwrap();
+    assert_eq!(lent.generation(), 0);
+    assert_eq!(lent.head_generation_on_disk().unwrap(), 0);
+
+    // Actor 1 commits generation 1.
+    lent.put(&key(100), Namespace::LOCAL, TAG, &value(100)).unwrap();
+    lent.commit().unwrap();
+    assert_eq!(lent.generation(), 1);
+    assert_eq!(lent.head_generation_on_disk().unwrap(), 1);
+
+    // Actor 2 opens the same store externally and commits generation 2.
+    let mut actor2 = super::driven::Driven::open(&dir, &settings, &root).unwrap();
+    actor2.put(key(101), Namespace::LOCAL, TAG, &value(101)).unwrap();
+    actor2.commit(&[]).unwrap();
+    assert_eq!(actor2.core().generation(), 2);
+
+    // Actor 1 still holds generation 1 in memory, but head_generation_on_disk sees 2 immediately!
+    let (mapped_before, named_before) = lent.mapped_of_named();
+    assert_eq!(lent.generation(), 1);
+    assert_eq!(lent.head_generation_on_disk().unwrap(), 2);
+    assert_eq!(lent.mapped_of_named(), (mapped_before, named_before), "head check must not map new segments");
+
+    // External wipe (`blaze clean --store` deleting head) reports generation 0 != 1.
+    std::fs::remove_file(dir.join("plain/head")).unwrap();
+    assert_eq!(lent.head_generation_on_disk().unwrap(), 0);
+
+    drop(actor2);
+    drop(lent);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Bounded-window streamed commit DST (rule 43): commits records spanning `Plain::put`, external
+/// `Batch`es, and `LentRecord`s (including an oversized 10 KiB single record under a 2 KiB piece
+/// cap) through `Driven::commit_records` with shuffled completions in `Sim`, asserting:
+/// 1. Peak in-flight payload `WriteAt` bytes never exceeds `COMMIT_PIECES_IN_FLIGHT * piece_bytes`.
+/// 2. Every committed record reads back equal and the on-disk segment bytes match `seal_segment`
+///    byte-for-byte.
+/// 3. A planted unbounded commit (`Plant::CommitWholeWindow`) is caught by the commit meter.
+fn run_commit_meter_case(seed: u64, plant: Plant) -> Result<(), &'static str> {
+    use super::core::{COMMIT_PIECES_IN_FLIGHT, LentRecord};
+    use super::driven::Driven;
+    use super::format::{record_crc, seal_segment};
+    use crate::plain::Batch;
+    use blaze_keyed::exec::RecordRef;
+
+    let piece_bytes = 2048usize;
+    let window_cap = u64::from(COMMIT_PIECES_IN_FLIGHT) * (piece_bytes as u64);
+    let root = test_root();
+    let base = (seed as u32) * 100;
+
+    let mut expected: blaze_own::Vec<(Key, blaze_own::Vec<u8, &blaze_mem::Frame>), &blaze_mem::Frame> = blaze_own::Vec::new_in(&root);
+    // 1. Store's own puts (small records)
+    for i in 0..12u32 {
+        let k = key(1000 + base + i);
+        let mut v: blaze_own::Vec<u8, &blaze_mem::Frame> = blaze_own::Vec::from_elem_in(((i * 31 + seed as u32) & 0xff) as u8, 700 + (i as usize) * 53, &root);
+        v[0] = (i & 0xff) as u8;
+        expected.push((k, v));
+    }
+    // 2. External worker batch (including an oversized 10 KiB single record > piece_bytes)
+    let mut batch = Batch::new(Namespace::LOCAL);
+    let big_k = key(2000 + base);
+    let big_v: blaze_own::Vec<u8, &blaze_mem::Frame> = blaze_own::Vec::from_iter_in((0..10_333usize).map(|j| ((j * 17 + seed as usize) & 0xff) as u8), &root);
+    batch.put(big_k, TAG, &big_v).map_err(|_| "batch put")?;
+    expected.push((big_k, big_v));
+    for i in 1..6u32 {
+        let k = key(2000 + base + i);
+        let v: blaze_own::Vec<u8, &blaze_mem::Frame> = blaze_own::Vec::from_iter_in((0..(1_300 + (i as usize) * 211)).map(|j| ((j * 13 + i as usize) & 0xff) as u8), &root);
+        batch.put(k, TAG, &v).map_err(|_| "batch put")?;
+        expected.push((k, v));
+    }
+    // 3. Lent records (simulating shared arena records)
+    let mut lent_bufs: blaze_own::Vec<(Key, blaze_own::Vec<u8, &blaze_mem::Frame>), &blaze_mem::Frame> = blaze_own::Vec::new_in(&root);
+    for i in 0..8u32 {
+        let k = key(3000 + base + i);
+        let v: blaze_own::Vec<u8, &blaze_mem::Frame> = blaze_own::Vec::from_iter_in((0..(1_900 + (i as usize) * 173)).map(|j| ((j * 7 + seed as usize) & 0xff) as u8), &root);
+        lent_bufs.push((k, v));
+    }
+    let lent_recs: blaze_own::Vec<LentRecord<'_>, &blaze_mem::Frame> = blaze_own::Vec::from_iter_in(
+        lent_bufs.iter().map(|(k, v)| LentRecord { key: *k, namespace: Namespace::LOCAL, tag: TAG, bytes: v.as_slice(), crc: record_crc(&k.0, TAG, v) }),
+        &root,
+    );
+    for (k, v) in &lent_bufs {
+        let mut copy = blaze_own::Vec::with_capacity_in(v.len(), &root);
+        copy.extend_from_slice(v);
+        expected.push((*k, copy));
+    }
+
+    // Meter every seg-* WriteAt during streamed commit via `Sim` + `Meter`.
+    let mut sim = Sim::new(seed.wrapping_add(17), Faults::default());
+    let mut actors = [Actor::new(cfg(1, 2, true, &root), &root, plant)];
+    settle(&mut sim, &mut actors);
+    actors[0].store.set_stream_commits(true);
+    actors[0].store.set_commit_piece_bytes(piece_bytes);
+    actors[0].store.map_all(sim.wall_ns(), &mut actors[0].effects).map_err(|_| "map_all")?;
+    settle(&mut sim, &mut actors);
+    let mut meter = Meter::default();
+    let mut done = Default::default();
+    for (k, v) in expected.iter().take(12) {
+        actors[0].store.put(*k, Namespace::LOCAL, TAG, v).map_err(|_| "plain put")?;
+    }
+    meter.on = true;
+    actors[0]
+        .store
+        .commit_records(&[&batch], &lent_recs, sim.wall_ns(), &mut actors[0].effects)
+        .map_err(|_| "commit_records")?;
+    loop {
+        for e in &actors[0].effects {
+            meter.asked(e);
+        }
+        sim.submit(&mut actors[0].effects);
+        if sim.in_flight() == 0 {
+            break;
+        }
+        sim.poll(&mut done, Deadline::after(sim.now(), Duration::from_secs(60)));
+        let wall = sim.wall_ns();
+        for c in done.drain(..) {
+            meter.done(c.tag.0);
+            actors[0].store.complete_with(c, wall, &[&batch], &lent_recs, &mut actors[0].effects);
+        }
+    }
+    meter.on = false;
+    if actors[0].store.broken().is_some() {
+        return Err("plain broken");
+    }
+    let committed = actors[0].store.take_committed().ok_or("commit did not settle")?.map_err(|_| "commit err")?;
+    if meter.total <= window_cap {
+        return Err("fixture too small");
+    }
+    if meter.alive_most > window_cap {
+        return Err("the commit meter: peak in-flight payload bytes exceeded cap");
+    }
+    if meter.write_most > piece_bytes as u64 {
+        return Err("the commit meter: single WriteAt exceeded piece_bytes");
+    }
+    // Verify byte-for-byte equality with `seal_segment`!
+    let refs: blaze_own::Vec<(RecordRef, &[u8]), &blaze_mem::Frame> = blaze_own::Vec::from_iter_in(
+        expected.iter().map(|(k, v)| (RecordRef { key: k.0, tag: TAG }, v.as_slice())),
+        &root,
+    );
+    let mut sealed_bytes = Default::default();
+    let _described = seal_segment(Namespace::LOCAL, &refs, &mut sealed_bytes).map_err(|_| "seal_segment")?;
+    let seg_id = committed.segments.first().copied().ok_or("no segment committed")?;
+    let seg_path = format!("plain/seg-{seg_id:016x}");
+    let disk = sim.contents(&FileName::new(&seg_path).expect("seg path"));
+    if disk.as_slice() != sealed_bytes.as_slice() {
+        return Err("segment bytes mismatch vs seal_segment");
+    }
+
+    // Also run `Driven::commit_records` end-to-end and verify every record reads back equal!
+    let mut driven = Driven::with(Sim::new(seed, Faults::default()), Path::new("/sim"), cfg(1, 1, true, &root), &root).map_err(|_| "driven open")?;
+    driven.core_mut().set_commit_piece_bytes(piece_bytes);
+    for (k, v) in expected.iter().take(12) {
+        driven.put(*k, Namespace::LOCAL, TAG, v).map_err(|_| "driven put")?;
+    }
+    let _ = driven.commit_records(&[&batch], &lent_recs).map_err(|_| "driven commit")?;
+    for (k, v) in &expected {
+        let got = driven.get(k).map_err(|_| "get")?.ok_or("missing key")?;
+        if driven.got(got).bytes != v.as_slice() {
+            return Err("record payload mismatch");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn streamed_commit_stays_within_window_and_matches_seal_segment() {
+    for seed in 0..8 {
+        if let Err(why) = run_commit_meter_case(seed, Plant::None) {
+            panic!("seed {seed}: {why}");
+        }
+    }
+}
+
+#[test]
+fn the_commit_meter_catches_an_unbounded_window() {
+    let mut caught = None;
+    for seed in 0..8 {
+        if let Err(why) = run_commit_meter_case(seed, Plant::CommitWholeWindow) {
+            assert!(why.contains("the commit meter"), "seed {seed}: planted unbounded commit failed another check first: {why}");
+            caught = Some(why);
+            break;
+        }
+    }
+    assert!(caught.is_some(), "no seed of 8 caught an unbounded commit window");
+}
+
+#[test]
+fn reused_semi_join_tracks_dead_resurrection_without_touching_live_roots() {
+    let root = test_root();
+    let mut c = cfg(1, 1, false, &root);
+    c.liveness = super::core::Liveness::Reached;
+    let sim = Sim::new(77, Faults::default());
+    let mut store = Driven::with(sim, Path::new("/sim"), c, &root).expect("open store");
+    store.disable_auto_merge();
+
+    // 1. Commit an unrooted (dead) record in its own segment.
+    let dead_k = key(90_001);
+    store.put(dead_k, Namespace::LOCAL, TAG, b"dead-record").expect("put dead");
+    let dead_commit = store.commit_with(&[]).expect("commit dead");
+    let dead_seg_id = dead_commit.segments[0];
+
+    // 2. Commit 16 unrelated indexed roots (`other-0`..`other-15`) + one `checkout` root with
+    //    two page indexes (`idx_a`, `idx_b`).
+    let mut other_sample = key(0);
+    for r in 0..16u32 {
+        let mut keys = [key(0); 8];
+        for (j, slot) in keys.iter_mut().enumerate() {
+            let k = key(1_000 + r * 100 + j as u32);
+            if r == 7 && j == 3 {
+                other_sample = k;
+            }
+            store.put(k, Namespace::LOCAL, TAG, &[r as u8, j as u8, 42]).expect("put other");
+            *slot = k;
+        }
+        let idx = store.index(&keys).expect("other index");
+        store.root_through(&format!("other-{r}"), &[idx], super::core::ROOT_LIFE_NS).expect("other root");
+    }
+    let ka1 = key(50_001);
+    let ka2 = key(50_002);
+    let kb1 = key(50_003);
+    let kb2 = key(50_004);
+    for (k, v) in [(ka1, b"a1"), (ka2, b"a2"), (kb1, b"b1"), (kb2, b"b2")] {
+        store.put(k, Namespace::LOCAL, TAG, v).expect("put checkout");
+    }
+    let idx_a = store.index(&[ka1, ka2]).expect("idx_a");
+    let idx_b = store.index(&[kb1, kb2]).expect("idx_b");
+    store.root_through("checkout", &[idx_a, idx_b], super::core::ROOT_LIFE_NS).expect("checkout root");
+    let live_commit = store.commit_with(&[]).expect("commit live");
+    let live_seg_id = live_commit.segments[0];
+
+    // 3. Incremental edit on `checkout`: replace `idx_b` with `idx_b2` reusing live `kb1` (from
+    //    replaced `idx_b`), live `other_sample` (from `other-7`), and one brand-new record.
+    //    Every reused key is already live, so ZERO committed segments should be marked touched.
+    let kb3 = key(50_005);
+    store.put(kb3, Namespace::LOCAL, TAG, b"b3").expect("put kb3");
+    let idx_b2 = store.index(&[kb1, other_sample, kb3]).expect("idx_b2");
+    store.root_through("checkout", &[idx_a, idx_b2], super::core::ROOT_LIFE_NS).expect("update checkout");
+    let inc = store.commit_with(&[]).expect("commit incremental");
+    let live_touched = store.core().segment_touched(live_seg_id).expect("live seg");
+    assert_ne!(live_touched, inc.generation, "already-live keys must not touch their segment");
+    let dead_touched = store.core().segment_touched(dead_seg_id).expect("dead seg");
+    assert_ne!(dead_touched, inc.generation, "unreferenced dead segment must not be touched");
+
+    // 4. Resurrect `dead_k` via a new index on `checkout`: `dead_seg_id` MUST be marked touched
+    //    at this generation so any concurrent sweep slice on it aborts.
+    let idx_resurrect = store.index(&[dead_k, kb3]).expect("idx_resurrect");
+    store.root_through("checkout", &[idx_a, idx_resurrect], super::core::ROOT_LIFE_NS).expect("resurrect root");
+    let res = store.commit_with(&[]).expect("commit resurrection");
+    let dead_touched = store.core().segment_touched(dead_seg_id).expect("dead seg after");
+    assert_eq!(dead_touched, res.generation, "resurrected dead key must mark its segment touched");
+}
+
+#[test]
+fn root_reach_bloom_and_replaced_index_hints_preserve_exact_touches_across_reopen() {
+    let root = test_root();
+    let mut c = cfg(1, 1, false, &root);
+    c.liveness = super::core::Liveness::Reached;
+    let sim = Sim::new(88, Faults::default());
+    let mut store = Driven::with(sim, Path::new("/sim"), c, &root).expect("open store");
+    store.disable_auto_merge();
+
+    // 1. Commit a dead record in its own segment, plus a dead index naming it (not rooted).
+    let dead_k = key(95_001);
+    store.put(dead_k, Namespace::LOCAL, TAG, b"dead-record-bloom").expect("put dead");
+    let bogus_dead_idx = store.index(&[dead_k]).expect("dead index");
+    let dead_commit = store.commit_with(&[]).expect("commit dead");
+    let dead_seg_id = dead_commit.segments[0];
+
+    // 2. Commit a large indexed shard (>= 16 indexes so a persistent root reach bloom is built)
+    //    plus a second large shard holding unrelated keys.
+    let mut shard0 = [key(0); 20];
+    let mut shard1 = [key(0); 20];
+    let mut kept_k = key(0);
+    for i in 0..20usize {
+        let i32_v = u32::try_from(i).unwrap();
+        let k0 = key(10_000 + i32_v * 2);
+        let k1 = key(10_000 + i32_v * 2 + 1);
+        store.put(k0, Namespace::LOCAL, TAG, &i32_v.to_le_bytes()).expect("put s0a");
+        store.put(k1, Namespace::LOCAL, TAG, &(i32_v + 100).to_le_bytes()).expect("put s0b");
+        if i == 11 {
+            kept_k = k0;
+        }
+        shard0[i] = store.index(&[k0, k1]).expect("s0 idx");
+
+        let u0 = key(20_000 + i32_v * 2);
+        let u1 = key(20_000 + i32_v * 2 + 1);
+        store.put(u0, Namespace::LOCAL, TAG, &(i32_v + 200).to_le_bytes()).expect("put s1a");
+        store.put(u1, Namespace::LOCAL, TAG, &(i32_v + 300).to_le_bytes()).expect("put s1b");
+        shard1[i] = store.index(&[u0, u1]).expect("s1 idx");
+    }
+    store.root_through("ws.reach.00", &shard0, super::core::ROOT_LIFE_NS).expect("root s0");
+    store.root_through("ws.reach.01", &shard1, super::core::ROOT_LIFE_NS).expect("root s1");
+    store.root_through("ws.reach.delta", &[], super::core::ROOT_LIFE_NS).expect("root delta");
+    let base_commit = store.commit_with(&[]).expect("commit shards");
+    let live_seg_id = base_commit.segments[0];
+
+    // 3. Reopen the store from disk so root blooms are loaded from the `bloom` sidecar.
+    let sim = store.into_driver();
+    let mut c2 = cfg(2, 1, false, &root);
+    c2.liveness = super::core::Liveness::Reached;
+    let mut store = Driven::with(sim, Path::new("/sim"), c2, &root).expect("reopen store");
+    store.disable_auto_merge();
+
+    // 4. Incremental delta edit reusing `kept_k` from `shard0[11]`, passing `shard0[11]` as a
+    //    replaced-index hint: zero segments should be marked touched.
+    let fresh_k = key(30_001);
+    store.put(fresh_k, Namespace::LOCAL, TAG, b"fresh-val").expect("put fresh");
+    let delta_idx = store.index(&[kept_k, fresh_k]).expect("delta idx");
+    store.hint_replaced_indexes(&[shard0[11]]);
+    store.root_through("ws.reach.delta", &[delta_idx], super::core::ROOT_LIFE_NS).expect("delta");
+    let inc = store.commit_with(&[]).expect("commit delta");
+    assert_ne!(store.core().segment_touched(live_seg_id).expect("live seg"), inc.generation, "already-live key must not touch its segment");
+    assert_ne!(store.core().segment_touched(dead_seg_id).expect("dead seg"), inc.generation, "unreferenced dead segment must not be touched");
+
+    // 5. Soundness control: resurrect `dead_k` while passing an UNROOTED `bogus_dead_idx` as a
+    //    hint — `reused` must verify hints against live unexpired roots, ignore `bogus_dead_idx`,
+    //    and STILL mark `dead_seg_id` touched.
+    let res_idx = store.index(&[dead_k, fresh_k]).expect("resurrect idx");
+    store.hint_replaced_indexes(&[bogus_dead_idx]);
+    store.root_through("ws.reach.delta", &[res_idx], super::core::ROOT_LIFE_NS).expect("delta res");
+    let res = store.commit_with(&[]).expect("commit resurrection");
+    assert_eq!(store.core().segment_touched(dead_seg_id).expect("dead seg"), res.generation, "bogus unrooted hint must never suppress touching a dead segment");
 }

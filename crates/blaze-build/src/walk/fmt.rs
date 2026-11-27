@@ -312,7 +312,7 @@ const fn counts_of(o: Options) -> usize {
     matches!(o.width, Some(Count::Arg)) as usize + matches!(o.precision, Some(Count::Arg)) as usize
 }
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// `format_args!` expression `e`: checks its template against its uses, then evaluates the
     /// arguments left to right; `Task::FormatArgs` builds the value from them.
     pub(super) fn format_args(&mut self, e: ExprId, args: List, uses: List) -> Result<(), BuildError> {
@@ -372,7 +372,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let has_placeholders = self.fmt_template_checked(e, uses_of)?;
         let n = list.len();
         let base = self.vals.len().checked_sub(n).ok_or(malformed("a `format_args!`'s arguments missing from the value stack (a build bug)"))?;
-        let mut refs = blaze_own::Vec::with_capacity_in(n, self.alloc.clone());
+        let mut refs = blaze_own::Vec::with_capacity_in(n, self.alloc);
         refs.extend_from_slice(&self.vals[base..]);
         self.truncate_vals(base);
 
@@ -387,7 +387,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 
         // The template's bytes as read-only data.
         let pieces = self.adts.format_template(self.body.owner, e).ok_or(malformed("a `format_args!` template that went away"))?;
-        let mut bytes = blaze_own::Vec::new_in(self.alloc.clone());
+        let mut bytes = blaze_own::Vec::new_in(self.alloc);
         // The `args` array: the values' `rt::Argument`s in placeholder order, so each
         // placeholder formats "the next argument" and none writes an `arg_index`; then the
         // counts' `from_usize`s, in template order, each named by its index (`fmt_template_checked`
@@ -435,6 +435,9 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let total = stride.checked_mul(count).ok_or(unsupported(e, "a `format_args!` argument array past 4 GiB"))?;
         let slot = self.b.slot(total, align, SlotKind::Temp);
         let arr = self.b.slot_addr(slot);
+        if self.live {
+            self.hold_copy_temp(e, (arr, 0))?;
+        }
         for (i, u) in in_order.enumerate() {
             let a = *list.get(u.arg as usize).ok_or(malformed("a format use past its arguments"))?;
             let r = refs[u.arg as usize];
@@ -466,6 +469,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             let made = self.pop()?;
             let off = i32::try_from(stride * i as u32).map_err(|_| malformed("an argument array offset past 2 GiB"))?;
             self.store(made, arg_repr, (arr, off))?;
+            self.end_temp_val(made);
         }
         self.b.store(Flags::NONE, arr, at.0, at.1 + args_off, MemAttrs::aligned(3));
         self.push_val(V::Place(at.0, at.1), None);

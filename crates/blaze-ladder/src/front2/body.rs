@@ -37,7 +37,7 @@ use super::scoped::ScopedBy;
 use super::source::NamesSource;
 use super::spell::Spelling;
 use super::type_miss::TypeMiss;
-use super::types::{Bounds, Builder, Env, ParamBound, SelfTy, Why};
+use super::types::{Bounds, Builder, ContainerParamBound, Env, HeadsArity, ParamBound, SelfGiven, SelfTy, Why};
 use crate::resolve::Paths;
 
 /// What a body's lowering did not take, by its range in the item's text (or past it, in an
@@ -248,7 +248,7 @@ impl<'n, S: NamesSource<'n>> blaze_lower::ValueNames for ModuleValues<'n, '_, S>
         }
         let (names, krate, item, owner, text) = (self.names, self.krate, self.item, self.owner, self.text);
         let planted = self.store.locals.planted();
-        let alloc = self.store.tys.alloc();
+        let alloc = self.store.work_alloc();
         let kept = &self.store.locals;
         let keys: &Keys = &*self.keys;
         let blocks = self.blocks.get_or_insert_with(|| super::glob_uses::PatternBlocks::of(names, kept, keys, krate, item, owner, text, alloc));
@@ -315,16 +315,21 @@ pub struct Body<'n> {
     /// lowered: read with it, `tys.view(&store.tys)`. A record is answered from `Store::tys`
     /// alone, which never holds a body's type, whatever bodies were checked before.
     pub tys: OwnTys<'static>,
-    pub params: Vec<(Name, u32), Global>,
+    pub params: blaze_own::Vec<(Name, u32), Alloc<'static>>,
     pub self_: SelfTy,
     /// The traits in scope at `module`, checker keys, sorted.
-    pub traits: Vec<ItemKey, Global>,
+    pub traits: blaze_own::Vec<ItemKey, Alloc<'static>>,
     /// The traits in scope at each block whose list is not `traits`: the blocks' `use`s
     /// ([`super::block_traits`]).
     pub blocks: super::block_traits::BlockTraits,
     /// Each written type that names nothing (E0412, [`TypeMiss`]): converted as the error type,
     /// reported by the check beside its own findings (front2 check.rs `check_rounds_as`).
-    pub type_misses: Vec<TypeMiss, Global>,
+    pub type_misses: blaze_own::Vec<TypeMiss, Alloc<'static>>,
+    /// Rewritten item text produced by comptime `inline for` unrolling (`None` for ordinary bodies).
+    pub expanded_text: Option<&'n str>,
+    /// Original generic owner and concrete ground arguments for a monomorphized `inline for`
+    /// specialization (`None` for ordinary bodies).
+    pub param_subst: Option<(ItemKey, blaze_own::Vec<PTy, Alloc<'static>>)>,
 }
 
 impl<'n> Body<'n> {
@@ -390,7 +395,7 @@ struct BodyTypes<'b, S> {
     text: &'b str,
     /// Each written type that names nothing (E0412), converted as the error type so the rest of
     /// the body is checked.
-    misses: Vec<TypeMiss, Global>,
+    misses: blaze_own::Vec<TypeMiss, Alloc<'static>>,
     /// The items declared in bodies, and whose body this is: a path through a type alias is
     /// expanded only where no item of the body takes its first segment
     /// ([`super::world_paths::AliasPaths`]).
@@ -403,6 +408,17 @@ struct BodyTypes<'b, S> {
     /// The fn heads made so far (`Store::fns`): a callee's `#[rustc_legacy_const_generics]`
     /// positions ([`Types::legacy_term`]).
     legacy: &'b dyn LegacyPositions,
+    /// Enclosing container `Self` regions, impl trait regions, and container + fn parameter bounds
+    /// handed to `RegionSink::set_given` when laying closure parameter annotations (`&Self`, `P::Cx`).
+    self_given: SelfGiven<'b>,
+    /// Heads requested via `Why::Need` by [`Self::closure_param_regions`]'s `Builder::ty_regions`
+    /// (e.g. a type named inside an omitted defaulted type argument whose pre-built `PTy` let
+    /// `BodyTypes::ty` succeed on a seeded `Head::Adt` without loading that head). Ensured by
+    /// `lower_at` before accepting the round so `closure_param_regions` never silently drops
+    /// shared elided regions.
+    region_needs: blaze_own::Vec<LibKey, Alloc<'static>>,
+    /// A const evaluation (`Why::NeedConst`) requested by [`Self::closure_param_regions`].
+    region_need_const: Option<Why>,
 }
 
 /// A fn's `#[rustc_legacy_const_generics(..)]` positions, by its key: what
@@ -558,13 +574,25 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
                 return Err(Refused::Form { what: "the callee of a call with a legacy const generic argument", range });
             }
         };
-        let Some(positions) = self.legacy.legacy_positions(checker_of(callee)) else {
+        let callee_key = checker_of(callee);
+        if callee_key != self.owner {
+            // `#[rustc_legacy_const_generics(..)]` lives in `FnHead::legacy_const_generics`
+            // (head_record v6): record the callee's `Head` cell so adding, removing, or editing
+            // the attribute invalidates this caller while body-only edits to `callee` never do
+            // (rule 21, rule 77).
+            self.builder.resolver.names.impls_read(super::tables::recorder::TableRead::Head {
+                item: callee_key.0.to_be_bytes(),
+                part: 0,
+            });
+        }
+        let Some(positions) = self.legacy.legacy_positions(callee_key) else {
             // The head is not made. Making it costs this body a whole conversion round (and
-            // the seeded path cannot add one), so it is asked for only when the callee's text
-            // writes the attribute at all: a fn whose text does not has no listed position,
-            // and its argument is an ordinary value. The text only filters; the positions are
-            // read from the head once it is made.
-            let written = self.builder.resolver.names.text_of(callee).is_some_and(|t| t.text.contains("rustc_legacy_const_generics"));
+            // the seeded path cannot add one), so it is asked for only when the callee's outer
+            // attributes write the attribute at all: a fn whose outer attributes do not has no
+            // listed position, and its argument is an ordinary value. Reading through
+            // `seeded_text_of` avoids recording a coarse `TableRead::Text` on `callee`; the
+            // `Head` cell recorded above covers any attribute/signature edit on `callee`.
+            let written = self.builder.resolver.names.seeded_text_of(callee).is_some_and(|t| has_legacy_const_attr_in_prefix(t.text));
             if !written {
                 return Ok(None);
             }
@@ -606,7 +634,7 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
         let usize_node = blaze_typeck::PNode::Uint(blaze_typeck::UintTy::Usize);
         // A `const` item declared in the body comes first (`const MOST: usize = ..; [x; MOST]`:
         // front2/const_open.rs `local_const`): a block's item shadows the module's name.
-        let made = match super::const_open::local_const(self.locals, self.owner, self.builder.heads, view, len, text, range) {
+        let made = match super::const_open::local_const(&self.builder.resolver, self.builder.marks, self.locals, self.owner, self.env.module, self.builder.heads, view, len, text, range) {
             Ok(Some(bits)) => match super::types::intern(tys, usize_node) {
                 Ok(ty) => super::types::intern(tys, blaze_typeck::PNode::ConstValue { ty, bits }),
                 Err(why) => Err(why),
@@ -651,7 +679,7 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
         let range = view.site(view.type_range(t)?)?;
         // Its refusal (a local constant not evaluated yet, a local value that is no constant)
         // stands only once the name is known to be no type.
-        let local = super::const_open::local_arg(self.locals, self.owner, self.builder.heads, view, t, name, range);
+        let local = super::const_open::local_arg(&self.builder.resolver, self.builder.marks, self.locals, self.owner, self.env.module, self.builder.heads, view, t, name, range);
         if matches!(local, Ok(Some(LocalArg::Type))) {
             return Types::ty(self, view, t, tys).map(ConstTerm::Is);
         }
@@ -706,6 +734,200 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
     /// `Gap::BodyConst`), so a body with one is converted and checked, never passed clean.
     fn takes_const_gaps(&self) -> bool {
         true
+    }
+
+    fn closure_param_regions(
+        &mut self,
+        view: &View<'_>,
+        t: lf::TypeId,
+        tys: &mut PortableTys<'_>,
+        closure: blaze_typeck::ExprId,
+        param: u32,
+        out: &mut dyn FnMut(blaze_typeck::ClosureParamRegion),
+    ) -> bool {
+        let Ok(range) = view.type_range(t) else { return false };
+        let mut env = self.env;
+        if let Some(r) = view.item_relative(range)
+            && let Some(body) = self.locals.body(self.owner)
+            && let Some(block) = body.blocks.iter().rev().find(|b| b.open <= r.start && r.start < b.close)
+        {
+            env.module = block.module;
+        }
+        let mut sink = super::types::RegionSink::new_in(self.mark_alloc);
+        sink.set_given(self.self_given);
+        let made = match self.builder.ty_regions(tys, &env, view, t, &mut sink) {
+            Ok(made) => made,
+            Err(Why::Need(k)) => {
+                if !self.region_needs.iter().any(|&seen| seen == k) {
+                    self.region_needs.push(k);
+                }
+                return false;
+            }
+            Err(why @ Why::NeedConst(..)) => {
+                if self.region_need_const.is_none() {
+                    self.region_need_const = Some(why);
+                }
+                return false;
+            }
+            Err(_) => return false,
+        };
+        if sink.refused().is_some() {
+            return false;
+        }
+        let &[frag] = sink.frags() else { return false };
+        let slots = sink.slots_of(frag);
+        let tys = tys.view();
+        let mut cursor = 0usize;
+        let mut stack: [(PTy, u64); 64] = [(PTy(0), 0); 64];
+        let mut sp = 1usize;
+        if let Some(s) = stack.get_mut(0) {
+            *s = (made, blaze_typeck::ClosureParamRegion::ROOT);
+        }
+        let mut steps = 0u32;
+        let kind_of = |slot: super::types::Slot| match slot.kind {
+            super::types::SlotKind::Static | super::types::SlotKind::Given(blaze_typeck::regions::Region::Static) => {
+                Some(blaze_typeck::WrittenRegion::Static)
+            }
+            super::types::SlotKind::Named(..) | super::types::SlotKind::Given(blaze_typeck::regions::Region::Param(_)) => {
+                Some(blaze_typeck::WrittenRegion::Named)
+            }
+            super::types::SlotKind::Elided(id)
+                if slots.iter().filter(|s| matches!(s.kind, super::types::SlotKind::Elided(k) if k == id)).count() > 1 =>
+            {
+                Some(blaze_typeck::WrittenRegion::Elided(id))
+            }
+            _ => None,
+        };
+        while let Some(top) = sp.checked_sub(1) {
+            sp = top;
+            steps += 1;
+            if steps > 128 {
+                return false;
+            }
+            let Some(&(ty, path)) = stack.get(top) else { return false };
+            let Ok(node) = tys.node(ty) else { return false };
+            match node {
+                blaze_typeck::PNode::Ref(_, inner) => {
+                    let Some(&slot) = slots.get(cursor) else { return false };
+                    cursor += 1;
+                    if let Some(kind) = kind_of(slot) {
+                        out(blaze_typeck::ClosureParamRegion { closure, param, path, own: 0, kind });
+                    }
+                    let Some(next) = blaze_typeck::ClosureParamRegion::push_step(path, 0) else { return false };
+                    let Some(dst) = stack.get_mut(sp) else { return false };
+                    *dst = (inner, next);
+                    sp += 1;
+                }
+                blaze_typeck::PNode::Ptr(_, inner)
+                | blaze_typeck::PNode::Slice(inner)
+                | blaze_typeck::PNode::Array(inner, _)
+                | blaze_typeck::PNode::Pat(inner, _) => {
+                    let Some(next) = blaze_typeck::ClosureParamRegion::push_step(path, 0) else { return false };
+                    let Some(dst) = stack.get_mut(sp) else { return false };
+                    *dst = (inner, next);
+                    sp += 1;
+                }
+                blaze_typeck::PNode::Tuple(l) | blaze_typeck::PNode::FnPtr(l, _) => {
+                    let Ok(elems) = tys.list(l) else { return false };
+                    for (ci, &child) in elems.iter().enumerate().rev() {
+                        let Ok(ci_u32) = u32::try_from(ci) else { return false };
+                        let Some(next) = blaze_typeck::ClosureParamRegion::push_step(path, ci_u32) else { return false };
+                        let Some(dst) = stack.get_mut(sp) else { return false };
+                        *dst = (child, next);
+                        sp += 1;
+                    }
+                }
+                blaze_typeck::PNode::Adt(k, l) => {
+                    let Some(nl) = super::types::declared_lifetimes(
+                        self.builder.heads,
+                        self.builder.resolver.names,
+                        k,
+                        super::types::Declared::Adt,
+                    ) else {
+                        return false;
+                    };
+                    for own in 0..nl {
+                        let Some(&slot) = slots.get(cursor) else { return false };
+                        cursor += 1;
+                        if let Some(kind) = kind_of(slot) {
+                            out(blaze_typeck::ClosureParamRegion { closure, param, path, own, kind });
+                        }
+                    }
+                    let Ok(args) = tys.list(l) else { return false };
+                    for (ci, &child) in args.iter().enumerate().rev() {
+                        let Ok(ci_u32) = u32::try_from(ci) else { return false };
+                        let Some(next) = blaze_typeck::ClosureParamRegion::push_step(path, ci_u32) else { return false };
+                        let Some(dst) = stack.get_mut(sp) else { return false };
+                        *dst = (child, next);
+                        sp += 1;
+                    }
+                }
+                blaze_typeck::PNode::Alias { trait_, name, args } => {
+                    let Some(trait_count) = super::types::declared_lifetimes(
+                        self.builder.heads,
+                        self.builder.resolver.names,
+                        trait_,
+                        super::types::Declared::Trait,
+                    ) else {
+                        return false;
+                    };
+                    let Some(own_count) = super::types::declared_lifetimes(
+                        self.builder.heads,
+                        self.builder.resolver.names,
+                        trait_,
+                        super::types::Declared::Assoc(name),
+                    ) else {
+                        return false;
+                    };
+                    let Some(nl) = trait_count.checked_add(own_count) else { return false };
+                    for own in 0..nl {
+                        let Some(&slot) = slots.get(cursor) else { return false };
+                        cursor += 1;
+                        if let Some(kind) = kind_of(slot) {
+                            out(blaze_typeck::ClosureParamRegion { closure, param, path, own, kind });
+                        }
+                    }
+                    let Ok(arg_list) = tys.list(args) else { return false };
+                    for (ci, &child) in arg_list.iter().enumerate().rev() {
+                        let Ok(ci_u32) = u32::try_from(ci) else { return false };
+                        let Some(next) = blaze_typeck::ClosureParamRegion::push_step(path, ci_u32) else { return false };
+                        let Some(dst) = stack.get_mut(sp) else { return false };
+                        *dst = (child, next);
+                        sp += 1;
+                    }
+                }
+                blaze_typeck::PNode::Dynamic(_) => {
+                    let arity = HeadsArity { heads: self.builder.heads, opaques: &[], names: self.builder.resolver.names };
+                    let Ok(sub) = super::types::subtree(tys, ty, &arity, self.mark_alloc) else { return false };
+                    let Ok(total) = usize::try_from(sub.slots) else { return false };
+                    if total > 0 {
+                        let Some(&slot) = slots.get(cursor) else { return false };
+                        if let Some(kind) = kind_of(slot) {
+                            out(blaze_typeck::ClosureParamRegion { closure, param, path, own: 0, kind });
+                        }
+                        let Some(next_cursor) = cursor.checked_add(total) else { return false };
+                        if next_cursor > slots.len() {
+                            return false;
+                        }
+                        cursor = next_cursor;
+                    }
+                }
+                blaze_typeck::PNode::Bool
+                | blaze_typeck::PNode::Char
+                | blaze_typeck::PNode::Int(_)
+                | blaze_typeck::PNode::Uint(_)
+                | blaze_typeck::PNode::Float(_)
+                | blaze_typeck::PNode::Str
+                | blaze_typeck::PNode::Never
+                | blaze_typeck::PNode::Param(_)
+                | blaze_typeck::PNode::ConstValue { .. }
+                | blaze_typeck::PNode::ConstParam(_)
+                | blaze_typeck::PNode::Infer
+                | blaze_typeck::PNode::Error => {}
+                _ => return false,
+            }
+        }
+        cursor == slots.len()
     }
 }
 
@@ -1064,7 +1286,7 @@ fn gat_segment(view: &View<'_>, at: ArgAt) -> Result<Option<(blaze_typeck::PathI
 /// The words of the constant expression `text` that may be names: each run of identifier
 /// bytes not starting with a digit (a number's digits and suffix are one token, never an
 /// identifier). A word inside a string literal is one too: a superset, never short of a name.
-fn identifiers(text: &str) -> impl Iterator<Item = &str> {
+pub(super) fn identifiers(text: &str) -> impl Iterator<Item = &str> {
     let bytes = text.as_bytes();
     let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80;
     let mut i = 0;
@@ -1126,10 +1348,76 @@ enum TypesInto<'t> {
 /// body and record from one table (the run path's seam). The returned body's own `tys` is
 /// empty: its types are `into`'s.
 pub fn lower_again<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, body: &Body<'n>, into: &mut PortableTys<'static>) -> Result<Body<'n>, BodyError> {
+    if let Some(text) = body.expanded_text {
+        let subst = body.param_subst.as_ref().map(|(orig, args)| (*orig, args.as_slice()));
+        return lower_body_with_text(names, prepared, keys, store, body.item, body.owner, text, subst, Some(into));
+    }
     match keys.library_in(names, body.owner) {
         Some(lib) => lower_fn_into(names, prepared, keys, store, lib, Some(into)),
         None => lower_member_into(names, prepared, keys, store, body.owner, Some(into)),
     }
+}
+
+fn copy_slice<T: Copy>(src: &[T], alloc: Alloc<'static>) -> blaze_own::Vec<T, Alloc<'static>> {
+    let mut out = blaze_own::Vec::with_capacity_in(src.len(), alloc);
+    out.extend_from_slice(src);
+    out
+}
+
+/// Lowers `owner`'s body from rewritten item text `text` (produced by `inline for` unrolling),
+/// optionally substituting generic parameter indices with concrete `subst` arguments from `orig`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lower_body_with_text<'n, S: NamesSource<'n>>(
+    names: S,
+    prepared: &Prepares<'n>,
+    keys: &mut Keys,
+    store: &mut Store<'n>,
+    item: LibKey,
+    owner: ItemKey,
+    text: &'n str,
+    param_subst: Option<(ItemKey, &[PTy])>,
+    into: Option<&mut PortableTys<'static>>,
+) -> Result<Body<'n>, BodyError> {
+    let head_key = param_subst.map_or(owner, |(orig, _)| orig);
+    let head = store.fns.get(&head_key).ok_or(BodyError::NoHead(head_key))?;
+    let krate = names.crate_of(head.lib).ok_or(BodyError::NoText(head.lib))?;
+    let alloc = store.work_alloc();
+    let container = head.container;
+    let site = Site {
+        item,
+        owner,
+        regions_owner: head_key,
+        container,
+        krate,
+        module: head.module,
+        text,
+        marks: None,
+        params: copy_slice(&head.params, alloc),
+        consts: copy_slice(&head.consts, alloc),
+        bounds: copy_slice(&head.bounds, alloc),
+        self_: head.self_,
+        self_assoc: copy_slice(&head.self_assoc, alloc),
+    };
+    let subst_slice = param_subst.map(|(_, args)| args);
+    let mut body = lower_at(names, prepared, keys, store, site, into, subst_slice, parser::Extensions::RECORDS)?;
+    body.expanded_text = Some(text);
+    if let Some((orig, args)) = param_subst {
+        let store_alloc = store.work_alloc();
+        let mut kept_args = blaze_own::Vec::with_capacity_in(args.len(), store_alloc);
+        kept_args.extend_from_slice(args);
+        body.param_subst = Some((orig, kept_args));
+        body.params.clear();
+        if let Some(spec_head) = store.fns.get(&owner) {
+            body.self_ = spec_head.self_;
+        }
+    }
+    if let Some(own) = super::own_trait::of_member(store, container).map_err(|e| BodyError::NoHead(e.0))? {
+        if let Err(at) = body.traits.binary_search(&own) {
+            body.traits.insert(at, own);
+            body.blocks.add(own, store.work_alloc());
+        }
+    }
+    Ok(body)
 }
 
 fn lower_fn_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, item: LibKey, into: Option<&mut PortableTys<'static>>) -> Result<Body<'n>, BodyError> {
@@ -1149,15 +1437,23 @@ fn lower_fn_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys
         store.ensure(names, keys, Want::Fn(item)).map_err(|error| BodyError::Head { item, error })?;
     }
     let head = store.fns.get(&owner).ok_or(BodyError::NoHead(owner))?;
+    let alloc = store.work_alloc();
     let site = Site {
-        item, owner, krate, module, text, marks,
-        params: head.params.clone(),
-        consts: head.consts.clone(),
-        bounds: head.bounds.clone(),
+        item,
+        owner,
+        regions_owner: owner,
+        container: head.container,
+        krate,
+        module,
+        text,
+        marks,
+        params: copy_slice(&head.params, alloc),
+        consts: copy_slice(&head.consts, alloc),
+        bounds: copy_slice(&head.bounds, alloc),
         self_: head.self_,
-        self_assoc: head.self_assoc.clone(),
+        self_assoc: copy_slice(&head.self_assoc, alloc),
     };
-    lower_at(names, prepared, keys, store, site, into)
+    lower_at(names, prepared, keys, store, site, into, None, parser::Extensions::NONE)
 }
 
 /// Lowers and converts the body of the member fn `key` of a trait or an impl, in the env its
@@ -1213,27 +1509,30 @@ fn lower_member_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, 
             return Err(BodyError::Record { item: head.lib, owner: key, why });
         }
     };
+    let alloc = store.work_alloc();
     let site = Site {
         item: head.lib,
         owner: key,
+        regions_owner: key,
+        container: head.container,
         krate,
         module: head.module,
         text: head.text,
         marks,
-        params: head.params.clone(),
-        consts: head.consts.clone(),
-        bounds: head.bounds.clone(),
+        params: copy_slice(&head.params, alloc),
+        consts: copy_slice(&head.consts, alloc),
+        bounds: copy_slice(&head.bounds, alloc),
         self_: head.self_,
-        self_assoc: head.self_assoc.clone(),
+        self_assoc: copy_slice(&head.self_assoc, alloc),
     };
     let container = head.container;
-    let mut body = lower_at(names, prepared, keys, store, site, into)?;
+    let mut body = lower_at(names, prepared, keys, store, site, into, None, parser::Extensions::NONE)?;
     // The body's own trait is in scope in it, imported or not (own_trait.rs: `impl
     // core::hash::Hash for X { .. self.field.hash(state) .. }`); `traits` stays sorted.
     if let Some(own) = super::own_trait::of_member(store, container).map_err(|e| BodyError::NoHead(e.0))? {
         if let Err(at) = body.traits.binary_search(&own) {
             body.traits.insert(at, own);
-            body.blocks.add(own, store.tys.alloc());
+            body.blocks.add(own, store.work_alloc());
         }
     }
     Ok(body)
@@ -1259,18 +1558,22 @@ fn refused_head<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>
 struct Site<'n> {
     item: LibKey,
     owner: ItemKey,
+    /// Checker key whose head regions (`Store::regions`) hold this fn's declared `where` bounds.
+    regions_owner: ItemKey,
+    /// Enclosing trait or impl container (`FnHead::container`), for `Self` / impl-trait / container bounds.
+    container: Option<ItemKey>,
     krate: usize,
     module: LibKey,
     text: &'n str,
     /// The marks of `text`'s words when a macro wrote it (front2 item_site.rs); `None` for a
     /// text of a file, or one that keeps no origin column (`item_site::marks_of`).
     marks: Option<blaze_scope::crate_roots::TextMarks<'n>>,
-    params: Vec<(Name, u32), Global>,
+    params: blaze_own::Vec<(Name, u32), Alloc<'static>>,
     /// The const generic parameters among `params` ([`Env::consts`]).
-    consts: Vec<(u32, PTy), Global>,
-    bounds: Vec<ParamBound, Global>,
+    consts: blaze_own::Vec<(u32, PTy), Alloc<'static>>,
+    bounds: blaze_own::Vec<ParamBound, Alloc<'static>>,
     self_: SelfTy,
-    self_assoc: Vec<(Name, PTy), Global>,
+    self_assoc: blaze_own::Vec<(Name, PTy), Alloc<'static>>,
 }
 
 /// The gate of a base-less struct expression `S { a: 1, .. }` (RFC 3681,
@@ -1353,8 +1656,9 @@ fn body_at<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, ite
     None
 }
 
-fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, site: Site<'n>, mut into: Option<&mut PortableTys<'static>>) -> Result<Body<'n>, BodyError> {
-    let Site { item, owner, krate, module, text, marks, params, consts, bounds, self_, self_assoc } = site;
+#[expect(clippy::too_many_arguments, reason = "internal body lowering entry point")]
+fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, site: Site<'n>, mut into: Option<&mut PortableTys<'static>>, param_subst: Option<&[PTy]>, extra_extensions: parser::Extensions) -> Result<Body<'n>, BodyError> {
+    let Site { item, owner, regions_owner, container, krate, module, text, marks, params, consts, bounds, self_, self_assoc } = site;
     // The body's local items keep these marks for their own heads and bodies (locals.rs
     // `LocalHead::marks`).
     let text_marks = marks;
@@ -1364,18 +1668,17 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
         Some(m) => Some(blaze_lower::mark_site::ItemMarks::of(text, m).map_err(|miss| BodyError::Record { item, owner, why: Why::Program(format!("{miss}").into_boxed_str(), Range::new(0, 0)) })?),
         None => None,
     };
-    // The store's allocator: the body, its types and its block traits are kept for the check.
-    let alloc = store.tys.alloc();
+    // The store's per-body work allocator: the body, its types and its block traits are kept for the check.
+    let alloc = store.work_alloc();
     let edition = names.edition_of(krate).ok_or(BodyError::NoText(item))?;
     let atoms = names.cfg_atoms(krate).ok_or(BodyError::NoText(item))?;
 
     // The body's blocks the names library made modules: a call in one, written by hand or by
-    // an expansion, reads its path there (scoped.rs `body_blocks`). Only for a text that is the
-    // library's item's or member's own (a local item's body, an anonymous constant's
-    // rendering: none).
-    // A member by its key, never by its text's slice (locals.rs `library_item_or_member`: a
-    // method's blocks had no modules before).
-    let blocks = match (super::locals::library_item_or_member(names, keys, item, owner, text), names.crate_key(krate)) {
+    // an expansion, reads its path there (scoped.rs `body_blocks`). Uses `store.locals.library_body`
+    // so both top-level items/members AND local fns/consts/statics whose blocks the names library
+    // wrote (`Locals::library_twin`, e.g. `std::sys::process::unix::<impl Command>::posix_spawn::get_posix_spawn_addchdir`)
+    // resolve block-local macro imports like `use crate::sys::weak::weak; weak!(...);`.
+    let blocks = match (store.locals.library_body(names, keys, item, owner, text), names.crate_key(krate)) {
         (Some(body), Some(crate_key)) => super::scoped::body_blocks(crate_key, body, text, alloc),
         _ => None,
     };
@@ -1390,9 +1693,10 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     let body_sources = store.sources;
     let mut expand = ByName::with_names(&scoped, host, alloc);
     let mut values = ModuleValues { names, module, store: &mut *store, keys: &mut *keys, failed: None, krate, item, owner, text, blocks: None };
+    let extensions = names.blaze_extensions(krate).with(extra_extensions);
     let lowered = match marks {
-        Some(marks) => blaze_lower::lower_body_expanding_marked(marks, edition, &mut CrateCfg(atoms), &mut values, &mut expand, alloc),
-        None => blaze_lower::lower_body_expanding(text, edition, &mut CrateCfg(atoms), &mut values, &mut expand, alloc),
+        Some(marks) => blaze_lower::lower_body_expanding_marked_with_extensions(marks, edition, extensions, &mut CrateCfg(atoms), &mut values, &mut expand, alloc),
+        None => blaze_lower::lower_body_expanding_with_extensions(text, edition, extensions, &mut CrateCfg(atoms), &mut values, &mut expand, alloc),
     };
     // D111: a body call's proc-macro read outside the member is a finding at the call, filed
     // through the item host's one filing (body_left.rs), whatever the body's own outcome.
@@ -1488,9 +1792,91 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     // `NonNull` there while its body read it at `alloc::io::error`: E0412 (ladder rungs f3-dyn,
     // x0-ref-11, x0-ref-12). Any other body: its own module.
     let types_at = store.locals.head(owner).map_or(module, |h| h.names_at);
+    note_body_record_field_names(&view, &store.maps);
     let mut last = item;
     let mut typeck = None;
+    let mut given_param_bounds: blaze_own::Vec<ContainerParamBound, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
     for _ in 0..MOST_ROUNDS {
+        let mut given_self: Option<blaze_own::Vec<blaze_typeck::regions::Region, Alloc<'static>>> = None;
+        let mut given_impl_trait: Option<blaze_own::Vec<blaze_typeck::regions::Region, Alloc<'static>>> = None;
+        given_param_bounds.clear();
+        if let Some(c) = container {
+            if let Some(cr) = store.container_regions.get(&c) {
+                if matches!(self_, SelfTy::Ty(..)) {
+                    if let Some(sr) = cr.self_regions.as_deref() {
+                        let mut v = blaze_own::Vec::with_capacity_in(sr.len(), alloc);
+                        v.extend_from_slice(sr);
+                        given_self = Some(v);
+                    }
+                    if let Some(tr) = cr.trait_regions.as_deref() {
+                        let mut v = blaze_own::Vec::with_capacity_in(tr.len(), alloc);
+                        v.extend_from_slice(tr);
+                        given_impl_trait = Some(v);
+                    }
+                }
+                if let Some(filed) = store.regions.made(c) {
+                    let arity = HeadsArity { heads: &store.maps, opaques: &[], names };
+                    super::heads::extract_elaborated_param_bounds(
+                        store.tys.view(),
+                        &store.regions,
+                        &arity,
+                        &filed.regions().clauses,
+                        &mut given_param_bounds,
+                        alloc,
+                    );
+                } else {
+                    for pb in &cr.param_bounds {
+                        let mut regs = blaze_own::Vec::with_capacity_in(pb.regions.len(), alloc);
+                        regs.extend_from_slice(&pb.regions);
+                        given_param_bounds.push(ContainerParamBound { param: pb.param, trait_: pb.trait_, regions: regs });
+                    }
+                }
+            } else if let Some(filed) = store.regions.made(c) {
+                // Frozen `Head::Impl` / `Head::Trait` records carry `life: None` (lifetime parts
+                // are made on demand), so `Store::file_heads` skips `restore_container` and leaves
+                // `store.container_regions` empty even though `store.regions.made(c)` holds the
+                // impl's `impl_header` columns (`Self` and impl-trait) and clauses.
+                let h = filed.regions();
+                if let SelfTy::Ty(self_ty, _) = self_
+                    && let Some((self_col, trait_col)) = h.impl_header.as_ref()
+                    && self_col.ty() == self_ty
+                {
+                    let mut v = blaze_own::Vec::with_capacity_in(self_col.as_slice().len(), alloc);
+                    v.extend_from_slice(self_col.as_slice());
+                    given_self = Some(v);
+                    if let Some(tc) = trait_col.as_ref() {
+                        let mut tv = blaze_own::Vec::with_capacity_in(tc.as_slice().len(), alloc);
+                        tv.extend_from_slice(tc.as_slice());
+                        given_impl_trait = Some(tv);
+                    }
+                }
+                let arity = HeadsArity { heads: &store.maps, opaques: &[], names };
+                super::heads::extract_elaborated_param_bounds(
+                    store.tys.view(),
+                    &store.regions,
+                    &arity,
+                    &h.clauses,
+                    &mut given_param_bounds,
+                    alloc,
+                );
+            }
+        }
+        if let Some(filed) = store.regions.made(regions_owner) {
+            let arity = HeadsArity { heads: &store.maps, opaques: &[], names };
+            super::heads::extract_elaborated_param_bounds(
+                store.tys.view(),
+                &store.regions,
+                &arity,
+                &filed.regions().clauses,
+                &mut given_param_bounds,
+                alloc,
+            );
+        }
+        let self_given = SelfGiven {
+            self_: given_self.as_deref(),
+            impl_trait: given_impl_trait.as_deref(),
+            param_bounds: &given_param_bounds,
+        };
         let mut types = BodyTypes {
             mark_alloc: alloc,
             // Every word's mark is in the lowered record (`View::mark_of_path`): an expansion's
@@ -1512,11 +1898,14 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
             failed: None,
             expanded_type: None,
             text,
-            misses: Vec::new_in(Global),
+            misses: blaze_own::Vec::new_in(alloc),
             locals: &store.locals,
             owner,
             async_ret,
             legacy: &store.fns,
+            self_given,
+            region_needs: blaze_own::Vec::new_in(alloc),
+            region_need_const: None,
         };
         // Each round converts into a fresh overlay of the records' table (read in place, never
         // copied): a refused round's types are dropped with it, none reaches `store.tys`, and
@@ -1535,15 +1924,33 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
             (None, false) => TypesInto::Overlay,
         };
         let (converted, kept) = match target {
-            TypesInto::Again(t) => (to_typeck(&view, owner, t, &mut types, alloc), None),
+            TypesInto::Again(t) => {
+                let mut converted = to_typeck(&view, owner, t, &mut types, alloc);
+                if let (Ok(b), Some(subst_args)) = (&mut converted, param_subst) {
+                    if let Err(err) = super::inline_for::subst_typeck_body(b, t, subst_args) {
+                        converted = Err(Refused::Check(err));
+                    }
+                }
+                (converted, None)
+            }
             TypesInto::Store => {
-                let converted = to_typeck(&view, owner, &mut store.tys, &mut types, alloc);
+                let mut converted = to_typeck(&view, owner, &mut store.tys, &mut types, alloc);
+                if let (Ok(b), Some(subst_args)) = (&mut converted, param_subst) {
+                    if let Err(err) = super::inline_for::subst_typeck_body(b, &mut store.tys, subst_args) {
+                        converted = Err(Refused::Check(err));
+                    }
+                }
                 let kept = converted.is_ok().then(|| OwnTys::in_base(alloc));
                 (converted, kept)
             }
             TypesInto::Overlay => {
                 let mut own = PortableTys::over(&store.tys, alloc).map_err(|error| BodyError::Table { item, error })?;
-                let converted = to_typeck(&view, owner, &mut own, &mut types, alloc);
+                let mut converted = to_typeck(&view, owner, &mut own, &mut types, alloc);
+                if let (Ok(b), Some(subst_args)) = (&mut converted, param_subst) {
+                    if let Err(err) = super::inline_for::subst_typeck_body(b, &mut own, subst_args) {
+                        converted = Err(Refused::Check(err));
+                    }
+                }
                 let kept = match converted {
                     Ok(_) => Some(own.keep_in(alloc).map_err(|error| BodyError::Table { item, error })?),
                     Err(_) => None,
@@ -1551,39 +1958,68 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
                 (converted, kept)
             }
         };
+        let BodyTypes { failed, expanded_type, misses, region_needs, region_need_const, .. } = types;
+        let want_of = |store: &Store<'n>, k: LibKey| match (Paths { names }).detail(k) {
+            Some(blaze_surface::ItemDetail::Fn { .. }) => Want::Fn(k),
+            _ => store.need(k),
+        };
         match converted {
             Ok(b) => {
+                if let Some(&first) = region_needs.first() {
+                    if again_now {
+                        return Err(BodyError::Convert {
+                            item,
+                            refused: Refused::Form { what: "a closure parameter's regions", range: Range::new(0, 0) },
+                            why: Some(Why::Need(first)),
+                            expanded_type: None,
+                        });
+                    }
+                    for &k in region_needs.iter() {
+                        last = k;
+                        let need = want_of(store, k);
+                        store.ensure(names, keys, need).map_err(|error| BodyError::Head { item, error })?;
+                    }
+                    continue;
+                }
+                if let Some(why @ Why::NeedConst(_, range)) = region_need_const {
+                    return Err(BodyError::Convert {
+                        item,
+                        refused: Refused::Form { what: "a closure parameter's regions", range },
+                        why: Some(why),
+                        expanded_type: None,
+                    });
+                }
                 // Lowered into another table (`lower_again`): the body keeps no types of its own.
                 let kept = match kept {
                     Some(k) => k,
                     None => OwnTys::none(alloc),
                 };
-                typeck = Some((b, kept, core::mem::take(&mut types.misses)));
+                typeck = Some((b, kept, misses));
                 break;
             }
             // A fn whose text has no body (an intrinsic's or a foreign fn's declaration, met
             // before its head was made): the table's to say how it is called, never a lowering.
             Err(Refused::NoBody) => return Err(BodyError::NoBody(owner)),
-            Err(refused) => match types.failed.take() {
+            Err(refused) => match failed {
                 // Lowered again into a finished table: a head it lacks cannot be added there.
                 Some(why @ Why::Need(_)) if again_now => return Err(BodyError::Convert { item, refused, why: Some(why), expanded_type: None }),
                 Some(Why::Need(k)) => {
                     last = k;
                     // A free fn's head (its const parameters, which type a const argument
                     // written on a path to it: `BodyTypes::arg_param`) is its `Want::Fn`.
-                    let need = match (Paths { names }).detail(k) {
-                        Some(blaze_surface::ItemDetail::Fn { .. }) => Want::Fn(k),
-                        _ => store.need(k),
-                    };
+                    let need = want_of(store, k);
                     store.ensure(names, keys, need).map_err(|error| BodyError::Head { item, error })?;
+                    for &rk in region_needs.iter() {
+                        if rk != k {
+                            last = rk;
+                            let rneed = want_of(store, rk);
+                            store.ensure(names, keys, rneed).map_err(|error| BodyError::Head { item, error })?;
+                        }
+                    }
                 }
                 why => {
-                    // The caller's site owns its parameters on the heap. Its allocator can
-                    // also own the spelling after the worker drops the lowering and store.
-                    let expanded_type = types.expanded_type.map(|at| view.text_at(at).map(|text| {
-                        let bytes = text.as_bytes().to_vec_in(*params.allocator());
-                        std::string::String::from_utf8(bytes).expect("copied from a str").into_boxed_str()
-                    }));
+                    // Own the spelling in `Box<str>` so it outlives the lowering and store.
+                    let expanded_type = expanded_type.map(|at| view.text_at(at).map(Box::<str>::from));
                     return Err(BodyError::Convert { item, refused, why, expanded_type });
                 }
             },
@@ -1591,15 +2027,796 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     }
     let Some((typeck, tys, type_misses)) = typeck else { return Err(BodyError::Rounds { item, last }) };
     defaults_gate(names, krate, &typeck).map_err(|why| BodyError::Record { item, owner, why })?;
+    if Store::view_has_record_type(&view) {
+        let body_env = Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts, body: None };
+        store.register_record_defaults(names, keys, item, &body_env, None, &view).map_err(|why| BodyError::Record { item, owner, why })?;
+    }
 
     let in_scope = names.traits_in_scope(module, alloc).map_err(|error| BodyError::Traits { item, error })?;
-    let mut traits = Vec::with_capacity_in(in_scope.len(), Global);
-    traits.extend(in_scope.iter().map(|&k| checker_of(k)));
+    let mut traits = blaze_own::Vec::with_capacity_in(in_scope.len(), alloc);
+    for &k in in_scope.iter() {
+        let _ = keys.item(k);
+        traits.push(checker_of(k));
+    }
     traits.sort_unstable();
     traits.dedup();
     // The traits a block's `use` brings into scope there (tracing's `use
     // $crate::__macro_support::Callsite as _;` in the block its macros expand to).
     let blocks = super::block_traits::of(names, &store.locals, owner, module, krate, &traits, alloc);
     drop(view);
-    Ok(Body { item, owner, module, lowered, typeck, tys, params, self_, traits, blocks, type_misses })
+    Ok(Body { item, owner, module, lowered, typeck, tys, params, self_, traits, blocks, type_misses, expanded_text: None, param_subst: None })
+}
+
+/// Records the field name spellings of every structural record literal and record pattern in
+/// `view` into `maps.record_field_names` so `inline for` unrolling can spell anonymous record
+/// fields even across function boundaries.
+fn note_body_record_field_names(view: &View<'_>, maps: &super::heads::Maps) {
+    use super::types::Heads as _;
+    for i in 0..view.exprs.len() {
+        let Ok(idx) = u32::try_from(i) else { break };
+        let Ok(blaze_lower::Expr::Record { fields, .. }) = view.expr(ExprId(idx)) else { continue };
+        let Ok(rows) = view.rows(fields) else { continue };
+        for &row in rows {
+            let Ok(fi) = blaze_lower::form::FieldInit::decode(row) else { continue };
+            let Ok(hash) = view.name(fi.name) else { continue };
+            let Ok(r) = view.name_range(fi.name) else { continue };
+            let Ok(raw) = view.text_at(r) else { continue };
+            let text = raw.strip_prefix("r#").unwrap_or(raw);
+            if !text.is_empty() {
+                maps.note_record_field_name(Name(hash), text);
+            }
+        }
+    }
+    for i in 0..view.pats.len() {
+        let Ok(idx) = u32::try_from(i) else { break };
+        let Ok(blaze_lower::Pat::Record { fields, .. }) = view.pat(blaze_lower::PatId(idx)) else { continue };
+        let Ok(rows) = view.rows(fields) else { continue };
+        for &row in rows {
+            let Ok(fp) = blaze_lower::form::FieldPat::decode(row) else { continue };
+            let Ok(hash) = view.name(fp.name) else { continue };
+            let Ok(r) = view.name_range(fp.name) else { continue };
+            let Ok(raw) = view.text_at(r) else { continue };
+            let text = raw.strip_prefix("r#").unwrap_or(raw);
+            if !text.is_empty() {
+                maps.note_record_field_name(Name(hash), text);
+            }
+        }
+    }
+}
+
+/// Whether `text` (a free fn item's source) may carry `#[rustc_legacy_const_generics(..)]` in
+/// its outer attribute prefix. Scans only leading whitespace, comments, and `#[...]` outer
+/// attributes before the `fn` signature (never scanning the function body), returning `true`
+/// conservatively on any malformed or unclosed comment, literal, or attribute so `FnHead`
+/// remains the single source of truth.
+fn has_legacy_const_attr_in_prefix(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    while i < len {
+        let Some(&b) = bytes.get(i) else { break };
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        // Line comment `//...\n` (including `///` doc comments).
+        if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            i += 2;
+            while let Some(&c) = bytes.get(i) {
+                i += 1;
+                if c == b'\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        // Nested block comment `/* ... */`.
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            let mut nest = 1u32;
+            while i < len && nest > 0 {
+                if bytes.get(i) == Some(&b'/') && bytes.get(i + 1) == Some(&b'*') {
+                    nest = nest.saturating_add(1);
+                    i += 2;
+                } else if bytes.get(i) == Some(&b'*') && bytes.get(i + 1) == Some(&b'/') {
+                    nest -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if nest != 0 {
+                return true;
+            }
+            continue;
+        }
+        // Outer attribute `#[...]`: scan balanced brackets, respecting comments and literals.
+        if b == b'#' && bytes.get(i + 1) == Some(&b'[') {
+            let attr_start = i;
+            i += 2;
+            let mut depth = 1u32;
+            while i < len && depth > 0 {
+                let Some(&c) = bytes.get(i) else { break };
+                match c {
+                    b'[' => {
+                        depth = depth.saturating_add(1);
+                        i += 1;
+                    }
+                    b']' => {
+                        depth -= 1;
+                        i += 1;
+                    }
+                    b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                        i += 2;
+                        while let Some(&ch) = bytes.get(i) {
+                            i += 1;
+                            if ch == b'\n' {
+                                break;
+                            }
+                        }
+                    }
+                    b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                        i += 2;
+                        let mut nest = 1u32;
+                        while i < len && nest > 0 {
+                            if bytes.get(i) == Some(&b'/') && bytes.get(i + 1) == Some(&b'*') {
+                                nest = nest.saturating_add(1);
+                                i += 2;
+                            } else if bytes.get(i) == Some(&b'*') && bytes.get(i + 1) == Some(&b'/') {
+                                nest -= 1;
+                                i += 2;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        if nest != 0 {
+                            return true;
+                        }
+                    }
+                    b'"' => {
+                        i += 1;
+                        let mut closed = false;
+                        while let Some(&ch) = bytes.get(i) {
+                            i += 1;
+                            if ch == b'\\' {
+                                if i < len {
+                                    i += 1;
+                                }
+                            } else if ch == b'"' {
+                                closed = true;
+                                break;
+                            }
+                        }
+                        if !closed {
+                            return true;
+                        }
+                    }
+                    b'r' if is_raw_string_prefix(bytes, i) => {
+                        let mut j = i + 1;
+                        let mut hashes = 0usize;
+                        while bytes.get(j) == Some(&b'#') {
+                            hashes += 1;
+                            j += 1;
+                        }
+                        if bytes.get(j) == Some(&b'"') {
+                            j += 1;
+                            let mut closed = false;
+                            while j < len {
+                                if bytes.get(j) == Some(&b'"') {
+                                    let mut k = j + 1;
+                                    let mut matched = 0usize;
+                                    while matched < hashes && bytes.get(k) == Some(&b'#') {
+                                        matched += 1;
+                                        k += 1;
+                                    }
+                                    if matched == hashes {
+                                        j = k;
+                                        closed = true;
+                                        break;
+                                    }
+                                }
+                                j += 1;
+                            }
+                            if !closed {
+                                return true;
+                            }
+                            i = j;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    b'\'' => {
+                        if bytes.get(i + 1) == Some(&b'\\') {
+                            // Escaped char literal like `'\''` or `'\u{10ffff}'`.
+                            i += 2;
+                            if i < len {
+                                i += 1;
+                            }
+                            let mut steps = 0usize;
+                            while let Some(&ch) = bytes.get(i) {
+                                i += 1;
+                                steps += 1;
+                                if ch == b'\'' || steps >= 16 {
+                                    break;
+                                }
+                            }
+                        } else if bytes.get(i + 2) == Some(&b'\'') {
+                            // Single ASCII byte char literal like `']'` or `'"'`.
+                            i += 3;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    _ => {
+                        i += 1;
+                    }
+                }
+            }
+            if depth != 0 {
+                return true;
+            }
+            if text.get(attr_start..i).is_none_or(|attr| attr.contains("rustc_legacy_const_generics")) {
+                return true;
+            }
+            continue;
+        }
+        // First non-whitespace, non-comment, non-outer-attribute token (`pub`, `fn`, `async`, ...).
+        return false;
+    }
+    false
+}
+
+/// Whether `bytes[at]` (`b'r'`) may start a Rust raw string (`r"..."`, `br#"..."#`, `cr#"..."#`),
+/// as opposed to an identifier ending in `r`.
+fn is_raw_string_prefix(bytes: &[u8], at: usize) -> bool {
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80;
+    let Some(prev_idx) = at.checked_sub(1) else { return true };
+    let Some(&prev) = bytes.get(prev_idx) else { return true };
+    if !is_ident(prev) {
+        return true;
+    }
+    if matches!(prev, b'b' | b'c') {
+        return prev_idx.checked_sub(1).and_then(|p| bytes.get(p)).is_none_or(|&b| !is_ident(b));
+    }
+    false
+}
+
+#[cfg(test)]
+mod legacy_const_read_tests {
+    use blaze_lower::scoped::Prepares;
+
+    use super::{has_legacy_const_attr_in_prefix, lower_fn};
+    use crate::front2::heads::Store;
+    use crate::front2::keys::{Keys, checker_of};
+    use crate::front2::source::NamesSource;
+    use crate::front2::tables::head_tests::{a, world_of};
+    use crate::front2::tables::recorder::{Recorder, RecorderOpts, TableRead};
+    use crate::front2::tables::view::{Tables, TablesOpts};
+
+    #[test]
+    fn prefix_scan_skips_body_and_finds_outer_attributes() {
+        assert!(!has_legacy_const_attr_in_prefix("pub fn plain(x: u32) -> u32 { /* rustc_legacy_const_generics */ x }"));
+        assert!(!has_legacy_const_attr_in_prefix("/// mentions rustc_legacy_const_generics\n#[inline]\npub fn plain(x: u32) -> u32 { let _ = \"rustc_legacy_const_generics\"; x }"));
+        assert!(!has_legacy_const_attr_in_prefix("/* /* nested rustc_legacy_const_generics */ */\n#[allow(clippy::all)]\nfn f() {}"));
+        assert!(!has_legacy_const_attr_in_prefix("#[foo(r#type)]\nfn f() { \"rustc_legacy_const_generics\"; }"));
+
+        assert!(has_legacy_const_attr_in_prefix("#[rustc_legacy_const_generics(1)]\npub fn f<const N: u32>(v: u32) -> u32 { v }"));
+        assert!(has_legacy_const_attr_in_prefix("/// doc\n#[inline]\n#[cfg_attr(all(), rustc_legacy_const_generics(1))]\npub unsafe fn f<const N: u32>(v: u32) -> u32 { v }"));
+        assert!(has_legacy_const_attr_in_prefix("#[doc = \"]\"]\n#[doc = r#\"]\"#]\n#[doc = \"a\\\"b]\"]\n#[foo(']')]\n#[rustc_legacy_const_generics(0)]\nfn f() {}"));
+    }
+
+    #[test]
+    fn legacy_const_probe_records_head_not_coarse_text() {
+        let src = "\
+#![no_std]
+#![feature(rustc_attrs)]
+pub fn plain_callee(x: u32) -> u32 { x + 1 }
+#[rustc_legacy_const_generics(1)]
+pub fn legacy_callee<const N: u32>(v: u32) -> u32 { v >> N }
+pub fn caller_plain(a: u32) -> u32 { plain_callee(a + 1) }
+pub fn caller_legacy(a: u32) -> u32 { legacy_callee(a, { 8 }) }
+";
+        let (records, sized, frame) = world_of(src);
+        let find_fn = |want: &str| {
+            let mut found = None;
+            NamesSource::each_item(records, 0, &mut |key, _| {
+                if NamesSource::name_of(records, key) == Some(want) {
+                    found = Some(key);
+                }
+            });
+            found.unwrap_or_else(|| panic!("missing fixture fn `{want}`"))
+        };
+        let plain_callee = find_fn("plain_callee");
+        let legacy_callee = find_fn("legacy_callee");
+        let caller_plain = find_fn("caller_plain");
+        let caller_legacy = find_fn("caller_legacy");
+        let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
+        let prepared = Prepares::new_in(bump);
+
+        // Normal call with expression argument: must record `Head`, never coarse `Text`, on callee.
+        {
+            let rec = Recorder::new(RecorderOpts { alloc: a() });
+            let tables = Tables::new(TablesOpts { records, impls: None, lang_crates: &[1], reads: &rec });
+            let mut keys = Keys::new_in(a());
+            let mut store = Store::new(sized, frame, a());
+            let body = lower_fn(tables, &prepared, &mut keys, &mut store, caller_plain).expect("lower caller_plain");
+            assert!(body.typeck.legacy_args.is_empty());
+            let reads = rec.keys().expect("recorded reads");
+            assert!(
+                !reads.contains(&TableRead::Text { key: plain_callee }),
+                "normal call must not record coarse TableRead::Text on callee: {:?}",
+                &*reads
+            );
+            assert!(
+                reads.contains(&TableRead::Head { item: checker_of(plain_callee).0.to_be_bytes(), part: 0 }),
+                "legacy const probe must record TableRead::Head on callee: {:?}",
+                &*reads
+            );
+        }
+
+        // Legacy const generic call: lowers the legacy arg and still records no `TableRead::Text` on callee.
+        {
+            let rec = Recorder::new(RecorderOpts { alloc: a() });
+            let tables = Tables::new(TablesOpts { records, impls: None, lang_crates: &[1], reads: &rec });
+            let mut keys = Keys::new_in(a());
+            let mut store = Store::new(sized, frame, a());
+            let body = lower_fn(tables, &prepared, &mut keys, &mut store, caller_legacy).expect("lower caller_legacy");
+            assert_eq!(body.typeck.legacy_args.len(), 1, "expected 1 lowered legacy const arg");
+            let reads = rec.keys().expect("recorded reads");
+            assert!(
+                !reads.contains(&TableRead::Text { key: legacy_callee }),
+                "legacy const call must not record coarse TableRead::Text on callee: {:?}",
+                &*reads
+            );
+            assert!(
+                reads.contains(&TableRead::Head { item: checker_of(legacy_callee).0.to_be_bytes(), part: 0 }),
+                "legacy const call must record TableRead::Head on callee: {:?}",
+                &*reads
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod closure_param_regions_tests {
+    use blaze_id::{ContentId, CrateItemKey};
+    use blaze_lower::scoped::Prepares;
+    use blaze_mem::Frame;
+    use blaze_scope::graph::Sysroot;
+    use blaze_scope::resolve::{CrateInput, SourceTexts, resolve_crates};
+    use blaze_scope::task::Serial;
+    use blaze_surface::Edition;
+    use blaze_typeck::{ClosureParamRegion, WrittenRegion};
+    use blaze_unit_graph::{Implicit, Prelude, StdIs};
+
+    use super::{Store, lower_fn, lower_member};
+    use crate::front2::Front2;
+    use crate::refusal::SourceFile;
+
+    struct OneFile<'a>(&'a str);
+    impl<'a> SourceTexts<'a> for OneFile<'a> {
+        fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
+            (krate == 0 && path == "/fnptr/src/lib.rs").then_some(self.0)
+        }
+    }
+
+    fn lower_regions<'a>(source: &str, fn_name: &str, alloc: blaze_own::Alloc<'a>) -> blaze_own::Vec<(u32, u64, u32, WrittenRegion), blaze_own::Alloc<'a>> {
+        let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+        let heap = blaze_own::testing::heap();
+        let store_alloc = heap.alloc();
+        let input = CrateInput {
+            name: "fnptr_test",
+            key: CrateItemKey(ContentId::of("closure_param_regions_fnptr_test", b"fnptr_test")),
+            root: "/fnptr/src/lib.rs",
+            shown_from: "/fnptr/",
+            edition: Edition::E2024,
+            implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2024), proc_macro: false, entry: false },
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        };
+        let names = resolve_crates(&[input], Sysroot::default(), &OneFile(source), &Serial, bump).expect("resolve");
+        let front_frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("front frame");
+        let files = [SourceFile { path: "src/lib.rs", text: source }];
+        let mut front = Front2::new(&names, &front_frame, &files, store_alloc).expect("front2");
+        let prepared = Prepares::new_in(bump);
+        let mut store = Store::new(front.index.lang("sized"), front.frame, store_alloc);
+        let (item, _, _) = names
+            .items(0)
+            .find(|(k, _, _)| names.item_text(*k).and_then(|t| t.name) == Some(fn_name))
+            .expect("target fn");
+        let body = lower_fn(&names, &prepared, &mut front.keys, &mut store, item).expect("lower_fn");
+        let mut out = blaze_own::Vec::new_in(alloc);
+        for r in body.typeck.closure_param_regions.iter() {
+            out.push((r.param, r.path, r.own, r.kind));
+        }
+        out
+    }
+
+    fn lower_member_regions<'a>(source: &str, method_name: &str, alloc: blaze_own::Alloc<'a>) -> blaze_own::Vec<(u32, u64, u32, WrittenRegion), blaze_own::Alloc<'a>> {
+        let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+        let heap = blaze_own::testing::heap();
+        let store_alloc = heap.alloc();
+        let input = CrateInput {
+            name: "fnptr_test",
+            key: CrateItemKey(ContentId::of("closure_param_regions_member_test", b"member_test")),
+            root: "/fnptr/src/lib.rs",
+            shown_from: "/fnptr/",
+            edition: Edition::E2024,
+            implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2024), proc_macro: false, entry: false },
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        };
+        let names = resolve_crates(&[input], Sysroot::default(), &OneFile(source), &Serial, bump).expect("resolve");
+        let front_frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("front frame");
+        let files = [SourceFile { path: "src/lib.rs", text: source }];
+        let mut front = Front2::new(&names, &front_frame, &files, store_alloc).expect("front2");
+        let prepared = Prepares::new_in(bump);
+        let mut store = Store::new(front.index.lang("sized"), front.frame, store_alloc);
+        let mut target = None;
+        let needle = std::format!("fn {method_name}(");
+        for (item, _, _) in names.items(0) {
+            if names.item_text(item).is_some_and(|t| t.text.trim_start().starts_with("impl") && t.text.contains(&needle)) {
+                store.ensure(&names, &mut front.keys, super::Want::Impl(item)).expect("impl head");
+                let container_ck = super::super::keys::checker_of(item);
+                target = Some(front.keys.member(container_ck, super::super::keys::MemberKind::Fn, method_name).expect("member key"));
+                break;
+            }
+        }
+        let key = target.expect("target member fn");
+        let body = lower_member(&names, &prepared, &mut front.keys, &mut store, key).expect("lower_member");
+        let mut out = blaze_own::Vec::new_in(alloc);
+        for r in body.typeck.closure_param_regions.iter() {
+            out.push((r.param, r.path, r.own, r.kind));
+        }
+        out
+    }
+
+    #[test]
+    fn front2_closure_param_regions_descend_into_fn_ptr_for_and_aliases() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let src = r#"#![no_core]
+pub struct Tx;
+pub type Edit<'x> = for<'b> fn(&'b mut Tx, &'x u8) -> &'static u8;
+
+pub fn elided_fn_ptr() {
+    let _ = |edit: fn(&mut Tx)| { let _ = edit; };
+}
+
+pub fn elided_ret_from_static_and_named<'a>() {
+    let _ = |f: fn(&'static u8) -> &u8, g: fn(&'a u8) -> &u8| { let _ = (f, g); };
+}
+
+pub fn hrtb_alias_and_tuple<'a>() {
+    let _ = |f: for<'b> fn(&'b u8, &'a u8) -> &'b u8, e: Edit<'a>, pair: (for<'b> fn(&'b u8), &'a u8)| {
+        let _ = (f, e, pair);
+    };
+}
+"#;
+        let step = |p: u64, c: u32| ClosureParamRegion::push_step(p, c).expect("step");
+        let root = ClosureParamRegion::ROOT;
+
+        // Elided `fn(&mut Tx)` (Tempo `retired_root_error_order_and_access_gas` shape):
+        // its parameter lifetime is late-bound by the fn pointer, so 0 free entries.
+        assert_eq!(&lower_regions(src, "elided_fn_ptr", alloc)[..], &[]);
+
+        // Return-type lifetime elision on bare fn pointers inherits the single input lifetime
+        // (`'static` or outer named `'a`) via `RegionSink::fn_ptr`.
+        assert_eq!(
+            &lower_regions(src, "elided_ret_from_static_and_named", alloc)[..],
+            &[
+                (0, step(root, 0), 0, WrittenRegion::Static),
+                (0, step(root, 1), 0, WrittenRegion::Static),
+                (1, step(root, 0), 0, WrittenRegion::Named),
+                (1, step(root, 1), 0, WrittenRegion::Named),
+            ]
+        );
+
+        // Higher-ranked `for<'b> fn(...)`, type alias expanding to `for<'b> fn(...)`, and tuple
+        // containing a `for<'b> fn(...)` followed by an outer `&'a u8`.
+        assert_eq!(
+            &lower_regions(src, "hrtb_alias_and_tuple", alloc)[..],
+            &[
+                (0, step(root, 1), 0, WrittenRegion::Named),
+                (1, step(root, 1), 0, WrittenRegion::Named),
+                (1, step(root, 2), 0, WrittenRegion::Static),
+                (2, step(root, 1), 0, WrittenRegion::Named),
+            ]
+        );
+    }
+
+    #[test]
+    fn front2_closure_param_regions_self_alias_and_dyn() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let src = r#"#![no_core]
+pub trait Tr {}
+pub trait Pool<'a> {
+    type Cx;
+}
+pub struct Writer<'a> {
+    pub r: &'a u8,
+    pub tag: u8,
+}
+impl<'a> Writer<'a> {
+    pub fn use_self(&self) {
+        let _ = |me: &Self, out: &'a u8| { let _ = (me, out); };
+    }
+}
+impl Writer<'_> {
+    pub fn use_elided_self(&self) {
+        let _ = |me: &Self| { let _ = me; };
+    }
+}
+pub fn use_proj<'a, P: Pool<'a>>() {
+    let _ = |cx: &P::Cx, x: &'a u8| { let _ = (cx, x); };
+}
+pub fn use_dyn<'a>() {
+    let _ = |a: &(dyn Tr + 'a), b: &(dyn Tr + 'static), c: &dyn Tr| { let _ = (a, b, c); };
+}
+"#;
+        let step = |p: u64, c: u32| ClosureParamRegion::push_step(p, c).expect("step");
+        let root = ClosureParamRegion::ROOT;
+
+        // `|me: &Self, out: &'a u8|` in `impl<'a> Writer<'a>`:
+        // outer `&` on `me` is elided (per-call late), while `Self`'s `'a` is `Named`.
+        assert_eq!(
+            &lower_member_regions(src, "use_self", alloc)[..],
+            &[
+                (0, step(root, 0), 0, WrittenRegion::Named),
+                (1, root, 0, WrittenRegion::Named),
+            ]
+        );
+
+        // `|me: &Self|` in `impl Writer<'_>`: elided impl lifetime is an owner lifetime of `Self`.
+        assert_eq!(
+            &lower_member_regions(src, "use_elided_self", alloc)[..],
+            &[(0, step(root, 0), 0, WrittenRegion::Named)]
+        );
+
+        // `|cx: &P::Cx, x: &'a u8|` in `fn use_proj<'a, P: Pool<'a>>()`:
+        // outer `&` on `cx` is elided (late), while `P::Cx`'s trait lifetime `'a` is `Named`.
+        assert_eq!(
+            &lower_regions(src, "use_proj", alloc)[..],
+            &[
+                (0, step(root, 0), 0, WrittenRegion::Named),
+                (1, root, 0, WrittenRegion::Named),
+            ]
+        );
+
+        // `|a: &(dyn Tr + 'a), b: &(dyn Tr + 'static), c: &dyn Tr|`:
+        // explicit `'a` / `'static` object bounds emit `Named` / `Static`; `&dyn Tr` ties the
+        // outer `&` and default trait object lifetime together via shared `Elided(0)`.
+        assert_eq!(
+            &lower_regions(src, "use_dyn", alloc)[..],
+            &[
+                (0, step(root, 0), 0, WrittenRegion::Named),
+                (1, step(root, 0), 0, WrittenRegion::Static),
+                (2, root, 0, WrittenRegion::Elided(0)),
+                (2, step(root, 0), 0, WrittenRegion::Elided(0)),
+            ]
+        );
+    }
+
+    /// Frozen `Head::Impl` records (seeded `blaze check` via `tables/task.rs`) carry `life: None`
+    /// so `Store::file_heads` skips `restore_container`, leaving `store.container_regions` empty
+    /// even though `store.regions.made(c)` holds the impl's `impl_header` and clauses. `lower_at`
+    /// must still supply `SelfGiven` from `store.regions.made(c)` so `|m: &Self|` in multi-lifetime
+    /// impls (`blaze-consteval/src/machine.rs:1996` and `blaze-native/src/layout.rs:1204`) marks
+    /// `Self`'s lifetimes `WrittenRegion::Named` while keeping the outer `&` elided (late).
+    #[test]
+    fn front2_closure_param_regions_frozen_impl_without_container_regions() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let src = r#"#![no_core]
+pub trait Pool<'a> {
+    type Cx;
+}
+pub struct Lay<'p, 'a> {
+    pub p: &'p u8,
+    pub a: &'a u8,
+}
+impl<'p, 'a> Lay<'p, 'a> {
+    pub fn apply(&mut self) {
+        let _ = |me: &Self| { let _ = me; };
+    }
+}
+pub struct Machine<'w, 'l, 'g, 't, 'wk, 'a, W: Pool<'a>> {
+    pub w: &'w W,
+    pub l: &'l u8,
+    pub g: &'g u8,
+    pub t: &'t u8,
+    pub wk: &'wk u8,
+    pub a: &'a u8,
+}
+impl<'w, 'l, 'g, 't, 'wk, 'a, W: Pool<'a>> Machine<'w, 'l, 'g, 't, 'wk, 'a, W> {
+    pub fn intrinsic(&mut self) {
+        let _ = |m: &Self, cx: &W::Cx| { let _ = (m, cx); };
+    }
+}
+"#;
+        let run_frozen = |method_name: &str| {
+            let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+            let erased = blaze_own::Erased::new(&frame);
+            let bump = erased.bump();
+            let store_heap = blaze_own::testing::heap();
+            let store_alloc = store_heap.alloc();
+            let input = CrateInput {
+                name: "frozen_self_test",
+                key: CrateItemKey(ContentId::of("closure_param_regions_frozen_self_test", b"frozen_self_test")),
+                root: "/fnptr/src/lib.rs",
+                shown_from: "/fnptr/",
+                edition: Edition::E2024,
+                implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2024), proc_macro: false, entry: false },
+                features: &[],
+                deps: &[],
+                cfg: &[],
+                script: None,
+            };
+            let names = resolve_crates(&[input], Sysroot::default(), &OneFile(src), &Serial, bump).expect("resolve");
+            let front_frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("front frame");
+            let files = [SourceFile { path: "src/lib.rs", text: src }];
+            let mut front = Front2::new(&names, &front_frame, &files, store_alloc).expect("front2");
+            let prepared = Prepares::new_in(bump);
+            let mut store = Store::new(front.index.lang("sized"), front.frame, store_alloc);
+            let mut target = None;
+            for (item, _, _) in names.items(0) {
+                if matches!(super::NamesSource::detail_of(&names, item), Some(blaze_surface::ItemDetail::Impl)) {
+                    store.ensure(&names, &mut front.keys, super::Want::Impl(item)).expect("impl head");
+                    let ck = super::checker_of(item);
+                    let found_mk = store.impls.get(&ck).and_then(|head| {
+                        head.fns
+                            .iter()
+                            .find_map(|&(nm, mk)| (nm == blaze_typeck::Name::of(method_name)).then_some(mk))
+                    });
+                    if let Some(mk) = found_mk {
+                        store.ensure(&names, &mut front.keys, super::Want::MemberFn(item, mk)).expect("member head");
+                        // Simulate a seeded store where `Head::Impl` was restored with
+                        // `life: None`: `store.container_regions` has no row for `ck`,
+                        // while `store.regions.made(ck)` still holds `impl_header` + clauses.
+                        store.container_regions.remove(&ck);
+                        assert!(store.container_regions.get(&ck).is_none());
+                        assert!(store.regions.made(ck).is_some());
+                        target = Some(mk);
+                    }
+                }
+            }
+            let key = target.expect("target member");
+            let body = lower_member(&names, &prepared, &mut front.keys, &mut store, key).expect("lower_member");
+            let mut out = blaze_own::Vec::new_in(alloc);
+            for r in body.typeck.closure_param_regions.iter() {
+                out.push((r.param, r.path, r.own, r.kind));
+            }
+            out
+        };
+
+        let step = |p: u64, c: u32| ClosureParamRegion::push_step(p, c).expect("step");
+        let root = ClosureParamRegion::ROOT;
+
+        // `Lay<'p, 'a>`: outer `&` stays elided (no `(0, root, ...)`), while `'p` and `'a` are `Named`.
+        assert_eq!(
+            &run_frozen("apply")[..],
+            &[
+                (0, step(root, 0), 0, WrittenRegion::Named),
+                (0, step(root, 0), 1, WrittenRegion::Named),
+            ]
+        );
+
+        // `Machine<'w, 'l, 'g, 't, 'wk, 'a, W: Pool<'a>>`: all 6 `Self` lifetimes AND `W::Cx`'s
+        // container-bound `'a` are `Named`, while both outer `&` stay elided (per-call late).
+        assert_eq!(
+            &run_frozen("intrinsic")[..],
+            &[
+                (0, step(root, 0), 0, WrittenRegion::Named),
+                (0, step(root, 0), 1, WrittenRegion::Named),
+                (0, step(root, 0), 2, WrittenRegion::Named),
+                (0, step(root, 0), 3, WrittenRegion::Named),
+                (0, step(root, 0), 4, WrittenRegion::Named),
+                (0, step(root, 0), 5, WrittenRegion::Named),
+                (1, step(root, 0), 0, WrittenRegion::Named),
+            ]
+        );
+    }
+
+    /// Frozen `Head::Adt` records (seeded `blaze check` via `Store::file_heads`) restore
+    /// `Records<'r, 'n, S = &'n Names<'n>>` into `store.maps.generics` with its pre-built
+    /// default `PTy(&Names)` WITHOUT restoring `Names` into `store.maps.generics`.
+    /// When a body (like `front2::program::make_from`) writes `|r: &Records<'_, '_>|` and never
+    /// names `Names` directly as a written type in the body, `BodyTypes::ty` succeeds on round 1
+    /// using the pre-built default `PTy`, while `BodyTypes::closure_param_regions` calls
+    /// `Builder::ty_regions` -> `lay_default_arg` -> `def_builder.ty_regions(&'n Names<'n>)`,
+    /// which returns `Err(Why::Need(Names))`. `closure_param_regions` must propagate `Why::Need`
+    /// so `lower_at` ensures `Names` and retries, instead of silently falling back to syntactic
+    /// `record_closure_param_regions` and dropping the shared `WrittenRegion::Elided(2)` slots.
+    #[test]
+    fn front2_closure_param_regions_seeded_default_arg_missing_head() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let src = r#"#![no_core]
+pub struct Names<'n>(pub &'n u8);
+pub struct Records<'r, 'n, S = &'n Names<'n>> {
+    pub r: &'r u8,
+    pub s: S,
+}
+pub fn make_from() {
+    let _ = |r: &Records<'_, '_>| { let _ = r; };
+}
+"#;
+        let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+        let store_heap = blaze_own::testing::heap();
+        let store_alloc = store_heap.alloc();
+        let input = CrateInput {
+            name: "seeded_defarg_test",
+            key: CrateItemKey(ContentId::of("closure_param_regions_seeded_defarg_test", b"seeded_defarg_test")),
+            root: "/fnptr/src/lib.rs",
+            shown_from: "/fnptr/",
+            edition: Edition::E2024,
+            implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2024), proc_macro: false, entry: false },
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        };
+        let names = resolve_crates(&[input], Sysroot::default(), &OneFile(src), &Serial, bump).expect("resolve");
+        let front_frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("front frame");
+        let files = [SourceFile { path: "src/lib.rs", text: src }];
+        let mut front = Front2::new(&names, &front_frame, &files, store_alloc).expect("front2");
+        let prepared = Prepares::new_in(bump);
+        let mut store = Store::new(front.index.lang("sized"), front.frame, store_alloc);
+
+        let mut names_key = None;
+        let mut records_key = None;
+        let mut fn_key = None;
+        for (item, _, _) in names.items(0) {
+            match super::NamesSource::name_of(&names, item) {
+                Some("Names") => names_key = Some(item),
+                Some("Records") => records_key = Some(item),
+                Some("make_from") => fn_key = Some(item),
+                _ => {}
+            }
+        }
+        let names_key = names_key.expect("Names");
+        let records_key = records_key.expect("Records");
+        let fn_key = fn_key.expect("make_from");
+
+        // Ensure `Records` and `make_from`'s head, then evict `Names` from `store.maps.generics`
+        // and `store.adts` to match a seeded store whose frozen `Head::Adt(Records)` restored
+        // `Records`'s pre-built default `PTy(&Names)` without loading `Names`'s head.
+        store.ensure(&names, &mut front.keys, super::Want::Adt(records_key)).expect("Records head");
+        store.ensure(&names, &mut front.keys, super::Want::Fn(fn_key)).expect("make_from head");
+        store.maps.generics.remove(&names_key);
+        store.adts.remove(&super::checker_of(names_key));
+        assert!(!store.maps.generics.contains_key(&names_key));
+
+        let body = lower_fn(&names, &prepared, &mut front.keys, &mut store, fn_key).expect("lower_fn");
+        assert!(store.maps.generics.contains_key(&names_key), "lower_at must ensure Names for closure_param_regions");
+        let mut out = blaze_own::Vec::new_in(alloc);
+        for r in body.typeck.closure_param_regions.iter() {
+            out.push((r.param, r.path, r.own, r.kind));
+        }
+
+        let step = |p: u64, c: u32| ClosureParamRegion::push_step(p, c).expect("step");
+        let root = ClosureParamRegion::ROOT;
+        let p_rec = step(root, 0);
+        let p_s_ref = step(p_rec, 0);
+        let p_names = step(p_s_ref, 0);
+        assert_eq!(
+            &out[..],
+            &[
+                (0, p_rec, 1, WrittenRegion::Elided(1)),
+                (0, p_s_ref, 0, WrittenRegion::Elided(1)),
+                (0, p_names, 0, WrittenRegion::Elided(1)),
+            ]
+        );
+    }
 }

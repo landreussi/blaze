@@ -34,14 +34,14 @@ use blaze_own::Vec;
 use core::alloc::Allocator;
 use core::cmp::Ordering;
 
-use blaze_body::body::Mutbl;
+use blaze_body::body::{ExprId, Mutbl, NONE, Role};
 use blaze_body::{
-    BadRow, Block, BlockKind, Body, BodyBuilder, BuildError, CalleeId, Callee, Const, ConstDecl, ConstKind,
-    Local, LocalDecl, LocalKind, Operand, Ops, Origin, Place, Proj, Span, Stmt, StmtKind, Subset, Table,
-    Unwind, Value, Verified,
+    AsmOpInput, AsmPiece, AsmPieceInput, BadRow, Block, BlockKind, Body, BodyBuilder, BuildError,
+    Callee, CalleeId, Const, ConstDecl, ConstKind, Local, LocalDecl, LocalKind, Operand, Ops,
+    Origin, Place, Proj, Span, Stmt, StmtKind, Subset, Table, Unwind, Value, Verified,
 };
 
-use crate::facts::{DropFacts, DropState, Field, NeedsDrop, PartState};
+use crate::facts::{DropFacts, DropState, Field, NeedsDrop, Part, PartState};
 
 /// Why a body could not be elaborated, naming the row.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -74,7 +74,7 @@ pub enum Plant {
 
 /// Elaborates every `Drop` row of `body` from `facts`, writing the output in `alloc`. The output
 /// is meant for [`blaze_body::verify`], which the caller runs for its proof.
-pub fn elaborate<F: DropFacts, A: Allocator + Clone>(
+pub fn elaborate<F: DropFacts, A: Allocator + Copy>(
     body: Verified<'_>,
     facts: &F,
     alloc: A,
@@ -83,7 +83,7 @@ pub fn elaborate<F: DropFacts, A: Allocator + Clone>(
 }
 
 #[doc(hidden)]
-pub fn elaborate_planted<F: DropFacts, A: Allocator + Clone>(
+pub fn elaborate_planted<F: DropFacts, A: Allocator + Copy>(
     body: Verified<'_>,
     facts: &F,
     alloc: A,
@@ -93,18 +93,21 @@ pub fn elaborate_planted<F: DropFacts, A: Allocator + Clone>(
         v: body,
         facts,
         plant,
-        b: BodyBuilder::new_in(alloc.clone()),
-        flags: Vec::new_in(alloc.clone()),
-        chains: Vec::new_in(alloc.clone()),
-        plans: Vec::with_capacity_in(body.stmts() as usize, alloc.clone()),
-        steps: Vec::new_in(alloc.clone()),
-        pending: Vec::new_in(alloc.clone()),
-        subsets: Vec::new_in(alloc.clone()),
+        alloc,
+        b: BodyBuilder::new_in(alloc),
+        flags: Vec::new_in(alloc),
+        chains: Vec::new_in(alloc),
+        plans: Vec::with_capacity_in(body.stmts() as usize, alloc),
+        steps: Vec::new_in(alloc),
+        arms: Vec::new_in(alloc),
+        pending: Vec::new_in(alloc),
+        subsets: Vec::new_in(alloc),
         next_subset: 0,
-        ops: Vec::new_in(alloc.clone()),
-        cases: Vec::new_in(alloc.clone()),
-        order: Vec::new_in(alloc.clone()),
+        ops: Vec::new_in(alloc),
+        cases: Vec::new_in(alloc),
+        order: Vec::new_in(alloc),
         blocks: Vec::new_in(alloc),
+        projs: Vec::new_in(alloc),
         konst: None,
     };
     e.copy_tables()?;
@@ -133,6 +136,14 @@ struct Step {
     flag: Option<u32>,
 }
 
+/// One variant's drop chain for a partially-moved enum.
+#[derive(Clone, Copy)]
+struct VariantArm {
+    discr: u128,
+    start: u32,
+    end: u32,
+}
+
 /// What a statement row becomes.
 #[derive(Clone, Copy)]
 enum Plan {
@@ -143,6 +154,8 @@ enum Plan {
     Flag(u32),
     /// The steps `start..end`.
     Parts { start: u32, end: u32 },
+    /// Switch on `discr = Discriminant(place)` across `arms[start..end]`.
+    Enum { discr: Place, start: u32, end: u32 },
 }
 
 /// A block made by the pass, filled after the input block that made it.
@@ -150,24 +163,30 @@ enum Plan {
 enum Pending {
     /// A drop step (a chain's link or a ladder's rung).
     Drop { block: Block, place: Place, flag: Option<u32>, target: Block, unwind: Unwind, kind: BlockKind, span: Span },
+    /// A variant arm's drop chain (`steps[start..end]`).
+    Chain { block: Block, start: u32, end: u32, target: Block, unwind: Unwind, kind: BlockKind, span: Span },
     /// The guarded side of a flag test: clear the flag, drop.
     Guarded { block: Block, flag: u32, place: Place, target: Block, unwind: Unwind, span: Span },
     /// A call's return edge: the flags its destination covers, then the call's target.
     Return { block: Block, dest: Place, target: Block, span: Span },
+    /// An `asm!`'s fall-through edge: sets drop flags for any non-discarded output places, then jumps to `target`.
+    AsmReturn { block: Block, asm: u32, target: Block, span: Span },
     /// The end of a ladder that unwinds out of the body.
     Resume { block: Block, span: Span },
 }
 
-struct Elab<'v, 'f, F: DropFacts, A: Allocator + Clone> {
+struct Elab<'v, 'f, F: DropFacts, A: Allocator + Copy> {
     v: Verified<'v>,
     facts: &'f F,
     plant: Plant,
+    alloc: A,
     b: BodyBuilder<A>,
     flags: Vec<Flag, A>,
     chains: Vec<Place, A>,
     /// One per input statement.
     plans: Vec<Plan, A>,
     steps: Vec<Step, A>,
+    arms: Vec<VariantArm, A>,
     pending: Vec<Pending, A>,
     /// The input's subsets, in statement order, and the next one to copy.
     subsets: Vec<Subset, A>,
@@ -177,6 +196,7 @@ struct Elab<'v, 'f, F: DropFacts, A: Allocator + Clone> {
     cases: Vec<(u128, Block), A>,
     order: Vec<usize, A>,
     blocks: Vec<Block, A>,
+    projs: Vec<Proj, A>,
     /// The flags' `false` and `true`, made when the first flag is.
     konst: Option<(Const, Const)>,
 }
@@ -185,7 +205,7 @@ fn path_order(a: &[Field], b: &[Field]) -> Ordering {
     a.iter().map(|f| f.index).cmp(b.iter().map(|f| f.index))
 }
 
-impl<F: DropFacts, A: Allocator + Clone> Elab<'_, '_, F, A> {
+impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
     /// `got` must be the input's id `want` of `table`: the builder's first error if it has one.
     fn same(&self, table: Table, got: u32, want: u32) -> Result<(), ElabError> {
         if got == want {
@@ -200,6 +220,7 @@ impl<F: DropFacts, A: Allocator + Clone> Elab<'_, '_, F, A> {
     /// Every table but the statements, in the order the input's rows are: each id the same.
     fn copy_tables(&mut self) -> Result<(), ElabError> {
         let v = self.v;
+        self.b.copy_overlay(&v.body());
         let mut next_local = 0u32;
         for i in 0..v.places() {
             let row = v.place(Place(i));
@@ -249,20 +270,68 @@ impl<F: DropFacts, A: Allocator + Clone> Elab<'_, '_, F, A> {
             let got = self.b.new_block(v.block(Block(i)).kind);
             self.same(Table::Blocks, got.0, i)?;
         }
+        let mut pieces: Vec<AsmPieceInput<'_>, A> = Vec::new_in(self.alloc);
+        let mut aops: Vec<AsmOpInput<'_>, A> = Vec::new_in(self.alloc);
+        for i in 0..v.asms() {
+            let row = v.asm(i);
+            pieces.clear();
+            for pi in row.pieces.start..row.pieces.end {
+                pieces.push(match v.asm_piece(pi) {
+                    AsmPiece::Text { start, len } => AsmPieceInput::Text(v.asm_str(start, len)),
+                    AsmPiece::Line => AsmPieceInput::Line,
+                    AsmPiece::Operand { index, modifier } => AsmPieceInput::Operand { index, modifier },
+                });
+            }
+            aops.clear();
+            for oi in row.ops.start..row.ops.end {
+                let op = v.asm_op(oi);
+                aops.push(AsmOpInput {
+                    kind: op.kind,
+                    reg_kind: op.reg_kind,
+                    reg: v.asm_str(op.reg_start, op.reg_len),
+                    in_op: op.in_op,
+                    out_place: op.out_place,
+                    label: op.label,
+                    discard_out: op.discard_out,
+                });
+            }
+            let clobbers = v.asm_str(row.clobbers_start, row.clobbers_len);
+            let got = self.b.new_asm(row.arch, row.options, clobbers, &pieces, &aops);
+            self.same(Table::Asms, got, i)?;
+        }
         for s in v.subsets() {
             self.subsets.push(s);
         }
         Ok(())
     }
 
-    /// The type of a dropped place, from the body: a local's or a field's.
-    fn place_ty(&self, stmt: Stmt, place: Place) -> Result<blaze_body::body::PTy, ElabError> {
-        let row = self.v.place(place);
-        match row.proj {
-            None => Ok(self.v.local(row.local).ty),
-            Some(Proj::Field { ty, .. }) => Ok(ty),
-            Some(_) => Err(ElabError::PlaceType { stmt, place }),
+    /// The type of a dropped place: a local's or a field's directly, or resolved iteratively
+    /// through non-field projections (`Deref`, `DerefBox`, `Index`, `ConstIndex`, `Subslice`,
+    /// `Downcast`) via [`DropFacts::project_ty`].
+    fn place_ty(&mut self, stmt: Stmt, place: Place) -> Result<blaze_body::body::PTy, ElabError> {
+        self.projs.clear();
+        let mut cur = place;
+        let anchor_ty = loop {
+            let row = self.v.place(cur);
+            match (row.parent, row.proj) {
+                (_, None) => break self.v.local(row.local).ty,
+                (_, Some(Proj::Field { ty, .. })) => break ty,
+                (Some(parent), Some(proj)) => {
+                    self.projs.push(proj);
+                    cur = parent;
+                }
+                (None, Some(_)) => return Err(ElabError::PlaceType { stmt, place }),
+            }
+        };
+        let mut ty = anchor_ty;
+        while let Some(proj) = self.projs.pop() {
+            ty = match self.facts.project_ty(ty, proj) {
+                Some(next) => next,
+                None if matches!(proj, Proj::Downcast(_)) => ty,
+                None => return Err(ElabError::PlaceType { stmt, place }),
+            };
         }
+        Ok(ty)
     }
 
     /// A plan for each statement: the facts read once, the parts' places and the flags made.
@@ -285,39 +354,78 @@ impl<F: DropFacts, A: Allocator + Clone> Elab<'_, '_, F, A> {
     }
 
     fn plan_drop(&mut self, stmt: Stmt, place: Place) -> Result<Plan, ElabError> {
+        let ty = self.place_ty(stmt, place)?;
         let facts = self.facts;
-        if facts.needs_drop(self.place_ty(stmt, place)?) == NeedsDrop::No {
+        if facts.needs_drop(ty) == NeedsDrop::No {
             return Ok(Plan::Remove);
         }
-        let parts = match facts.at(stmt) {
-            DropState::Uninit => return Ok(Plan::Remove),
-            DropState::Init => return Ok(Plan::Keep),
-            DropState::Maybe => return Ok(Plan::Flag(self.flag_for(place)?)),
-            DropState::Partial(parts) => parts,
-        };
+        match facts.at(stmt) {
+            DropState::Uninit => Ok(Plan::Remove),
+            DropState::Init => Ok(Plan::Keep),
+            DropState::Maybe => Ok(Plan::Flag(self.flag_for(place)?)),
+            DropState::Partial(parts) => {
+                let (start, end) = self.plan_parts(stmt, place, parts)?;
+                Ok(if start == end { Plan::Remove } else { Plan::Parts { start, end } })
+            }
+            DropState::Enum { discr_ty, variants } => {
+                let arm_start = u32::try_from(self.arms.len()).map_err(|_| ElabError::BadPart { stmt })?;
+                for vd in variants {
+                    if vd.parts.is_empty() {
+                        continue;
+                    }
+                    let vp = self.b.project(place, Proj::Downcast(vd.variant));
+                    let (start, end) = self.plan_parts(stmt, vp, vd.parts)?;
+                    if start < end {
+                        self.arms.push(VariantArm { discr: vd.discr, start, end });
+                    }
+                }
+                let arm_end = u32::try_from(self.arms.len()).map_err(|_| ElabError::BadPart { stmt })?;
+                if arm_start == arm_end {
+                    return Ok(Plan::Remove);
+                }
+                let decl = LocalDecl { ty: discr_ty, kind: LocalKind::Temp(ExprId(NONE), Role::Value), mutbl: Mutbl::Mut };
+                let discr_local = self.b.new_local(decl);
+                let discr = self.b.local_place(discr_local);
+                Ok(Plan::Enum { discr, start: arm_start, end: arm_end })
+            }
+        }
+    }
+
+    fn plan_parts(&mut self, stmt: Stmt, base: Place, parts: &[Part<'_>]) -> Result<(u32, u32), ElabError> {
+        let facts = self.facts;
         self.order.clear();
-        for i in 0..parts.len() {
-            if parts[i].path.is_empty() {
+        for (i, part) in parts.iter().enumerate() {
+            if part.path.is_empty() {
                 return Err(ElabError::BadPart { stmt });
             }
             self.order.push(i);
         }
-        self.order.sort_unstable_by(|&a, &b| path_order(parts[a].path, parts[b].path));
+        self.order.sort_unstable_by(|&a, &b| {
+            let pa = parts.get(a).map_or(&[][..], |p| p.path);
+            let pb = parts.get(b).map_or(&[][..], |p| p.path);
+            path_order(pa, pb)
+        });
         for w in self.order.windows(2) {
-            let (a, b) = (parts[w[0]].path, parts[w[1]].path);
-            if b.len() >= a.len() && path_order(a, &b[..a.len()]) == Ordering::Equal {
+            let [i, j] = w else { continue };
+            let (Some(a), Some(b)) = (parts.get(*i).map(|p| p.path), parts.get(*j).map(|p| p.path)) else {
+                return Err(ElabError::BadPart { stmt });
+            };
+            if let Some(prefix) = b.get(..a.len())
+                && path_order(a, prefix) == Ordering::Equal
+            {
                 return Err(ElabError::BadPart { stmt });
             }
         }
-        let start = self.steps.len() as u32;
+        let start = u32::try_from(self.steps.len()).map_err(|_| ElabError::BadPart { stmt })?;
         for k in 0..self.order.len() {
-            let part = parts[self.order[k]];
-            let mut p = place;
+            let Some(&ord) = self.order.get(k) else { continue };
+            let Some(&part) = parts.get(ord) else { return Err(ElabError::BadPart { stmt }) };
+            let mut p = base;
             for f in part.path {
                 p = self.b.project(p, Proj::Field { index: f.index, ty: f.ty });
             }
-            let ty = part.path[part.path.len() - 1].ty;
-            if facts.needs_drop(ty) == NeedsDrop::No {
+            let Some(last) = part.path.last() else { return Err(ElabError::BadPart { stmt }) };
+            if facts.needs_drop(last.ty) == NeedsDrop::No {
                 continue;
             }
             let flag = match part.state {
@@ -326,8 +434,8 @@ impl<F: DropFacts, A: Allocator + Clone> Elab<'_, '_, F, A> {
             };
             self.steps.push(Step { place: p, flag });
         }
-        let end = self.steps.len() as u32;
-        Ok(if start == end { Plan::Remove } else { Plan::Parts { start, end } })
+        let end = u32::try_from(self.steps.len()).map_err(|_| ElabError::BadPart { stmt })?;
+        Ok((start, end))
     }
 
     /// The drop flag of `place`, made the first time it is asked for.
@@ -356,16 +464,17 @@ impl<F: DropFacts, A: Allocator + Clone> Elab<'_, '_, F, A> {
 
     /// Whether `d` is `place` of flag `i` or a prefix of it.
     fn covers(&self, d: Place, i: usize) -> bool {
-        self.chains[self.flags[i].chain.range()].contains(&d)
+        let Some(flag) = self.flags.get(i) else { return false };
+        self.chains.get(flag.chain.range()).is_some_and(|c| c.contains(&d))
     }
 
     /// Writes flag `i`. Only reached with a flag `i`, and `plan` made the constants with the
     /// first flag, so `konst` is set here.
     fn set(&mut self, i: usize, on: bool, span: Span) {
         let Some((off, on_c)) = self.konst else { return };
+        let Some(flag) = self.flags.get(i) else { return };
         let c = if on { on_c } else { off };
-        let dest = self.flags[i].flag;
-        self.b.assign(dest, Value::Use(Operand::Const(c)), span);
+        self.b.assign(flag.flag, Value::Use(Operand::Const(c)), span);
     }
 
     /// Clears each flag `p` covers, but the ones `keep` names and the ones the steps test.
@@ -375,7 +484,7 @@ impl<F: DropFacts, A: Allocator + Clone> Elab<'_, '_, F, A> {
                 continue;
             }
             if let Some((a, b)) = steps
-                && self.steps[a as usize..b as usize].iter().any(|s| s.flag == Some(i as u32))
+                && self.steps.get(a as usize..b as usize).is_some_and(|s| s.iter().any(|s| s.flag == Some(i as u32)))
             {
                 continue;
             }
@@ -431,7 +540,7 @@ impl<F: DropFacts, A: Allocator + Clone> Elab<'_, '_, F, A> {
     fn moved_in_terminator(&mut self, kind: StmtKind, span: Span) {
         let v = self.v;
         match kind {
-            StmtKind::Call { callee, args, .. } => {
+            StmtKind::Call { callee, args, .. } | StmtKind::TailCall { callee, args } => {
                 if let Callee::Value(o) = v.callee(callee) {
                     self.moved(o, span);
                 }
@@ -494,13 +603,22 @@ impl<F: DropFacts, A: Allocator + Clone> Elab<'_, '_, F, A> {
                 }
             }
         }
+        // Visit input blocks in statement-start order so loans and subsets (both recorded in
+        // original emission order) replay with identical IDs even when blocks were filled out of
+        // block-index order.
+        let mut block_order: Vec<u32, A> = Vec::with_capacity_in(usize::try_from(v.blocks()).unwrap_or(0), self.alloc);
         for bi in 0..v.blocks() {
+            block_order.push(bi);
+        }
+        block_order.sort_unstable_by_key(|&bi| v.block(Block(bi)).stmts.start);
+        for &bi in block_order.iter() {
             let block = Block(bi);
             let row = v.block(block);
             self.b.start(block);
             if bi == 0 {
                 for i in 0..self.flags.len() {
-                    let l = self.flags[i].of.0;
+                    let Some(flag) = self.flags.get(i) else { continue };
+                    let l = flag.of.0;
                     self.set(i, l >= 1 && l <= v.args(), Span::default());
                 }
             }
@@ -543,7 +661,7 @@ impl<F: DropFacts, A: Allocator + Clone> Elab<'_, '_, F, A> {
             }
             StmtKind::StorageLive(l) | StmtKind::StorageDead(l) => {
                 for i in 0..self.flags.len() {
-                    if self.flags[i].of == l {
+                    if self.flags.get(i).is_some_and(|f| f.of == l) {
                         self.set(i, false, span);
                     }
                 }
@@ -582,7 +700,33 @@ impl<F: DropFacts, A: Allocator + Clone> Elab<'_, '_, F, A> {
             }
             StmtKind::InlineAsm { asm, operands, target, unwind } => {
                 let operands = self.reops(operands);
+                let target = match target {
+                    Some(t) if asm < v.asms() => {
+                        let row = v.asm(asm);
+                        let mut any_flag = false;
+                        for oi in row.ops.start..row.ops.end {
+                            if let Some(p) = v.asm_op(oi).out_place
+                                && self.any_under(p)
+                            {
+                                any_flag = true;
+                                break;
+                            }
+                        }
+                        if any_flag {
+                            let r = self.b.new_block(v.block(t).kind);
+                            self.pending.push(Pending::AsmReturn { block: r, asm, target: t, span });
+                            Some(r)
+                        } else {
+                            Some(t)
+                        }
+                    }
+                    other => other,
+                };
                 self.b.terminate(StmtKind::InlineAsm { asm, operands, target, unwind }, span);
+            }
+            StmtKind::TailCall { callee, args } => {
+                let args = self.reops(args);
+                self.b.terminate(StmtKind::TailCall { callee, args }, span);
             }
             other => {
                 self.b.terminate(other, span);
@@ -593,23 +737,48 @@ impl<F: DropFacts, A: Allocator + Clone> Elab<'_, '_, F, A> {
     }
 
     fn drop(&mut self, s: Stmt, place: Place, target: Block, unwind: Unwind, kind: BlockKind, span: Span) -> Result<(), ElabError> {
-        match self.plans[s.index()] {
-            Plan::NotDrop => return Err(ElabError::Copy { table: Table::Stmts, row: s.0 }),
-            Plan::Remove => {
+        match self.plans.get(s.index()).copied() {
+            None | Some(Plan::NotDrop) => return Err(ElabError::Copy { table: Table::Stmts, row: s.0 }),
+            Some(Plan::Remove) => {
                 self.clear_under(place, None, None, span);
                 self.b.terminate(StmtKind::Goto(target), span);
             }
-            Plan::Keep => {
+            Some(Plan::Keep) => {
                 self.clear_under(place, None, None, span);
                 self.b.terminate(StmtKind::Drop { place, target, unwind }, span);
             }
-            Plan::Flag(f) => {
+            Some(Plan::Flag(f)) => {
                 self.clear_under(place, None, Some(f), span);
                 self.drop_one(place, Some(f), target, unwind, kind, span);
             }
-            Plan::Parts { start, end } => {
+            Some(Plan::Parts { start, end }) => {
                 self.clear_under(place, Some((start, end)), None, span);
                 self.chain(start, end, target, unwind, kind, span);
+            }
+            Some(Plan::Enum { discr, start, end }) => {
+                let first_step = self.arms.get(usize::try_from(start).unwrap_or(0)).map_or(0, |a| a.start);
+                let last_step = self.arms.get(usize::try_from(end).unwrap_or(0).saturating_sub(1)).map_or(0, |a| a.end);
+                self.clear_under(place, Some((first_step, last_step)), None, span);
+                self.b.assign(discr, Value::Discriminant(place), span);
+                self.cases.clear();
+                for ai in start..end {
+                    let Some(arm) = self.arms.get(usize::try_from(ai).unwrap_or(usize::MAX)).copied() else {
+                        continue;
+                    };
+                    let arm_block = self.b.new_block(kind);
+                    self.cases.push((arm.discr, arm_block));
+                    self.pending.push(Pending::Chain {
+                        block: arm_block,
+                        start: arm.start,
+                        end: arm.end,
+                        target,
+                        unwind,
+                        kind,
+                        span,
+                    });
+                }
+                let cases = self.b.cases(&self.cases);
+                self.b.terminate(StmtKind::Switch { on: Operand::Copy(discr), cases, otherwise: target }, span);
             }
         }
         Ok(())
@@ -621,9 +790,11 @@ impl<F: DropFacts, A: Allocator + Clone> Elab<'_, '_, F, A> {
             self.b.terminate(StmtKind::Drop { place, target, unwind }, span);
             return;
         };
+        let Some(flag_row) = self.flags.get(f as usize) else { return };
+        let flag_place = flag_row.flag;
         let guarded = self.b.new_block(kind);
         let cases = self.b.cases(&[(0, target)]);
-        let on = Operand::Copy(self.flags[f as usize].flag);
+        let on = Operand::Copy(flag_place);
         self.b.terminate(StmtKind::Switch { on, cases, otherwise: guarded }, span);
         self.pending.push(Pending::Guarded { block: guarded, flag: f, place, target, unwind, span });
     }
@@ -653,21 +824,24 @@ impl<F: DropFacts, A: Allocator + Clone> Elab<'_, '_, F, A> {
             };
         }
         for k in 0..n {
-            let step = self.steps[start as usize + k];
-            let to = if k + 1 < n { self.blocks[k] } else { target };
-            let uw = if ladder && k + 1 < n { Unwind::Cleanup(self.blocks[rungs + k]) } else { unwind };
+            let Some(&step) = self.steps.get(start as usize + k) else { continue };
+            let to = if k + 1 < n { self.blocks.get(k).copied().unwrap_or(target) } else { target };
+            let uw = if ladder && k + 1 < n {
+                self.blocks.get(rungs + k).copied().map_or(unwind, Unwind::Cleanup)
+            } else {
+                unwind
+            };
             if k == 0 {
                 self.drop_one(step.place, step.flag, to, uw, kind, span);
-            } else {
-                let block = self.blocks[k - 1];
+            } else if let Some(&block) = self.blocks.get(k - 1) {
                 self.pending.push(Pending::Drop { block, place: step.place, flag: step.flag, target: to, unwind: uw, kind, span });
             }
         }
         if ladder {
-            for k in 0..n - 1 {
-                let step = self.steps[start as usize + k + 1];
-                let to = if k + 1 < n - 1 { self.blocks[rungs + k + 1] } else { bottom };
-                let block = self.blocks[rungs + k];
+            for k in 0..n.saturating_sub(1) {
+                let Some(&step) = self.steps.get(start as usize + k + 1) else { continue };
+                let Some(&block) = self.blocks.get(rungs + k) else { continue };
+                let to = if k + 1 < n - 1 { self.blocks.get(rungs + k + 1).copied().unwrap_or(bottom) } else { bottom };
                 self.pending.push(Pending::Drop {
                     block,
                     place: step.place,
@@ -690,6 +864,10 @@ impl<F: DropFacts, A: Allocator + Clone> Elab<'_, '_, F, A> {
                 self.b.start(block);
                 self.drop_one(place, flag, target, unwind, kind, span);
             }
+            Pending::Chain { block, start, end, target, unwind, kind, span } => {
+                self.b.start(block);
+                self.chain(start, end, target, unwind, kind, span);
+            }
             Pending::Guarded { block, flag, place, target, unwind, span } => {
                 self.b.start(block);
                 self.set(flag as usize, false, span);
@@ -698,6 +876,16 @@ impl<F: DropFacts, A: Allocator + Clone> Elab<'_, '_, F, A> {
             Pending::Return { block, dest, target, span } => {
                 self.b.start(block);
                 self.set_under(dest, span);
+                self.b.terminate(StmtKind::Goto(target), span);
+            }
+            Pending::AsmReturn { block, asm, target, span } => {
+                self.b.start(block);
+                let row = self.v.asm(asm);
+                for oi in row.ops.start..row.ops.end {
+                    if let Some(dest) = self.v.asm_op(oi).out_place {
+                        self.set_under(dest, span);
+                    }
+                }
                 self.b.terminate(StmtKind::Goto(target), span);
             }
             Pending::Resume { block, span } => {

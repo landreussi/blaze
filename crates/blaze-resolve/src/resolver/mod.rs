@@ -68,6 +68,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use std::alloc::Global;
+use blaze_own::{LocalShare, Share};
 use blaze_trace::{debug, trace};
 
 use crate::interning::InternedString;
@@ -224,7 +225,7 @@ fn activate_deps_loop(
     // Activate all the initial summaries to kick off some work.
     for (summary, opts) in summaries {
         debug!("initial activation: {}", summary.package_id());
-        let res = activate(&mut resolver_ctx, registry, None, summary.clone(), first_version, opts);
+        let res = activate(&mut resolver_ctx, registry, None, summary.share(), first_version, opts);
         match res {
             Ok(Some((frame, _))) => remaining_deps.push(frame),
             Ok(None) => (),
@@ -388,7 +389,7 @@ fn activate_deps_loop(
                 Some(BacktrackFrame {
                     context: ResolverContext::clone(&resolver_ctx),
                     remaining_deps: remaining_deps.clone(),
-                    remaining_candidates: remaining_candidates.clone(),
+                    remaining_candidates: remaining_candidates.local_share(),
                     parent: Summary::clone(&parent),
                     dep: Dependency::clone(&dep),
                     features: Rc::clone(&features),
@@ -463,7 +464,7 @@ fn activate_deps_loop(
                             conflicting
                                 .iter()
                                 .filter(|&(p, _)| p != &pid)
-                                .map(|(&p, r)| (p, r.clone())),
+                                .map(|(&p, &r)| (p, r)),
                         );
 
                         has_past_conflicting_dep = true;
@@ -489,7 +490,7 @@ fn activate_deps_loop(
                             })
                             .next()
                     {
-                        let rel = conflict.get(&pid).unwrap().clone();
+                        let rel = *conflict.get(&pid).unwrap();
 
                         // The conflict we found is
                         // "other dep will not succeed if we are activated."
@@ -502,7 +503,7 @@ fn activate_deps_loop(
                             conflict
                                 .iter()
                                 .filter(|&(p, _)| p != &pid)
-                                .map(|(&p, r)| (p, r.clone())),
+                                .map(|(&p, &r)| (p, r)),
                         );
                         conflicting_activations.insert(other_parent, rel);
                         has_past_conflicting_dep = true;
@@ -635,7 +636,7 @@ fn activate(
         cx.parents
             .link(candidate_pid, parent_pid)
             // and associate dep with that edge
-            .insert(dep.clone());
+            .insert(dep.share());
     }
 
     let activated = cx.flag_activated(&candidate, opts, parent)?;
@@ -651,7 +652,7 @@ fn activate(
                 return Ok(None);
             }
             trace!("activating {} (replacing {})", replace.package_id(), candidate_pid);
-            replace.clone()
+            replace.share()
         }
         None => {
             if activated {
@@ -714,6 +715,9 @@ struct RemainingCandidates {
     has_another: Option<Summary>,
 }
 
+impl Share for RemainingCandidates {}
+impl LocalShare for RemainingCandidates {}
+
 impl RemainingCandidates {
     fn new(candidates: &Rc<[Summary]>) -> RemainingCandidates {
         RemainingCandidates { remaining: RcVecIter::new(Rc::clone(candidates)), has_another: None }
@@ -775,7 +779,7 @@ impl RemainingCandidates {
             // necessarily return the item just yet. Instead we stash it away to
             // get returned later, and if we replaced something then that was
             // actually the candidate to try first so we return that.
-            if let Some(r) = self.has_another.replace(b.clone()) {
+            if let Some(r) = self.has_another.replace(b.share()) {
                 return Some((r, true));
             }
         }
@@ -801,7 +805,7 @@ fn generalize_conflicting(
     let (backtrack_critical_age, backtrack_critical_id) =
         shortcircuit_max(conflicting_activations.keys().map(|&c| cx.is_active(c).map(|a| (a, c))))?;
     let backtrack_critical_reason: ConflictReason =
-        conflicting_activations[&backtrack_critical_id].clone();
+        conflicting_activations[&backtrack_critical_id];
 
     if cx.parents.is_path_from_to(&parent.package_id(), &backtrack_critical_id) {
         // We are a descendant of the trigger of the problem.
@@ -858,7 +862,7 @@ fn generalize_conflicting(
                 // A + B is redundant but can't be activated, as if
                 // A + B is active then A is active and we know that is not ok.
                 for (_, other) in &others {
-                    con.extend(other.iter().map(|(&id, re)| (id, re.clone())));
+                    con.extend(other.iter().map(|(&id, &re)| (id, re)));
                 }
                 // Now that we have this combined conflict, we can do a substitution:
                 // A dep is equivalent to one of the things it can resolve to.
@@ -977,58 +981,72 @@ fn find_candidate(
 }
 
 fn check_cycles(resolve: &Resolve) -> CargoResult<()> {
+    enum Frame {
+        Enter(PackageId),
+        Exit(PackageId),
+    }
+
     // Perform a simple cycle check by visiting all nodes.
     // We visit each node at most once and we keep
     // track of the path through the graph as we walk it. If we walk onto the
     // same node twice that's a cycle.
-    let mut checked = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: Some(resolve.len()) });
+    let alloc = Global;
+    let mut checked =
+        Set::new(SetOpts { hasher: FixedState, alloc, capacity: Some(resolve.len()) });
     let mut path = Vec::with_capacity(4);
-    let mut visited = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: Some(4) });
+    let mut visited = Set::new(SetOpts { hasher: FixedState, alloc, capacity: Some(4) });
+    let mut stack = blaze_own::Vec::new_in(alloc);
     for pkg in resolve.iter() {
-        if !checked.contains(&pkg) {
-            visit(resolve, pkg, &mut visited, &mut path, &mut checked)?
+        if checked.contains(&pkg) {
+            continue;
         }
-    }
-    return Ok(());
+        stack.push(Frame::Enter(pkg));
+        while let Some(frame) = stack.pop() {
+            match frame {
+                Frame::Enter(id) => {
+                    if !visited.insert(id) {
+                        // We found a cycle and need to construct an error. Performance is no longer top priority.
+                        let iter = path.iter().rev().scan(id, |child, parent| {
+                            let dep = resolve.transitive_deps_not_replaced(*parent).find_map(
+                                |(dep_id, transitive_dep)| {
+                                    (*child == dep_id
+                                        || Some(*child) == resolve.replacement(dep_id))
+                                    .then_some(transitive_dep)
+                                },
+                            );
+                            *child = *parent;
+                            Some((parent, dep))
+                        });
+                        let iter = std::iter::once((&id, None)).chain(iter);
+                        let cycle = errors::describe_path(iter);
+                        return Err(crate::ResolveError::PackageCycle { package: id, path: cycle });
+                    }
 
-    fn visit(
-        resolve: &Resolve,
-        id: PackageId,
-        visited: &mut Set<PackageId, FixedState, Global>,
-        path: &mut Vec<PackageId>,
-        checked: &mut Set<PackageId, FixedState, Global>,
-    ) -> CargoResult<()> {
-        if !visited.insert(id) {
-            // We found a cycle and need to construct an error. Performance is no longer top priority.
-            let iter = path.iter().rev().scan(id, |child, parent| {
-                let dep = resolve.transitive_deps_not_replaced(*parent).find_map(
-                    |(dep_id, transitive_dep)| {
-                        (*child == dep_id || Some(*child) == resolve.replacement(dep_id))
-                            .then_some(transitive_dep)
-                    },
-                );
-                *child = *parent;
-                Some((parent, dep))
-            });
-            let iter = std::iter::once((&id, None)).chain(iter);
-            let cycle = errors::describe_path(iter);
-            return Err(crate::ResolveError::PackageCycle { package: id, path: cycle });
-        }
-
-        if checked.insert(id) {
-            path.push(id);
-            for (dep_id, _transitive_dep) in resolve.transitive_deps_not_replaced(id) {
-                visit(resolve, dep_id, visited, path, checked)?;
-                if let Some(replace_id) = resolve.replacement(dep_id) {
-                    visit(resolve, replace_id, visited, path, checked)?;
+                    if checked.insert(id) {
+                        path.push(id);
+                        stack.push(Frame::Exit(id));
+                        let start = stack.len();
+                        for (dep_id, _transitive_dep) in resolve.transitive_deps_not_replaced(id) {
+                            stack.push(Frame::Enter(dep_id));
+                            if let Some(replace_id) = resolve.replacement(dep_id) {
+                                stack.push(Frame::Enter(replace_id));
+                            }
+                        }
+                        if let Some(tail) = stack.get_mut(start..) {
+                            tail.reverse();
+                        }
+                    } else {
+                        visited.remove(&id);
+                    }
+                }
+                Frame::Exit(id) => {
+                    path.pop();
+                    visited.remove(&id);
                 }
             }
-            path.pop();
         }
-
-        visited.remove(&id);
-        Ok(())
     }
+    Ok(())
 }
 
 /// Checks that packages are unique when written to lock file.

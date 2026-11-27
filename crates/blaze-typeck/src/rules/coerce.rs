@@ -19,7 +19,7 @@
 use crate::columns::AdjustKind;
 use crate::diag::{At, DiagCode, PendingDiag, PendingGoal};
 use crate::error::{CheckError, Malformed, Stop};
-use crate::ids::{ExprId, FnPtrHeader, ItemKey, LangItem, Mutbl, Safety};
+use crate::ids::{ExprId, FnPtrHeader, ItemKey, LangItem, Mutbl, RecordSchema, Safety};
 use crate::machine::Machine;
 use crate::ty::{Cause, Goal, Ty, TyList, TyView, TypeCtx};
 use crate::world::World;
@@ -35,8 +35,20 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
     /// Coerces `a` to `b`, recording the adjustments on `e`. `false`: they do not coerce, and
     /// nothing was bound.
     pub(crate) fn coerce(&mut self, e: Option<ExprId>, a: Ty, b: Ty, two_phase: bool) -> Result<bool, Stop> {
-        let a = self.ty.shallow_resolve(a);
-        let b = self.ty.shallow_resolve(b);
+        let mut a = self.ty.shallow_resolve(a);
+        let mut b = self.ty.shallow_resolve(b);
+        if matches!(self.view(a), TyView::Alias { .. })
+            || (matches!(self.view(a), TyView::Infer(_))
+                && matches!(
+                    self.view(b),
+                    TyView::Ref(..) | TyView::Ptr(..) | TyView::FnPtr(..) | TyView::Union(..) | TyView::Record(..) | TyView::Adt(..)
+                ))
+        {
+            a = self.try_structurally_resolve(a)?;
+        }
+        if matches!(self.view(b), TyView::Alias { .. }) {
+            b = self.try_structurally_resolve(b)?;
+        }
         if self.is_err(a) || self.is_err(b) {
             self.unify(a, b)?;
             return Ok(true);
@@ -45,9 +57,13 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             if let Some(e) = e {
                 self.adjust.push((e, AdjustKind::NeverToAny, b));
             }
-            if self.is_ty_var(b) {
+            if self.is_ty_var(b) && self.active_inferred_err_var() != Some(b) {
                 self.diverging.push(b);
             }
+            return Ok(true);
+        }
+        if self.active_inferred_err_var() == Some(b) {
+            self.inferred_err_coercions.push((e, a));
             return Ok(true);
         }
         if self.is_ty_var(a) {
@@ -95,6 +111,7 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         match self.view(b) {
             TyView::Ptr(mb, _) => return self.coerce_raw_ptr(a, b, mb),
             TyView::Ref(mb, _) => return self.coerce_borrowed(a, b, mb, two_phase),
+            TyView::Union(lb) => return self.coerce_to_union(a, b, lb),
             _ => {}
         }
         match (self.view(a), self.view(b)) {
@@ -161,6 +178,12 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
                 self.adj_scratch.push((AdjustKind::UnsafeFnPointer, b));
                 Ok(Some(()))
             }
+            // Width-subtyping projection of structural records: `{ a, b, .. } -> { a }`.
+            (TyView::Record(src_schema, src_tys), TyView::Record(dst_schema, dst_tys))
+                if src_schema != dst_schema && self.ty.list_len(src_tys) > self.ty.list_len(dst_tys) =>
+            {
+                self.coerce_record_project(b, src_schema, src_tys, dst_schema, dst_tys)
+            }
             _ => self.unify_some(a, b),
         }
     }
@@ -175,7 +198,7 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
     /// asked in a probe, then registered; never on a variable source pointee (one to a `dyn`
     /// target is first resolved by selecting the pending obligations: a projection's variable).
     fn coerce_unsized(&mut self, a: Ty, b: Ty, cause: Cause) -> Result<Option<Unsizing>, Stop> {
-        let (ma, pointee_a, mb, pointee_b, raw) = match (self.view(a), self.view(b)) {
+        let (ma, mut pointee_a, mb, mut pointee_b, raw) = match (self.view(a), self.view(b)) {
             (TyView::Ref(ma, x), TyView::Ref(mb, y)) => (ma, x, mb, y, false),
             (TyView::Ref(ma, x), TyView::Ptr(mb, y)) | (TyView::Ptr(ma, x), TyView::Ptr(mb, y)) => {
                 (ma, x, mb, y, true)
@@ -186,29 +209,31 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         if ma == Mutbl::Not && mb == Mutbl::Mut {
             return Ok(None);
         }
+        // A type that names an associated type (an indexed `<Vec<[u8; 32]> as Index<usize>>::Output`,
+        // a field `digest: T::Digest` read through `&self.digest`, a call's `-> &T::Digest`) is
+        // lowered as a variable bound by its `Projection` obligation (`Machine::lower` /
+        // `Machine::project`), and is the concrete array/struct or rigid alias only once that
+        // obligation is selected. Resolve before matching any unsizable target (slice, `dyn`, or
+        // struct reaching unsized), as autoderef does at each step: else the variable refuses the
+        // unsizing, the reborrow arm resolves it via autoderef, and `&[u8; 32]` to `&[u8]` or
+        // `&Alias` to `&dyn Debug` is E0308.
+        if matches!(self.view(pointee_b), TyView::Alias { .. }) {
+            pointee_b = self.try_structurally_resolve(pointee_b)?;
+        }
+        let target_is_unsizable = match self.view(pointee_b) {
+            TyView::Slice(_) | TyView::Dynamic(_) => true,
+            TyView::Adt(_, lb) => self.target_reaches_unsized(lb),
+            _ => false,
+        };
+        if target_is_unsizable && (self.is_ty_var(pointee_a) || matches!(self.view(pointee_a), TyView::Alias { .. })) {
+            pointee_a = self.try_structurally_resolve(pointee_a)?;
+        }
         let unsizing = match (self.view(pointee_a), self.view(pointee_b)) {
             (TyView::Array(elem_a, _), TyView::Slice(elem_b)) => {
                 if !self.unify(elem_a, elem_b)? {
                     return Ok(None);
                 }
                 Some(Unsizing::Adjust)
-            }
-            // A type that names an associated type (a field `digest: T::Digest` read through
-            // `&self.digest`, a call's `-> &T::Digest`) is lowered as a variable bound by its
-            // `Projection` obligation (`Machine::lower`), and is the alias (`<T as
-            // Digestible>::Digest`, rigid in a generic body) only once that obligation is
-            // selected. Selected here, as autoderef does at each step: else the variable
-            // refused the unsizing, the reborrow arm then resolved it to the alias, and `&Alias`
-            // to `&dyn Debug` was E0308. The Reference, "Unsized Coercions": "`T` to `dyn U`,
-            // when `T` implements `U + Sized`": for a projection that is the associated type's
-            // declared bounds (`type Digest: Debug;`, its implied `Sized`) or a where clause in
-            // scope, which the solver's `Unsize` asks of the alias.
-            (TyView::Infer(_), TyView::Dynamic(_)) if self.is_ty_var(pointee_a) => {
-                let resolved = self.try_structurally_resolve(pointee_a)?;
-                if self.is_ty_var(resolved) {
-                    return Ok(None);
-                }
-                self.unsize_to_dyn(resolved, pointee_b, cause)?
             }
             (TyView::Infer(_), _) | (_, TyView::Infer(_)) => return Ok(None),
             (_, TyView::Dynamic(_)) => self.unsize_to_dyn(pointee_a, pointee_b, cause)?,
@@ -259,8 +284,14 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
     /// (rules/coerce_nested.rs) and the two do not unify as they are; then the one general
     /// question `a: CoerceUnsized<b>`, asked, registered, and one `Unsize` adjustment. The
     /// nested pointer's own `CoerceUnsized` is the impl's where-clause, the solver's goal.
-    fn coerce_unsized_adt(&mut self, a: Ty, b: Ty, lb: TyList, cause: Cause) -> Result<Option<Unsizing>, Stop> {
-        if !self.target_reaches_unsized(lb) || self.probe(|m| m.unify_some(a, b))?.is_some() {
+    fn coerce_unsized_adt(&mut self, mut a: Ty, b: Ty, lb: TyList, cause: Cause) -> Result<Option<Unsizing>, Stop> {
+        if !self.target_reaches_unsized(lb) {
+            return Ok(None);
+        }
+        if !self.ty.ty_flags(a).is_empty() {
+            a = self.try_structurally_resolve(a)?;
+        }
+        if self.probe(|m| m.unify_some(a, b))?.is_some() {
             return Ok(None);
         }
         let unsizing = self.unsize_goal(LangItem::CoerceUnsized, a, b, cause)?;
@@ -398,10 +429,6 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             }
         }
         let Some(i) = found else { return Ok(None) };
-        if i == 1 && ma == Mutbl::Not && mb == Mutbl::Not {
-            // `&*x` of a `&T` to `&T` is no adjustment at all.
-            return Ok(Some(()));
-        }
         for s in steps.iter().take(i + 1).skip(1) {
             let kind = AdjustKind::Deref { overloaded: if s.overloaded { Some(Mutbl::Not) } else { None } };
             self.adj_scratch.push((kind, s.ty));
@@ -432,5 +459,120 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             self.adj_scratch.push((AdjustKind::MutToConstPointer, b));
         }
         Ok(Some(()))
+    }
+
+    /// Coercion into a structural union `b = Union(lb)`:
+    /// 1. If `a` is `Union(la)`: exact unification when arities match; otherwise sub-union
+    ///    widening (`A | B -> A | B | C`) when every member of `la` unifies with a unique member
+    ///    of `lb` (`AdjustKind::UnionWiden`).
+    /// 2. If `a` is not a union: member injection (`A -> A | B`) when `a` unifies with a unique
+    ///    member `v` of `lb` (`AdjustKind::UnionInject { variant: v }`).
+    fn coerce_to_union(&mut self, a: Ty, b: Ty, lb: TyList) -> Result<Option<()>, Stop> {
+        let nb = self.ty.list_len(lb);
+        if let TyView::Union(la) = self.view(a) {
+            let na = self.ty.list_len(la);
+            if na == nb && self.commit_if(|m| m.unify_some(a, b))?.is_some() {
+                return Ok(Some(()));
+            }
+            let widened = self.commit_if(|m| -> Result<Option<()>, Stop> {
+                for i in 0..na {
+                    let ma = m.ty.list_get(la, i);
+                    let mut matched: Option<u32> = None;
+                    let mut count = 0u32;
+                    for j in 0..nb {
+                        let mb = m.ty.list_get(lb, j);
+                        if m.probe(|m2| m2.unify(ma, mb))? {
+                            matched = Some(j);
+                            count += 1;
+                            if count > 1 {
+                                return Ok(None);
+                            }
+                        }
+                    }
+                    let Some(j) = matched else { return Ok(None) };
+                    let mb = m.ty.list_get(lb, j);
+                    if !m.unify(ma, mb)? {
+                        return Ok(None);
+                    }
+                }
+                Ok(Some(()))
+            })?;
+            if widened.is_some() {
+                self.adj_scratch.push((AdjustKind::UnionWiden, b));
+                return Ok(Some(()));
+            }
+            return Ok(None);
+        }
+        let mut matched: Option<u32> = None;
+        let mut count = 0u32;
+        for j in 0..nb {
+            let mb = self.ty.list_get(lb, j);
+            if self.probe(|m| m.unify(a, mb))? {
+                matched = Some(j);
+                count += 1;
+                if count > 1 {
+                    return Ok(None);
+                }
+            }
+        }
+        if let Some(variant) = matched {
+            let mb = self.ty.list_get(lb, variant);
+            if self.unify(a, mb)? {
+                self.adj_scratch.push((AdjustKind::UnionInject { variant }, b));
+                return Ok(Some(()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Structural record width-subtyping projection: `{ a, b, .. } -> { a }` when every field
+    /// name of `dst_schema` exists in `src_schema` and its field types unify.
+    fn coerce_record_project(
+        &mut self,
+        b: Ty,
+        src_schema: RecordSchema,
+        src_tys: TyList,
+        dst_schema: RecordSchema,
+        dst_tys: TyList,
+    ) -> Result<Option<()>, Stop> {
+        let src_len = self.ty.list_len(src_tys);
+        let dst_len = self.ty.list_len(dst_tys);
+        if src_len <= dst_len {
+            return Ok(None);
+        }
+        let mut pairs: blaze_own::Vec<(Ty, Ty), _> =
+            blaze_own::Vec::with_capacity_in(usize::try_from(dst_len).unwrap_or(0), self.alloc);
+        let Some(src_name_len) = self.record_names(src_schema).map(|ns| ns.len()) else { return Ok(None) };
+        let Some(dst_name_len) = self.record_names(dst_schema).map(|ns| ns.len()) else { return Ok(None) };
+        if src_name_len != usize::try_from(src_len).unwrap_or(usize::MAX)
+            || dst_name_len != usize::try_from(dst_len).unwrap_or(usize::MAX)
+        {
+            return Ok(None);
+        }
+        let mut dst_copy: blaze_own::Vec<crate::ids::Name, _> =
+            blaze_own::Vec::with_capacity_in(dst_name_len, self.alloc);
+        if let Some(dst_names) = self.record_names(dst_schema) {
+            dst_copy.extend_from_slice(dst_names);
+        }
+        for (di, &nm) in dst_copy.iter().enumerate() {
+            let Some(si_u32) = self.record_field_index(src_schema, nm) else {
+                return Ok(None);
+            };
+            let Ok(di_u32) = u32::try_from(di) else { return Ok(None) };
+            pairs.push((self.ty.list_get(src_tys, si_u32), self.ty.list_get(dst_tys, di_u32)));
+        }
+        let projected = self.commit_if(|m| -> Result<Option<()>, Stop> {
+            for &(st, dt) in pairs.iter() {
+                if !m.unify(st, dt)? {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(()))
+        })?;
+        if projected.is_some() {
+            self.adj_scratch.push((AdjustKind::RecordProject, b));
+            return Ok(Some(()));
+        }
+        Ok(None)
     }
 }

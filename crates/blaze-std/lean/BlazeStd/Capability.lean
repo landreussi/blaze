@@ -107,12 +107,12 @@ theorem chan_push_preserves_bound {α : Type} (c c' : BoundedChan α) (v : α)
     c'.withinBound := by
   unfold BoundedChan.push at hpush
   by_cases hlt : c.buf.length < c.cap
-  · rw [if_pos hlt] at hpush
+  · simp only [hlt, ↓reduceIte] at hpush
     cases hpush
     unfold BoundedChan.withinBound
     simp only [List.length_append, List.length_singleton]
     omega
-  · rw [if_neg hlt] at hpush
+  · simp only [hlt, ↓reduceIte] at hpush
     cases hpush
 
 /-- A successful pop preserves the bounded channel's capacity invariant. -/
@@ -130,7 +130,8 @@ theorem chan_pop_preserves_bound {α : Type} (c c' : BoundedChan α) (v : α)
     unfold BoundedChan.withinBound at hbound ⊢
     rw [hbuf] at hbound
     simp only [List.length_cons] at hbound
-    omega
+    dsimp only
+    exact Nat.le_of_succ_le hbound
 
 /-- Strict FIFO delivery: pushing `a` then `b` into an empty channel of capacity ≥ 2 pops `a`
     first, then `b`, returning the channel to empty. -/
@@ -143,10 +144,10 @@ theorem chan_fifo_order {α : Type} (cap : Nat) (hcap : 2 ≤ cap) (a b : α) :
   refine ⟨{ cap := cap, buf := [a] }, { cap := cap, buf := [a, b] }, { cap := cap, buf := [b] },
     ?_, ?_, rfl, rfl⟩
   · unfold BoundedChan.empty BoundedChan.push
-    simp only [List.length_nil, List.nil_append]
-    rw [if_pos (by omega : 0 < cap)]
+    have h0 : 0 < cap := by omega
+    simp only [List.length_nil, List.nil_append, h0, ↓reduceIte]
   · unfold BoundedChan.push
-    simp only [List.length_singleton, List.cons_append, List.nil_append]
-    rw [if_pos (by omega : 1 < cap)]
+    have h1 : 1 < cap := by omega
+    simp only [List.length_singleton, List.cons_append, List.nil_append, h1, ↓reduceIte]
 
 end BlazeStd.Capability

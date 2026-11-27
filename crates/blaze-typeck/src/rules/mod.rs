@@ -25,6 +25,7 @@ pub(crate) mod c_variadic;
 #[cfg(test)]
 mod c_variadic_tests;
 pub(crate) mod call;
+pub(crate) mod capability;
 pub(crate) mod cast;
 pub(crate) mod closure;
 pub(crate) mod coerce;
@@ -33,6 +34,7 @@ pub(crate) mod coerce_nested;
 pub(crate) mod coerce_interior;
 pub(crate) mod control;
 pub(crate) mod coroutine;
+pub(crate) mod cost;
 pub(crate) mod expect_inputs;
 pub(crate) mod fallback;
 pub(crate) mod field;
@@ -71,6 +73,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             Expr::Break { value, target } => self.expr_break(f, e, value, target),
             Expr::Continue { target: _ } => Ok(Flow::Done(self.common.never)),
             Expr::Return { value } => self.expr_return(f, e, value),
+            Expr::Become { value } => self.expr_return(f, e, Some(value)),
             Expr::Call { callee, args } => self.expr_call(f, e, callee, args),
             Expr::MethodCall { receiver, name, generic_args, args, scope } => {
                 self.expr_method_call(f, e, receiver, name, generic_args, args, scope)
@@ -87,6 +90,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             Expr::Array { elems } => self.expr_array(f, e, elems),
             Expr::Repeat { elem, len, count } => self.expr_repeat(f, e, elem, len, count),
             Expr::Struct { path, fields, base } => self.expr_struct(f, e, path, fields, base),
+            Expr::Record { fields, base } => self.expr_record(f, e, fields, base),
             Expr::Index { base, index } => self.expr_index(f, e, base, index),
             Expr::Closure { params, param_tys, ret, body, is_async, .. } => {
                 self.expr_closure(f, e, params, param_tys, ret, body, is_async)
@@ -102,6 +106,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
     }
 
+    /// Whether `t`'s struct tail is an unsized built-in (`str`, `[T]`, `dyn ..`, or `extern type`).
+    pub(crate) fn is_unsized_tail(&mut self, t: Ty) -> Result<bool, Stop> {
+        let tail = self.struct_tail(t)?;
+        Ok(matches!(self.view(tail), TyView::Str | TyView::Slice(_) | TyView::Dynamic(_) | TyView::Foreign(_)))
+    }
+
     /// `Expectation::rvalue_hint`: an unsized expected type is only a hint. rustc
     /// (expectation.rs `rvalue_hint`) matches the type's STRUCT TAIL (`struct_tail_raw`):
     /// `ty::Slice | ty::Str | ty::Dynamic` give `ExpectRvalueLikeUnsized`. So a struct whose last
@@ -112,11 +122,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// at `RwLock::new(cursor)` and E0277 "`dyn ..: Sized`". As the hint, `T` is
     /// `RwLock<RawRwLock, BtreeDumpCursor>`, and the `Arc` coerces after (`CoerceUnsized`).
     pub(crate) fn rvalue_hint(&mut self, t: Ty) -> Result<Expectation, Stop> {
-        let tail = self.struct_tail(t)?;
-        Ok(match self.view(tail) {
-            TyView::Str | TyView::Slice(_) | TyView::Dynamic(_) => Expectation::RvalueLikeUnsized(t),
-            _ => Expectation::HasType(t),
-        })
+        Ok(if self.is_unsized_tail(t)? { Expectation::RvalueLikeUnsized(t) } else { Expectation::HasType(t) })
     }
 
     /// The type's struct tail (rustc's `struct_tail_raw`): a struct's last field at its
@@ -127,7 +133,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let mut t = t;
         for _ in 0..Self::TAIL_DEPTH {
             let next = match self.view(t) {
-                TyView::Tuple(l) => match self.ty.list_len(l) {
+                TyView::Tuple(l) | TyView::Record(_, l) => match self.ty.list_len(l) {
                     0 => return Ok(t),
                     n => self.ty.list_get(l, n - 1),
                 },
@@ -150,15 +156,16 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// How many structs [`Self::struct_tail`] goes through.
     const TAIL_DEPTH: u32 = 64;
 
-    /// `Expectation::adjust_for_branches`: an expected type that is still a variable is no
-    /// expectation for the branches.
+    /// `Expectation::adjust_for_branches`: an expected type that is still a variable, or a
+    /// castable target (`if c { 8 } else { x } as u64`), is no expectation for the branches.
     pub(crate) fn adjust_for_branches(&mut self, ex: Expectation) -> Expectation {
         match ex {
             Expectation::HasType(t) => {
                 let t = self.ty.shallow_resolve(t);
                 if self.is_ty_var(t) { Expectation::None } else { Expectation::HasType(t) }
             }
-            other => other,
+            Expectation::RvalueLikeUnsized(t) => Expectation::RvalueLikeUnsized(t),
+            Expectation::Castable(_) | Expectation::None => Expectation::None,
         }
     }
 

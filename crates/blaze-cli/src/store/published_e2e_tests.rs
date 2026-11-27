@@ -198,7 +198,7 @@ fn only_the_published_class_leaves_and_a_second_home_reads_each_record_once() {
     }
     assert_eq!(trust::checks(), first, "a second lookup verified again");
     assert_eq!(store.remote.as_ref().expect("the origin").reader.report().keys, asked.keys, "a second lookup asked the origin");
-    store.commit_puts().expect("B's commit");
+    lent_b.commit().expect("B's commit");
     for (key, _) in &records.public {
         let lend = lent_b.get(&CasKey(*key)).expect("a get").expect("kept");
         assert_eq!((lend.tag, lend.namespace), (ReservedTag::Drive.tag(), Namespace::LOCAL), "kept as B's own record, under its own tag");
@@ -429,6 +429,7 @@ fn interrupted(tape: &Tape, order: Order) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The invariant: publishing a set interrupted at any point leaves either the old published set whole or the new one, never writing a head before its payloads.
 #[test]
 fn a_publish_stopped_anywhere_leaves_the_old_set_whole_or_the_new() {
     blaze_sim::check(Config::cases(48), |tape| interrupted(tape, Order::HeadLast));

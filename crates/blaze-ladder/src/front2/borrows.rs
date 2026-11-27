@@ -11,10 +11,9 @@
 //! `Drop`, which declare lifetimes, each callee's signature and its lifetime part) are gathered
 //! here, ONE home: [`gather_facts`], which the census (tests/flow_census.rs) calls too.
 //!
-//! The verdict is TRUSTED NOWHERE YET: on bstd, census 3 (flow.md) found 536 findings in 206
-//! of 1,756 lowered bodies, all false. The command files each finding as a NOTE and keeps
-//! saying "NOT checked: borrows" until that census reads 0 false findings (blaze-cli
-//! body_types.rs `BORROWS_ARE_ERRORS`).
+//! Borrow checking runs under `OneRule` (`blaze-borrow` + `RegionSlots`) and its findings are
+//! errors (`blaze-cli body_types.rs` `BORROWS_ARE_ERRORS = true`); any body whose borrows cannot
+//! be lowered whole files a refusal (`BORROWS_NOT_CHECKED`) so `check` reports it honestly.
 
 use blaze_flow::loans::{Access, conflicts, for_each_access};
 use blaze_flow::{BorrowFinding, BorrowKind, Flow, Loan, MoveFindingKind, MoveOut, Point, StmtKind, Value};
@@ -26,10 +25,14 @@ use blaze_typeck as tc;
 use core::alloc::Allocator;
 
 use super::body::Body;
-use super::borrow_reads::{AdtAnswer, HeadAnswer, adt_read, file_borrow_reads, head_read, impl_read};
+use super::borrow_reads::{AdtAnswer, HeadAnswer, adt_read, assoc_copy_read, clauses_read, copy_supertrait_read, file_borrow_reads, head_read, impl_read};
 use super::check::{Records, answer_impls, eval_len};
 use super::reads::Read;
-use super::borrows_nested::{FlowOf, NestedFacts, Requirements, closure_flow_of, flow_of, nested_inner_first, nested_range, next_nested};
+use super::borrows_nested::{
+    ClosureEnvUse, FlowOf, NestedFacts, Requirements, classify_closure_env_use, closure_flow_of, closure_flow_of_as_fn_once, env_escapes_closure, flow_of,
+    nested_inner_first, nested_range,
+    next_nested, prepare_closure_env, propagate_nested_requirement,
+};
 use super::stalled_goals::{AsyncInteriors, Decision, Stalls, decide_stalled_goals};
 use super::borrows_unmade::{AdtUnmade, HeadClass};
 use super::heads::{HeadError, Want, member_fn_want};
@@ -103,6 +106,10 @@ struct RegionFields {
     variant_count: usize,
     first_field: usize,
     regions: AdtFieldRegions,
+    /// Per-body slice `(start, len)` into `BorrowFacts::suppressed_field_regions` naming field
+    /// indices whose `PNode::Alias` may normalize in this body and must return `None` from
+    /// `Facts::field_regions`.
+    suppressed: Option<(u32, u32)>,
 }
 
 /// One finding of the move or borrow check: its code (rustc's error code where one names the
@@ -297,6 +304,9 @@ impl core::fmt::Display for BorrowRefused {
                     Some(External::Env) => "External::Env",
                     Some(External::Capture(_)) => "capture",
                     Some(External::Static) => "'static",
+                    Some(External::OwnerParam(_)) => "owner param",
+                    Some(External::Param(_)) => "type param",
+                    Some(External::DynPlaceholder(_)) => "dyn placeholder",
                     None => "hidden",
                 };
                 write!(f, "[{} -> {}] ", endpoint(*from), endpoint(*into))?;
@@ -434,27 +444,54 @@ pub struct BorrowLangs {
     pub copy: Option<tc::ItemKey>,
     pub drop: Option<tc::ItemKey>,
     pub owned_box: Option<tc::ItemKey>,
+    pub manually_drop: Option<tc::ItemKey>,
+    pub phantom_data: Option<tc::ItemKey>,
     /// `Clone`: a `Copy` impl's `T: Clone` bound beside `T: Copy` asks nothing more of `T`
     /// (`Copy: Clone`), read by [`Facts::copy_args`]'s provider (borrow_fields.rs).
     pub clone: Option<tc::ItemKey>,
     /// The traits whose every proof relates no region ([`Facts::trait_relates_nothing`]):
-    /// `Sized`, `MetaSized`, `PointeeSized` and `Destruct`. Each is `#[rustc_deny_explicit_impl]`
-    /// in core (library/core/src/marker.rs: no impl can be written), and its builtin rule reads
-    /// no region: sizedness ignores lifetimes, and `Destruct` "non-const bounds will always
-    /// hold for every type" (its doc there). A `[const] Destruct` in a const context asks a
-    /// const `Drop`, whose impl must be as generic as its type (E0366): no region either.
+    /// `Sized`, `MetaSized`, `PointeeSized`, `Destruct`, `DiscriminantKind`, and `Pointee`.
+    /// Each is `#[rustc_deny_explicit_impl]` in core (no impl can be written), and its builtin
+    /// rule reads no region.
     pub relates_nothing: [Option<tc::ItemKey>; 4],
+    /// The callable traits (`Fn`, `FnMut`, `FnOnce`), for [`Facts::is_fn_trait`].
+    pub fn_traits: [Option<tc::ItemKey>; 3],
+    /// `Deref`: for [`Facts::deref_impl`].
+    pub deref: Option<tc::ItemKey>,
+    /// `core::future::Future`, for [`Facts::is_future_trait`].
+    pub future: Option<tc::ItemKey>,
+    /// Compiler-builtin traits whose associated types always have zero lifetimes:
+    /// `DiscriminantKind::Discriminant` and `Pointee::Metadata`.
+    pub discriminant_kind: Option<tc::ItemKey>,
+    pub pointee: Option<tc::ItemKey>,
+    /// `core::marker::Tuple`, used by `inst_needs_drop` when verifying `FnMut` blanket impls.
+    pub tuple_trait: Option<tc::ItemKey>,
+    /// `core::any::TryAsDynCompatible` (`#[lang = "try_as_dyn"]`). Note: NOT in `relates_nothing`
+    /// because `dyn Trait + 'b: TryAsDynCompatible<'a>` requires `'b == 'a` for soundness of
+    /// `core::any::try_as_dyn`.
+    pub try_as_dyn: Option<tc::ItemKey>,
 }
 
 impl BorrowLangs {
     pub fn of(index: &Index<'_>) -> BorrowLangs {
         let lang = |n: &str| index.lang(n).map(checker_of);
+        let discriminant_kind = lang("discriminant_kind");
+        let pointee = lang("pointee_trait");
         BorrowLangs {
             copy: lang("copy"),
             drop: lang("drop"),
             owned_box: lang("owned_box"),
+            manually_drop: lang("manually_drop"),
+            phantom_data: lang("phantom_data"),
             clone: lang("clone"),
             relates_nothing: [lang("sized"), lang("meta_sized"), lang("pointee_sized"), lang("destruct")],
+            fn_traits: [lang("fn"), lang("fn_mut"), lang("fn_once")],
+            deref: lang("deref"),
+            future: lang("future_trait"),
+            discriminant_kind,
+            pointee,
+            tuple_trait: lang("tuple_trait"),
+            try_as_dyn: lang("try_as_dyn"),
         }
     }
 }
@@ -474,13 +511,33 @@ pub struct BorrowFacts<'a> {
     field_leads: AVec<'a, FieldLead>,
     /// Frozen field region columns by ADT, addressed by variant and field in constant time.
     field_regions: blaze_hash::HashMap<tc::ItemKey, RegionFields, Alloc<'a>>,
+    /// Per-body suppressed field indices referenced by [`RegionFields::suppressed`].
+    suppressed_field_regions: AVec<'a, u32>,
     /// Per ADT whose one `Copy` impl was read, sorted by checker key: where its arguments'
     /// needs are in `copy_need` (borrow_fields.rs `copy_args_of`; `Facts::copy_args`).
     copy_args: AVec<'a, (u128, u32, u32)>,
     copy_need: AVec<'a, bool>,
+    /// Per ADT whose structural drop summary was read, sorted by checker key: where its
+    /// arguments' drop flags are in `drop_need` (borrow_fields.rs `drop_facts_of`; `Facts::drop_args`).
+    drop_args: AVec<'a, (u128, u32, u32)>,
+    drop_need: AVec<'a, bool>,
+    /// Instantiated body `PTy`s (sorted by `PTy::0`) whose structural drop glue was resolved by
+    /// `borrow_fields::InstDropEval` (normalizing `PNode::Alias` fields), for `Facts::inst_needs_drop`.
+    inst_drop: AVec<'a, (u32, bool)>,
+    /// Per ADT whose strict-drop summary was read (RFC 1327 `#[may_dangle]`), sorted by checker
+    /// key: where its arguments' strict flags are in `drop_strict_need` (`Facts::drop_strict`).
+    drop_strict: AVec<'a, (u128, u32, u32)>,
+    drop_strict_need: AVec<'a, bool>,
+    /// Per ADT whose per-lifetime drop-liveness summary was read, sorted by checker key: where
+    /// its lifetime flags are in `drop_lt_need` (`Facts::drop_lifetimes`).
+    drop_lifetimes: AVec<'a, (u128, u32, u32)>,
+    drop_lt_need: AVec<'a, bool>,
     /// The body owner's type parameters bounded by `Copy` in its clauses (own and inherited:
     /// `Preds::clauses`), sorted, each once (`Facts::param_copy`).
     param_copy: AVec<'a, u32>,
+    /// `PNode::Alias` types in this body bounded by `Copy` (via their associated type's own
+    /// trait bounds or the body owner's `where` clauses), sorted by `PTy::0` (`Facts::alias_copy`).
+    alias_copy: AVec<'a, u32>,
     /// Per callee with a made head, sorted. Its signature regions are NOT here: the lowering
     /// reads them from the head records ([`BorrowFacts::read_by`], D148), each in place.
     callees: AVec<'a, (u128, CalleeFacts)>,
@@ -507,6 +564,9 @@ pub struct BorrowFacts<'a> {
     /// `Facts::trait_lifetimes` (the one call rule). The read: the names source files the
     /// trait's `Item` cell as it answers (tables/view.rs `declared_lifetimes`, D155).
     trait_counts: AVec<'a, (u128, Option<u32>)>,
+    /// Sorted checker keys of gathered traits marked `auto trait` (`TraitFlags::AUTO`), for
+    /// `blaze_flow_lower::Facts::is_auto_trait`.
+    auto_traits: AVec<'a, u128>,
     /// Each `<_ as trait_>::name` of those types, sorted, and its lifetime count (the trait's
     /// plus the associated type's own, `Arity::alias_lifetimes`), for `Facts::alias_lifetimes`;
     /// its reads the trait's `Item` and `Members` cells, filed by the names source likewise.
@@ -547,6 +607,22 @@ pub struct BorrowFacts<'a> {
     /// [`BorrowLangs::relates_nothing`], copied by the gather: the core lang items, read from
     /// the toolchain's library (its key covers them).
     relates_nothing: [Option<tc::ItemKey>; 4],
+    fn_traits: [Option<tc::ItemKey>; 3],
+    future_trait: Option<tc::ItemKey>,
+    into_future_trait: Option<tc::ItemKey>,
+    discriminant_kind: Option<tc::ItemKey>,
+    pointee: Option<tc::ItemKey>,
+    try_as_dyn: Option<tc::ItemKey>,
+    /// Unique `Deref` impl per ADT, sorted by ADT key (`Facts::deref_impl`).
+    deref_impls: AVec<'a, (u128, tc::ItemKey)>,
+    /// `(trait_key, assoc_name, assoc_item)` sorted by `(trait_key, assoc_name)` (`Facts::assoc_item`).
+    assoc_items: AVec<'a, (u128, tc::Name, tc::ItemKey)>,
+    /// RPITIT opaques sorted by opaque key (`Facts::rpitit_opaque`).
+    rpitit_opaques: AVec<'a, (u128, blaze_flow_lower::RpititOpaque)>,
+    /// Trait-impl methods overriding RPITIT fns, sorted by `(imp, fn_name)` (`Facts::impl_fn`).
+    impl_fns: AVec<'a, (u128, tc::Name, tc::ItemKey)>,
+    /// Enclosing trait impl of `owner` and its `Self`-supertrait impls (when unique for `SelfTy`).
+    owner_trait_impls: AVec<'a, blaze_flow_lower::OwnerTraitImpl>,
 }
 
 /// The facts the lowering asks: a body's gathered [`BorrowFacts`] with the head records' region
@@ -590,9 +666,18 @@ impl<'a> BorrowFacts<'a> {
             field_params: AVec::new_in(alloc),
             field_leads: AVec::new_in(alloc),
             field_regions: blaze_hash::HashMap::new_in(alloc),
+            suppressed_field_regions: AVec::new_in(alloc),
             copy_args: AVec::new_in(alloc),
             copy_need: AVec::new_in(alloc),
+            drop_args: AVec::new_in(alloc),
+            drop_need: AVec::new_in(alloc),
+            inst_drop: AVec::new_in(alloc),
+            drop_strict: AVec::new_in(alloc),
+            drop_strict_need: AVec::new_in(alloc),
+            drop_lifetimes: AVec::new_in(alloc),
+            drop_lt_need: AVec::new_in(alloc),
             param_copy: AVec::new_in(alloc),
+            alias_copy: AVec::new_in(alloc),
             callees: AVec::new_in(alloc),
             calls: super::call_generics::CallBoundsTable::new_in(alloc),
             ties: ties::TiesTable::new_in(alloc),
@@ -600,6 +685,7 @@ impl<'a> BorrowFacts<'a> {
             shape_refused: AVec::new_in(alloc),
             object_traits: AVec::new_in(alloc),
             trait_counts: AVec::new_in(alloc),
+            auto_traits: AVec::new_in(alloc),
             alias_counts: AVec::new_in(alloc),
             fn_binders: true,
             variance_at: AVec::new_in(alloc),
@@ -613,6 +699,17 @@ impl<'a> BorrowFacts<'a> {
             implied_state: None,
             constant_initializer: false,
             relates_nothing: [None; 4],
+            fn_traits: [None; 3],
+            future_trait: None,
+            into_future_trait: None,
+            discriminant_kind: None,
+            pointee: None,
+            try_as_dyn: None,
+            deref_impls: AVec::new_in(alloc),
+            assoc_items: AVec::new_in(alloc),
+            rpitit_opaques: AVec::new_in(alloc),
+            impl_fns: AVec::new_in(alloc),
+            owner_trait_impls: AVec::new_in(alloc),
         }
     }
 
@@ -640,6 +737,11 @@ impl<'a> BorrowFacts<'a> {
     /// Each ADT whose row was not made, and why, by checker key.
     pub fn unmade(&self) -> &[(u128, AdtUnmade)] {
         &self.unmade
+    }
+
+    /// Whether `trait_` is `core::any::TryAsDynCompatible` (`#[lang = "try_as_dyn"]`).
+    pub fn is_try_as_dyn_trait(&self, trait_: tc::ItemKey) -> bool {
+        Some(trait_) == self.try_as_dyn
     }
 
     fn variant(&self, adt: tc::ItemKey, variant: u32) -> Option<(u32, u32)> {
@@ -705,15 +807,56 @@ impl Facts for ReadBy<'_, '_> {
         if field >= count {
             return None;
         }
-        row.regions.field(first as usize - row.first_field + field as usize)
+        let field_idx = first as usize - row.first_field + field as usize;
+        if let Some((start, len)) = row.suppressed
+            && let Ok(fi) = u32::try_from(field_idx)
+            && self
+                .facts
+                .suppressed_field_regions
+                .get(start as usize..start as usize + len as usize)
+                .is_some_and(|sl| sl.iter().any(|&x| x == fi))
+        {
+            return None;
+        }
+        row.regions.field(field_idx)
     }
     fn copy_args(&self, adt: tc::ItemKey) -> Option<&[bool]> {
         let at = self.facts.copy_args.binary_search_by_key(&adt.0, |&(k, _, _)| k).ok()?;
         let &(_, start, len) = self.facts.copy_args.get(at)?;
-        self.facts.copy_need.get(start as usize..(start + len) as usize)
+        let start = usize::try_from(start).ok()?;
+        let end = start.checked_add(usize::try_from(len).ok()?)?;
+        self.facts.copy_need.get(start..end)
+    }
+    fn drop_args(&self, adt: tc::ItemKey) -> Option<&[bool]> {
+        let at = self.facts.drop_args.binary_search_by_key(&adt.0, |&(k, _, _)| k).ok()?;
+        let &(_, start, len) = self.facts.drop_args.get(at)?;
+        let start = usize::try_from(start).ok()?;
+        let end = start.checked_add(usize::try_from(len).ok()?)?;
+        self.facts.drop_need.get(start..end)
+    }
+    fn inst_needs_drop(&self, ty: tc::PTy) -> Option<bool> {
+        let at = self.facts.inst_drop.binary_search_by_key(&ty.0, |&(k, _)| k).ok()?;
+        self.facts.inst_drop.get(at).map(|&(_, v)| v)
+    }
+    fn drop_strict(&self, adt: tc::ItemKey) -> Option<&[bool]> {
+        let at = self.facts.drop_strict.binary_search_by_key(&adt.0, |&(k, _, _)| k).ok()?;
+        let &(_, start, len) = self.facts.drop_strict.get(at)?;
+        let start = usize::try_from(start).ok()?;
+        let end = start.checked_add(usize::try_from(len).ok()?)?;
+        self.facts.drop_strict_need.get(start..end)
+    }
+    fn drop_lifetimes(&self, adt: tc::ItemKey) -> Option<&[bool]> {
+        let at = self.facts.drop_lifetimes.binary_search_by_key(&adt.0, |&(k, _, _)| k).ok()?;
+        let &(_, start, len) = self.facts.drop_lifetimes.get(at)?;
+        let start = usize::try_from(start).ok()?;
+        let end = start.checked_add(usize::try_from(len).ok()?)?;
+        self.facts.drop_lt_need.get(start..end)
     }
     fn param_copy(&self, index: u32) -> bool {
         self.facts.param_copy.binary_search(&index).is_ok()
+    }
+    fn alias_copy(&self, alias: tc::PTy) -> bool {
+        self.facts.alias_copy.binary_search(&alias.0).is_ok()
     }
     fn shape(&self, item: tc::ItemKey) -> Option<blaze_flow_lower::Shape<'_>> {
         let at = self.facts.shapes.binary_search_by_key(&item.0, |(k, _)| *k).ok()?;
@@ -733,6 +876,46 @@ impl Facts for ReadBy<'_, '_> {
     }
     fn trait_relates_nothing(&self, trait_: tc::ItemKey) -> bool {
         self.facts.relates_nothing.contains(&Some(trait_))
+            || Some(trait_) == self.facts.discriminant_kind
+            || Some(trait_) == self.facts.pointee
+    }
+    fn is_auto_trait(&self, trait_: tc::ItemKey) -> bool {
+        self.facts.auto_traits.binary_search(&trait_.0).is_ok()
+    }
+    fn is_try_as_dyn_trait(&self, trait_: tc::ItemKey) -> bool {
+        self.facts.is_try_as_dyn_trait(trait_)
+    }
+    fn is_fn_trait(&self, trait_: tc::ItemKey) -> bool {
+        self.facts.fn_traits.contains(&Some(trait_))
+    }
+    fn is_future_trait(&self, trait_: tc::ItemKey) -> bool {
+        Some(trait_) == self.facts.future_trait
+    }
+    fn is_into_future_trait(&self, trait_: tc::ItemKey) -> bool {
+        Some(trait_) == self.facts.into_future_trait
+    }
+    fn assoc_item(&self, trait_: tc::ItemKey, name: tc::Name) -> Option<tc::ItemKey> {
+        let at = self.facts.assoc_items.binary_search_by_key(&(trait_.0, name), |&(k, n, _)| (k, n)).ok()?;
+        Some(self.facts.assoc_items[at].2)
+    }
+    fn owner_trait_impl(&self, trait_: tc::ItemKey) -> Option<blaze_flow_lower::OwnerTraitImpl> {
+        self.facts.owner_trait_impls.iter().copied().find(|oti| oti.trait_ == trait_)
+    }
+    fn deref_impl(&self, adt: tc::ItemKey) -> Option<tc::ItemKey> {
+        let at = self.facts.deref_impls.binary_search_by_key(&adt.0, |&(k, _)| k).ok()?;
+        Some(self.facts.deref_impls[at].1)
+    }
+    fn is_zero_slot_builtin_assoc(&self, trait_: tc::ItemKey, name: tc::Name) -> bool {
+        (Some(trait_) == self.facts.discriminant_kind && name == tc::Name::of("Discriminant"))
+            || (Some(trait_) == self.facts.pointee && name == tc::Name::of("Metadata"))
+    }
+    fn rpitit_opaque(&self, opaque: tc::ItemKey) -> Option<blaze_flow_lower::RpititOpaque> {
+        let at = self.facts.rpitit_opaques.binary_search_by_key(&opaque.0, |&(k, _)| k).ok()?;
+        self.facts.rpitit_opaques.get(at).map(|&(_, v)| v)
+    }
+    fn impl_fn(&self, imp: tc::ItemKey, fn_name: tc::Name) -> Option<tc::ItemKey> {
+        let at = self.facts.impl_fns.binary_search_by_key(&(imp.0, fn_name), |&(k, n, _)| (k, n)).ok()?;
+        self.facts.impl_fns.get(at).map(|&(_, _, v)| v)
     }
     fn adt_variances(&self, adt: tc::ItemKey) -> Option<&[blaze_flow_lower::Variance]> {
         let at = self.facts.variance_at.binary_search_by_key(&adt.0, |&(k, _, _)| k).ok()?;
@@ -772,6 +955,134 @@ impl Facts for ReadBy<'_, '_> {
 /// reference to a type parameter or to a type with no reference at its head, a type with no
 /// reference at its head, or not read (a projection, an opaque type or a trait object, which may
 /// stand for a reference; two references deep).
+/// Collects a trait's sorted direct `Self` supertraits and `Self: 'r` outlives bounds (excluding
+/// `Region::Late`), keeping both `copy_supertrait_read` sites identical (rule 21).
+fn trait_self_supers<'a>(
+    def: &super::heads::TraitExtra,
+    tys: tc::PTys<'_>,
+    direct: &mut AVec<'a, u128>,
+    self_outlives: &mut AVec<'a, tc::regions::Region>,
+) {
+    direct.clear();
+    self_outlives.clear();
+    for sc in def.supertraits.iter() {
+        match *sc {
+            tc::PClause::Trait { trait_: sup, args }
+                if tys.list(args).ok().and_then(|l| l.first().copied()).is_some_and(|first| matches!(tys.node(first), Ok(tc::PNode::Param(0)))) =>
+            {
+                direct.push(sup.0);
+            }
+            tc::PClause::TypeOutlives { ty, region }
+                if matches!(tys.node(ty), Ok(tc::PNode::Param(0)))
+                    && !matches!(region, tc::regions::Region::Late { .. }) =>
+            {
+                self_outlives.push(region);
+            }
+            _ => {}
+        }
+    }
+    direct.sort_unstable();
+    direct.dedup();
+    self_outlives.sort_unstable();
+    self_outlives.dedup();
+}
+
+/// Structural equality of two erased `PTy`s residing in different `PTys` tables (bounded,
+/// zero-allocation, used to match owner `where` clauses against body `PNode::Alias` types).
+fn pty_eq_across(ta: tc::PTys<'_>, a: tc::PTy, tb: tc::PTys<'_>, b: tc::PTy) -> bool {
+    let mut stack = [(tc::PTy(0), tc::PTy(0)); 64];
+    let mut sp = 1usize;
+    stack[0] = (a, b);
+    let mut steps = 0u32;
+    while sp > 0 {
+        steps += 1;
+        if steps > 256 {
+            return false;
+        }
+        sp -= 1;
+        let Some(&(x, y)) = stack.get(sp) else { return false };
+        let (Ok(nx), Ok(ny)) = (ta.node(x), tb.node(y)) else { return false };
+        let push_pair = |stack: &mut [(tc::PTy, tc::PTy); 64], sp: &mut usize, px: tc::PTy, py: tc::PTy| -> bool {
+            let Some(slot) = stack.get_mut(*sp) else { return false };
+            *slot = (px, py);
+            *sp += 1;
+            true
+        };
+        let push_lists = |stack: &mut [(tc::PTy, tc::PTy); 64], sp: &mut usize, lx: tc::List, ly: tc::List| -> bool {
+            let (Ok(sx), Ok(sy)) = (ta.list(lx), tb.list(ly)) else { return false };
+            if sx.len() != sy.len() {
+                return false;
+            }
+            for (&ex, &ey) in sx.iter().zip(sy.iter()) {
+                if !push_pair(stack, sp, ex, ey) {
+                    return false;
+                }
+            }
+            true
+        };
+        match (nx, ny) {
+            (tc::PNode::Bool, tc::PNode::Bool)
+            | (tc::PNode::Char, tc::PNode::Char)
+            | (tc::PNode::Str, tc::PNode::Str)
+            | (tc::PNode::Never, tc::PNode::Never) => {}
+            (tc::PNode::Int(i), tc::PNode::Int(j)) if i == j => {}
+            (tc::PNode::Uint(i), tc::PNode::Uint(j)) if i == j => {}
+            (tc::PNode::Float(i), tc::PNode::Float(j)) if i == j => {}
+            (tc::PNode::Param(i), tc::PNode::Param(j)) if i == j => {}
+            (tc::PNode::ConstParam(i), tc::PNode::ConstParam(j)) if i == j => {}
+            (tc::PNode::ConstValue { ty: tx, bits: vx }, tc::PNode::ConstValue { ty: ty, bits: vy }) if vx == vy => {
+                if !push_pair(&mut stack, &mut sp, tx, ty) {
+                    return false;
+                }
+            }
+            (tc::PNode::Ref(mx, ix), tc::PNode::Ref(my, iy)) | (tc::PNode::Ptr(mx, ix), tc::PNode::Ptr(my, iy)) if mx == my => {
+                if !push_pair(&mut stack, &mut sp, ix, iy) {
+                    return false;
+                }
+            }
+            (tc::PNode::Slice(ix), tc::PNode::Slice(iy)) => {
+                if !push_pair(&mut stack, &mut sp, ix, iy) {
+                    return false;
+                }
+            }
+            (tc::PNode::Array(ix, lx), tc::PNode::Array(iy, ly)) if lx == ly => {
+                if !push_pair(&mut stack, &mut sp, ix, iy) {
+                    return false;
+                }
+            }
+            (tc::PNode::Tuple(lx), tc::PNode::Tuple(ly))
+            | (tc::PNode::Union(lx), tc::PNode::Union(ly))
+            | (tc::PNode::Dynamic(lx), tc::PNode::Dynamic(ly)) => {
+                if !push_lists(&mut stack, &mut sp, lx, ly) {
+                    return false;
+                }
+            }
+            (tc::PNode::Adt(kx, lx), tc::PNode::Adt(ky, ly))
+            | (tc::PNode::Opaque(kx, lx), tc::PNode::Opaque(ky, ly))
+            | (tc::PNode::FnDef(kx, lx), tc::PNode::FnDef(ky, ly))
+            | (tc::PNode::ExTrait(kx, lx), tc::PNode::ExTrait(ky, ly))
+                if kx == ky =>
+            {
+                if !push_lists(&mut stack, &mut sp, lx, ly) {
+                    return false;
+                }
+            }
+            (tc::PNode::FnPtr(lx, sx), tc::PNode::FnPtr(ly, sy)) if sx == sy => {
+                if !push_lists(&mut stack, &mut sp, lx, ly) {
+                    return false;
+                }
+            }
+            (tc::PNode::Alias { trait_: tx, name: nx, args: lx }, tc::PNode::Alias { trait_: ty, name: ny, args: ly }) if tx == ty && nx == ny => {
+                if !push_lists(&mut stack, &mut sp, lx, ly) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn field_lead(tys: tc::PTys<'_>, t: tc::PTy) -> FieldLead {
     let plain = |n: tc::PNode| {
         matches!(
@@ -784,6 +1095,8 @@ fn field_lead(tys: tc::PTys<'_>, t: tc::PTy) -> FieldLead {
                 | tc::PNode::Str
                 | tc::PNode::Never
                 | tc::PNode::Tuple(_)
+                | tc::PNode::Record(..)
+                | tc::PNode::Union(_)
                 | tc::PNode::Ptr(..)
                 | tc::PNode::Array(..)
                 | tc::PNode::Slice(_)
@@ -839,6 +1152,233 @@ fn ensure_why<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, w: Want) -> Re
 fn container_head<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, lib: blaze_id::ItemKey, is_trait: bool) -> bool {
     let wants: &[Want] = if is_trait { &[Want::Head(lib), Want::Members(lib)] } else { &[Want::Impl(lib)] };
     wants.iter().all(|&w| ensure_one(r, w))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyImpl {
+    None,
+    Positive,
+    Negative,
+}
+
+/// Whether `trait_` has a positive, negative, or no explicit impl for `adt`.
+fn copy_impl_state<'n, 'a, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    trait_: Option<tc::ItemKey>,
+    adt: tc::ItemKey,
+    alloc: Alloc<'a>,
+) -> Result<CopyImpl, ImplsUnknown> {
+    let trait_ = trait_.ok_or(ImplsUnknown::NoLangItem)?;
+    let shape = tc::Shape::Adt(adt);
+    let mut list: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+    if let Some(v) = answer_impls(r, trait_, shape) {
+        list.extend_from_slice(&v);
+    } else {
+        let b = r.buckets.as_ref().ok_or(ImplsUnknown::NotAnswered)?;
+        if let Some(got) = b.impls_of(trait_, shape)
+            && !got.is_empty()
+        {
+            list.extend_from_slice(got);
+        } else {
+            return match b.trait_gap(trait_, shape) {
+                Some((candidate, why)) => {
+                    use core::fmt::Write;
+                    let mut said = Words::EMPTY;
+                    let _ = write!(said, "candidate {candidate:x}, header `");
+                    match r.names.signature_text_of(candidate) {
+                        Some(t) => {
+                            for (i, word) in t.impl_header.unwrap_or(t.text).split_whitespace().take(24).enumerate() {
+                                let _ = write!(said, "{}{word}", if i == 0 { "" } else { " " });
+                            }
+                        }
+                        None => {
+                            let _ = write!(said, "(no text)");
+                        }
+                    }
+                    let _ = write!(said, "`: {why}");
+                    Err(ImplsUnknown::RefusedCandidate { candidate, krate: b.krate(candidate), why: said })
+                }
+                None => Err(ImplsUnknown::NotAnswered),
+            };
+        }
+    }
+    if list.is_empty() {
+        return Ok(CopyImpl::None);
+    }
+    let mut saw_neg = false;
+    for &imp in list.iter() {
+        if !r.store.impls.contains_key(&imp)
+            && let Some(lib) = r.keys.library_in(r.names, imp)
+        {
+            let _ = ensure_one(r, Want::Impl(lib));
+        }
+        match r.store.impls.get(&imp).map(|h| h.polarity) {
+            Some(tc::ImplPolarity::Positive) | None => return Ok(CopyImpl::Positive),
+            Some(tc::ImplPolarity::Negative) => saw_neg = true,
+            Some(tc::ImplPolarity::Reservation) => {}
+        }
+    }
+    Ok(if saw_neg { CopyImpl::Negative } else { CopyImpl::None })
+}
+
+/// Whether an `AUTO_COPY_PUB` struct `root` is `Copy` (for instantiations where its required
+/// generic parameters are `Copy`), pushing its required-parameter mask onto `need` when
+/// `generics > 0`. Iterative worklist (no recursion), bounded to 256 steps.
+fn auto_copy_of<'n, 'a, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    langs: BorrowLangs,
+    root: tc::ItemKey,
+    need: &mut AVec<'a, bool>,
+    alloc: Alloc<'a>,
+) -> Option<(bool, Option<(u32, u32)>)> {
+    let generics = r.store.adts.get(&root)?.generics;
+    let g_usize = usize::try_from(generics).ok()?;
+    let start = need.len();
+    for _ in 0..g_usize {
+        need.push(false);
+    }
+    let mut stack: AVec<'a, (tc::PTy, Option<usize>)> = AVec::new_in(alloc);
+    let mut envs: AVec<'a, (Option<usize>, tc::List)> = AVec::new_in(alloc);
+    let mut nested_need: AVec<'a, bool> = AVec::new_in(alloc);
+    if let Some(row) = r.store.adts.get(&root) {
+        for f in row.fields.iter() {
+            stack.push((f.ty, None));
+        }
+    }
+    let mut steps = 0u32;
+    while let Some((ty, env)) = stack.pop() {
+        steps += 1;
+        if steps > 256 {
+            need.truncate(start);
+            return Some((false, None));
+        }
+        let Ok(node) = r.store.tys.view().node(ty) else {
+            need.truncate(start);
+            return Some((false, None));
+        };
+        match node {
+            tc::PNode::Bool
+            | tc::PNode::Char
+            | tc::PNode::Int(_)
+            | tc::PNode::Uint(_)
+            | tc::PNode::Float(_)
+            | tc::PNode::Never
+            | tc::PNode::Ptr(..)
+            | tc::PNode::FnDef(..)
+            | tc::PNode::FnPtr(..)
+            | tc::PNode::ConstValue { .. }
+            | tc::PNode::ConstParam(_)
+            | tc::PNode::Ref(tc::Mutbl::Not, _) => {}
+            tc::PNode::Array(inner, _) | tc::PNode::Pat(inner, _) => {
+                stack.push((inner, env));
+            }
+            tc::PNode::Tuple(l) | tc::PNode::Record(_, l) | tc::PNode::Union(l) => {
+                let Ok(items) = r.store.tys.view().list(l) else {
+                    need.truncate(start);
+                    return Some((false, None));
+                };
+                for &item in items {
+                    stack.push((item, env));
+                }
+            }
+            tc::PNode::Param(p) => match env {
+                None => {
+                    let Ok(pi) = usize::try_from(p) else {
+                        need.truncate(start);
+                        return Some((false, None));
+                    };
+                    if let Some(slot) = need.get_mut(start + pi) {
+                        *slot = true;
+                    } else {
+                        need.truncate(start);
+                        return Some((false, None));
+                    }
+                }
+                Some(e) => {
+                    let &(parent, args_list) = envs.get(e)?;
+                    let Ok(items) = r.store.tys.view().list(args_list) else {
+                        need.truncate(start);
+                        return Some((false, None));
+                    };
+                    let Ok(pi) = usize::try_from(p) else {
+                        need.truncate(start);
+                        return Some((false, None));
+                    };
+                    let Some(&arg) = items.get(pi) else {
+                        need.truncate(start);
+                        return Some((false, None));
+                    };
+                    stack.push((arg, parent));
+                }
+            },
+            tc::PNode::Adt(nested_k, nested_args) => {
+                if !r.store.adts.contains_key(&nested_k)
+                    && let Some(lib) = r.keys.library_in(r.names, nested_k)
+                {
+                    let _ = ensure_one(r, Want::Adt(lib));
+                }
+                match copy_impl_state(r, langs.copy, nested_k, alloc) {
+                    Ok(CopyImpl::Positive) => {
+                        nested_need.clear();
+                        let mask = fields::copy_args_of(r, langs, nested_k, Some(true), &mut nested_need, alloc);
+                        let Ok(args) = r.store.tys.view().list(nested_args) else {
+                            need.truncate(start);
+                            return Some((false, None));
+                        };
+                        match mask {
+                            Some((ms, ml))
+                                if usize::try_from(ml).ok() == Some(args.len())
+                                    && let Ok(ms_u) = usize::try_from(ms)
+                                    && let Some(flags) = nested_need.get(ms_u..ms_u + args.len()) =>
+                            {
+                                for (&a, &req) in args.iter().zip(flags.iter()) {
+                                    if req {
+                                        stack.push((a, env));
+                                    }
+                                }
+                            }
+                            _ => {
+                                for &a in args {
+                                    stack.push((a, env));
+                                }
+                            }
+                        }
+                    }
+                    Ok(CopyImpl::None)
+                        if r.store.is_auto_copy_pub(r.names, r.keys, nested_k)
+                            && matches!(has_impl(r, langs.drop, nested_k), Ok(false) | Err(ImplsUnknown::NoLangItem))
+                            && !matches!(copy_impl_state(r, langs.clone, nested_k, alloc), Ok(CopyImpl::Negative)) =>
+                    {
+                        let env_id = envs.len();
+                        envs.push((env, nested_args));
+                        if let Some(nrow) = r.store.adts.get(&nested_k) {
+                            for f in nrow.fields.iter() {
+                                stack.push((f.ty, Some(env_id)));
+                            }
+                        } else {
+                            need.truncate(start);
+                            return Some((false, None));
+                        }
+                    }
+                    _ => {
+                        need.truncate(start);
+                        return Some((false, None));
+                    }
+                }
+            }
+            _ => {
+                need.truncate(start);
+                return Some((false, None));
+            }
+        }
+    }
+    if g_usize == 0 {
+        need.truncate(start);
+        return Some((true, None));
+    }
+    let start_u32 = u32::try_from(start).ok()?;
+    let len_u32 = u32::try_from(g_usize).ok()?;
+    Some((true, Some((start_u32, len_u32))))
 }
 
 /// Whether `trait_` has an impl for the ADT `adt`: refused when the question could not be
@@ -989,14 +1529,8 @@ pub enum FactsPlant {
     /// `Facts::alias_lifetimes` answer nothing): the one call rule refuses each call whose
     /// contract holds an alias or a trait reference by `Count`, and each selected impl read
     /// for an associated value by `HeadUnread`, as before the counts reached the flows
-    /// (borrows_nested.rs `NestedFacts`). Only the census asks with it (the old paths read
-    /// neither count).
+    /// (borrows_nested.rs `NestedFacts`).
     NoTraitCounts,
-    /// NOT a fact: every fact gathered as `None` does, and the census runs its one-rule side
-    /// without the closure-argument tie (blaze-flow-lower `CensusRule::OneUntied`, one_call.rs
-    /// `tie_closure_args`), so `x.map(|s| s.as_str())` is (b) again and its twin returned as
-    /// `'static` is accepted. Only the census asks with it (front2 call_census.rs `census_of`).
-    ClosureArgsUntied,
 }
 
 /// [`gather_facts`] with one provider turned off ([`FactsPlant`]).
@@ -1012,36 +1546,833 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     let mut g = BorrowFacts::new_in(alloc);
     g.fn_binders = plant != FactsPlant::FnBindersFree;
     g.relates_nothing = langs.relates_nothing;
-    // A `const` or `static` item's body is a constant initializer: its extending borrows'
-    // temporaries live for `'static` (the Reference, "Temporary lifetime extension").
-    g.constant_initializer = r.keys.library_in(r.names, owner).is_some_and(|lib| {
-        matches!(r.names.detail_of(lib), Some(blaze_surface::ItemDetail::Const { .. } | blaze_surface::ItemDetail::Static { .. }))
-    });
-    // The owner's `T: Copy` clauses (own and inherited, as the call bounds read them below):
-    // a value of such a parameter is copied, never moved (the Reference, "Copy types"). Its
-    // read is the owner's head row, filed with the heads' (rule 21). A bound only implied by
-    // a supertrait (`T: Tr` with `trait Tr: Copy`) is not read: the parameter stays moved,
-    // the stricter answer for a move (it can only add a finding).
-    if let Some(copy) = langs.copy
-        && let Some(p) = r.store.preds.get(&owner)
+    g.fn_traits = langs.fn_traits;
+    g.future_trait = langs.future;
+    g.into_future_trait = super::langs::find(r.index, crate::resolve::Paths { names: r.names }, tc::LangItem::IntoFuture).ok().flatten().map(checker_of);
+    g.discriminant_kind = langs.discriminant_kind;
+    g.pointee = langs.pointee;
+    g.try_as_dyn = langs.try_as_dyn;
+    // A `const` or `static` item's body (module-level, local in a fn/macro, associated, or
+    // anonymous) is a constant initializer: its extending borrows' temporaries live for `'static`
+    // (the Reference, "Temporary lifetime extension").
+    g.constant_initializer = matches!(
+        super::by_origin::kind_of_key(r.names, &*r.keys, owner),
+        Ok(
+            super::by_origin::KeyKind::Item(super::by_origin::ItemKind::Const(_) | super::by_origin::ItemKind::Static(_))
+                | super::by_origin::KeyKind::MemberConst { .. }
+                | super::by_origin::KeyKind::Anon { .. }
+        )
+    );
+    // The owner's `T: Copy` and transitive supertrait `T: 'r` clauses (own and inherited),
+    // including transitive supertraits (`T: Tr` where `trait Tr: Copy` or `trait Tr: 'static`,
+    // e.g. `Planted<P>: Copy`, `Relation: 'static`, `Prefab: 'static`, or parameterized
+    // `L: LoadItems<'a>` where `trait LoadItems<'a>: 'a` implies `L: 'a`). Each inspected
+    // trait's direct `Self` supertraits and `Self: 'r` outlives bounds are filed as a
+    // `BorrowHead` read row (rule 21).
+    let mut param_outlives: AVec<'a, (u32, tc::regions::Region)> = AVec::new_in(alloc);
     {
-        let tys = r.store.tys.view();
-        for c in p.clauses.iter() {
-            if let tc::PClause::Trait { trait_, args } = *c
-                && trait_ == copy
-                && let Ok(&[t]) = tys.list(args)
-                && let Ok(tc::PNode::Param(i)) = tys.node(t)
+        let mut lt_pool: AVec<'a, Option<tc::regions::Region>> = AVec::new_in(alloc);
+        let mut param_traits: AVec<'a, (u32, tc::ItemKey, usize, usize)> = AVec::new_in(alloc);
+        {
+            let owner_regions = r.store.regions.reader(r.store.work_alloc());
+            let owner_views = owner_regions.clauses(owner).ok();
+            let mut read_owner_clauses = false;
+            if let Some(head) = r.store.fns.get(&owner)
+                && let super::types::SelfTy::Trait(lib) = head.self_
             {
-                g.param_copy.push(i);
+                let tk = checker_of(lib);
+                let lt_start = lt_pool.len();
+                if let Ok(params) = owner_regions.lifetime_params(tk) {
+                    for i in 0..params.count() {
+                        lt_pool.push(Some(tc::regions::Region::Param(i)));
+                    }
+                }
+                param_traits.push((0, tk, lt_start, lt_pool.len() - lt_start));
+            }
+            if let Some(p) = r.store.preds.get(&owner) {
+                let tys = r.store.tys.view();
+                for (nth, c) in p.clauses.iter().enumerate() {
+                    if let tc::PClause::Trait { trait_, args } = *c
+                        && let Ok(list) = tys.list(args)
+                        && let Some(&first) = list.first()
+                        && let Ok(tc::PNode::Param(i)) = tys.node(first)
+                    {
+                        if Some(trait_) == langs.copy {
+                            g.param_copy.push(i);
+                        } else {
+                            let lt_start = lt_pool.len();
+                            if let Some(views) = owner_views
+                                && let Ok(nth_u32) = u32::try_from(nth)
+                                && let Some(cv) = views.iter().find(|v| v.nth == nth_u32)
+                            {
+                                read_owner_clauses = true;
+                                for &reg in cv.col.own() {
+                                    lt_pool.push(match reg {
+                                        tc::regions::Region::Static | tc::regions::Region::Param(_) => Some(reg),
+                                        tc::regions::Region::Late { .. } => None,
+                                    });
+                                }
+                            }
+                            param_traits.push((i, trait_, lt_start, lt_pool.len() - lt_start));
+                        }
+                    }
+                }
+            }
+            if read_owner_clauses {
+                g.reads.push(clauses_read(owner.0, &owner_regions));
+            }
+        }
+        if !param_traits.is_empty() {
+            let mut visited: AVec<'a, (tc::ItemKey, usize, usize)> = AVec::new_in(alloc);
+            let mut stack: AVec<'a, (tc::ItemKey, usize, usize)> = AVec::new_in(alloc);
+            let mut direct: AVec<'a, u128> = AVec::new_in(alloc);
+            let mut self_outlives: AVec<'a, tc::regions::Region> = AVec::new_in(alloc);
+            let mut recorded: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+            let mut clauses_recorded: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+            for &(param, start_trait, start_lo, start_len) in param_traits.iter() {
+                let mut found_copy = g.param_copy.scan_for(&param).is_some();
+                let mut found_static = param_outlives.iter().any(|&(p, reg)| p == param && reg == tc::regions::Region::Static);
+                if found_copy && found_static {
+                    continue;
+                }
+                visited.clear();
+                stack.clear();
+                stack.push((start_trait, start_lo, start_len));
+                while let Some((t, t_lo, t_len)) = stack.pop() {
+                    if Some(t) == langs.copy {
+                        found_copy = true;
+                        if found_static {
+                            break;
+                        }
+                        continue;
+                    }
+                    let t_lts_match = |lo: usize, len: usize| lt_pool.get(lo..lo + len) == lt_pool.get(t_lo..t_lo + t_len);
+                    if visited.iter().any(|&(vk, vlo, vlen)| vk == t && t_lts_match(vlo, vlen)) || visited.len() >= 64 {
+                        continue;
+                    }
+                    visited.push((t, t_lo, t_len));
+                    if !r.store.trait_defs.contains_key(&t)
+                        && let Some(lib) = r.keys.library_in(r.names, t)
+                    {
+                        ensure_one(r, Want::Members(lib));
+                    }
+                    if let Some(def) = r.store.trait_defs.get(&t) {
+                        let tys = r.store.tys.view();
+                        trait_self_supers(def, tys, &mut direct, &mut self_outlives);
+                        if recorded.scan_for(&t).is_none() {
+                            recorded.push(t);
+                            g.reads.push(copy_supertrait_read(t.0, Some((&direct, &self_outlives))));
+                        }
+                        for &reg in self_outlives.iter() {
+                            match reg {
+                                tc::regions::Region::Static => {
+                                    found_static = true;
+                                    param_outlives.push((param, tc::regions::Region::Static));
+                                }
+                                tc::regions::Region::Param(j) => {
+                                    if let Ok(ji) = usize::try_from(j)
+                                        && let Some(Some(mapped)) = lt_pool.get(t_lo..t_lo + t_len).and_then(|s| s.get(ji)).copied()
+                                    {
+                                        if mapped == tc::regions::Region::Static {
+                                            found_static = true;
+                                        }
+                                        param_outlives.push((param, mapped));
+                                    }
+                                }
+                                tc::regions::Region::Late { .. } => {}
+                            }
+                        }
+                        if found_copy && found_static {
+                            break;
+                        }
+                        let t_regions = r.store.regions.reader(r.store.work_alloc());
+                        let t_views = if !direct.is_empty() && t_len > 0 {
+                            if clauses_recorded.scan_for(&t).is_none() {
+                                clauses_recorded.push(t);
+                                g.reads.push(clauses_read(t.0, &t_regions));
+                            }
+                            t_regions.clauses(t).ok()
+                        } else {
+                            None
+                        };
+                        for &sup in direct.iter() {
+                            let sup_key = tc::ItemKey(sup);
+                            let mut pushed_any = false;
+                            if let Some(views) = t_views {
+                                for cv in views {
+                                    if let Ok(tc::PNode::ExTrait(ct, args)) = tys.node(cv.col.ty())
+                                        && ct == sup_key
+                                        && tys
+                                            .list(args)
+                                            .ok()
+                                            .and_then(|l| l.first().copied())
+                                            .is_some_and(|first| matches!(tys.node(first), Ok(tc::PNode::Param(0))))
+                                    {
+                                        let next_lo = lt_pool.len();
+                                        let own_slice = cv.col.own();
+                                        for &reg in own_slice {
+                                            let mapped = match reg {
+                                                tc::regions::Region::Static => Some(tc::regions::Region::Static),
+                                                tc::regions::Region::Param(k) => usize::try_from(k)
+                                                    .ok()
+                                                    .and_then(|ki| lt_pool.get(t_lo..t_lo + t_len)?.get(ki).copied().flatten()),
+                                                tc::regions::Region::Late { .. } => None,
+                                            };
+                                            lt_pool.push(mapped);
+                                        }
+                                        stack.push((sup_key, next_lo, lt_pool.len() - next_lo));
+                                        pushed_any = true;
+                                    }
+                                }
+                            }
+                            if !pushed_any {
+                                stack.push((sup_key, 0, 0));
+                            }
+                        }
+                    } else if recorded.scan_for(&t).is_none() {
+                        recorded.push(t);
+                        g.reads.push(copy_supertrait_read(t.0, None));
+                    }
+                }
+                if found_copy {
+                    g.param_copy.push(param);
+                }
             }
         }
         g.param_copy.sort_unstable();
         g.param_copy.dedup();
+        param_outlives.sort_unstable();
+        param_outlives.dedup();
+    }
+    // Ensure callees, FnDef value items, selected impls, and supertrait heads BEFORE collecting
+    // ADTs so every ADT named inside a signature, selected impl header/assoc value, or supertrait
+    // clause gets its `AdtFacts` and variances (preventing `Count/Contract/AdtLifetimes`).
+    let mut items: AVec<'a, u128> = AVec::new_in(alloc);
+    for k in c.callees.column::<1>().iter() {
+        items.push(k.0);
+    }
+    let has_value_callable = c.types.view().nodes().any(|n| matches!(n, tc::PNode::FnPtr(..) | tc::PNode::Dynamic(_)));
+    if has_value_callable {
+        for d in c.expr_defs.column::<1>().iter() {
+            if let tc::Def::Static(k, _) | tc::Def::Const(k) = *d {
+                items.push(k.0);
+            }
+        }
+    }
+    let mut opaques: AVec<'a, u128> = AVec::new_in(alloc);
+    let mut traits: AVec<'a, u128> = AVec::new_in(alloc);
+    for n in c.types.view().nodes() {
+        match n {
+            tc::PNode::FnDef(k, _) => items.push(k.0),
+            tc::PNode::Opaque(k, _) => opaques.push(k.0),
+            tc::PNode::ExTrait(k, _) | tc::PNode::ExProj { trait_: k, .. } | tc::PNode::Alias { trait_: k, .. } => traits.push(k.0),
+            _ => {}
+        }
+    }
+    items.push(owner.0);
+    items.sort_unstable();
+    items.dedup();
+    opaques.sort_unstable();
+    opaques.dedup();
+    for &k in items.iter() {
+        let key = tc::ItemKey(k);
+        if !r.store.fns.contains_key(&key) && !r.store.ctors.contains_key(&key) {
+            match r.keys.origin(key).cloned() {
+                Some(Origin::Item(lib)) => {
+                    match r.names.detail_of(lib) {
+                        Some(blaze_surface::ItemDetail::Variant { .. }) => {
+                            if let Some((parent, _)) = r.names.variant_of(lib) {
+                                ensure_one(r, Want::Adt(parent));
+                            }
+                        }
+                        Some(blaze_surface::ItemDetail::Struct | blaze_surface::ItemDetail::Enum | blaze_surface::ItemDetail::Union) => {
+                            ensure_one(r, Want::Adt(lib));
+                        }
+                        _ => {
+                            ensure_one(r, Want::Fn(lib));
+                        }
+                    }
+                }
+                Some(Origin::Member { container, kind, .. }) => {
+                    if let Some(lib) = r.keys.library_in(r.names, container) {
+                        match r.names.detail_of(lib) {
+                            Some(blaze_surface::ItemDetail::Impl) => {
+                                container_head(r, lib, false);
+                            }
+                            Some(blaze_surface::ItemDetail::Trait) => {
+                                container_head(r, lib, true);
+                            }
+                            Some(blaze_surface::ItemDetail::Struct | blaze_surface::ItemDetail::Enum | blaze_surface::ItemDetail::Union)
+                                if kind == super::keys::MemberKind::Ctor =>
+                            {
+                                ensure_one(r, Want::Adt(lib));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(w) = member_fn_want(r.names, &*r.keys, key) {
+                        ensure_one(r, w);
+                    }
+                }
+                None => {}
+            }
+        }
+        if let Some(f) = r.store.fns.get(&key) {
+            let tys = r.store.tys.view();
+            let self_ref = f.self_param && f.inputs.first().is_some_and(|&t| matches!(tys.node(t), Ok(tc::PNode::Ref(..))));
+            let callee = CalleeFacts { writes_lifetimes: f.qualifiers.writes_lifetimes(), self_ref, c_variadic: f.c_variadic };
+            g.callees.push((k, callee));
+        } else if r.store.ctors.contains_key(&key) {
+            g.callees.push((k, CalleeFacts { writes_lifetimes: true, self_ref: false, c_variadic: false }));
+        } else {
+            g.reads.push(head_read(k, HeadAnswer::NotMade));
+        }
+    }
+    let mut selected: AVec<'a, (u128, Option<tc::Name>)> = AVec::new_in(alloc);
+    if let Some(Origin::Member { container, .. }) = r.keys.origin(owner).cloned()
+        && let Some(ih) = r.store.impls.get(&container)
+        && let Some(tr) = ih.trait_
+    {
+        let tys = r.store.tys.view();
+        let (self_shape, tc_shape) = match tys.node(ih.self_ty) {
+            Ok(tc::PNode::Adt(k, _)) => (Some(blaze_flow_lower::SelfShape::Adt(k)), Some(tc::Shape::Adt(k))),
+            Ok(tc::PNode::Ref(m, _)) => (Some(blaze_flow_lower::SelfShape::Ref(m)), Some(tc::Shape::Ref(m))),
+            Ok(tc::PNode::Tuple(l)) => {
+                let n = tys.list(l).ok().and_then(|ks| u32::try_from(ks.len()).ok());
+                (n.map(blaze_flow_lower::SelfShape::Tuple), n.map(tc::Shape::Tuple))
+            }
+            _ => (None, None),
+        };
+        if let (Some(self_shape), Some(tc_shape)) = (self_shape, tc_shape) {
+            g.owner_trait_impls.push(blaze_flow_lower::OwnerTraitImpl { imp: container, trait_: tr, generics: ih.generics, self_shape });
+            traits.push(tr.0);
+            selected.push((container.0, None));
+            // Also record unique impls of `tr`'s `Self`-supertraits for `SelfTy` (e.g.
+            // `Cloned<I>: Iterator` inside `impl DoubleEndedIterator for Cloned<I>`).
+            let mut work: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+            let mut seen: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+            work.push(tr);
+            seen.push(tr);
+            while let Some(cur) = work.pop() {
+                if seen.len() >= 32 {
+                    break;
+                }
+                if !r.store.trait_defs.contains_key(&cur)
+                    && let Some(lib) = r.keys.library_in(r.names, cur)
+                {
+                    ensure_one(r, Want::Members(lib));
+                }
+                let mut sups: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+                if let Some(def) = r.store.trait_defs.get(&cur) {
+                    let tys = r.store.tys.view();
+                    for sc in def.supertraits.iter() {
+                        if let tc::PClause::Trait { trait_: sup, args } = *sc
+                            && let Ok(list) = tys.list(args)
+                            && list.first().is_some_and(|&a| matches!(tys.node(a), Ok(tc::PNode::Param(0))))
+                            && seen.scan_for(&sup).is_none()
+                        {
+                            seen.push(sup);
+                            sups.push(sup);
+                        }
+                    }
+                }
+                for &sup in sups.iter() {
+                    work.push(sup);
+                    if let Some(impls) = answer_impls(r, sup, tc_shape)
+                        && let &[imp] = &impls[..]
+                        && let Some(lib) = r.keys.library_in(r.names, imp)
+                        && container_head(r, lib, false)
+                        && let Some(sup_ih) = r.store.impls.get(&imp)
+                    {
+                        g.owner_trait_impls.push(blaze_flow_lower::OwnerTraitImpl { imp, trait_: sup, generics: sup_ih.generics, self_shape });
+                        traits.push(sup.0);
+                        selected.push((imp.0, None));
+                    }
+                }
+            }
+        }
+    }
+    for p in c.selected.iter() {
+        traits.push(p.trait_.0);
+        if let tc::Selected::Impl { imp, .. } = p.selected {
+            selected.push((imp.0, p.name));
+        }
+    }
+    if let Some(p) = r.store.preds.get(&owner) {
+        for cl in p.clauses.iter() {
+            if let tc::PClause::Trait { trait_, .. } | tc::PClause::Projection { trait_, .. } = *cl {
+                traits.push(trait_.0);
+            }
+        }
+    }
+    selected.sort_unstable_by_key(|&(k, n)| (k, n.is_some(), n.map_or(0, |n| n.0)));
+    selected.dedup();
+    let mut last_impl = None;
+    for &(k, _) in selected.iter() {
+        if last_impl == Some(k) {
+            continue;
+        }
+        last_impl = Some(k);
+        if let Some(lib) = r.keys.library_in(r.names, tc::ItemKey(k))
+            && matches!(r.names.detail_of(lib), Some(blaze_surface::ItemDetail::Impl))
+        {
+            container_head(r, lib, false);
+        }
+    }
+    for &k in items.iter() {
+        if let Some(p) = r.store.preds.get(&tc::ItemKey(k)) {
+            for cl in p.clauses.iter() {
+                if let tc::PClause::Trait { trait_, .. } | tc::PClause::Projection { trait_, .. } = *cl {
+                    traits.push(trait_.0);
+                }
+            }
+        }
+    }
+    for &(k, _) in selected.iter() {
+        if let Some(p) = r.store.preds.get(&tc::ItemKey(k)) {
+            for cl in p.clauses.iter() {
+                if let tc::PClause::Trait { trait_, .. } | tc::PClause::Projection { trait_, .. } = *cl {
+                    traits.push(trait_.0);
+                }
+            }
+        }
+    }
+    // Ensure trait heads transitively through supertraits, trait where-clauses, associated-type
+    // item bounds, and nested alias traits so `regions.clauses` and `assoc_items` are loaded for
+    // supertrait elaboration in `blaze-borrow`.
+    {
+        fn push_clause_traits(stys: tc::PTys<'_>, cl: &tc::PClause, traits: &mut AVec<'_, u128>) {
+            let (args, extra_ty) = match *cl {
+                tc::PClause::Trait { trait_: sup, args } => {
+                    if traits.scan_for(&sup.0).is_none() {
+                        traits.push(sup.0);
+                    }
+                    (Some(args), None)
+                }
+                tc::PClause::Projection { trait_: sup, args, term, .. } => {
+                    if traits.scan_for(&sup.0).is_none() {
+                        traits.push(sup.0);
+                    }
+                    (Some(args), Some(term))
+                }
+                _ => (None, None),
+            };
+            let mut st = [tc::PTy(0); 32];
+            let mut len = 0usize;
+            if let Some(args) = args
+                && let Ok(list) = stys.list(args)
+            {
+                for &t in list {
+                    if len < st.len() {
+                        st[len] = t;
+                        len += 1;
+                    }
+                }
+            }
+            if let Some(t) = extra_ty
+                && len < st.len()
+            {
+                st[len] = t;
+                len += 1;
+            }
+            let mut steps = 0u32;
+            while len > 0 && steps < 64 {
+                len -= 1;
+                steps += 1;
+                let Ok(node) = stys.node(st[len]) else { continue };
+                match node {
+                    tc::PNode::Alias { trait_: at, args: al, .. }
+                    | tc::PNode::ExProj { trait_: at, args: al, .. }
+                    | tc::PNode::ExTrait(at, al) => {
+                        if traits.scan_for(&at.0).is_none() {
+                            traits.push(at.0);
+                        }
+                        if let Ok(xs) = stys.list(al) {
+                            for &x in xs {
+                                if len < st.len() {
+                                    st[len] = x;
+                                    len += 1;
+                                }
+                            }
+                        }
+                    }
+                    tc::PNode::Adt(_, al)
+                    | tc::PNode::Tuple(al)
+                    | tc::PNode::Dynamic(al)
+                    | tc::PNode::Opaque(_, al) => {
+                        if let Ok(xs) = stys.list(al) {
+                            for &x in xs {
+                                if len < st.len() {
+                                    st[len] = x;
+                                    len += 1;
+                                }
+                            }
+                        }
+                    }
+                    tc::PNode::Ref(_, x)
+                    | tc::PNode::Ptr(_, x)
+                    | tc::PNode::Slice(x)
+                    | tc::PNode::Array(x, _) => {
+                        if len < st.len() {
+                            st[len] = x;
+                            len += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut ti = 0usize;
+        traits.sort_unstable();
+        traits.dedup();
+        while ti < traits.len() && traits.len() < 1024 {
+            let tk = tc::ItemKey(traits[ti]);
+            ti += 1;
+            if let Some(lib) = r.keys.library_in(r.names, tk)
+                && matches!(r.names.detail_of(lib), Some(blaze_surface::ItemDetail::Trait))
+            {
+                container_head(r, lib, true);
+                r.store.ensure_assoc_regions(r.names, r.keys, lib);
+            }
+            let stys = r.store.tys.view();
+            if let Some(p) = r.store.preds.get(&tk) {
+                for cl in p.clauses.iter() {
+                    push_clause_traits(stys, cl, &mut traits);
+                }
+            }
+            if let Some(def) = r.store.trait_defs.get(&tk) {
+                for sc in def.supertraits.iter() {
+                    push_clause_traits(stys, sc, &mut traits);
+                }
+                for a in def.assoc.iter() {
+                    g.assoc_items.push((tk.0, a.name, a.item));
+                    if let Some(ap) = r.store.preds.get(&a.item) {
+                        for ac in ap.clauses.iter() {
+                            push_clause_traits(stys, ac, &mut traits);
+                        }
+                    }
+                }
+            }
+        }
+        traits.sort_unstable();
+        traits.dedup();
+        g.assoc_items.sort_unstable_by_key(|&(k, n, _)| (k, n));
+        g.assoc_items.dedup_by_key(|&mut (k, n, _)| (k, n));
+    }
+    // Check which `PNode::Alias` types in this body are bounded by `Copy` (either via their
+    // associated type item's own trait bounds `type At<'a>: Copy` / supertrait of `Copy`, or
+    // via the body owner's `where` clauses `M::At<'_>: Copy`).
+    if let Some(copy_tr) = langs.copy {
+        let mut visited: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+        let mut stack: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+        let mut direct: AVec<'a, u128> = AVec::new_in(alloc);
+        let mut self_outlives: AVec<'a, tc::regions::Region> = AVec::new_in(alloc);
+        let mut recorded: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+        let mut assoc_copy_cache: AVec<'a, (u128, bool)> = AVec::new_in(alloc);
+        let mut reaches_copy = |r: &mut Records<'_, 'n, S>, start: tc::ItemKey, reads: &mut AVec<'a, Read>| -> bool {
+            visited.clear();
+            stack.clear();
+            stack.push(start);
+            while let Some(t) = stack.pop() {
+                if t == copy_tr {
+                    return true;
+                }
+                if visited.scan_for(&t).is_some() || visited.len() >= 64 {
+                    continue;
+                }
+                visited.push(t);
+                if !r.store.trait_defs.contains_key(&t)
+                    && let Some(lib) = r.keys.library_in(r.names, t)
+                {
+                    ensure_one(r, Want::Members(lib));
+                }
+                if let Some(def) = r.store.trait_defs.get(&t) {
+                    let tys = r.store.tys.view();
+                    trait_self_supers(def, tys, &mut direct, &mut self_outlives);
+                    if recorded.scan_for(&t).is_none() {
+                        recorded.push(t);
+                        reads.push(copy_supertrait_read(t.0, Some((&direct, &self_outlives))));
+                    }
+                    for &sup in direct.iter() {
+                        stack.push(tc::ItemKey(sup));
+                    }
+                } else if recorded.scan_for(&t).is_none() {
+                    recorded.push(t);
+                    reads.push(copy_supertrait_read(t.0, None));
+                }
+            }
+            false
+        };
+        let body_tys = c.types.view();
+        for (idx, n) in body_tys.nodes().enumerate() {
+            let tc::PNode::Alias { trait_, name, .. } = *n else { continue };
+            let mut is_copy = false;
+            if let Ok(pos) = g.assoc_items.binary_search_by_key(&(trait_.0, name), |&(k, nm, _)| (k, nm))
+                && let Some(&(_, _, a_item)) = g.assoc_items.get(pos)
+            {
+                if let Some(&(_, cached)) = assoc_copy_cache.iter().find(|&&(k, _)| k == a_item.0) {
+                    is_copy = cached;
+                } else {
+                    let mut sups: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+                    if let Some(ap) = r.store.preds.get(&a_item) {
+                        let stys = r.store.tys.view();
+                        for ac in ap.clauses.iter() {
+                            if let tc::PClause::Trait { trait_: sup, args } = *ac
+                                && let Ok(list) = stys.list(args)
+                                && let Some(&first) = list.first()
+                                && let Ok(tc::PNode::Alias { trait_: at, name: an, .. }) = stys.node(first)
+                                && at == trait_
+                                && an == name
+                            {
+                                sups.push(sup);
+                            }
+                        }
+                    }
+                    let mut found = false;
+                    for &sup in sups.iter() {
+                        if reaches_copy(r, sup, &mut g.reads) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    assoc_copy_cache.push((a_item.0, found));
+                    g.reads.push(assoc_copy_read(a_item.0, found));
+                    is_copy = found;
+                }
+            }
+            if !is_copy
+                && let Ok(pty_id) = u32::try_from(idx)
+            {
+                let mut owner_sups: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+                if let Some(op) = r.store.preds.get(&owner) {
+                    let stys = r.store.tys.view();
+                    for oc in op.clauses.iter() {
+                        if let tc::PClause::Trait { trait_: sup, args } = *oc
+                            && let Ok(list) = stys.list(args)
+                            && let Some(&first) = list.first()
+                            && pty_eq_across(stys, first, body_tys, tc::PTy(pty_id))
+                        {
+                            owner_sups.push(sup);
+                        }
+                    }
+                }
+                for &sup in owner_sups.iter() {
+                    if reaches_copy(r, sup, &mut g.reads) {
+                        is_copy = true;
+                        break;
+                    }
+                }
+            }
+            if is_copy && let Ok(pty_id) = u32::try_from(idx) {
+                g.alias_copy.push(pty_id);
+            }
+        }
+        g.alias_copy.sort_unstable();
+        g.alias_copy.dedup();
+    }
+    // Gather RPITIT synthetic metadata (`rpitit_opaques`, overriding `impl_fns`, and `Twin`
+    // default opaque regions) before ADT/read collection so every overriding impl fn and Twin
+    // opaque participates in ADT variance/outlives, read tracking (Rule 21), and signature facts.
+    {
+        let mut extra_opaques: AVec<'a, u128> = AVec::new_in(alloc);
+        for &ok_u128 in opaques.iter() {
+            if let Some(twin) = r.store.rpitit_defaults.get(&tc::ItemKey(ok_u128)) {
+                extra_opaques.push(twin.source.0);
+            }
+        }
+        for &tk_u128 in traits.iter() {
+            let tk = tc::ItemKey(tk_u128);
+            ensure_rpitit_trait_rows(r, tk);
+            let Some(tr_rows) = r.store.rpitit_traits.get(&tk) else { continue };
+            let Some(trait_types) = r.keys.library_in(r.names, tk).and_then(|lib| r.store.maps.traits.get(&lib)).map(|th| th.generics) else {
+                continue;
+            };
+            for s in tr_rows.rows.iter() {
+                let default_twin = s.default.and_then(|d| match r.store.tys.view().node(d) {
+                    Ok(tc::PNode::Opaque(k, _)) => Some(k),
+                    _ => None,
+                });
+                g.rpitit_opaques.push((
+                    s.opaque.0,
+                    blaze_flow_lower::RpititOpaque {
+                        trait_: tk,
+                        name: s.name,
+                        fn_name: s.fn_name,
+                        trait_fn: s.trait_fn,
+                        trait_types,
+                        default_twin,
+                    },
+                ));
+                extra_opaques.push(s.opaque.0);
+                if let Some(tw) = default_twin {
+                    extra_opaques.push(tw.0);
+                }
+            }
+        }
+        let mut last_imp = None;
+        let mut new_impl_fns: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+        for &(imp_u128, _) in selected.iter() {
+            if last_imp == Some(imp_u128) {
+                continue;
+            }
+            last_imp = Some(imp_u128);
+            let imp_k = tc::ItemKey(imp_u128);
+            let Some(tr) = r.store.impls.get(&imp_k).and_then(|ih| ih.trait_) else { continue };
+            ensure_rpitit_trait_rows(r, tr);
+            let Some(ih) = r.store.impls.get(&imp_k) else { continue };
+            let Some(tr_rows) = r.store.rpitit_traits.get(&tr) else { continue };
+            for s in tr_rows.rows.iter() {
+                if let Some(&(_, impl_fn)) = ih.fns.iter().find(|&&(n, _)| n == s.fn_name) {
+                    g.impl_fns.push((imp_u128, s.fn_name, impl_fn));
+                    if items.scan_for(&impl_fn.0).is_none() && new_impl_fns.scan_for(&impl_fn).is_none() {
+                        new_impl_fns.push(impl_fn);
+                    }
+                }
+            }
+        }
+        for &impl_fn in new_impl_fns.iter() {
+            if !r.store.fns.contains_key(&impl_fn)
+                && let Some(w) = member_fn_want(r.names, &*r.keys, impl_fn)
+            {
+                ensure_one(r, w);
+            }
+            items.push(impl_fn.0);
+            if let Some(f) = r.store.fns.get(&impl_fn) {
+                let tys = r.store.tys.view();
+                let self_ref = f.self_param && f.inputs.first().is_some_and(|&t| matches!(tys.node(t), Ok(tc::PNode::Ref(..))));
+                g.callees.push((impl_fn.0, CalleeFacts { writes_lifetimes: f.qualifiers.writes_lifetimes(), self_ref, c_variadic: f.c_variadic }));
+                let out = r.store.fn_output(impl_fn).unwrap_or(f.output);
+                let mut st: AVec<'a, tc::PTy> = AVec::new_in(alloc);
+                st.push(out);
+                let mut steps = 0u32;
+                while let Some(t) = st.pop() {
+                    steps += 1;
+                    if steps > 1024 {
+                        break;
+                    }
+                    let Ok(node) = tys.node(t) else { continue };
+                    if let tc::PNode::Opaque(ok, _) = node {
+                        extra_opaques.push(ok.0);
+                    }
+                    if let Ok((list, last)) = super::adt_variance::children(tys, t, node) {
+                        st.extend_from_slice(list);
+                        if let Some(ch) = last {
+                            st.push(ch);
+                        }
+                    }
+                }
+            } else {
+                g.reads.push(head_read(impl_fn.0, HeadAnswer::NotMade));
+            }
+        }
+        opaques.extend_from_slice(&extra_opaques);
+        opaques.sort_unstable();
+        opaques.dedup();
+        items.sort_unstable();
+        items.dedup();
+        g.callees.sort_unstable_by_key(|&(k, _)| k);
+        g.callees.dedup_by_key(|&mut (k, _)| k);
+        g.rpitit_opaques.sort_unstable_by_key(|&(k, _)| k);
+        g.rpitit_opaques.dedup_by_key(|&mut (k, _)| k);
+        g.impl_fns.sort_unstable_by_key(|&(imp, n, _)| (imp, n));
+        g.impl_fns.dedup_by_key(|&mut (imp, n, _)| (imp, n));
+        for &ok_u128 in opaques.iter() {
+            let ok = tc::ItemKey(ok_u128);
+            if r.store.rpitit_defaults.contains_key(&ok) && r.store.regions.made(ok).is_none() {
+                ensure_twin_opaque_regions(r, ok);
+            }
+        }
     }
     let mut adts: AVec<'a, u128> = AVec::new_in(alloc);
     for n in c.types.view().nodes() {
         if let tc::PNode::Adt(k, _) = n {
             adts.push(k.0);
+        }
+    }
+    // Also collect every ADT mentioned in selected impl headers/assoc values/where-clauses,
+    // callee signatures/clauses, opaque clauses, and trait supertrait clauses.
+    {
+        let reader = r.store.regions.reader(alloc);
+        let tys = r.store.tys.view();
+        let mut walk_ty = |root: tc::PTy| {
+            let mut st: AVec<'a, tc::PTy> = AVec::new_in(alloc);
+            st.push(root);
+            let mut steps = 0u32;
+            while let Some(t) = st.pop() {
+                steps += 1;
+                if steps > 4096 {
+                    break;
+                }
+                let Ok(node) = tys.node(t) else { continue };
+                if let tc::PNode::Adt(a, _) = node {
+                    adts.push(a.0);
+                }
+                if let Ok((list, last)) = super::adt_variance::children(tys, t, node) {
+                    st.extend_from_slice(list);
+                    if let Some(c) = last {
+                        st.push(c);
+                    }
+                }
+            }
+        };
+        for &(k, name) in selected.iter() {
+            let ik = tc::ItemKey(k);
+            if let Ok((self_col, trait_col)) = reader.impl_header(ik) {
+                walk_ty(self_col.ty());
+                if let Some(tc) = trait_col {
+                    walk_ty(tc.ty());
+                }
+            }
+            if let Some(n) = name
+                && let Ok(v) = reader.impl_assoc(ik, n)
+            {
+                walk_ty(v.ty());
+            }
+            if let Some(ih) = r.store.impls.get(&ik) {
+                for &(an, _) in ih.assoc.iter() {
+                    if let Ok(v) = reader.impl_assoc(ik, an) {
+                        walk_ty(v.ty());
+                    }
+                }
+            }
+            if let Ok(cls) = reader.clauses(ik) {
+                for cv in cls {
+                    walk_ty(cv.col.ty());
+                }
+            }
+        }
+        for &k in items.iter() {
+            let ik = tc::ItemKey(k);
+            if let Ok(sig) = reader.sig(ik) {
+                walk_ty(sig.col.ty());
+            }
+            if let Ok(cls) = reader.clauses(ik) {
+                for cv in cls {
+                    walk_ty(cv.col.ty());
+                }
+            }
+        }
+        for &k in opaques.iter() {
+            if let Ok(cls) = reader.clauses(tc::ItemKey(k)) {
+                for cv in cls {
+                    walk_ty(cv.col.ty());
+                }
+            }
+        }
+        for &k in traits.iter() {
+            if let Ok(cls) = reader.clauses(tc::ItemKey(k)) {
+                for cv in cls {
+                    walk_ty(cv.col.ty());
+                }
+            }
+        }
+        for &(_, _, a_item) in g.assoc_items.iter() {
+            if let Ok(cls) = reader.clauses(a_item) {
+                for cv in cls {
+                    walk_ty(cv.col.ty());
+                }
+            }
         }
     }
     adts.sort_unstable();
@@ -1079,6 +2410,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             });
         }
     }
+    let mut alias_guard: Option<fields::FieldAliasGuard<'a>> = None;
     for &k in adts.iter() {
         let key = tc::ItemKey(k);
         // The store holds only the ADTs something asked for: ask. One that cannot be made stays
@@ -1117,17 +2449,22 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             g.variants.push((k, vi as u32, first, g.fields.len() as u32 - first));
         }
         let regions = row.field_regions.clone();
+        let has_alias_field = plant != FactsPlant::NoFieldRegions
+            && fields::adt_has_alias_field(r.store.tys.view(), &row.fields);
         let field_count = row.fields.len();
         let variant_count = row.variants.len();
-        let copy = has_impl(r, langs.copy, key);
+        let copy_state = copy_impl_state(r, langs.copy, key, alloc);
         // A `Copy` type has no `Drop` impl: the Reference, "Special types and traits", `Copy`:
         // "Copy cannot be implemented for types that implement Drop" (rustc E0184), so YES to
         // `Copy` is NO to `Drop` without asking (an unread candidate cannot be its `Drop`).
-        let drop_impl = match copy {
-            Ok(true) => Ok(false),
+        // Likewise, in a `#![no_core]` crate graph with no `#[lang = "drop"]` trait at all, no ADT
+        // can implement `Drop`.
+        let drop_impl = match copy_state {
+            Ok(CopyImpl::Positive) => Ok(false),
+            _ if langs.drop.is_none() => Ok(false),
             _ => has_impl(r, langs.drop, key),
         };
-        if let Err(why) = copy {
+        if let Err(why) = copy_state {
             g.unknown.push((k, "Copy"));
             g.unknown_why.push(why);
         }
@@ -1135,13 +2472,36 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             g.unknown.push((k, "Drop"));
             g.unknown_why.push(why);
         }
-        let (copy, drop_impl) = (copy.ok(), drop_impl.ok());
-        // Which arguments the one `Copy` impl needs `Copy` (borrow_fields.rs); ADTs are taken
-        // in key order, so `copy_args` stays sorted.
-        let copy_need = match plant {
-            FactsPlant::NoCopyArgs => None,
-            _ => fields::copy_args_of(r, langs, key, copy, &mut g.copy_need, alloc),
+        let no_drop = matches!(drop_impl, Ok(false) | Err(ImplsUnknown::NoLangItem));
+        let (copy, copy_need) = match copy_state {
+            Ok(CopyImpl::Positive) => {
+                let copy = Some(true);
+                let copy_need = match plant {
+                    FactsPlant::NoCopyArgs => None,
+                    _ => fields::copy_args_of(r, langs, key, copy, &mut g.copy_need, alloc),
+                };
+                (copy, copy_need)
+            }
+            Ok(CopyImpl::None)
+                if no_drop
+                    && r.store.is_auto_copy_pub(r.names, r.keys, key)
+                    && !matches!(copy_impl_state(r, langs.clone, key, alloc), Ok(CopyImpl::Negative)) =>
+            {
+                match auto_copy_of(r, langs, key, &mut g.copy_need, alloc) {
+                    Some((true, mask)) => {
+                        let copy_need = match plant {
+                            FactsPlant::NoCopyArgs => None,
+                            _ => mask,
+                        };
+                        (Some(true), copy_need)
+                    }
+                    _ => (Some(false), None),
+                }
+            }
+            Ok(CopyImpl::None | CopyImpl::Negative) => (Some(false), None),
+            Err(_) => (None, None),
         };
+        let drop_impl = drop_impl.ok();
         if let Some((start, len)) = copy_need {
             g.copy_args.push((k, start, len));
         }
@@ -1156,10 +2516,49 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             g.variance_at.push((k, lo, hi));
         }
         let copy_taken = copy.unwrap_or(false);
+        let adt_uncond_copy = copy_need.is_some_and(|(start, len)| {
+            let s = start as usize;
+            let e = s.saturating_add(len as usize);
+            g.copy_need.get(s..e).is_some_and(|need| need.iter().all(|&b| !b))
+        });
+        let drop_summary = fields::drop_facts_of(
+            r,
+            langs,
+            key,
+            drop_impl,
+            adt_uncond_copy,
+            &mut g.drop_need,
+            &mut g.drop_strict_need,
+            &mut g.drop_lt_need,
+            &mut g.reads,
+            alloc,
+        );
+        let needs_drop = drop_summary.needs_drop;
+        let drop_need = drop_summary.drop_args;
+        let drop_strict_span = drop_summary.drop_strict;
+        let drop_lt_span = drop_summary.drop_lifetimes;
+        if let Some((start, len)) = drop_need {
+            g.drop_args.push((k, start, len));
+        }
+        if let Some((start, len)) = drop_strict_span {
+            g.drop_strict.push((k, start, len));
+        }
+        if let Some((start, len)) = drop_lt_span {
+            g.drop_lifetimes.push((k, start, len));
+        }
+        let deref_impl = if let Some(deref_tr) = langs.deref
+            && let Some(impls) = answer_impls(r, deref_tr, tc::Shape::Adt(key))
+            && let &[imp] = &impls[..]
+        {
+            g.deref_impls.push((k, imp));
+            Some(imp.0)
+        } else {
+            None
+        };
         let facts = AdtFacts {
             copy: copy_taken,
             drop_impl: drop_impl.unwrap_or(false),
-            needs_drop: !copy_taken,
+            needs_drop,
             lifetimes,
             union: kind == tc::AdtKind::Union,
             is_enum: kind == tc::AdtKind::Enum,
@@ -1171,11 +2570,50 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         for &(_, _, _, count) in g.variants[variants_from..].iter() {
             variant_lens.push(count);
         }
-        let copy_args = copy_need.and_then(|(start, len)| g.copy_need.get(start as usize..(start + len) as usize));
-        let variances = variances.and_then(|(lo, hi)| g.variance_list.get(lo as usize..hi as usize));
+        let copy_args = copy_need.and_then(|(start, len)| {
+            let s = usize::try_from(start).ok()?;
+            let e = s.checked_add(usize::try_from(len).ok()?)?;
+            g.copy_need.get(s..e)
+        });
+        let drop_args = drop_need.and_then(|(start, len)| {
+            let s = usize::try_from(start).ok()?;
+            let e = s.checked_add(usize::try_from(len).ok()?)?;
+            g.drop_need.get(s..e)
+        });
+        let drop_strict = drop_strict_span.and_then(|(start, len)| {
+            let s = usize::try_from(start).ok()?;
+            let e = s.checked_add(usize::try_from(len).ok()?)?;
+            g.drop_strict_need.get(s..e)
+        });
+        let drop_lifetimes = drop_lt_span.and_then(|(start, len)| {
+            let s = usize::try_from(start).ok()?;
+            let e = s.checked_add(usize::try_from(len).ok()?)?;
+            g.drop_lt_need.get(s..e)
+        });
+        let variances = variances.and_then(|(lo, hi)| {
+            let s = usize::try_from(lo).ok()?;
+            let e = usize::try_from(hi).ok()?;
+            g.variance_list.get(s..e)
+        });
+        let suppressed = if has_alias_field {
+            let guard = alias_guard.get_or_insert_with(|| fields::FieldAliasGuard::new_in(alloc));
+            guard.check_adt(r, owner, c.types.view(), key, &mut g.suppressed_field_regions)
+        } else {
+            None
+        };
         let mut absent = AVec::new_in(alloc);
         let spans = if plant == FactsPlant::NoFieldRegions {
             absent.resize(field_count, NO_ROW);
+            &absent[..]
+        } else if let Some((s, len)) = suppressed {
+            absent.extend_from_slice(&regions.at[..]);
+            if let Some(sl) = g.suppressed_field_regions.get(s as usize..s as usize + len as usize) {
+                for &fi in sl {
+                    if let Some(slot) = absent.get_mut(fi as usize) {
+                        *slot = NO_ROW;
+                    }
+                }
+            }
             &absent[..]
         } else {
             &regions.at[..]
@@ -1193,89 +2631,67 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 field_regions: spans,
                 region_list: &regions.list,
                 copy_args,
+                drop_args,
+                drop_strict,
+                drop_lifetimes,
+                deref_impl,
                 variances,
             },
         );
         g.reads.push(read);
         if plant != FactsPlant::NoFieldRegions {
-            g.field_regions.insert(key, RegionFields { first_variant: variants_from, variant_count, first_field: fields_from, regions });
+            g.field_regions.insert(
+                key,
+                RegionFields { first_variant: variants_from, variant_count, first_field: fields_from, regions, suppressed },
+            );
         }
     }
-    let mut items: AVec<'a, u128> = AVec::new_in(alloc);
-    for k in c.callees.column::<1>().iter() {
-        items.push(k.0);
+    if let Some(guard) = alias_guard {
+        guard.push_reads(&mut g.reads);
     }
-    items.push(owner.0);
-    items.sort_unstable();
-    items.dedup();
-    for &k in items.iter() {
-        // A callee's head is made when something asks: ask, so its regions are filed and not
-        // taken as unknown (a call of unknown signature is related coarsely, and cannot say
-        // that the callee demands `'static`). A member is made with its impl or its trait.
-        let key = tc::ItemKey(k);
-        if !r.store.fns.contains_key(&key) {
-            match r.keys.origin(key).cloned() {
-                Some(Origin::Item(lib)) => {
-                    ensure_one(r, Want::Fn(lib));
-                }
-                Some(Origin::Member { container, .. }) => {
-                    // The container asked by what it is, never tried as one kind and then the
-                    // other: a struct's ctor (made with the struct's head) and an anonymous
-                    // constant (a member of its module) have no container head to make, and a
-                    // refused ask of one is a seed error that refuses a seeded body (lane FM).
-                    if let Some(lib) = r.keys.library_in(r.names, container) {
-                        match r.names.detail_of(lib) {
-                            Some(blaze_surface::ItemDetail::Impl) => {
-                                container_head(r, lib, false);
-                            }
-                            Some(blaze_surface::ItemDetail::Trait) => {
-                                container_head(r, lib, true);
-                            }
-                            _ => {}
-                        }
-                    }
-                    // An impl's fn's signature is its own want (heads.rs `Want::MemberFn`).
-                    if let Some(w) = member_fn_want(r.names, &*r.keys, key) {
-                        ensure_one(r, w);
-                    }
-                }
-                None => {}
+    // Evaluate instantiated structural drop glue for concrete body `PNode::Adt` types whose
+    // uninstantiated ADT summary had `needs_drop && !drop_impl` (e.g. `Flatten<...>`,
+    // `Split<'_, &str>`, `SplitWhitespace<'_>` whose fields hold `PNode::Alias`).
+    {
+        let body_tys = c.types.view();
+        let mut eval: Option<fields::InstDropEval<'a>> = None;
+        for (idx, node) in body_tys.nodes().enumerate() {
+            let tc::PNode::Adt(k, _) = *node else { continue };
+            let Ok(at) = g.adts.binary_search_by_key(&k.0, |&(ak, _)| ak) else { continue };
+            let af = g.adts[at].1;
+            if !af.needs_drop || af.drop_impl {
+                continue;
+            }
+            let Ok(pty_id) = u32::try_from(idx) else { continue };
+            let ev = eval.get_or_insert_with(|| fields::InstDropEval::new_in(alloc));
+            if let Some(needs) = ev.eval_body_ty(r, langs, body_tys, tc::PTy(pty_id)) {
+                g.inst_drop.push((pty_id, needs));
             }
         }
-        let Some(f) = r.store.fns.get(&key) else {
-            g.reads.push(head_read(k, HeadAnswer::NotMade));
-            continue;
-        };
-        let tys = r.store.tys.view();
-        let self_ref = f.self_param && f.inputs.first().is_some_and(|&t| matches!(tys.node(t), Ok(tc::PNode::Ref(..))));
-        let callee = CalleeFacts { writes_lifetimes: f.qualifiers.writes_lifetimes(), self_ref };
-        g.callees.push((k, callee));
-    }
-    // Each impl a projection of the body selected (`c.selected`: a call's `T::Out` at the
-    // impl's `type Out`, blaze-flow-lower impl_call.rs), with the associated types read of it:
-    // its head made now (as a callee's above), so its regions are filed and its row below
-    // says them, not `NoHead`.
-    // Every impl the body's record selected: for a projection (`Some(name)`: the associated
-    // type is read) and for a trait bound (`None`: its header and where-clauses are related at
-    // the call, blaze-borrow relate.rs `impl_where`), so its head is made and its row filed.
-    let mut selected: AVec<'a, (u128, Option<tc::Name>)> = AVec::new_in(alloc);
-    for p in c.selected.iter() {
-        if let tc::Selected::Impl { imp, .. } = p.selected {
-            selected.push((imp.0, p.name));
+        if let Some(ev) = eval {
+            ev.push_reads(&mut g.reads);
         }
+        g.inst_drop.sort_unstable_by_key(|&(k, _)| k);
     }
-    selected.sort_unstable_by_key(|&(k, n)| (k, n.is_some(), n.map_or(0, |n| n.0)));
-    selected.dedup();
-    let mut last_impl = None;
-    for &(k, _) in selected.iter() {
-        if last_impl == Some(k) {
-            continue;
-        }
-        last_impl = Some(k);
-        if let Some(lib) = r.keys.library_in(r.names, tc::ItemKey(k))
-            && matches!(r.names.detail_of(lib), Some(blaze_surface::ItemDetail::Impl))
-        {
-            container_head(r, lib, false);
+    let target_name = tc::Name::of("Target");
+    let prev_selected_len = selected.len();
+    for &(_, imp) in g.deref_impls.iter() {
+        selected.push((imp.0, Some(target_name)));
+    }
+    if selected.len() != prev_selected_len {
+        selected.sort_unstable_by_key(|&(k, n)| (k, n.is_some(), n.map_or(0, |n| n.0)));
+        selected.dedup();
+        let mut last_impl = None;
+        for &(k, _) in selected.iter() {
+            if last_impl == Some(k) {
+                continue;
+            }
+            last_impl = Some(k);
+            if let Some(lib) = r.keys.library_in(r.names, tc::ItemKey(k))
+                && matches!(r.names.detail_of(lib), Some(blaze_surface::ItemDetail::Impl))
+            {
+                container_head(r, lib, false);
+            }
         }
     }
     // From here the records are only read. Each head's regions (D148) are its head record's,
@@ -1284,7 +2700,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     // refused, an old form) is named by the lowering at the call that needs them
     // (`Form::RegionsUnread`), never related under a guess.
     {
-        let regions = r.store.regions.reader(r.store.tys.alloc());
+        let regions = r.store.regions.reader(alloc);
         // Each head's row (rule 21): its callee facts and its signature column as read, or
         // why it was not, so a lifetime-only edit of a callee's signature moves the body's
         // read list (the regions digest moves with it: head_record.rs `regions_digest`).
@@ -1306,7 +2722,24 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 }
                 i += 1;
             }
+            if let Some(ih) = r.store.impls.get(&tc::ItemKey(imp)) {
+                for &(an, _) in ih.assoc.iter() {
+                    if names.scan_for(&an).is_none() {
+                        names.push(an);
+                    }
+                }
+                names.sort_unstable_by_key(|n| n.0);
+            }
             g.reads.push(impl_read(imp, &names, &regions));
+        }
+        for &k in traits.iter() {
+            g.reads.push(clauses_read(k, &regions));
+        }
+        for &k in opaques.iter() {
+            g.reads.push(clauses_read(k, &regions));
+        }
+        for &(_, _, a_item) in g.assoc_items.iter() {
+            g.reads.push(clauses_read(a_item.0, &regions));
         }
         // The generic shape of each head whose signature regions are filed: where its type
         // parameters stand among its positions (blaze-flow-lower generic_call.rs), counted by
@@ -1328,7 +2761,8 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             // `RegionReader::opaque_captures`), never the in-process maps ([`ShapeArity`]).
             let arity = ShapeArity { declared: super::types::HeadsArity { heads: &r.store.maps, opaques: &[], names: r.names }, regions: &regions };
             let mut shape = blaze_flow_lower::ShapeBuf::new_in(alloc);
-            match blaze_flow_lower::read_shape(r.store.tys.view(), &f.inputs[..], f.output, &arity, &mut shape, alloc) {
+            let out = r.store.fn_output(key).unwrap_or(f.output);
+            match blaze_flow_lower::read_shape(r.store.tys.view(), &f.inputs[..], out, &arity, &mut shape, alloc) {
                 Ok(()) => g.shapes.push((k, shape)),
                 Err(why) => g.shape_refused.push((k, why)),
             }
@@ -1341,7 +2775,8 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             let key = tc::ItemKey(k);
             let head = r.store.fns.get(&key);
             let clauses = r.store.preds.get(&key).map(|p| &p.clauses[..]);
-            g.calls.gather(k, head, clauses, r.store.tys.view(), &regions, future, alloc);
+            let extra_outlives: &[(u32, tc::regions::Region)] = if k == owner.0 { &param_outlives } else { &[] };
+            g.calls.gather(k, head, clauses, r.store.tys.view(), &regions, future, extra_outlives, alloc);
             g.ties.gather(k, head, clauses, r.store.tys.view(), &regions);
         }
         // Each trait object's principal: whether it declares a lifetime decides how an unsized
@@ -1374,7 +2809,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         // blaze-flow-lower one_call.rs `clause_of`), whether or not such a node was interned
         // yet. The census (wave-1119): 54,907 `Count` refusals named an alias's lifetimes "not
         // filed". The count itself is the one read below (rule 21).
-        for n in c.types.view().nodes().chain(r.store.tys.view().nodes()) {
+        for n in c.types.view().nodes() {
             match n {
                 tc::PNode::ExTrait(t, _) => g.trait_counts.push((t.0, None)),
                 tc::PNode::Alias { trait_, name, .. } | tc::PNode::ExProj { trait_, name, .. } => {
@@ -1384,16 +2819,212 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 _ => {}
             }
         }
-        for &k in items.iter() {
-            let Some(p) = r.store.preds.get(&tc::ItemKey(k)) else { continue };
-            for cl in p.clauses.iter() {
-                match *cl {
-                    tc::PClause::Trait { trait_, .. } => g.trait_counts.push((trait_.0, None)),
-                    tc::PClause::Projection { trait_, name, .. } => {
-                        g.alias_counts.push((trait_.0, name, None));
-                        g.trait_counts.push((trait_.0, None));
+        // Walk only the `PTy`s in `r.store.tys` reachable from this body's gathered heads
+        // (`items`, `owner`'s container impl, `selected`, `opaques`, `traits`, `assoc_items`,
+        // and `roots` ADTs), never scanning unrelated heads in `r.store.tys`.
+        {
+            struct TyWalk<'a, 't> {
+                stys: tc::PTys<'t>,
+                seen: blaze_hash::Map<u32, (), blaze_hash::FixedState, Alloc<'a>>,
+                st: AVec<'a, tc::PTy>,
+            }
+            impl<'a> TyWalk<'a, '_> {
+                fn walk_ty(&mut self, root: tc::PTy, trait_counts: &mut AVec<'a, (u128, Option<u32>)>, alias_counts: &mut AVec<'a, (u128, tc::Name, Option<u32>)>) {
+                    if self.seen.insert(root.0, ()).is_some() {
+                        return;
                     }
-                    tc::PClause::Const { .. } | tc::PClause::TypeOutlives { .. } | tc::PClause::RegionOutlives { .. } => {}
+                    self.st.push(root);
+                    while let Some(t) = self.st.pop() {
+                        let Ok(node) = self.stys.node(t) else { continue };
+                        match node {
+                            tc::PNode::ExTrait(tr, _) => trait_counts.push((tr.0, None)),
+                            tc::PNode::Alias { trait_, name, .. } | tc::PNode::ExProj { trait_, name, .. } => {
+                                alias_counts.push((trait_.0, name, None));
+                                trait_counts.push((trait_.0, None));
+                            }
+                            _ => {}
+                        }
+                        if let Ok((list, last)) = super::adt_variance::children(self.stys, t, node) {
+                            for &ch in list {
+                                if self.seen.insert(ch.0, ()).is_none() {
+                                    self.st.push(ch);
+                                }
+                            }
+                            if let Some(ch) = last
+                                && self.seen.insert(ch.0, ()).is_none()
+                            {
+                                self.st.push(ch);
+                            }
+                        }
+                    }
+                }
+                fn walk_list(&mut self, list: tc::List, trait_counts: &mut AVec<'a, (u128, Option<u32>)>, alias_counts: &mut AVec<'a, (u128, tc::Name, Option<u32>)>) {
+                    if let Ok(items) = self.stys.list(list) {
+                        for &t in items {
+                            self.walk_ty(t, trait_counts, alias_counts);
+                        }
+                    }
+                }
+                fn walk_clause(&mut self, cl: &tc::PClause, trait_counts: &mut AVec<'a, (u128, Option<u32>)>, alias_counts: &mut AVec<'a, (u128, tc::Name, Option<u32>)>) {
+                    match *cl {
+                        tc::PClause::Trait { trait_, args } => {
+                            trait_counts.push((trait_.0, None));
+                            self.walk_list(args, trait_counts, alias_counts);
+                        }
+                        tc::PClause::ForFields { container, trait_, args } => {
+                            trait_counts.push((trait_.0, None));
+                            self.walk_ty(container, trait_counts, alias_counts);
+                            self.walk_list(args, trait_counts, alias_counts);
+                        }
+                        tc::PClause::Projection { trait_, args, name, term } => {
+                            alias_counts.push((trait_.0, name, None));
+                            trait_counts.push((trait_.0, None));
+                            self.walk_list(args, trait_counts, alias_counts);
+                            self.walk_ty(term, trait_counts, alias_counts);
+                        }
+                        tc::PClause::Const { args, .. } => self.walk_list(args, trait_counts, alias_counts),
+                        tc::PClause::TypeOutlives { ty, .. } => self.walk_ty(ty, trait_counts, alias_counts),
+                        tc::PClause::RegionOutlives { .. } => {}
+                    }
+                }
+            }
+            let mut walker = TyWalk {
+                stys: r.store.tys.view(),
+                seen: blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc, capacity: None }),
+                st: AVec::new_in(alloc),
+            };
+            for &k in items.iter() {
+                let ik = tc::ItemKey(k);
+                if let Ok(sig) = regions.sig(ik) {
+                    walker.walk_ty(sig.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                }
+                if let Ok(cls) = regions.clauses(ik) {
+                    for cv in cls {
+                        walker.walk_ty(cv.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(f) = r.store.fns.get(&ik) {
+                    for &t in f.inputs.iter() {
+                        walker.walk_ty(t, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                    walker.walk_ty(r.store.fn_output(ik).unwrap_or(f.output), &mut g.trait_counts, &mut g.alias_counts);
+                }
+                if let Some(p) = r.store.preds.get(&ik) {
+                    for cl in p.clauses.iter() {
+                        walker.walk_clause(cl, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+            }
+            if let Some(Origin::Member { container, .. }) = r.keys.origin(owner) {
+                let ik = *container;
+                if let Ok((self_col, trait_col)) = regions.impl_header(ik) {
+                    walker.walk_ty(self_col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    if let Some(tc_col) = trait_col {
+                        walker.walk_ty(tc_col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Ok(cls) = regions.clauses(ik) {
+                    for cv in cls {
+                        walker.walk_ty(cv.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(ih) = r.store.impls.get(&ik) {
+                    walker.walk_ty(ih.self_ty, &mut g.trait_counts, &mut g.alias_counts);
+                    walker.walk_list(ih.trait_args.list(), &mut g.trait_counts, &mut g.alias_counts);
+                }
+                if let Some(p) = r.store.preds.get(&ik) {
+                    for cl in p.clauses.iter() {
+                        walker.walk_clause(cl, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+            }
+            let mut last_imp = None;
+            for &(k, name) in selected.iter() {
+                let ik = tc::ItemKey(k);
+                if let Some(n) = name
+                    && let Ok(v) = regions.impl_assoc(ik, n)
+                {
+                    walker.walk_ty(v.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                }
+                if last_imp == Some(k) {
+                    continue;
+                }
+                last_imp = Some(k);
+                if let Ok((self_col, trait_col)) = regions.impl_header(ik) {
+                    walker.walk_ty(self_col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    if let Some(tc_col) = trait_col {
+                        walker.walk_ty(tc_col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(ih) = r.store.impls.get(&ik) {
+                    walker.walk_ty(ih.self_ty, &mut g.trait_counts, &mut g.alias_counts);
+                    walker.walk_list(ih.trait_args.list(), &mut g.trait_counts, &mut g.alias_counts);
+                    for &(an, v) in ih.assoc.iter() {
+                        walker.walk_ty(v, &mut g.trait_counts, &mut g.alias_counts);
+                        if let Ok(rv) = regions.impl_assoc(ik, an) {
+                            walker.walk_ty(rv.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                        }
+                    }
+                }
+                if let Ok(cls) = regions.clauses(ik) {
+                    for cv in cls {
+                        walker.walk_ty(cv.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(p) = r.store.preds.get(&ik) {
+                    for cl in p.clauses.iter() {
+                        walker.walk_clause(cl, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+            }
+            for &k in opaques.iter() {
+                let ik = tc::ItemKey(k);
+                if let Ok(cls) = regions.clauses(ik) {
+                    for cv in cls {
+                        walker.walk_ty(cv.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(p) = r.store.preds.get(&ik) {
+                    for cl in p.clauses.iter() {
+                        walker.walk_clause(cl, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+            }
+            for &k in traits.iter() {
+                let ik = tc::ItemKey(k);
+                if let Ok(cls) = regions.clauses(ik) {
+                    for cv in cls {
+                        walker.walk_ty(cv.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(def) = r.store.trait_defs.get(&ik) {
+                    for cl in def.supertraits.iter() {
+                        walker.walk_clause(cl, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(p) = r.store.preds.get(&ik) {
+                    for cl in p.clauses.iter() {
+                        walker.walk_clause(cl, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+            }
+            for &(_, _, a_item) in g.assoc_items.iter() {
+                if let Ok(cls) = regions.clauses(a_item) {
+                    for cv in cls {
+                        walker.walk_ty(cv.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(p) = r.store.preds.get(&a_item) {
+                    for cl in p.clauses.iter() {
+                        walker.walk_clause(cl, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+            }
+            for &k in roots.iter() {
+                if let Some(row) = r.store.adts.get(&tc::ItemKey(k)) {
+                    for f in row.fields.iter() {
+                        walker.walk_ty(f.ty, &mut g.trait_counts, &mut g.alias_counts);
+                    }
                 }
             }
         }
@@ -1412,20 +3043,188 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         g.trait_counts.dedup_by_key(|&mut (k, _)| k);
         g.alias_counts.sort_unstable_by_key(|&(k, n, _)| (k, n));
         g.alias_counts.dedup_by_key(|&mut (k, n, _)| (k, n));
-        let arity = super::types::HeadsArity { heads: &r.store.maps, opaques: &[], names: r.names };
-        let count = |got: tc::regions::Count| match got {
-            tc::regions::Count::Known(n) => Some(n),
-            tc::regions::Count::NotKnown => None,
-        };
-        for t in g.trait_counts.iter_mut() {
-            t.1 = count(tc::regions::Arity::trait_lifetimes(&arity, tc::ItemKey(t.0)));
+        {
+            let arity = super::types::HeadsArity { heads: &r.store.maps, opaques: &[], names: r.names };
+            let count = |got: tc::regions::Count| match got {
+                tc::regions::Count::Known(n) => Some(n),
+                tc::regions::Count::NotKnown => None,
+            };
+            for t in g.trait_counts.iter_mut() {
+                t.1 = count(tc::regions::Arity::trait_lifetimes(&arity, tc::ItemKey(t.0)));
+                if r.keys
+                    .library_in(r.names, tc::ItemKey(t.0))
+                    .and_then(|lib| r.store.maps.traits.get(&lib))
+                    .is_some_and(|td| td.flags.has(tc::TraitFlags::AUTO))
+                {
+                    g.auto_traits.push(t.0);
+                }
+            }
+            g.auto_traits.sort_unstable();
+            g.auto_traits.dedup();
+            for a in g.alias_counts.iter_mut() {
+                a.2 = count(tc::regions::Arity::alias_lifetimes(&arity, tc::ItemKey(a.0), a.1));
+            }
         }
+        // Synthetic RPITIT associated types (`async fn` / `-> impl Trait` in traits) are not
+        // written as `type ...;` members in the trait text, so `NamesSource::assoc_lifetimes`
+        // answers `None`; their lifetime count is the corresponding RPITIT opaque's captures.
+        drop(regions);
         for a in g.alias_counts.iter_mut() {
-            a.2 = count(tc::regions::Arity::alias_lifetimes(&arity, tc::ItemKey(a.0), a.1));
+            if a.2.is_some() {
+                continue;
+            }
+            let tk = tc::ItemKey(a.0);
+            ensure_rpitit_trait_rows(r, tk);
+            if let Some(opaque) = r.store.rpitit_traits.get(&tk).and_then(|tr| tr.rows.iter().find(|s| s.name == a.1)).map(|s| s.opaque) {
+                a.2 = r.store.regions.made(opaque).and_then(|f| f.regions().opaque_captures).or_else(|| r.store.maps.opaque_lifetimes.get(&opaque).copied());
+            }
         }
     }
     g.items = items;
     g
+}
+
+/// Files `FiledRegions` for a provided trait fn's RPITIT `Twin` opaque (`rpitit::default_key`)
+/// by cloning its source opaque's regions and rewriting `Opaque(source, args)` to
+/// `Opaque(twin, args)` in each clause column root.
+fn ensure_twin_opaque_regions<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, twin_k: tc::ItemKey) {
+    let Some((source, owner)) = r.store.rpitit_defaults.get(&twin_k).map(|t| (t.source, t.owner)) else {
+        return;
+    };
+    if r.store.regions.made(twin_k).is_some() {
+        return;
+    }
+    if r.store.regions.made(source).is_none()
+        && let Some(w) = member_fn_want(r.names, &*r.keys, owner)
+    {
+        ensure_one(r, w);
+    }
+    let Some(src_filed) = r.store.regions.made(source) else {
+        return;
+    };
+    let alloc = r.store.tys.alloc();
+    let src = src_filed.regions();
+    let mut lifetimes = tc::regions::LifetimeParams::new_in(src.params.count(), alloc);
+    for i in 0..src.params.count() {
+        if src.params.is_late(i) == Ok(true) {
+            let _ = lifetimes.set_late(i);
+        }
+    }
+    for &(longer, shorter) in src.params.outlives() {
+        let _ = lifetimes.add_outlives(longer, shorter);
+    }
+    let mut hr = tc::region_facts::HeadRegions::new_in(lifetimes, alloc);
+    hr.opaque_captures = src.opaque_captures;
+    hr.outlives.extend_from_slice(&src.outlives);
+
+    struct TwinArity<'a> {
+        inner: &'a dyn tc::regions::Arity,
+        twin: tc::ItemKey,
+        source: tc::ItemKey,
+        captures: Option<u32>,
+    }
+    impl tc::regions::Arity for TwinArity<'_> {
+        fn adt_lifetimes(&self, adt: tc::ItemKey) -> tc::regions::Count {
+            self.inner.adt_lifetimes(adt)
+        }
+        fn opaque_captures(&self, opaque: tc::ItemKey) -> tc::regions::Count {
+            if opaque == self.twin {
+                match self.captures {
+                    Some(n) => tc::regions::Count::Known(n),
+                    None => self.inner.opaque_captures(self.source),
+                }
+            } else {
+                self.inner.opaque_captures(opaque)
+            }
+        }
+        fn alias_lifetimes(&self, trait_: tc::ItemKey, name: tc::Name) -> tc::regions::Count {
+            self.inner.alias_lifetimes(trait_, name)
+        }
+        fn trait_lifetimes(&self, trait_: tc::ItemKey) -> tc::regions::Count {
+            self.inner.trait_lifetimes(trait_)
+        }
+    }
+
+    let swap_one = |tys: &tc::PortableTys<'_>, t: tc::PTy| -> Option<tc::PTy> {
+        match tys.view().node(t).ok()? {
+            tc::PNode::Opaque(k, args) if k == source => tys.intern_shared(tc::PNode::Opaque(twin_k, args)).ok(),
+            _ => Some(t),
+        }
+    };
+    let swap_list = |tys: &tc::PortableTys<'_>, l: tc::List| -> Option<tc::List> {
+        let items = tys.view().list(l).ok()?;
+        let mut out: AVec<'static, tc::PTy> = AVec::with_capacity_in(items.len(), alloc);
+        let mut changed = false;
+        for &it in items {
+            let sw = swap_one(tys, it)?;
+            if sw != it {
+                changed = true;
+            }
+            out.push(sw);
+        }
+        if !changed {
+            return Some(l);
+        }
+        tys.intern_list_shared(&out).ok()
+    };
+
+    let arity = TwinArity { inner: src_filed.arity(), twin: twin_k, source, captures: src.opaque_captures };
+    for cl in src.clauses.iter() {
+        let root_ty = cl.col.ty();
+        let Ok(node) = r.store.tys.view().node(root_ty) else { continue };
+        let new_ty = match node {
+            tc::PNode::Opaque(k, args) if k == source => r.store.tys.intern_shared(tc::PNode::Opaque(twin_k, args)).ok(),
+            tc::PNode::ExTrait(tr, args) => swap_list(&r.store.tys, args).and_then(|a| r.store.tys.intern_shared(tc::PNode::ExTrait(tr, a)).ok()),
+            tc::PNode::ExProj { trait_, name, args, term } => swap_list(&r.store.tys, args).and_then(|a| {
+                let t = swap_one(&r.store.tys, term)?;
+                r.store.tys.intern_shared(tc::PNode::ExProj { trait_, name, args: a, term: t }).ok()
+            }),
+            _ => Some(root_ty),
+        };
+        let Some(new_ty) = new_ty else { continue };
+        if let Ok(col) = tc::regions::RegionCol::lay(r.store.tys.view(), new_ty, &arity, cl.col.as_slice(), alloc) {
+            hr.clauses.push(tc::region_facts::ClauseRegions { nth: cl.nth, binders: cl.binders, col });
+        }
+    }
+    if let Ok(filed) = super::head_record::FiledRegions::new(hr, &arity, r.store.tys.view(), alloc) {
+        r.store.regions.file(twin_k, filed);
+        if let Some(n) = src.opaque_captures {
+            r.store.maps.opaque_lifetimes.insert_absent(twin_k, n);
+        }
+    }
+}
+
+/// Populate `Store::rpitit_traits` for `trait_` if not already computed (e.g. when borrow
+/// checking runs against a warm cached `Checked` record without re-running typeck in this process).
+fn ensure_rpitit_trait_rows<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, trait_: tc::ItemKey) {
+    if r.store.rpitit_traits.contains_key(&trait_) {
+        return;
+    }
+    let Some(lib) = r.keys.library_in(r.names, trait_) else { return };
+    if !matches!(r.names.detail_of(lib), Some(blaze_surface::ItemDetail::Trait)) {
+        return;
+    }
+    container_head(r, lib, true);
+    if !r.store.maps.traits.get(&lib).is_some_and(super::rpitit::may_have_rows) {
+        return;
+    }
+    for _ in 0..256 {
+        let step = {
+            let Some(t) = r.store.maps.traits.get(&lib) else { return };
+            let Some(extra) = r.store.trait_defs.get(&trait_) else { return };
+            match super::rpitit::trait_rows(r.store, trait_, t, &extra.assoc) {
+                Ok(_) => None,
+                Err(super::rpitit::Need::Fn(fk)) => Some(fk),
+                Err(super::rpitit::Need::Refused(..)) => None,
+            }
+        };
+        let Some(fk) = step else { break };
+        if let Some(w) = member_fn_want(r.names, &*r.keys, fk) {
+            ensure_one(r, w);
+        } else {
+            break;
+        }
+    }
 }
 
 /// The variances of ADT `key`'s parameters, lifetimes first then its type and const
@@ -1453,7 +3252,7 @@ fn adt_variances_in(table: &super::adt_facts::AdtFactsTable<'_>, key: u128, list
 fn owner_implied_input<'n, 'a, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: tc::ItemKey, alloc: Alloc<'a>) -> super::adt_facts::ImpliedInput<'a> {
     let mut input = super::adt_facts::ImpliedInput::new_in(alloc);
     let arity = super::types::HeadsArity { heads: &r.store.maps, opaques: &[], names: r.names };
-    let reader = r.store.regions.reader(r.store.tys.alloc());
+    let reader = r.store.regions.reader(alloc);
     let tys = r.store.tys.view();
     match reader.sig(owner) {
         Ok(sig) => input.piece(owner.0, tys, &arity, sig.col.ty(), sig.col.as_slice()),
@@ -1572,7 +3371,7 @@ fn adt_facts_of<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, roots: &
     }
     // Each laid with its fields' columns, as the head record filed them.
     let arity = super::types::HeadsArity { heads: &r.store.maps, opaques: &[], names: r.names };
-    let reader = r.store.regions.reader(r.store.tys.alloc());
+    let reader = r.store.regions.reader(alloc);
     let tys = r.store.tys.view();
     let mut input = AdtFactsInput::new_in(alloc);
     for &(k, unmade) in seen.iter() {
@@ -1745,7 +3544,7 @@ fn gap_words<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, callee: tc::ItemKey
 /// `FutureWitness` by `decide_stalled_goals`, never a pass (rule 3).
 pub(super) fn witness_and_decide<'n, 'a, S: NamesSource<'n>>(
     r: &mut Records<'_, 'n, S>,
-    body: &Body<'n>,
+    body: &Body<'_>,
     done: &tc::Checked<'_>,
     reads: &mut AVec<'a, Read>,
     alloc: Alloc<'a>,
@@ -1757,7 +3556,7 @@ pub(super) fn witness_and_decide<'n, 'a, S: NamesSource<'n>>(
         reads.extend_from_slice(facts.reads());
         reads.extend_from_slice(facts.calls.reads());
         reads.extend_from_slice(facts.ties.reads());
-        let reader = r.store.regions.reader(r.store.tys.alloc());
+        let reader = r.store.regions.reader(alloc);
         let lowering = facts.read_by(&reader, r.store.tys.view());
         if let Ok(tys) = body.tys.view(&r.store.tys) {
             let view = body.typeck.view(tys);
@@ -1791,7 +3590,7 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
     // Every fn's signature regions are its head record's, read in place (D148): the lowering's
     // facts are the gathered ones with the head records' reader. The control
     // (`FactsPlant::NoAliases`) gives none: every call carrying a lifetime is then refused.
-    let reader = r.store.regions.reader(r.store.tys.alloc());
+    let reader = r.store.regions.reader(alloc);
     let regions: &dyn RegionFacts = if plant == FactsPlant::NoAliases { &NoRegions } else { &reader };
     let lowering = facts.read_by(regions, r.store.tys.view());
     if let Some(out) = show.as_deref_mut() {
@@ -1835,11 +3634,23 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
     // and apart from the borrow lowerings below (stalled_goals.rs `witness_all`).
     interiors.witness_all(&view, done, &NestedFacts::with_requirements(lowering, &requirements), alloc);
     for &of in nested_inner_first(&view, alloc).iter() {
+        let closure_usage = if plant != FactsPlant::NoClosureRequirements
+            && let FlowOf::Closure(closure) = of
+        {
+            Some(classify_closure_env_use(closure, &view, done, r.store, &langs, &lowering, alloc))
+        } else {
+            None
+        };
         let lowered = {
             let nested = NestedFacts::with_requirements(lowering, &requirements);
             match of {
                 FlowOf::Closure(closure) => {
-                    closure_flow_of(&view, done, closure, &nested, alloc).map(|cf| (cf.lowered.flow, cf.lowered.params, cf.externals, cf.lowered.coarse))
+                    let cf = if closure_usage == Some(ClosureEnvUse::FnOnceOnly) {
+                        closure_flow_of_as_fn_once(&view, done, closure, &nested, alloc)
+                    } else {
+                        closure_flow_of(&view, done, closure, &nested, alloc)
+                    };
+                    cf.map(|cf| (cf.lowered.flow, cf.lowered.params, cf.externals, cf.lowered.coarse))
                 }
                 FlowOf::AsyncBlock(block) => {
                     blaze_flow_lower::lower_async(&view, done, block, &nested, alloc).map(|la| (la.flow, AVec::new_in(alloc), la.externals, la.coarse))
@@ -1847,7 +3658,7 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
                 FlowOf::Owner => continue,
             }
         };
-        let (flow, params, externals, flow_coarse) = match lowered {
+        let (flow, params, mut externals, flow_coarse) = match lowered {
             Ok(x) => x,
             Err(refusal) => {
                 verdict.refused = Some(lower_refused(r, &facts, refusal));
@@ -1862,10 +3673,17 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
             let _ = show_flow(&flow, of, out);
         }
         needs.clear();
+        let mut forbid_env_escape: AVec<'a, blaze_flow::Origin> = AVec::new_in(alloc);
+        if let Some(usage) = closure_usage
+            && usage != ClosureEnvUse::FnOnceOnly
+            && let FlowOf::Closure(closure) = of
+        {
+            prepare_closure_env(closure, done, usage, &mut externals, &mut forbid_env_escape, alloc);
+        }
         // The control (FactsPlant::NoClosureRequirements): no externals, so no requirement is
         // mapped and each outlives result stays the refusal.
         let externals = if plant == FactsPlant::NoClosureRequirements { None } else { Some(&externals[..]) };
-        if file_flow(&flow, &params, of, &view, externals, &mut needs, &mut verdict, alloc) {
+        if file_flow(&flow, &params, of, &view, externals, &forbid_env_escape, &mut needs, &mut verdict, alloc) {
             break;
         }
         let made = match of {
@@ -1899,7 +3717,7 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
         if let Some(out) = show.as_deref_mut() {
             let _ = show_flow(&flow, of, out);
         }
-        if file_flow(&flow, &params, of, &view, None, &mut needs, &mut verdict, alloc) {
+        if file_flow(&flow, &params, of, &view, None, &[], &mut needs, &mut verdict, alloc) {
             break;
         }
         next = next_nested(&view, of);
@@ -1945,13 +3763,14 @@ fn lower_refused<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, facts: &BorrowF
 /// nested flow's outlives result as a closure requirement pushed onto `needs` (when `externals`
 /// is a closure's and blaze-flow-lower `requirement` maps it) or else a `NestedOutlives`
 /// refusal. `true`: the body's check stops here (`verdict.refused` is set, `within` with it).
-#[expect(clippy::too_many_arguments, reason = "the flow, its parameters, which flow, the body's view, the closure's externals, the two outputs and the allocator")]
+#[expect(clippy::too_many_arguments, reason = "the flow, its parameters, which flow, the body's view, the closure's externals and env-escape list, the two outputs and the allocator")]
 pub(super) fn file_flow<'a>(
     flow: &Flow<Alloc<'a>>,
     params: &[blaze_flow_lower::ParamOrigin],
     of: FlowOf,
     view: &tc::BodyView<'_>,
     externals: Option<&[(blaze_flow::Origin, blaze_flow_lower::External)]>,
+    forbid_env_escape: &[blaze_flow::Origin],
     needs: &mut AVec<'a, Requirement>,
     verdict: &mut BorrowVerdict<'a>,
     alloc: Alloc<'a>,
@@ -1979,11 +3798,12 @@ pub(super) fn file_flow<'a>(
                     (span, invalidated_words(flow, at, loan, returned))
                 }
                 // A nested body's outlives result is its owner's to prove: a closure's, between
-                // two positions of its value, is a requirement its maker's flow emits; a region
-                // the call chooses escaping into one the closure keeps is E0521; any other is
-                // refused (never dropped).
+                // two positions of its value (or propagated through a late-bound region's
+                // non-local upper/lower bound in `flow.known`), is a requirement its maker's flow
+                // emits; a region the call chooses escaping into one the closure keeps is E0521;
+                // any other is refused (never dropped).
                 BorrowFinding::UnprovenOutlives { span, from, into, .. } if of.is_nested(view) => {
-                    if let Some(req) = externals.and_then(|ext| blaze_flow_lower::requirement(ext, from, into)) {
+                    if let Some(req) = externals.and_then(|ext| propagate_nested_requirement(ext, &flow.known, from, into, alloc)) {
                         needs.push(req);
                         continue;
                     }
@@ -1993,6 +3813,8 @@ pub(super) fn file_flow<'a>(
                     // requirement on the owner (blaze-flow-lower closure.rs `escapes_closure`).
                     if externals.is_some_and(|ext| blaze_flow_lower::escapes_closure(ext, &flow.known, from, into, alloc)) {
                         (span, ("E0521", "borrowed data escapes outside of closure: a region each call chooses must outlive one the closure keeps"))
+                    } else if externals.is_some_and(|ext| env_escapes_closure(ext, &flow.known, forbid_env_escape, from, into, alloc)) {
+                        (span, ("E0521", "captured variable cannot escape closure body: a per-call environment reference must outlive a region the closure's owner names"))
                     } else {
                         if verdict.refused.is_none() {
                             let endpoint = |origin| externals?.iter().find(|(o, _)| *o == origin).map(|&(_, end)| end);
@@ -2274,13 +4096,27 @@ macro_rules! byte {
     };
 }
 
-fn m(x: &u8, _y: byte!()) -> &u8 {
+fn m_macro(x: &u8, _y: byte!()) -> &u8 {
+    x
+}
+
+fn calls_macro_type() {
+    let a = 1u8;
+    let r = m_macro(&a, 2);
+    let _ = *r;
+}
+
+fn stub<'a>(a: &'a u8, _b: &'a u8) -> &'a u8 {
+    a
+}
+
+fn m(x: &u8, _y: fn(&u8, &u8) -> &u8) -> &u8 {
     x
 }
 
 fn calls_soft_refused() {
     let a = 1u8;
-    let r = m(&a, 2);
+    let r = m(&a, stub);
     let _ = *r;
 }
 
@@ -2313,11 +4149,12 @@ fn main() {}
         let files = [("/l3/src/main.rs".to_string(), SOURCE.to_string())];
         let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
         let user = UserCrate { name: "l3", dir: "/l3/", root: "/l3/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
         let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
         let crates = inputs.crates();
-        let names = inputs.resolve(&crates, alloc).expect("fixture names");
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
         let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
-        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
         let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
         let bodies = world.bodies(alloc);
         let body = |name: &str| {
@@ -2385,6 +4222,12 @@ fn main() {}
         std::println!("h: {h_text}");
         assert!(h_text.contains("E0106"), "h's own check reports its E0106: {h_text}");
 
+        // A callee whose signature contains a type macro (`m_macro` takes `byte!()`) has its
+        // expanded type's regions laid and its calls borrow-checked cleanly.
+        let (types, mac) = world.check_borrows(body("calls_macro_type"), alloc);
+        assert!(types.is_clean(), "calls_macro_type is typed: {types:?}");
+        assert!(mac.is_clean(), "calls_macro_type is clean: {mac:?}");
+
         // A head whose regions alone were refused: typed, and the call refused by its name.
         let (types, soft) = world.check_borrows(body("calls_soft_refused"), alloc);
         std::println!("calls_soft_refused: {types:?} {soft:?}");
@@ -2397,16 +4240,17 @@ fn main() {}
                 assert!(matches!(why, blaze_typeck::region_facts::UnreadWhy::Refused { .. }), "calls_soft_refused: why: {why:?}");
                 let named = item.and_then(|lib| names.item_text(lib)).and_then(|t| t.name);
                 assert_eq!(named, Some("m"), "calls_soft_refused names the callee");
-                // By its typed cause and part: `m`'s input 1 is `byte!()`, a type macro's
-                // expansion the region walk does not lay; the class is printed first and short
-                // (blaze-cli `first_refusal_class` keeps up to the first `] `).
+                // By its typed cause and part: `m`'s input 1 is `fn(&u8, &u8) -> &u8`, whose
+                // elided return lifetime has two input lifetimes (`FnPtrElision`); the class is
+                // printed first and short (blaze-cli `first_refusal_class` keeps up to the first
+                // `] `).
                 use crate::front2::head_record::Unlaid;
                 use crate::front2::types::{NotLaidWhy, SigPart};
-                assert_eq!(unlaid, Some(Unlaid::NotLaid { why: NotLaidWhy::TypeMacro, part: SigPart::Input(1) }), "calls_soft_refused: the typed kind");
+                assert_eq!(unlaid, Some(Unlaid::NotLaid { why: NotLaidWhy::FnPtrElision, part: SigPart::Input(1) }), "calls_soft_refused: the typed kind");
                 let mut said = super::Words::EMPTY;
                 core::fmt::Write::write_fmt(&mut said, format_args!("{refused}")).unwrap();
                 let said = said.as_str();
-                assert!(said.starts_with("[NotLaid/TypeMacro/Input] "), "calls_soft_refused: the class is not first: {said}");
+                assert!(said.starts_with("[NotLaid/FnPtrElision/Input] "), "calls_soft_refused: the class is not first: {said}");
                 assert!(said.contains("input 1"), "calls_soft_refused: the input is not named: {said}");
                 // CONTROL (rule 23): the same refusal with no typed kind prints the old class,
                 // so the bracket above is the kind's, not the text's.
@@ -2471,11 +4315,12 @@ fn main() {}
         let files = [("/f18/src/main.rs".to_string(), SOURCE.to_string())];
         let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
         let user = UserCrate { name: "f18", dir: "/f18/", root: "/f18/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
         let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
         let crates = inputs.crates();
-        let names = inputs.resolve(&crates, alloc).expect("fixture names");
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
         let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
-        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
         let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
         let bodies = world.bodies(alloc);
         let body = |name: &str| {
@@ -2514,5 +4359,1789 @@ fn main() {}
         assert!(!twin.is_clean() && twin.diagnostics.iter().any(|d| d.code == "E0277"), "local_send_rc: {twin:?}");
         assert!(!matches!(twin.typed, Some(Ok(_))), "local_send_rc keeps a record: {:?}", twin.typed);
         std::println!("F18: local_send keeps {} bytes; control: {control:?}; twin: {:?}", bytes.len(), twin.typed.as_ref().map(|t| t.as_ref().map(|b| b.len())));
+    }
+}
+
+/// `[External::Env -> External::SigOwner]`: a closure passed directly to an `FnOnce`-only callee
+/// (e.g. `Option::and_then(|p| self.ends.get_mut(p))`) consumes its `ByMutRef` capture once, so
+/// its `&mut` capture position becomes an owner-enforced `Need::Capture` -> `Need::Sig`
+/// requirement; `FnMut` closures and `ByValue` captures still reject escaping env references
+/// with `E0521`, and owner-side aliasing/dangling borrows are still caught.
+#[cfg(test)]
+mod closure_env_tests {
+    use super::{BorrowRefused, FactsPlant};
+    use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+
+    const SOURCE: &str = r#"
+struct Slab {
+    items: [u8; 4],
+}
+
+impl Slab {
+    fn get_mut(&mut self, i: usize) -> Option<&mut u8> {
+        self.items.get_mut(i)
+    }
+}
+
+struct Sim {
+    ends: Slab,
+}
+
+fn fnonce_and_then_mut_capture(slab: &mut Slab, peer: Option<usize>) {
+    if let Some(it) = peer.and_then(|p| slab.get_mut(p)) {
+        *it = 1;
+    }
+}
+
+fn fnonce_projected_field_mut_capture(sim: &mut Sim, peer: Option<usize>) {
+    if let Some(it) = peer.and_then(|p| sim.ends.get_mut(p)) {
+        *it = 2;
+    }
+}
+
+fn fnonce_aliasing_conflict_rejected(slab: &mut Slab, peer: Option<usize>) {
+    let it = peer.and_then(|p| slab.get_mut(p));
+    let other = slab.items[0];
+    if let Some(m) = it {
+        *m = other;
+    }
+}
+
+fn fnonce_dangling_return_rejected(peer: Option<usize>) -> Option<&'static mut u8> {
+    let mut slab = Slab { items: [0; 4] };
+    peer.and_then(|p| slab.get_mut(p))
+}
+
+fn call_mut_twice<'a, F: FnMut() -> &'a mut u8>(mut f: F) -> (&'a mut u8, &'a mut u8) {
+    let a = f();
+    let b = f();
+    (a, b)
+}
+
+fn fn_mut_escape_rejected() {
+    let mut x = 0u8;
+    let (_a, _b) = call_mut_twice(|| &mut x);
+}
+
+fn fnonce_by_value_escape_rejected() {
+    let x = 0u8;
+    let r = Some(()).map(move |()| &x);
+    if let Some(p) = r {
+        let _ = *p;
+    }
+}
+
+fn main() {}
+"#;
+
+    #[test]
+    fn closure_fnonce_env_and_soundness() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let files = [("/cenv/src/main.rs".to_string(), SOURCE.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate { name: "cenv", dir: "/cenv/", root: "/cenv/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let body = |name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture body {name}"))
+        };
+
+        for name in ["fnonce_and_then_mut_capture", "fnonce_projected_field_mut_capture"] {
+            let (types, borrows) = world.check_borrows(body(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+
+        // CONTROL (rule 23): without closure requirements, `fnonce_and_then_mut_capture` falls
+        // back to `NestedOutlives`.
+        let (_, planted) = world.check_borrows_planted(body("fnonce_and_then_mut_capture"), FactsPlant::NoClosureRequirements, alloc);
+        assert!(matches!(planted.refused, Some(BorrowRefused::NestedOutlives { .. })), "CONTROL: {planted:?}");
+
+        // NEGATIVE 1: owner still enforces mutable borrow lifetime of the captured place.
+        let (types, aliasing) = world.check_borrows(body("fnonce_aliasing_conflict_rejected"), alloc);
+        assert!(types.is_clean(), "aliasing types: {types:?}");
+        assert!(aliasing.refused.is_none(), "aliasing refused: {aliasing:?}");
+        assert!(
+            aliasing.findings.iter().any(|d| d.code == "E0503" || d.code == "E0502"),
+            "aliasing must be rejected as E0503/E0502: {aliasing:?}"
+        );
+
+        // NEGATIVE 2: owner rejects returning a borrow of a local slab through `Option::and_then`.
+        let (types, dangling) = world.check_borrows(body("fnonce_dangling_return_rejected"), alloc);
+        assert!(types.is_clean(), "dangling types: {types:?}");
+        assert!(dangling.refused.is_none(), "dangling refused: {dangling:?}");
+        assert!(
+            dangling.findings.iter().any(|d| d.code == "E0515" || d.code == "E0597"),
+            "dangling must be rejected as E0515/E0597: {dangling:?}"
+        );
+
+        // NEGATIVE 3: `FnMut` closure cannot return `&mut` reborrowed from `&mut self`.
+        let (types, fn_mut) = world.check_borrows(body("fn_mut_escape_rejected"), alloc);
+        assert!(types.is_clean(), "fn_mut types: {types:?}");
+        assert!(fn_mut.refused.is_none(), "fn_mut refused: {fn_mut:?}");
+        assert!(
+            fn_mut.findings.iter().any(|d| d.code == "E0521"),
+            "fn_mut escape must be rejected as E0521: {fn_mut:?}"
+        );
+
+        // NEGATIVE 4: `ByValue` capture in a `move` `FnOnce` closure cannot return a reference
+        // to the closure-owned variable (lowered as `FnOnce::call_once(self)`, so returning `&x`
+        // is rustc's exact E0515 dangling local reference error).
+        let (types, by_val) = world.check_borrows(body("fnonce_by_value_escape_rejected"), alloc);
+        assert!(types.is_clean(), "by_val types: {types:?}");
+        assert!(by_val.refused.is_none(), "by_val refused: {by_val:?}");
+        assert!(
+            by_val.findings.iter().any(|d| d.code == "E0515"),
+            "by_val escape must be rejected as E0515: {by_val:?}"
+        );
+    }
+}
+
+/// `[NotLaid/DynRegion/Input]` & `[NotLaid/DynRegion/Output]`: trait objects whose principal
+/// trait carries lifetime parameters (`&mut dyn Store<'_>`, `&dyn Store<'m>`,
+/// `Box<dyn Store<'m>>`, `&mut dyn StoreAssoc<'m, Out = &'a u8>`) lay both the object's
+/// default lifetime bound (RFC 599/1156) and the trait's own lifetime arguments soundly.
+#[cfg(test)]
+mod dyn_region_tests {
+    use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+
+    const SOURCE: &str = r#"
+trait Store<'m> {
+    fn get(&self) -> &'m u8;
+}
+
+struct MemStore<'m>(&'m u8);
+
+impl<'m> Store<'m> for MemStore<'m> {
+    fn get(&self) -> &'m u8 {
+        self.0
+    }
+}
+
+trait StoreAssoc<'m> {
+    type Out;
+    fn take(&mut self) -> Self::Out;
+}
+
+fn tell_public(store: &mut dyn Store<'_>) -> u8 {
+    *store.get()
+}
+
+fn run_snapshot(store: &dyn Store<'_>) -> u8 {
+    *store.get()
+}
+
+fn read_store<'m>(store: &dyn Store<'m>) -> &'m u8 {
+    store.get()
+}
+
+fn take_box<'m>(store: Box<dyn Store<'m>>) -> &'m u8 {
+    store.get()
+}
+
+fn keep_store<'a, 'm>(store: &'a dyn Store<'m>) -> &'a dyn Store<'m> {
+    store
+}
+
+fn use_assoc<'m, 'a>(store: &mut dyn StoreAssoc<'m, Out = &'a u8>) -> &'a u8 {
+    store.take()
+}
+
+fn dyn_store_named_lifetime_ok<'a, 'm>(store: &'a dyn Store<'m>) -> &'m u8 {
+    let r = read_store(store);
+    r
+}
+
+fn dyn_store_dangling_trait_lifetime_rejected<'a, 'm, 'b>(store: &'a dyn Store<'m>) -> &'b u8 {
+    read_store(store)
+}
+
+fn dyn_store_object_default_dangling_rejected<'a, 'm>(store: &'a dyn Store<'m>) -> &'m dyn Store<'m> {
+    keep_store(store)
+}
+
+fn main() {}
+"#;
+
+    #[test]
+    fn dyn_trait_lifetimes_and_defaults_soundness() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let files = [("/dynr/src/main.rs".to_string(), SOURCE.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate { name: "dynr", dir: "/dynr/", root: "/dynr/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let body = |name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture body {name}"))
+        };
+
+        for name in [
+            "tell_public",
+            "run_snapshot",
+            "read_store",
+            "take_box",
+            "keep_store",
+            "use_assoc",
+            "dyn_store_named_lifetime_ok",
+        ] {
+            let (types, borrows) = world.check_borrows(body(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+
+        // NEGATIVE 1: trait lifetime `'m` of `&'a dyn Store<'m>` cannot satisfy unrelated `'a`.
+        let (types, bad_trait_lt) = world.check_borrows(body("dyn_store_dangling_trait_lifetime_rejected"), alloc);
+        assert!(types.is_clean(), "bad_trait_lt types: {types:?}");
+        assert!(bad_trait_lt.refused.is_none(), "bad_trait_lt refused: {bad_trait_lt:?}");
+        assert!(
+            !bad_trait_lt.findings.is_empty(),
+            "unrelated trait lifetime `'m` -> `'a` must be rejected: {bad_trait_lt:?}"
+        );
+
+        // NEGATIVE 2: default object lifetime `'a` of `&'a dyn Store<'m>` cannot satisfy unrelated `'m`.
+        let (types, bad_obj_lt) = world.check_borrows(body("dyn_store_object_default_dangling_rejected"), alloc);
+        assert!(types.is_clean(), "bad_obj_lt types: {types:?}");
+        assert!(bad_obj_lt.refused.is_none(), "bad_obj_lt refused: {bad_obj_lt:?}");
+        assert!(
+            !bad_obj_lt.findings.is_empty(),
+            "unrelated object lifetime `'a` -> `'m` must be rejected: {bad_obj_lt:?}"
+        );
+    }
+}
+
+/// `[NotLaid/DefaultArg]`: omitted defaulted type arguments whose defaults mention lifetimes
+/// (`Records<'r, 'n, S = &'n Names<'n>>`, `Def<T = &'static u8>`, chained defaults, type aliases
+/// with lifetime defaults, fn-pointer defaults) lay their exact region slots in `PNode::Adt`
+/// order as `Slot::quiet` while preserving Rust soundness and elision rules.
+#[cfg(test)]
+mod default_arg_region_tests {
+    use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+
+    const SOURCE: &str = r#"
+struct Names<'n>(&'n u8);
+
+struct Records<'r, 'n, S = &'n Names<'n>> {
+    r: &'r u8,
+    s: S,
+}
+
+struct Def<T = &'static u8>(T);
+
+struct Chain<'a, A = &'a u8, B = (A, &'a u8)>(A, B);
+
+struct FnDef<F = for<'x> fn(&'x u8) -> &'x u8>(F);
+
+type AliasRec<'r, 'n, S = &'n Names<'n>> = Records<'r, 'n, S>;
+
+fn id<'x>(x: &'x u8) -> &'x u8 {
+    x
+}
+
+fn records_elided(r: &Records<'_, '_>) -> u8 {
+    *r.r + *r.s.0
+}
+
+fn records_named<'r, 'n>(r: &'r Records<'r, 'n>) -> &'n u8 {
+    r.s.0
+}
+
+fn def_static_quiet(x: &u8, _y: Def) -> &u8 {
+    x
+}
+
+fn def_in_option(x: &u8, _y: Option<Def>) -> &u8 {
+    x
+}
+
+fn chain_ok<'a>(c: Chain<'a>) -> &'a u8 {
+    c.1.1
+}
+
+fn alias_rec_ok<'r, 'n>(r: &'r AliasRec<'r, 'n>) -> &'n u8 {
+    r.s.0
+}
+
+fn fn_def_ok<'a>(f: FnDef, x: &'a u8) -> &'a u8 {
+    (f.0)(x)
+}
+
+fn calls_all_defaults() {
+    let a = 1u8;
+    let b = 2u8;
+    let names = Names(&b);
+    let rec = Records { r: &a, s: &names };
+    let _ = records_elided(&rec);
+    let n = records_named(&rec);
+    let _ = *n;
+    let d = def_static_quiet(&a, Def(&0));
+    let _ = *d;
+    let o = def_in_option(&a, Some(Def(&0)));
+    let _ = *o;
+    let c = chain_ok(Chain(&a, (&a, &a)));
+    let _ = *c;
+    let ar = alias_rec_ok(&rec);
+    let _ = *ar;
+    let fr = fn_def_ok(FnDef(id), &a);
+    let _ = *fr;
+}
+
+fn records_default_static_rejected<'r, 'n>(r: &'r Records<'r, 'n>) -> &'static u8 {
+    r.s.0
+}
+
+fn records_default_wrong_lt_rejected<'r, 'n>(r: Records<'r, 'n>) -> &'r u8 {
+    r.s.0
+}
+
+fn records_local_dangling_rejected<'a>() -> &'a u8 {
+    let a = 1u8;
+    let b = 2u8;
+    let names = Names(&b);
+    let rec = Records { r: &a, s: &names };
+    records_named(&rec)
+}
+
+fn chain_wrong_lt_rejected<'a, 'b>(c: Chain<'a>) -> &'b u8 {
+    c.1.1
+}
+
+fn def_elision_rejected(d: Def) -> &u8 {
+    d.0
+}
+
+fn main() {}
+"#;
+
+    #[test]
+    fn defaulted_type_arg_lifetimes_soundness() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let files = [("/defarg/src/main.rs".to_string(), SOURCE.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate { name: "defarg", dir: "/defarg/", root: "/defarg/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let body = |name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture body {name}"))
+        };
+
+        for name in [
+            "records_elided",
+            "records_named",
+            "def_static_quiet",
+            "def_in_option",
+            "chain_ok",
+            "alias_rec_ok",
+            "fn_def_ok",
+            "calls_all_defaults",
+        ] {
+            let (types, borrows) = world.check_borrows(body(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+
+        // NEGATIVE 1-4: defaulted lifetime arguments enforce exact outlives and dangling checks.
+        for name in [
+            "records_default_static_rejected",
+            "records_default_wrong_lt_rejected",
+            "records_local_dangling_rejected",
+            "chain_wrong_lt_rejected",
+        ] {
+            let (types, bad) = world.check_borrows(body(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(bad.refused.is_none(), "{name} must not refuse: {bad:?}");
+            assert!(!bad.findings.is_empty(), "{name} must be rejected: {bad:?}");
+        }
+
+        // NEGATIVE 5: defaulted `'static` in `Def` is `quiet` and does NOT satisfy output elision (E0106).
+        let (elision_types, _) = world.check_borrows(body("def_elision_rejected"), alloc);
+        let elision_text = std::format!("{elision_types:?}");
+        assert!(!elision_types.is_clean(), "def_elision_rejected must fail E0106: {elision_text}");
+        assert!(elision_text.contains("E0106"), "def_elision_rejected must report E0106: {elision_text}");
+    }
+
+    #[test]
+    fn closure_default_arg_regions_soundness() {
+        const SRC: &str = r#"
+struct Names<'n>(&'n u8);
+trait NamesSource<'n> {}
+impl<'n> NamesSource<'n> for &'n Names<'n> {}
+
+struct Records<'r, 'n, S = &'n Names<'n>> {
+    r: &'r u8,
+    idx: &'r mut Names<'n>,
+    s: S,
+}
+
+fn refused<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>) -> u8 {
+    *r.r
+}
+
+fn equate_inv<'a>(_a: &mut &'a u8, _b: &mut &'a u8) {}
+fn require_static(_x: &'static u8) {}
+
+// POSITIVE: `|r: &Records<'_, '_>|` ties `'n` and defaulted `S = &'n Names<'n>` via shared
+// `WrittenRegion::Elided`, so calling `refused<'n, S: NamesSource<'n>>(r)` checks cleanly.
+fn closure_records_refused_ok() {
+    let refuse = |r: &Records<'_, '_>| refused(r);
+    let a = 1u8;
+    let b = 2u8;
+    let n = Names(&b);
+    let mut n2 = Names(&b);
+    let rec = Records { r: &a, idx: &mut n2, s: &n };
+    let _ = refuse(&rec);
+}
+
+// POSITIVE: body never names `Names` directly — only via `Records`'s defaulted `S`.
+fn closure_records_no_names_mentioned_ok(r: &Records<'_, '_>) -> u8 {
+    let refuse = |x: &Records<'_, '_>| refused(x);
+    refuse(r)
+}
+
+// NEGATIVE 1: explicitly writing distinct `'_` lifetimes for `'n` and `S = &'_ Names<'_>`
+// leaves them independent late regions, so calling `refused` must still be refused `NestedOutlives`.
+fn closure_records_distinct_elided_rejected() {
+    let refuse = |r: &Records<'_, '_, &'_ Names<'_>>| refused(r);
+    let a = 1u8;
+    let b = 2u8;
+    let n = Names(&b);
+    let mut n2 = Names(&b);
+    let rec = Records { r: &a, idx: &mut n2, s: &n };
+    let _ = refuse(&rec);
+}
+
+// NEGATIVE 2: equating two genuinely independent late-bound closure parameters must not pass.
+fn closure_independent_late_equated_rejected() {
+    let f = |a: &mut &u8, b: &mut &u8| equate_inv(a, b);
+    let x = 1u8;
+    let y = 2u8;
+    let mut rx = &x;
+    let mut ry = &y;
+    f(&mut rx, &mut ry);
+}
+
+// NEGATIVE 3: requiring a closure's defaulted `'n` reference to outlive `'static` must be rejected.
+fn closure_records_return_static_rejected() {
+    let _f = |r: &Records<'_, '_>| require_static(r.s.0);
+}
+
+fn main() {}
+"#;
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let files = [("/clrec/src/main.rs".to_string(), SRC.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate { name: "clrec", dir: "/clrec/", root: "/clrec/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SRC }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let body = |name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture body {name}"))
+        };
+
+        // POSITIVE tests must type-check and borrow-check cleanly.
+        for name in ["closure_records_refused_ok", "closure_records_no_names_mentioned_ok"] {
+            let (types, borrows) = world.check_borrows(body(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+
+        // NEGATIVE 1-2: genuinely independent late lifetimes must still fail `NestedOutlives(Late -> Late)`.
+        for name in ["closure_records_distinct_elided_rejected", "closure_independent_late_equated_rejected"] {
+            let (types, bad) = world.check_borrows(body(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(
+                matches!(
+                    bad.refused,
+                    Some(super::BorrowRefused::NestedOutlives {
+                        from: Some(blaze_flow_lower::External::Late),
+                        into: Some(blaze_flow_lower::External::Late),
+                        ..
+                    })
+                ),
+                "{name} must refuse Late -> Late: {bad:?}"
+            );
+        }
+
+        // NEGATIVE 3: returning a late-bound defaulted lifetime as `'static` must produce a borrow finding.
+        let (types, bad_ret) = world.check_borrows(body("closure_records_return_static_rejected"), alloc);
+        assert!(types.is_clean(), "closure_records_return_static_rejected types: {types:?}");
+        assert!(bad_ret.refused.is_none(), "closure_records_return_static_rejected must not refuse: {bad_ret:?}");
+        assert!(
+            !bad_ret.findings.is_empty(),
+            "closure_records_return_static_rejected must reject returning `'n` as `'static`: {bad_ret:?}"
+        );
+    }
+}
+
+/// `NestedOutlives { from: Capture | Param, into: Late }`: NLL closure region propagation through
+/// late-bound regions (`std::thread::scope`'s `'env: 'scope`, and unbounded `for<'a>` propagating
+/// to `'static`), preserving Rust soundness against local-borrow escapes, unbounded type params,
+/// and unprovable `Late -> Late` constraints.
+#[cfg(test)]
+mod nested_late_outlives_tests {
+    use super::{BorrowRefused, FactsPlant};
+    use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+
+    const SOURCE: &str = r#"
+fn scope_mut_capture_ok(xs: &mut [u8], tag: &u8) {
+    std::thread::scope(|scope| {
+        for chunk in xs.chunks_mut(2) {
+            scope.spawn(move || {
+                for slot in chunk.iter_mut() {
+                    *slot = *tag;
+                }
+            });
+        }
+    });
+}
+
+fn scope_generic_param_ok<A: Send>(first: impl FnOnce() -> A + Send) -> A {
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(first);
+        handle.join().unwrap()
+    })
+}
+
+fn call_with_any<F>(f: F) -> u8
+where
+    F: for<'a> FnOnce(&'a u8) -> &'a u8,
+{
+    static X: u8 = 42;
+    *f(&X)
+}
+
+static GLOBAL_BYTE: u8 = 7;
+
+fn unbounded_late_static_capture_ok() -> u8 {
+    let r: &'static u8 = &GLOBAL_BYTE;
+    call_with_any(|_x| r)
+}
+
+fn unbounded_late_local_capture_rejected() -> u8 {
+    let local = 1u8;
+    let r = &local;
+    call_with_any(|_x| r)
+}
+
+fn require_for_all<F>(f: F)
+where
+    F: for<'a> FnOnce(&mut &'a u8),
+{
+    static X: u8 = 0;
+    let mut r: &u8 = &X;
+    f(&mut r);
+}
+
+fn need_outlives<'a, T: 'a>(_: &mut &'a u8, _: T) {}
+
+fn unbounded_late_param_rejected<T>(x: T) {
+    require_for_all(move |a| {
+        need_outlives(a, x);
+    });
+}
+
+fn call_two_lates<F>(f: F) -> u8
+where
+    F: for<'a, 'b> FnOnce(&'a u8, &'b u8) -> &'a u8,
+{
+    static X: u8 = 1;
+    let y = 2u8;
+    *f(&X, &y)
+}
+
+fn late_to_late_rejected() -> u8 {
+    call_two_lates(|_x, y| y)
+}
+
+struct FakeScope<'scope, 'env: 'scope> {
+    _marker: core::marker::PhantomData<(&'scope mut &'scope (), &'env mut &'env ())>,
+}
+
+impl<'scope, 'env> FakeScope<'scope, 'env> {
+    fn spawn<F: FnOnce() + 'scope>(&'scope self, _f: F) {}
+}
+
+fn with_fake_scope<'env, F>(_anchor: &mut &'env u8, f: F)
+where
+    F: for<'scope> FnOnce(&'scope FakeScope<'scope, 'env>),
+{
+    let s = FakeScope { _marker: core::marker::PhantomData };
+    f(&s);
+}
+
+fn fake_scope_short_capture_rejected<'env>(anchor: &mut &'env u8) {
+    let local = 1u8;
+    let r = &local;
+    with_fake_scope(anchor, |scope| {
+        scope.spawn(move || {
+            let _ = *r;
+        });
+    });
+}
+
+fn main() {}
+"#;
+
+    #[test]
+    fn nested_outlives_into_late_propagation_soundness() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let files = [("/nlate/src/main.rs".to_string(), SOURCE.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate { name: "nlate", dir: "/nlate/", root: "/nlate/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let body = |name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture body {name}"))
+        };
+
+        for name in ["scope_mut_capture_ok", "scope_generic_param_ok", "unbounded_late_static_capture_ok"] {
+            let (types, borrows) = world.check_borrows(body(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+
+        // CONTROL (rule 23): without closure requirements, `scope_mut_capture_ok` falls back to `NestedOutlives`.
+        let (_, planted) = world.check_borrows_planted(body("scope_mut_capture_ok"), FactsPlant::NoClosureRequirements, alloc);
+        assert!(matches!(planted.refused, Some(BorrowRefused::NestedOutlives { .. })), "CONTROL: {planted:?}");
+
+        // NEGATIVE 1: unbounded `for<'a>` with local borrow capture propagates to `'static` and rejects (E0597).
+        let (types, bad_local) = world.check_borrows(body("unbounded_late_local_capture_rejected"), alloc);
+        assert!(types.is_clean(), "bad_local types: {types:?}");
+        assert!(bad_local.refused.is_none(), "bad_local refused: {bad_local:?}");
+        assert!(bad_local.findings.iter().any(|d| d.code == "E0597"), "bad_local must be E0597: {bad_local:?}");
+
+        // NEGATIVE 2: unbounded `for<'a>` with generic param `T` propagates to `T: 'static` and rejects (E0310).
+        let (types, bad_param) = world.check_borrows(body("unbounded_late_param_rejected"), alloc);
+        assert!(types.is_clean(), "bad_param types: {types:?}");
+        assert!(bad_param.refused.is_none(), "bad_param refused: {bad_param:?}");
+        assert!(bad_param.findings.iter().any(|d| d.code == "E0310"), "bad_param must be E0310: {bad_param:?}");
+
+        // NEGATIVE 3: `Late -> Late` (`'b: 'a`) with no lower bound must never be accepted.
+        let (types, bad_late) = world.check_borrows(body("late_to_late_rejected"), alloc);
+        assert!(types.is_clean(), "bad_late types: {types:?}");
+        assert!(!bad_late.is_clean(), "late_to_late must never be accepted: {bad_late:?}");
+
+        // NEGATIVE 4: explicit outer `'env` longer than local borrow rejects (E0597) after propagation.
+        let (types, bad_scope) = world.check_borrows(body("fake_scope_short_capture_rejected"), alloc);
+        assert!(types.is_clean(), "bad_scope types: {types:?}");
+        assert!(bad_scope.refused.is_none(), "bad_scope refused: {bad_scope:?}");
+        assert!(bad_scope.findings.iter().any(|d| d.code == "E0597"), "bad_scope must be E0597: {bad_scope:?}");
+    }
+}
+
+/// Regression and soundness tests for closures taking `me: &Self` inside `impl<'a> T<'a>` and
+/// `impl T<'_>` (`blaze-consteval/src/machine.rs:1996` and `blaze-native/src/layout.rs:1204`
+/// shapes): `Self`'s container lifetimes are owner regions (`WrittenRegion::Named`), while the
+/// outer `&` on `&Self` remains a per-call late region so returning `&me.tag` is still rejected
+/// with E0521 and returning `'a` as `'static` is still rejected.
+#[cfg(test)]
+mod closure_self_param_region_tests {
+    use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+
+    const SOURCE: &str = r#"
+struct Writer<'a> {
+    bytes: &'a [u8],
+    tag: u8,
+}
+
+impl<'a> Writer<'a> {
+    fn slice(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    fn far_ok(&mut self, opt: Option<&'a [u8]>) -> Result<&'a [u8], &'a [u8]> {
+        let far = |me: &Self| -> &'a [u8] { me.slice() };
+        opt.ok_or_else(|| far(self))
+    }
+
+    fn info_ok(&mut self) -> Result<u8, &'a [u8]> {
+        let info = |m: &Self| -> Result<u8, &'a [u8]> {
+            if m.tag == 0 { Err(m.slice()) } else { Ok(m.tag) }
+        };
+        info(self)
+    }
+
+    fn bad_escape_self_ref(&mut self) -> &'a u8 {
+        let bad = |me: &Self| -> &'a u8 { &me.tag };
+        bad(self)
+    }
+
+    fn bad_static_self(&mut self) -> &'static [u8] {
+        let bad = |me: &Self| -> &'static [u8] { me.slice() };
+        bad(self)
+    }
+}
+
+impl Writer<'_> {
+    fn elided_impl_ok(&mut self) -> u8 {
+        let far = |me: &Self| me.slice();
+        far(self).len() as u8
+    }
+}
+
+fn main() {}
+"#;
+
+    #[test]
+    fn closure_self_param_regions_and_soundness() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let files = [("/cself/src/main.rs".to_string(), SOURCE.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate { name: "cself", dir: "/cself/", root: "/cself/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let member = |method: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Member { name, .. } = body else { return None };
+                    (name == method).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture method {method}"))
+        };
+
+        for name in ["far_ok", "info_ok", "elided_impl_ok"] {
+            let (types, borrows) = world.check_borrows(member(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+
+        // NEGATIVE 1: outer `&` on `me: &Self` is still a per-call late region (E0521).
+        let (types, bad_ref) = world.check_borrows(member("bad_escape_self_ref"), alloc);
+        assert!(types.is_clean(), "bad_escape_self_ref types: {types:?}");
+        assert!(bad_ref.refused.is_none(), "bad_escape_self_ref refused: {bad_ref:?}");
+        assert!(
+            bad_ref.findings.iter().any(|d| d.code == "E0521"),
+            "bad_escape_self_ref must be E0521: {bad_ref:?}",
+        );
+
+        // NEGATIVE 2: `'a` inside `Self` must remain an owner lifetime, never `'static`.
+        let (types, bad_static) = world.check_borrows(member("bad_static_self"), alloc);
+        assert!(types.is_clean(), "bad_static_self types: {types:?}");
+        assert!(!bad_static.is_clean(), "bad_static_self must be rejected: {bad_static:?}");
+    }
+}
+
+/// Regression and soundness tests for:
+/// 1. Blanket impls whose associated type projects through an impl parameter's lifetime-carrying
+///    bound (`impl<'de, A: ?Sized + SeqAccess<'de>> SeqAccess<'de> for &mut A { type Error =
+///    A::Error; }`, `crates/blaze-protocol/src/cbor/de.rs::deserialize_any` shape): `heads.rs`
+///    lays `impl_assoc` with `impl_given` (`param_bounds`) so the impl's `HeadRegions` are filed
+///    instead of refusing with `HeadUnread`.
+/// 2. `FnOnce`-only consumers of `move` closures with `ByValue` `&mut` captures
+///    (`crates/blaze-cli/src/store/take.rs:826` `scope.may_overlap` shape): `borrows.rs` classifies
+///    closure env usage BEFORE lowering and lowers `FnOnceOnly` closures via
+///    `lower_closure_as_fn_once`, while rejecting returning a reference to the owned capture local
+///    and rejecting `FnMut` escapes (E0521).
+#[cfg(test)]
+mod wave4_front2_soundness_tests {
+    use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+
+    const SOURCE: &str = r#"
+// --- 1. Blanket impl assoc type projecting through lifetime-carrying param bound (cbor/de.rs) ---
+pub trait SeqAccess<'de> {
+    type Error;
+    fn next_element(&mut self) -> Result<Option<&'de [u8]>, Self::Error>;
+}
+
+impl<'de, A> SeqAccess<'de> for &mut A
+where
+    A: ?Sized + SeqAccess<'de>,
+{
+    type Error = A::Error;
+    fn next_element(&mut self) -> Result<Option<&'de [u8]>, Self::Error> {
+        (**self).next_element()
+    }
+}
+
+pub struct Items<'a, 'de> {
+    pub bytes: &'a &'de [u8],
+}
+
+impl<'de> SeqAccess<'de> for Items<'_, 'de> {
+    type Error = u32;
+    fn next_element(&mut self) -> Result<Option<&'de [u8]>, u32> {
+        Ok(Some(*self.bytes))
+    }
+}
+
+pub trait Visitor<'de> {
+    type Value;
+    fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error>;
+}
+
+pub fn cbor_visit_seq_ok<'de, V: Visitor<'de>>(bytes: &'de [u8], visitor: V) -> Result<V::Value, u32> {
+    let mut items = Items { bytes: &bytes };
+    visitor.visit_seq(&mut items)
+}
+
+pub struct BorrowVisitor;
+impl<'de> Visitor<'de> for BorrowVisitor {
+    type Value = Option<&'de [u8]>;
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        seq.next_element()
+    }
+}
+
+// NEGATIVE: `'de` flows through `&mut Items<'_, 'de>`'s `SeqAccess<'de>` impl and must NOT unify with `'static`.
+pub fn cbor_visit_seq_bad_static<'de>(bytes: &'de [u8]) -> Result<Option<&'static [u8]>, u32> {
+    let mut items = Items { bytes: &bytes };
+    BorrowVisitor.visit_seq(&mut items)
+}
+
+// --- 2. FnOnceOnly + ByValue `&mut` capture (`store/take.rs:826` `may_overlap` shape) ---
+pub struct Cx;
+pub struct Scope<'a>(core::marker::PhantomData<&'a ()>);
+impl<'a> Scope<'a> {
+    pub fn may_overlap<T: Send, E>(
+        &self,
+        _name: &'static str,
+        task: impl FnOnce(&Cx) -> Result<T, E> + Send,
+    ) -> Result<T, E> {
+        let cx = Cx;
+        task(&cx)
+    }
+
+    pub fn repeat_mut<T, E>(
+        &self,
+        mut task: impl FnMut(&Cx) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let cx = Cx;
+        task(&cx)
+    }
+}
+
+fn fetch_chunk<'b>(_cx: &Cx, bufs_chunk: &'b mut [u8]) -> &'b mut [u8] {
+    bufs_chunk
+}
+
+pub fn may_overlap_by_value_mut_ok<'b>(scope: &Scope<'_>, bufs_chunk: &'b mut [u8]) -> &'b mut [u8] {
+    let res = scope.may_overlap("take-lan-segz", move |worker_cx| -> Result<_, core::convert::Infallible> {
+        Ok(fetch_chunk(worker_cx, bufs_chunk))
+    });
+    match res {
+        Ok(s) => s,
+        Err(e) => match e {},
+    }
+}
+
+// NEGATIVE 1: returning a reference to the owned `bufs_chunk` capture local itself (not reborrowing
+// through `&'b mut [u8]`) MUST still be rejected under `lower_closure_as_fn_once`.
+pub fn may_overlap_by_value_local_ref_bad<'b>(scope: &Scope<'_>, bufs_chunk: &'b mut [u8]) -> &'b [u8] {
+    let mut owned = [1u8; 4];
+    let _ = bufs_chunk;
+    let res = scope.may_overlap("bad-local", move |_worker_cx| -> Result<&'b [u8], core::convert::Infallible> {
+        owned[0] = 2;
+        Ok(&owned[..])
+    });
+    match res {
+        Ok(s) => s,
+        Err(e) => match e {},
+    }
+}
+
+// NEGATIVE 2: under an `FnMut` consumer, escaping a reborrow of a `ByValue` `&mut` capture MUST
+// still be rejected with E0521 (cannot reborrow `bufs_chunk` across multiple `FnMut` calls).
+pub fn fn_mut_by_value_escape_bad<'b>(scope: &Scope<'_>, bufs_chunk: &'b mut [u8]) -> &'b mut [u8] {
+    let res = scope.repeat_mut(move |worker_cx| -> Result<_, core::convert::Infallible> {
+        Ok(fetch_chunk(worker_cx, bufs_chunk))
+    });
+    match res {
+        Ok(s) => s,
+        Err(e) => match e {},
+    }
+}
+
+fn main() {}
+"#;
+
+    #[test]
+    fn impl_assoc_param_bounds_and_fn_once_by_value_soundness() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let files = [("/w4sound/src/main.rs".to_string(), SOURCE.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate { name: "w4sound", dir: "/w4sound/", root: "/w4sound/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let body = |name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture body {name}"))
+        };
+
+        // POSITIVE 1: `visitor.visit_seq(&mut items)` selects blanket `&mut A: SeqAccess<'de>` cleanly.
+        let (types, borrows) = world.check_borrows(body("cbor_visit_seq_ok"), alloc);
+        assert!(types.is_clean(), "cbor_visit_seq_ok types: {types:?}");
+        assert!(borrows.is_clean(), "cbor_visit_seq_ok borrows: {borrows:?}");
+
+        // NEGATIVE 1: `'de` through `&mut A: SeqAccess<'de>` must not outlive `'static`.
+        let (types, bad_static) = world.check_borrows(body("cbor_visit_seq_bad_static"), alloc);
+        assert!(types.is_clean(), "cbor_visit_seq_bad_static types: {types:?}");
+        assert!(bad_static.refused.is_none(), "cbor_visit_seq_bad_static refused: {bad_static:?}");
+        assert!(!bad_static.findings.is_empty(), "cbor_visit_seq_bad_static must be rejected: {bad_static:?}");
+
+        // POSITIVE 2: `scope.may_overlap(..., move |cx| Ok(fetch_chunk(cx, bufs_chunk)))` passes clean.
+        let (types, borrows) = world.check_borrows(body("may_overlap_by_value_mut_ok"), alloc);
+        assert!(types.is_clean(), "may_overlap_by_value_mut_ok types: {types:?}");
+        assert!(borrows.is_clean(), "may_overlap_by_value_mut_ok borrows: {borrows:?}");
+
+        // NEGATIVE 2: returning a borrow of an owned `move`-captured local MUST still be rejected.
+        let (types, bad_local) = world.check_borrows(body("may_overlap_by_value_local_ref_bad"), alloc);
+        assert!(types.is_clean(), "may_overlap_by_value_local_ref_bad types: {types:?}");
+        assert!(bad_local.refused.is_none(), "may_overlap_by_value_local_ref_bad refused: {bad_local:?}");
+        assert!(!bad_local.findings.is_empty(), "may_overlap_by_value_local_ref_bad must be rejected: {bad_local:?}");
+
+        // NEGATIVE 3: under `FnMut`, escaping a reborrow of a `ByValue` `&mut` capture stays E0521.
+        let (types, bad_fn_mut) = world.check_borrows(body("fn_mut_by_value_escape_bad"), alloc);
+        assert!(types.is_clean(), "fn_mut_by_value_escape_bad types: {types:?}");
+        assert!(bad_fn_mut.refused.is_none(), "fn_mut_by_value_escape_bad refused: {bad_fn_mut:?}");
+        assert!(
+            bad_fn_mut.findings.iter().any(|d| d.code == "E0521"),
+            "fn_mut_by_value_escape_bad must be E0521: {bad_fn_mut:?}",
+        );
+    }
+}
+
+/// Regression and soundness tests for Wave 5 `front2` fixes:
+/// 1. Instantiated `PNode::Alias` structural drop-glue evaluator (`inst_needs_drop`):
+///    - `Split<'_, &str>`, `SplitWhitespace<'_>`, and `Flatten<Take<slice::Iter<'_, Option<&T>>>>`
+///      prove `needs_drop == false`.
+///    - Negative soundness controls: `Flatten<vec::IntoIter<Vec<DropGuard>>>`, `Flatten<option::IntoIter<DropGuard<'_>>>`,
+///      custom `Drop` searcher, and generic `P` MUST still require drop and reject conflicting mutations.
+/// 2. `FieldRegionsUnaligned` on ADT fields holding `PNode::Alias` (`run_parent.rs::lowering_counts` shape).
+/// 3. Parameterized supertrait outlives propagation (`L: LoadItems<'a>` where `trait LoadItems<'a>: 'a`,
+///    `items_record.rs::{read, record}` shape), plus negative controls without `: 'a` or requiring `'static`.
+/// 4. Default trait object lifetimes in zero-lifetime type aliases (`type ArcAlias<T> = Arc<T>;
+///    ArcAlias<dyn Store>`, `h3/config.rs::client` shape), plus negative controls proving `'static`
+///    and refusing lifetime-parameterized aliases.
+#[cfg(test)]
+mod wave5_front2_soundness_tests {
+    use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+
+    const SOURCE: &str = r#"
+#![feature(try_as_dyn, type_info)]
+extern crate alloc;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::any::TypeId;
+use core::marker::PhantomData;
+
+// --- 1. Instantiated PNode::Alias structural drop-glue (`inst_needs_drop`) ---
+
+pub fn split_str_no_drop_ok(inbox: &mut Vec<u8>) -> usize {
+    let head = core::str::from_utf8(&inbox[..]).unwrap_or("");
+    let mut lines = head.split("\r\n");
+    let first_len = lines.next().unwrap_or("").len();
+    // `lines` is still in scope until end of function; mutating `inbox` is valid ONLY because
+    // `Split<'_, &str>` has no drop glue (`<&str as Pattern>::Searcher<'_> = StrSearcher`).
+    inbox.push(0);
+    first_len
+}
+
+pub fn split_whitespace_no_drop_ok(inbox: &mut Vec<u8>) -> usize {
+    let head = core::str::from_utf8(&inbox[..]).unwrap_or("");
+    let mut parts = head.split_whitespace();
+    let first_len = parts.next().unwrap_or("").len();
+    // `parts` (`SplitWhitespace<'_>`) has no drop glue.
+    inbox.push(0);
+    first_len
+}
+
+pub fn flatten_take_option_ref_no_drop_ok(items: &mut [Option<&u32>; 4], count: usize) {
+    let target = 7u32;
+    if !items.iter().take(count).flatten().any(|&&x| x == target) {
+        if let Some(slot) = items.get_mut(count) {
+            *slot = None;
+        }
+    }
+}
+
+pub struct DropGuard<'a> {
+    slot: &'a mut u32,
+}
+
+impl Drop for DropGuard<'_> {
+    fn drop(&mut self) {
+        *self.slot += 1;
+    }
+}
+
+// NEGATIVE 1: `Flatten<option::IntoIter<DropGuard<'_>>>` drops `DropGuard<'_>` at scope exit,
+// so mutating `*x` while `flat` is still in scope MUST be rejected.
+pub fn flatten_dropping_inner_bad(x: &mut u32) {
+    let flat = Some(Some(DropGuard { slot: x })).into_iter().flatten();
+    *x = 99;
+    let _ = &flat;
+}
+
+// NEGATIVE 2: `Flatten<vec::IntoIter<Vec<DropGuard<'_>>>>` drops `Vec` and `DropGuard<'_>` at
+// scope exit, so mutating `*x` before `flat` drops MUST be rejected.
+pub fn flatten_vec_drop_bad(x: &mut u32) {
+    let mut inner = Vec::new();
+    inner.push(DropGuard { slot: x });
+    let mut outer = Vec::new();
+    outer.push(inner);
+    let _flat = outer.into_iter().flatten();
+    *x = 42;
+}
+
+pub trait MyPat<'a> {
+    type Searcher;
+    fn make(self, x: &'a mut u32) -> Self::Searcher;
+}
+
+pub struct MySplit<'a, P: MyPat<'a>> {
+    searcher: P::Searcher,
+}
+
+fn make_my_split<'a, P: MyPat<'a>>(searcher: P::Searcher) -> MySplit<'a, P> {
+    MySplit { searcher }
+}
+
+pub struct NoDropPat;
+impl<'a> MyPat<'a> for NoDropPat {
+    type Searcher = &'a u32;
+    fn make(self, x: &'a mut u32) -> &'a u32 {
+        &*x
+    }
+}
+
+pub struct DropPat;
+impl<'a> MyPat<'a> for DropPat {
+    type Searcher = DropGuard<'a>;
+    fn make(self, x: &'a mut u32) -> DropGuard<'a> {
+        DropGuard { slot: x }
+    }
+}
+
+pub fn custom_pat_no_drop_ok(x: &mut u32) {
+    let _s = make_my_split::<'_, NoDropPat>(&*x);
+    *x = 1;
+}
+
+// NEGATIVE 3: `MySplit<DropPat>` normalizes `Searcher` to `DropGuard<'a>` which implements `Drop`,
+// so mutating `*x` while `_s` is in scope MUST be rejected.
+pub fn custom_pat_drop_bad(x: &mut u32) {
+    let _s = make_my_split::<'_, DropPat>(DropGuard { slot: x });
+    *x = 1;
+}
+
+// NEGATIVE 4: generic `P: MyPat<'a>` cannot prove `needs_drop == false`, so borrowing `x` into
+// `MySplit<P>` and mutating `*x` before `_s` drops MUST be rejected.
+pub fn custom_pat_generic_bad<P: for<'a> MyPat<'a>>(x: &mut u32, p: P) {
+    let _s = make_my_split::<'_, P>(p.make(x));
+    *x = 1;
+}
+
+// --- 2. FieldRegionsUnaligned for PNode::Alias fields (`run_parent.rs::lowering_counts`) ---
+
+pub trait Front {
+    type Maker;
+}
+
+pub struct RunMaker<'h> {
+    pub data: &'h u8,
+}
+
+impl<'h> RunMaker<'h> {
+    pub fn count(&self) -> u8 {
+        *self.data
+    }
+}
+
+pub struct Heavy<M> {
+    pub maker: M,
+}
+
+pub struct Started<'a, M> {
+    pub heavy: Option<Heavy<M>>,
+    pub _marker: PhantomData<&'a ()>,
+}
+
+pub struct Lazy<'a, F: Front> {
+    pub started: Option<Started<'a, F::Maker>>,
+}
+
+impl<'a, F: Front> Lazy<'a, F> {
+    pub fn lowering_counts_ok<'h>(&self) -> u8
+    where
+        F: Front<Maker = RunMaker<'h>>,
+    {
+        self.started
+            .as_ref()
+            .and_then(|s| s.heavy.as_ref())
+            .map_or(0, |heavy| heavy.maker.count())
+    }
+
+    // NEGATIVE: returning `'h` as `'static` through `heavy.maker.data` MUST be rejected.
+    pub fn lowering_counts_bad_static<'h>(&self) -> Option<&'static u8>
+    where
+        F: Front<Maker = RunMaker<'h>>,
+    {
+        self.started
+            .as_ref()
+            .and_then(|s| s.heavy.as_ref())
+            .map(|heavy| heavy.maker.data)
+    }
+}
+
+// --- 3. Parameterized supertrait outlives (`items_record.rs::{read, record}`) ---
+
+pub trait LoadItems<'a>: 'a {
+    fn file(&self) -> Option<&'a str>;
+}
+
+pub trait SubLoadItems<'a>: LoadItems<'a> {}
+
+pub trait UnboundedLoad<'a> {
+    fn file(&self) -> Option<&'a str>;
+}
+
+fn take_a<'a, F: Fn() -> Option<&'a str> + 'a>(f: F) -> Option<&'a str> {
+    f()
+}
+
+fn take_static<F: Fn() -> usize + 'static>(f: F) -> usize {
+    f()
+}
+
+pub struct RecordItems<'a, L> {
+    load: Arc<L>,
+    _marker: PhantomData<&'a ()>,
+}
+
+impl<'a, L: LoadItems<'a>> RecordItems<'a, L> {
+    pub fn record_ok(&self) -> Option<&'a str> {
+        let load = Arc::clone(&self.load);
+        take_a(move || load.file())
+    }
+
+    // NEGATIVE: `L: LoadItems<'a>` implies `L: 'a`, NOT `L: 'static`.
+    pub fn record_bad_static(&self) -> usize {
+        let load = Arc::clone(&self.load);
+        take_static(move || load.file().map_or(0, |s| s.len()))
+    }
+}
+
+impl<'a, L: SubLoadItems<'a>> RecordItems<'a, L> {
+    pub fn record_transitive_ok(&self) -> Option<&'a str> {
+        let load = Arc::clone(&self.load);
+        take_a(move || load.file())
+    }
+}
+
+impl<'a, L: UnboundedLoad<'a>> RecordItems<'a, L> {
+    // NEGATIVE: `UnboundedLoad<'a>` has NO `: 'a` supertrait, so `L: 'a` MUST NOT be accepted.
+    pub fn record_unbounded_bad(&self) -> Option<&'a str> {
+        let load = Arc::clone(&self.load);
+        take_a(move || load.file())
+    }
+}
+
+// --- 4. Default trait object lifetimes in zero-lifetime type aliases (`h3/config.rs::client`) ---
+
+pub trait SessionStore: Send + Sync {}
+pub struct OwnedStore;
+impl SessionStore for OwnedStore {}
+pub struct BorrowedStore<'a>(pub &'a u8);
+impl SessionStore for BorrowedStore<'_> {}
+
+pub type ArcAlias<T> = Arc<T>;
+pub type RefAlias<'a, T> = &'a T;
+
+pub fn store_via_alias(_store: ArcAlias<dyn SessionStore>) {}
+
+pub fn alias_object_default_ok() {
+    let s: Arc<OwnedStore> = Arc::new(OwnedStore);
+    store_via_alias(s as Arc<dyn SessionStore>);
+}
+
+// NEGATIVE 1: `ArcAlias<dyn SessionStore>` defaults to `dyn SessionStore + 'static`, so passing
+// a short-lived `Arc<dyn SessionStore + 'a>` into it MUST be rejected with an outlives error.
+pub fn alias_object_default_short_bad<'a>(s: Arc<dyn SessionStore + 'a>) {
+    store_via_alias(s);
+}
+
+// NEGATIVE 2: a type alias declaring a lifetime parameter (`RefAlias<'a, T>`) does NOT blindly
+// default `dyn SessionStore` to `'static`.
+pub fn alias_with_lifetime_refused<'a>(_r: RefAlias<'a, dyn SessionStore>) {}
+
+// --- 5. `dyn T: TryAsDynCompatible<'a>` (`blaze-text/src/debug.rs::{form, reflect_of}`) ---
+
+pub trait DynForm {
+    fn tag(&self) -> u8;
+}
+
+pub fn trait_info_of_dyn_ok(id: TypeId) -> bool {
+    id.trait_info_of::<dyn DynForm>().is_some()
+}
+
+pub fn try_as_dyn_same_lt_ok<'a, T: 'a>(x: &'a T) -> Option<&'a (dyn DynForm + 'a)> {
+    core::any::try_as_dyn::<T, dyn DynForm + 'a>(x)
+}
+
+// NEGATIVE: `dyn DynForm + 'static: TryAsDynCompatible<'a>` must require `'a == 'static`, so
+// turning `&'a u8` into `&'a (dyn DynForm + 'static)` MUST be rejected.
+pub fn try_as_dyn_short_as_static_bad<'a>(x: &'a &'a u8) -> Option<&'a (dyn DynForm + 'static)> {
+    core::any::try_as_dyn::<&'a u8, dyn DynForm + 'static>(x)
+}
+
+fn main() {}
+"#;
+
+    #[test]
+    fn wave5_front2_blockers_and_soundness() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let files = [("/w5sound/src/main.rs".to_string(), SOURCE.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate { name: "w5sound", dir: "/w5sound/", root: "/w5sound/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let free = |name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture body {name}"))
+        };
+        let member = |method: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Member { name, .. } = body else { return None };
+                    (name == method).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture method {method}"))
+        };
+
+        // 1. inst_needs_drop positives
+        for name in [
+            "split_str_no_drop_ok",
+            "split_whitespace_no_drop_ok",
+            "flatten_take_option_ref_no_drop_ok",
+            "custom_pat_no_drop_ok",
+        ] {
+            let (types, borrows) = world.check_borrows(free(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+
+        // 1. inst_needs_drop negatives (MUST reject!)
+        for name in [
+            "flatten_dropping_inner_bad",
+            "flatten_vec_drop_bad",
+            "custom_pat_drop_bad",
+            "custom_pat_generic_bad",
+        ] {
+            let (types, borrows) = world.check_borrows(free(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.refused.is_none(), "{name} refused: {borrows:?}");
+            assert!(!borrows.findings.is_empty(), "{name} must report a borrow error: {borrows:?}");
+        }
+
+        // 2. FieldRegionsUnaligned on PNode::Alias field
+        {
+            let (types, borrows) = world.check_borrows(member("lowering_counts_ok"), alloc);
+            assert!(types.is_clean(), "lowering_counts_ok types: {types:?}");
+            assert!(borrows.is_clean(), "lowering_counts_ok borrows: {borrows:?}");
+
+            let (types, bad) = world.check_borrows(member("lowering_counts_bad_static"), alloc);
+            assert!(types.is_clean(), "lowering_counts_bad_static types: {types:?}");
+            assert!(!bad.is_clean(), "lowering_counts_bad_static must be rejected: {bad:?}");
+        }
+
+        // 3. Parameterized supertrait outlives (`LoadItems<'a>: 'a`)
+        for name in ["record_ok", "record_transitive_ok"] {
+            let (types, borrows) = world.check_borrows(member(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+        for name in ["record_bad_static", "record_unbounded_bad"] {
+            let (types, bad) = world.check_borrows(member(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(!bad.is_clean(), "{name} must NOT be accepted: {bad:?}");
+        }
+
+        // 4. Default trait object lifetimes in zero-lifetime type aliases (`ArcAlias<dyn SessionStore>`)
+        {
+            let (types, borrows) = world.check_borrows(free("alias_object_default_ok"), alloc);
+            assert!(types.is_clean(), "alias_object_default_ok types: {types:?}");
+            assert!(borrows.is_clean(), "alias_object_default_ok borrows: {borrows:?}");
+
+            let (types, bad) = world.check_borrows(free("alias_object_default_short_bad"), alloc);
+            assert!(types.is_clean(), "alias_object_default_short_bad types: {types:?}");
+            assert!(bad.refused.is_none(), "alias_object_default_short_bad refused: {bad:?}");
+            assert!(!bad.findings.is_empty(), "alias_object_default_short_bad must reject short borrow: {bad:?}");
+
+            let (types, refused) = world.check_borrows(free("alias_with_lifetime_refused"), alloc);
+            assert!(types.is_clean(), "alias_with_lifetime_refused types: {types:?}");
+            assert!(!refused.is_clean(), "alias_with_lifetime_refused must NOT silently default to 'static: {refused:?}");
+        }
+
+        // 5. `dyn T: TryAsDynCompatible<'a>` (`blaze-text/src/debug.rs`)
+        {
+            for name in ["trait_info_of_dyn_ok", "try_as_dyn_same_lt_ok"] {
+                let (types, borrows) = world.check_borrows(free(name), alloc);
+                assert!(types.is_clean(), "{name} types: {types:?}");
+                assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+            }
+
+            let (types, bad) = world.check_borrows(free("try_as_dyn_short_as_static_bad"), alloc);
+            assert!(types.is_clean(), "try_as_dyn_short_as_static_bad types: {types:?}");
+            assert!(bad.refused.is_none(), "try_as_dyn_short_as_static_bad refused: {bad:?}");
+            assert!(!bad.findings.is_empty(), "try_as_dyn_short_as_static_bad must be rejected: {bad:?}");
+        }
+    }
+}
+
+/// Regression and soundness tests for Wave 6 `front2` fixes:
+/// 1. `InstDropEval::select_impl` scaling past 64 candidates in large `Shape::Ref(Not)` buckets
+///    (`crates/blaze-cli/src/engine_bodies.rs:4005` `to_open.iter().take(count).flatten().any(...)`
+///    inside an `if ... && let Some(slot) = to_open.get_mut(count)` chain with 70+ `IntoIterator`
+///    impls on `&T`), plus negative soundness controls proving dropping inners still reject.
+/// 2. `PNode::Alias` in `field_row` + per-body `FieldAliasGuard`:
+///    - Clears `Lazy<'r, 'a, F, D>` methods (`run_parent.rs`) and `Hit<'s, 'b, K>` (`proof.rs`)
+///      whose `PNode::Alias` fields stay unnormalized.
+///    - Negative soundness controls: swapping lifetimes across `&'r` / `&'a`, returning `&'b K::Root`
+///      as `'s` / `'static`, concrete normalized alias swapping lifetimes (`Pair<'a, 'b>` ->
+///      `(&'b u8, &'a u8)`), blanket-impl normalized alias, and `where F: Front<Maker = RunMaker<'h>>`
+///      returning `'h` as `'static` MUST ALL be rejected!
+#[cfg(test)]
+mod wave6_front2_soundness_tests {
+    use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+
+    const SOURCE: &str = r#"
+extern crate alloc;
+use alloc::vec::Vec;
+use core::marker::PhantomData;
+
+// --- 1. Exact `engine_bodies.rs:4005` if-let chain with >64 `IntoIterator for &` impls ---
+pub struct Unopened {
+    pub world_at: u32,
+}
+
+macro_rules! dummy_into_iters {
+    ($($name:ident),*) => {
+        $(
+            pub struct $name;
+            impl<'a> IntoIterator for &'a $name {
+                type Item = &'a u8;
+                type IntoIter = core::slice::Iter<'a, u8>;
+                fn into_iter(self) -> Self::IntoIter {
+                    [].iter()
+                }
+            }
+        )*
+    };
+}
+
+dummy_into_iters!(
+    D00, D01, D02, D03, D04, D05, D06, D07, D08, D09,
+    D10, D11, D12, D13, D14, D15, D16, D17, D18, D19,
+    D20, D21, D22, D23, D24, D25, D26, D27, D28, D29,
+    D30, D31, D32, D33, D34, D35, D36, D37, D38, D39,
+    D40, D41, D42, D43, D44, D45, D46, D47, D48, D49,
+    D50, D51, D52, D53, D54, D55, D56, D57, D58, D59,
+    D60, D61, D62, D63, D64, D65, D66, D67, D68, D69
+);
+
+pub fn pre_open_chain_ok(rest: &[Unopened], places: &[usize]) {
+    let mut to_open: [Option<&Unopened>; 8] = [None; 8];
+    let mut count = 0usize;
+    for &place in places {
+        if place > 0
+            && let Some(unopened) = rest.get(place - 1)
+            && !to_open.iter().take(count).flatten().any(|prev| prev.world_at == unopened.world_at)
+            && let Some(slot) = to_open.get_mut(count)
+        {
+            *slot = Some(unopened);
+            count += 1;
+        }
+    }
+}
+
+pub struct DropGuard<'a> {
+    slot: &'a mut u32,
+}
+
+impl Drop for DropGuard<'_> {
+    fn drop(&mut self) {
+        *self.slot += 1;
+    }
+}
+
+// NEGATIVE: `Flatten<Take<vec::IntoIter<Option<DropGuard<'_>>>>>` MUST still require drop even
+// with 70+ `IntoIterator` impls in scope, rejecting conflicting mutation before scope exit.
+pub fn flatten_take_vec_drop_bad(x: &mut u32, count: usize) {
+    let mut v = Vec::new();
+    v.push(Some(DropGuard { slot: x }));
+    let _flat = v.into_iter().take(count).flatten();
+    *x = 77;
+}
+
+// --- 2. Exact `run_parent.rs` `Lazy<'r, 'a, F, D>` (2 lifetimes + PNode::Alias field) ---
+pub trait Front {
+    type Start;
+    type Ids;
+    type Maker;
+}
+
+pub struct RunMaker<'h> {
+    pub data: &'h u8,
+}
+
+impl<'h> RunMaker<'h> {
+    pub fn count(&self) -> u8 {
+        *self.data
+    }
+}
+
+pub struct Heavy<I, M> {
+    pub ids: I,
+    pub maker: M,
+}
+
+pub struct Started<'a, S, I, M> {
+    pub start: S,
+    pub heavy: Option<Heavy<I, M>>,
+    pub _marker: PhantomData<&'a ()>,
+}
+
+pub struct Lazy<'r, 'a, F: Front, D> {
+    pub cx: &'r u8,
+    pub front: F,
+    pub folder: D,
+    pub started: Option<Started<'a, F::Start, F::Ids, F::Maker>>,
+}
+
+impl<'r, 'a, F: Front, D> Lazy<'r, 'a, F, D> {
+    pub fn is_cold_ok(&self) -> bool {
+        self.started.is_none()
+    }
+
+    pub fn start_ok(&self) -> Option<&F::Start> {
+        self.started.as_ref().map(|s| &s.start)
+    }
+
+    pub fn is_heavy_ok(&self) -> bool {
+        self.started.as_ref().is_some_and(|s| s.heavy.is_some())
+    }
+
+    pub fn cx_ok(&self) -> &'r u8 {
+        self.cx
+    }
+
+    // NEGATIVE: returning `'r` as `'a` across sibling fields of `Lazy` MUST be rejected.
+    pub fn lazy_bad_r_as_a(&self) -> &'a u8 {
+        self.cx
+    }
+
+    // NEGATIVE: returning `'h` as `'static` through normalized `F::Maker = RunMaker<'h>` MUST
+    // be rejected (suppressed by `FieldAliasGuard`).
+    pub fn lazy_lowering_bad_static<'h>(&self) -> Option<&'static u8>
+    where
+        F: Front<Maker = RunMaker<'h>>,
+    {
+        self.started
+            .as_ref()
+            .and_then(|s| s.heavy.as_ref())
+            .map(|heavy| heavy.maker.data)
+    }
+}
+
+// --- 3. Exact `proof.rs` `Hit<'s, 'b, K: Kind>` (2 lifetimes + `&'b K::Root`) ---
+pub trait Kind {
+    type Root;
+}
+
+pub trait HasPayload {
+    fn payload(&self) -> usize;
+}
+
+#[derive(Clone, Copy)]
+pub struct Brand<'s>(PhantomData<fn(&'s ()) -> &'s ()>);
+
+#[derive(Clone, Copy)]
+pub struct Holds<'s, K> {
+    pub brand: Brand<'s>,
+    pub _k: PhantomData<K>,
+}
+
+pub struct Hit<'s, 'b, K: Kind> {
+    holds: Holds<'s, K>,
+    root: &'b K::Root,
+    bytes: &'b [u8],
+}
+
+pub fn make_hit<'s, 'b, K: Kind>(brand: Brand<'s>, root: &'b K::Root, bytes: &'b [u8]) -> Hit<'s, 'b, K> {
+    Hit { holds: Holds { brand, _k: PhantomData }, root, bytes }
+}
+
+impl<'s, 'b, K: Kind> Hit<'s, 'b, K> {
+    pub fn root_ok(&self) -> &'b K::Root {
+        self.root
+    }
+
+    // NEGATIVE: returning `&'b K::Root` as `&'s K::Root` MUST be rejected.
+    pub fn root_bad_s(&self) -> &'s K::Root {
+        self.root
+    }
+
+    // NEGATIVE: returning `&'b K::Root` as `&'static K::Root` MUST be rejected.
+    pub fn root_bad_static(&self) -> &'static K::Root {
+        self.root
+    }
+}
+
+impl<'s, 'b, K: Kind> Hit<'s, 'b, K>
+where
+    K::Root: HasPayload,
+{
+    pub fn payload_ok(&self) -> (&'b [u8], usize) {
+        (self.bytes, self.root.payload())
+    }
+}
+
+// --- 4. Soundness controls for normalized `PNode::Alias` fields ---
+pub trait SwapTr {
+    type Assoc;
+}
+
+pub struct Pair<'a, 'b>(pub &'a u8, pub &'b u8);
+
+impl<'a, 'b> SwapTr for Pair<'a, 'b> {
+    // Same slot count (2) as `Pair<'a, 'b>`, but SWAPPED order!
+    type Assoc = (&'b u8, &'a u8);
+}
+
+pub struct AliasBox<T: SwapTr> {
+    pub x: T::Assoc,
+}
+
+// NEGATIVE: `f.x.0` has type `&'b u8`, NOT `&'a u8`; unnormalized `[Arg(0)]` would map it to `'a`
+// if `FieldAliasGuard` did not suppress concrete instantiations!
+pub fn alias_swap_bad<'a, 'b>(f: AliasBox<Pair<'a, 'b>>) -> &'a u8 {
+    f.x.0
+}
+
+pub trait BlanketTr {
+    type Assoc;
+}
+
+impl<T> BlanketTr for T {
+    type Assoc = &'static u8;
+}
+
+pub struct BlanketBox<'a, T: BlanketTr> {
+    pub r: &'a u8,
+    pub x: T::Assoc,
+}
+
+// NEGATIVE: `BlanketTr` has a blanket impl, so `FieldAliasGuard` suppresses `x` while keeping
+// `r` sound; returning `r` (`&'a u8`) as `&'static u8` MUST be rejected.
+pub fn alias_blanket_bad<'a, T: BlanketTr>(b: BlanketBox<'a, T>) -> &'static u8 {
+    b.r
+}
+
+fn main() {}
+"#;
+
+    #[test]
+    fn wave6_front2_blockers_and_soundness() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let files = [("/w6sound/src/main.rs".to_string(), SOURCE.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate { name: "w6sound", dir: "/w6sound/", root: "/w6sound/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let free = |name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture body {name}"))
+        };
+        let member = |method: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Member { name, .. } = body else { return None };
+                    (name == method).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture method {method}"))
+        };
+
+        // 1. Positive: `engine_bodies.rs:4005` chain with 70+ `IntoIterator for &` impls + `proof.rs::hit`
+        for name in ["pre_open_chain_ok", "make_hit"] {
+            let (types, borrows) = world.check_borrows(free(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+
+        // 2. Positive: `Lazy<'r, 'a, F, D>` and `Hit<'s, 'b, K>` methods
+        for name in ["is_cold_ok", "start_ok", "is_heavy_ok", "cx_ok", "root_ok", "payload_ok"] {
+            let (types, borrows) = world.check_borrows(member(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+
+        // 3. Negative soundness controls (free functions): MUST be rejected!
+        for name in ["flatten_take_vec_drop_bad", "alias_swap_bad", "alias_blanket_bad"] {
+            let (types, bad) = world.check_borrows(free(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(!bad.is_clean(), "{name} must NOT be accepted: {bad:?}");
+        }
+        // Specifically verify `flatten_take_vec_drop_bad` produces a real borrow finding (not refusal).
+        {
+            let (_, bad) = world.check_borrows(free("flatten_take_vec_drop_bad"), alloc);
+            assert!(bad.refused.is_none(), "flatten_take_vec_drop_bad refused: {bad:?}");
+            assert!(!bad.findings.is_empty(), "flatten_take_vec_drop_bad must report borrow error: {bad:?}");
+        }
+
+        // 4. Negative soundness controls (methods): MUST be rejected!
+        for name in ["lazy_bad_r_as_a", "lazy_lowering_bad_static", "root_bad_s", "root_bad_static"] {
+            let (types, bad) = world.check_borrows(member(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(!bad.is_clean(), "{name} must NOT be accepted: {bad:?}");
+        }
+        // Specifically verify `lazy_bad_r_as_a`, `root_bad_s`, `root_bad_static` report exact findings.
+        for name in ["lazy_bad_r_as_a", "root_bad_s", "root_bad_static"] {
+            let (_, bad) = world.check_borrows(member(name), alloc);
+            assert!(bad.refused.is_none(), "{name} refused: {bad:?}");
+            assert!(!bad.findings.is_empty(), "{name} must report borrow error: {bad:?}");
+        }
     }
 }

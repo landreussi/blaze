@@ -94,7 +94,7 @@ fn tests_record(n: usize) -> &'static [u8] {
         }
     }
     out.extend_from_slice(&strings);
-    blaze_scope::resolve::aligned(&out, g)
+    blaze_scope::resolve::aligned(&out, blaze_own::testing::bump())
 }
 
 /// What the zygote's channel and its reap carry.
@@ -480,7 +480,7 @@ fn drive<Z: Zygotes>(runner: &mut Runner<'static, Z>, width: u32, n: usize) -> R
     for i in 0..n {
         ids.push(id(i));
     }
-    let ids: &'static [TestId] = ids.leak();
+    let ids: &'static [TestId] = ids.leak_static();
     let mut machine = TestLoop::new(config(width), g).map_err(harness)?;
     let mut out: AVec<'_, Effect<'_>> = Vec::new_in(g);
     machine.begin(&mut out).map_err(harness)?;
@@ -617,17 +617,17 @@ fn control_a_runner_that_acts_on_the_exit_first_loses_a_result() {
 /// the reason, and the command fails. With the host check removed from `Runner::begin_suite`,
 /// the simulated zygote starts and the first assertion fails.
 #[test]
-fn on_linux_every_run_is_refused_for_want_of_a_sandbox() {
+fn on_unsupported_host_every_run_is_refused_for_want_of_a_sandbox() {
     let tape = Tape::new(&[], blaze_sim::Tail::Calm, 1_000);
     let g = Alloc::global();
     let mut scripts: AVec<'static, Script> = Vec::new_in(g);
     scripts.resize(3, Script::Pass);
-    let mut runner = Runner::new(SimZygote::new(&tape, scripts, None), &config(2).plan, Host::Linux, g);
+    let mut runner = Runner::new(SimZygote::new(&tape, scripts, None), &config(2).plan, Host::Other, g);
     let driven = drive(&mut runner, 2, 3).expect("the request ends");
     assert_eq!(runner.zygotes().starts, 0, "no zygote starts without a sandbox");
     assert!(driven.stopped.is_none(), "{:?}", driven.stopped);
     for row in 0..3 {
-        assert!(driven.text.contains(&format!("NOT RUN m::t{row}: cannot be run yet: no test sandbox is built for Linux yet")), "{}", driven.text);
+        assert!(driven.text.contains(&format!("NOT RUN m::t{row}: cannot be run yet: no test sandbox is built for this host yet")), "{}", driven.text);
     }
     assert!(driven.status.is_some_and(|status| status.not_run == 3 && !status.passed()), "{:?}", driven.status.map(|status| status.not_run));
 }
@@ -642,4 +642,121 @@ fn unbuilt_bodies_keep_the_not_run_line_per_test() {
     assert!(driven.text.contains("NOT RUN m::t0: cannot be run yet: the code builder cannot build test bodies yet (test.md, piece 8)"), "{}", driven.text);
     assert!(driven.text.contains("NOT RUN m::t1: cannot be run yet: the code builder cannot build test bodies yet (test.md, piece 8)"), "{}", driven.text);
     assert!(driven.text.contains("2 could not be run yet"), "{}", driven.text);
+}
+
+/// Regression: when one `wait` returns a sibling's completion after the clock has crossed
+/// another flight's `answer_due`, `Runner::step` drains already-ready completions at `now`
+/// before `watch` declares `ZygoteSilent`. Control: when no completion is ready on the drain,
+/// `Runner` still kills the zygote with `RunError::ZygoteSilent`.
+#[test]
+fn runner_drains_ready_completions_before_declaring_zygote_silent() {
+    enum WaveItem {
+        Ready,
+        Ended(ChildEnd<'static>),
+        Closed,
+        Exited(Status),
+    }
+
+    struct TwoWave {
+        now: Nanos,
+        step: u8,
+        answer_row_zero_on_drain: bool,
+        batch: AVec<'static, WaveItem>,
+        rows: [Option<TestId>; 2],
+    }
+
+    impl TwoWave {
+        fn finished(row: u32, test: TestId) -> WaveItem {
+            WaveItem::Ended(ChildEnd {
+                row,
+                test,
+                micros: 10,
+                how: blaze_run::zygote::How::Reported(blaze_run::zygote::Said::Returned),
+                keep: Ok(()),
+                text: "",
+                entered: &[],
+                reads: &[],
+                output: blaze_run::result::Captured { digest: [0; 32], total: 0, tail: &[] },
+            })
+        }
+    }
+
+    impl Zygotes for TwoWave {
+        fn start(&mut self, _suite: SuiteId, _width: u32) -> Result<Start, RunError> {
+            self.batch.push(WaveItem::Ready);
+            Ok(Start::Running)
+        }
+        fn ask(&mut self, row: u32, test: TestId, _budget: Nanos) -> Result<(), RunError> {
+            self.rows[row as usize] = Some(test);
+            Ok(())
+        }
+        fn end(&mut self) -> Result<(), RunError> {
+            self.batch.push(WaveItem::Closed);
+            self.batch.push(WaveItem::Exited(Status::Exited { code: 0 }));
+            Ok(())
+        }
+        fn kill(&mut self) -> Result<(), RunError> {
+            Ok(())
+        }
+        fn wait(&mut self, _until: Nanos) -> Result<(), RunError> {
+            if !self.batch.is_empty() {
+                return Ok(());
+            }
+            match self.step {
+                0 => {
+                    self.step = 1;
+                    // Past BUDGET (1 s) + ANSWER_SLACK (1.4 s) = 2.4 s: row 1 arrives first.
+                    self.now = Nanos(3_000_000_000);
+                    if let Some(test) = self.rows[1] {
+                        self.batch.push(Self::finished(1, test));
+                    }
+                }
+                1 => {
+                    self.step = 2;
+                    // Immediate drain at `now`: row 0 was already ready unless this is the control.
+                    if self.answer_row_zero_on_drain
+                        && let Some(test) = self.rows[0]
+                    {
+                        self.batch.push(Self::finished(0, test));
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        fn heard_len(&self) -> usize {
+            self.batch.len()
+        }
+        fn heard(&self, at: usize) -> Option<Heard<'_>> {
+            Some(match self.batch.get(at)? {
+                WaveItem::Ready => Heard::Ready,
+                WaveItem::Ended(end) => Heard::Ended(*end),
+                WaveItem::Closed => Heard::Closed,
+                WaveItem::Exited(status) => Heard::Exited(*status),
+            })
+        }
+        fn clear(&mut self) {
+            self.batch.clear();
+        }
+        fn now(&self) -> Nanos {
+            self.now
+        }
+        fn parked(&self, _row: u32) -> Nanos {
+            Nanos(0)
+        }
+    }
+
+    let g = blaze_own::testing::heap().alloc();
+    // Ready completion drained before `watch`: both tests pass with zero `ZygoteSilent`.
+    let drained_zygote = TwoWave { now: Nanos(0), step: 0, answer_row_zero_on_drain: true, batch: Vec::new_in(g), rows: [None, None] };
+    let mut runner = Runner::new(drained_zygote, &config(2).plan, Host::Macos, g);
+    let driven = drive(&mut runner, 2, 2).expect("request completes");
+    assert!(driven.stopped.is_none(), "expected drain before ZygoteSilent, got {:?}", driven.stopped);
+    assert!(driven.text.contains("ran 2: 2 passed, 0 failed"), "{}", driven.text);
+
+    // Control: genuinely silent row 0 still triggers `RunError::ZygoteSilent`.
+    let silent_zygote = TwoWave { now: Nanos(0), step: 0, answer_row_zero_on_drain: false, batch: Vec::new_in(g), rows: [None, None] };
+    let mut runner = Runner::new(silent_zygote, &config(2).plan, Host::Macos, g);
+    let driven = drive(&mut runner, 2, 2).expect("request stops cleanly");
+    assert!(matches!(driven.stopped, Some(RunError::ZygoteSilent { row: 0, .. })), "expected ZygoteSilent for row 0, got {:?}", driven.stopped);
 }

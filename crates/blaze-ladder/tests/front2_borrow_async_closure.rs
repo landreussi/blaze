@@ -144,6 +144,56 @@ fn simulate_rc() {
     });
 }
 
+// `FnOnce`-only async-move closure whose body only reads its captures by `&self` (mirrors
+// `reth_node_metrics::MetricServer::start_endpoint`'s `spawn_with_graceful_shutdown_signal(async
+// move |mut signal| loop { ... })`). Because every callable obligation on the closure is
+// by-value `FnOnce`, its future owns its environment.
+fn spawn_move_capture_send() {
+    let cap = 7u8;
+    spawn_io(async move |x: u8| {
+        other().await;
+        let _ = cap.wrapping_add(x);
+    });
+}
+
+fn spawn_move_capture_rc() {
+    let r = Rc::new(7u8);
+    spawn_io(async move |x: u8| {
+        other().await;
+        let _ = (*r).wrapping_add(x);
+    });
+}
+
+// Foreign-body caller checking `Send` on an `async fn` that awaits an async closure
+// (mirrors `reth_e2e_test_utils::E2ETestSetupBuilder::build`'s `(0..n).map(async |idx| ..)`).
+async fn build_with_async_closure(n: usize) -> usize {
+    let f = async |idx: usize| {
+        let tmp = Rc::new(idx);
+        drop(tmp);
+        other().await;
+        idx
+    };
+    f(n).await
+}
+
+fn call_build_send() {
+    require_send(build_with_async_closure(1));
+}
+
+type BoxFut<T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+type Relaunch = std::sync::Arc<dyn Fn() -> BoxFut<u8> + Send + Sync>;
+
+fn launch_node_arc_closure_unsize(flag: bool, val: u8) -> BoxFut<u8> {
+    Box::pin(async move {
+        let saved = flag.then(|| val);
+        async {}.await;
+        if let Some(v) = saved {
+            let _relaunch: Relaunch = std::sync::Arc::new(move || Box::pin(async move { v }));
+        }
+        val
+    })
+}
+
 fn main() {}
 "#;
 
@@ -165,7 +215,7 @@ fn an_async_closure_is_a_stored_closure_value() {
     };
     let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, alloc).expect("fixture names");
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("fixture names");
     let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
     let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("body checker");
@@ -201,39 +251,47 @@ fn an_async_closure_is_a_stored_closure_value() {
     use blaze_ladder::front2::opaque_auto::CoroutineAnswer;
     use blaze_ladder::front2::world_items::Gap;
     let captures_unknown = CoroutineAnswer::CapturesUnknown.why();
-    for (name, owner) in [("execute_rc", "hold_rc"), ("execute_info_rc", "info_rc")] {
-        let got = world.check(BodyRef::Free(key_of(name)), alloc);
-        std::println!("{name}: {got:?}");
-        let e0277 = got.diagnostics.iter().any(|d| d.code == "E0277");
-        let gap = got.refused.is_some() || !got.gaps.is_empty() || !got.undecided.is_empty();
-        assert!(e0277 || gap, "TWIN `{name}`: rustc refuses it (E0277); never clean: {got:?}");
+    // `hold_rc` calls `c()` directly (not exclusively via `FnOnce`/`AsyncFnOnce`), so its call
+    // future remains `CapturesUnknown`.
+    {
+        let got = world.check(BodyRef::Free(key_of("execute_rc")), alloc);
+        std::println!("execute_rc: {got:?}");
         let the_row = |g: &Gap| {
             matches!(g, Gap::CoroutineRow { ordinal, path, why, .. }
-                if *ordinal >= blaze_typeck::coroutine_id::CLOSURE_BASE && path.contains(owner) && Some(*why) == captures_unknown)
+                if *ordinal >= blaze_typeck::coroutine_id::CLOSURE_BASE && path.contains("hold_rc") && Some(*why) == captures_unknown)
         };
         assert!(
             got.diagnostics.is_empty() && !got.gaps.is_empty() && got.gaps.iter().all(the_row),
-            "TWIN `{name}` TODAY: the named gap, the call future of `{owner}`'s async closure whose captured places \
-             were not established (`CapturesUnknown`: its kind is `Fn`, so its call future stores its captures behind \
-             a reference, a type the checker does not make), not E0277; if this is E0277 now, the checker's by-reference \
-             call future landed: assert E0277: {got:?}"
+            "TWIN `execute_rc`: direct call of `Fn` async-move closure stays `CapturesUnknown`: {got:?}"
+        );
+    }
+    // `info_rc` passes `async move |_s: &str| *r` exclusively to an `AsyncFnOnce` bound, so the
+    // future owns its environment and proves `Rc<u8>: !Send` (E0277, zero gaps).
+    {
+        let got = world.check(BodyRef::Free(key_of("execute_info_rc")), alloc);
+        std::println!("execute_info_rc: {got:?}");
+        assert!(
+            got.diagnostics.iter().any(|d| d.code == "E0277") && got.gaps.is_empty() && got.undecided.is_empty(),
+            "TWIN `execute_info_rc`: AsyncFnOnce-only async-move closure holding Rc is E0277 with zero gaps: {got:?}"
         );
     }
 
-    // 4: the FUTURE an async closure's call returns, never decided from the closure value's
-    // captures (see the module doc, case 4). Not clean: E0277 or a named gap.
-    for name in ["returned_rc", "simulate_rc"] {
+    // 4: the FUTURE an async closure's call returns: its exact interior is lowered by
+    // `lower_async_witness`, so `Rc<u8>` held across `.await` is E0277 and dropped before `.await`
+    // is clean with zero gaps.
+    for name in ["returned_rc", "simulate_rc", "spawn_move_capture_rc"] {
         let got = world.check(BodyRef::Free(key_of(name)), alloc);
         std::println!("{name}: {got:?}");
-        let e0277 = got.diagnostics.iter().any(|d| d.code == "E0277");
-        let gap = got.refused.is_some() || !got.gaps.is_empty() || !got.undecided.is_empty();
-        assert!(e0277 || gap, "TWIN `{name}`: rustc refuses it (E0277: `Rc<u8>` held across the body's `.await`); never clean: {got:?}");
+        assert!(
+            got.diagnostics.iter().any(|d| d.code == "E0277") && got.gaps.is_empty(),
+            "TWIN `{name}`: rustc refuses it (E0277: `Rc<u8>` held across the body's `.await`): {got:?}"
+        );
     }
-    // Its oracle: no `Rc` held across the `.await`. Rust accepts it; blaze has no exact interior
-    // of the closure's body yet, so a gap is allowed, a false E0277 is not.
-    let got = world.check(BodyRef::Free(key_of("returned_dropped")), alloc);
-    std::println!("returned_dropped: {got:?}");
-    assert!(!got.diagnostics.iter().any(|d| d.code == "E0277"), "returned_dropped: no false E0277: {got:?}");
+    for name in ["returned_dropped", "spawn_move_capture_send", "call_build_send", "launch_node_arc_closure_unsize"] {
+        let got = world.check(BodyRef::Free(key_of(name)), alloc);
+        std::println!("{name}: {got:?}");
+        assert!(got.is_clean() && got.gaps.is_empty() && got.undecided.is_empty(), "{name}: clean with zero gaps: {got:?}");
+    }
 
     // 3: CONTROL, the borrow lowering: refused by name.
     let (types, borrows) = world.check_borrows(BodyRef::Free(key_of("hold")), alloc);

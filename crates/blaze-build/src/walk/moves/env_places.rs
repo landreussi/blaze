@@ -62,7 +62,7 @@ use blaze_own::Vec;
 use blaze_typeck::env_fields::{Cover, PathError, cover, use_path};
 use blaze_typeck::{CaptureKind, CaptureProj, EnvField, Expr, ExprId, PNode, PTy};
 
-use super::super::{Held, NO_EXPR, Repr, V, Walk, malformed, unsupported};
+use super::super::{Held, NO_EXPR, Repr, Shape, V, Walk, malformed, unsupported};
 use super::Step;
 use crate::{BuildError, FnTrait};
 
@@ -77,21 +77,32 @@ pub(in crate::walk) struct EnvOwned {
     init: bool,
 }
 
+/// Where a captured place lives: a sized place at `(base, off)`, or an unsized place behind the
+/// 16-byte wide pointer `{ addr, meta }` stored at `(base, off)`.
+#[derive(Clone, Copy)]
+pub(in crate::walk) enum PlaceAt {
+    Sized(Value, i32),
+    /// A sized place captured by reference in a coroutine/closure environment: `(env, off)` holds
+    /// the immutable pointer, reloaded on demand so it never crosses a coroutine suspension.
+    Indirect(Value, i32),
+    Unsized(Value, i32),
+}
+
 /// The fields of the environment of the closure whose body is being built, when one of them
 /// holds a place below its binding (empty otherwise: every use then takes the plain path).
 pub(in crate::walk) struct EnvPlaces<A: Allocator> {
     /// Every field, in field order (`cover` reads them all).
     env: Vec<EnvField, A>,
     /// Per field: where the held place is (`None`: a whole binding, bound to its own home).
-    at: Vec<Option<(Value, i32)>, A>,
+    at: Vec<Option<PlaceAt>, A>,
     /// Per field: its state when the body owns it (`None`: borrowed, a whole binding, or a
     /// type that needs no drop).
     owned: Vec<Option<EnvOwned>, A>,
 }
 
-impl<A: Allocator + Clone> EnvPlaces<A> {
+impl<A: Allocator + Copy> EnvPlaces<A> {
     pub(in crate::walk) fn new_in(alloc: A) -> Self {
-        EnvPlaces { env: Vec::new_in(alloc.clone()), at: Vec::new_in(alloc.clone()), owned: Vec::new_in(alloc) }
+        EnvPlaces { env: Vec::new_in(alloc), at: Vec::new_in(alloc), owned: Vec::new_in(alloc) }
     }
 }
 
@@ -103,7 +114,7 @@ fn path_error(e: ExprId, error: PathError) -> BuildError {
     }
 }
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// The offset of field `field` of variant `variant` of a value of ground type `g`, its row,
     /// and whether `g` implements `Drop`: walk.rs `decl_field`, the one lookup by declaration
     /// index (closure.rs `field_offset` is it too). Refused: a union's field and an enum
@@ -133,17 +144,21 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 
     /// Where captured place `f` of closure `e`'s environment is, in the OWNER's body: from its
     /// binding's home, or, inside a closure body holding the place or one above it, from that
-    /// field; each field at its offset, each dereference of a thin reference or raw pointer
-    /// through the pointer loaded. With it: the owner's field it started from and whether that
-    /// field holds exactly `f`.
-    fn owner_place(&mut self, e: ExprId, f: EnvField) -> Result<((Value, i32), Option<(usize, bool)>), BuildError> {
+    /// field; each field at its offset, each dereference of a thin or wide reference or raw
+    /// pointer through the pointer loaded. With it: the owner's field it started from and whether
+    /// that field holds exactly `f`.
+    fn owner_place(&mut self, e: ExprId, f: EnvField) -> Result<(PlaceAt, Option<(usize, bool)>), BuildError> {
         let (mut at, from, outer) = match self.slots.get(f.base.ix()).copied().flatten() {
-            Some((home, _)) => (self.home(home), 0, None),
+            Some((home, _)) => {
+                let (base, off) = self.home(home);
+                (PlaceAt::Sized(base, off), 0, None)
+            }
             None => {
                 let Some((j, taken)) = self.outer_field(f) else {
                     return Err(malformed("a binding captured before its binding (no home, no field of the environment above the place)"));
                 };
                 let at = self.env_places.at.get(j).copied().flatten().ok_or(malformed("a whole-binding field of an environment without its binding's home"))?;
+                let at = self.resolve_place(at);
                 (at, taken, Some((j, taken == f.len)))
             }
         };
@@ -152,21 +167,69 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             let before = f.ty_before(self.checked, i).ok_or(malformed("a captured place's type past the record's types"))?;
             let g = self.ground_ty(before).map_err(|error| Self::ty_err(e, error))?;
             match proj {
-                CaptureProj::Field { variant, field } => {
-                    let (off, _, _) = self.env_field_offset(e, g, variant, field)?;
-                    at = (at.0, at.1 + off);
-                }
+                CaptureProj::Field { variant, field } => match at {
+                    PlaceAt::Sized(base, off) => {
+                        let (foff, _, _) = self.env_field_offset(e, g, variant, field)?;
+                        at = PlaceAt::Sized(base, off + foff);
+                    }
+                    PlaceAt::Unsized(w, woff) => {
+                        let l = self.layout(g).map_err(|error| Self::ty_err(e, error))?;
+                        let li = usize::try_from(l).map_err(|_| malformed("a layout index past usize"))?;
+                        let layout = self.layouts.get(li).ok_or(malformed("a layout index past `layouts`"))?;
+                        if layout.is_union {
+                            return Err(unsupported(e, "not lowered: a captured place below a union's field"));
+                        }
+                        if variant != 0 || !self.has_unsized_tail(l) {
+                            return Err(unsupported(e, "not lowered: a captured place below an unsized aggregate without an unsized tail"));
+                        }
+                        let Shape::Fields { first, len } = layout.shape else {
+                            return Err(malformed("an unsized aggregate that is not a struct or a tuple"));
+                        };
+                        if field >= len {
+                            return Err(malformed("a field index past its aggregate's fields"));
+                        }
+                        let ls_id = self.ls_of(g).map_err(|error| Self::ty_err(e, error))?;
+                        let dyn_prefix = self.ls.dyn_chain(ls_id);
+                        let fi = first.checked_add(field).and_then(|i| usize::try_from(i).ok()).ok_or(malformed("a field index past usize"))?;
+                        let &(_, foff, _) = self.layout_fields.get(fi).ok_or(malformed("a field index past `layout_fields`"))?;
+                        let foff = i32::try_from(foff).map_err(|_| unsupported(e, "a field at 2 GiB or more"))?;
+                        let addr = self.b.load(Ty::PTR, Flags::NONE, w, woff, MemAttrs::aligned(3));
+                        if field + 1 == len {
+                            let meta = self.b.load(Ty::I64, Flags::NONE, w, woff + 8, MemAttrs::aligned(3));
+                            let tail = match dyn_prefix {
+                                None => self.address((addr, foff)),
+                                Some(prefix) => {
+                                    let vtable = self.b.load(Ty::PTR, Flags::NONE, w, woff + 8, MemAttrs::aligned(3));
+                                    let off = crate::dyn_tail::tail_offset(&mut self.b, prefix, vtable);
+                                    self.b.ptr_add(Flags::INBOUNDS, addr, off)
+                                }
+                            };
+                            let slot = self.b.slot(16, 3, SlotKind::Temp);
+                            let to = self.b.slot_addr(slot);
+                            self.b.store(Flags::NONE, tail, to, 0, MemAttrs::aligned(3));
+                            self.b.store(Flags::NONE, meta, to, 8, MemAttrs::aligned(3));
+                            at = PlaceAt::Unsized(to, 0);
+                        } else {
+                            at = PlaceAt::Sized(addr, foff);
+                        }
+                    }
+                    PlaceAt::Indirect(..) => return Err(malformed("unresolved indirect capture place in owner_place")),
+                },
                 CaptureProj::Deref => {
                     if !matches!(self.ground_node(g).map_err(|error| Self::ty_err(e, error))?, PNode::Ref(..) | PNode::Ptr(..)) {
                         return Err(unsupported(e, "not lowered: a captured place through a `Box`'s contents (`(*b).f`)"));
                     }
-                    if self.repr(g).map_err(|error| Self::ty_err(e, error))? != Repr::Ptr {
-                        return Err(unsupported(e, "not lowered: a captured place through a wide pointer"));
-                    }
-                    let V::Scalar(p) = self.load(Repr::Ptr, at) else {
-                        return Err(malformed("a thin pointer loaded as other than a scalar"));
+                    let PlaceAt::Sized(base, off) = at else {
+                        return Err(malformed("a pointer dereferenced from an unsized place"));
                     };
-                    at = (p, 0);
+                    if self.repr(g).map_err(|error| Self::ty_err(e, error))? == Repr::Ptr {
+                        let V::Scalar(p) = self.load(Repr::Ptr, (base, off)) else {
+                            return Err(malformed("a thin pointer loaded as other than a scalar"));
+                        };
+                        at = PlaceAt::Sized(p, 0);
+                    } else {
+                        at = PlaceAt::Unsized(base, off);
+                    }
                 }
                 CaptureProj::Index => return Err(malformed("a captured place with an element projection (the place analysis keeps none)")),
             }
@@ -181,11 +244,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// with `Drop` (E0509), more than 64 parts.
     fn move_env_part(&mut self, e: ExprId, f: EnvField) -> Result<(), BuildError> {
         let mask = self
-            .owned
-            .get(f.base.ix())
-            .copied()
-            .flatten()
-            .and_then(|o| o.rest)
+            .field_mask(f.base)
             .ok_or(malformed("a binding a closure moves a part of without field flags (`scan_env_moves` did not mark it)"))?;
         let start = self.moves.steps.len() as u32;
         for i in 0..f.len {
@@ -216,7 +275,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         }
         let len = self.moves.steps.len() as u32 - start;
         let Some(bit) = self.part_bit(mask, start, len, 0, Some(e))? else {
-            return Err(unsupported(e, "a move out of more than 64 parts of one local (its word)"));
+            return Err(unsupported(e, "a move out of more than 256 parts of one local (its bitset)"));
         };
         self.clear_bit(mask, bit);
         Ok(())
@@ -229,11 +288,24 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     pub(in crate::walk) fn store_env_place(&mut self, e: ExprId, f: EnvField, dst: (Value, i32)) -> Result<(), BuildError> {
         let (src, outer) = self.owner_place(e, f)?;
         match f.how {
-            CaptureKind::ByRef | CaptureKind::ByMutRef => {
-                let a = self.address(src);
-                self.store(V::Scalar(a), Repr::Ptr, dst)
-            }
+            CaptureKind::ByRef | CaptureKind::ByMutRef => match src {
+                PlaceAt::Sized(base, off) => {
+                    let a = self.address((base, off));
+                    self.store(V::Scalar(a), Repr::Ptr, dst)
+                }
+                PlaceAt::Unsized(w, woff) => {
+                    let addr = self.b.load(Ty::PTR, Flags::NONE, w, woff, MemAttrs::aligned(3));
+                    let meta = self.b.load(Ty::I64, Flags::NONE, w, woff + 8, MemAttrs::aligned(3));
+                    self.b.store(Flags::NONE, addr, dst.0, dst.1, MemAttrs::aligned(3));
+                    self.b.store(Flags::NONE, meta, dst.0, dst.1 + 8, MemAttrs::aligned(3));
+                    Ok(())
+                }
+                PlaceAt::Indirect(..) => Err(malformed("unresolved indirect capture place in store_env_place")),
+            },
             CaptureKind::ByValue => {
+                let PlaceAt::Sized(base, off) = src else {
+                    return Err(unsupported(e, "not lowered: a by-value capture of an unsized place"));
+                };
                 let t = f.place_ty(self.checked).ok_or(malformed("a captured place's type past the record's types"))?;
                 let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
                 let repr = self.repr(g).map_err(|error| Self::ty_err(e, error))?;
@@ -248,7 +320,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                         }
                     }
                 }
-                let v = self.load(repr, src);
+                let v = self.load(repr, (base, off));
                 self.store(v, repr, dst)
             }
         }
@@ -258,15 +330,38 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// a place below the binding, whose type needs drop) gets field flags (`partial`), the word
     /// `move_env_part` clears and its drops read, as `scan_part_moves` gives one to a binding a
     /// place expression moves a part of.
-    pub(in crate::walk) fn scan_env_moves(&mut self) -> Result<(), BuildError> {
+    /// Scans every closure and async block in the body for by-value captures:
+    /// - A whole-binding by-value capture (`move ||` / `async move`) moves `f.base` at `e` even
+    ///   when every use of `f.base` inside the inner body only borrows it (e.g. `provider.get()`).
+    ///   If `e` stands under a branch or loop relative to `f.base`'s declaration (`decl`), give
+    ///   `f.base` a drop flag so sibling match/`if` arms do not see `self.init[f.base] == false`.
+    /// - A by-value capture of a place below its binding whose type needs drop gives `f.base`
+    ///   partial-move field flags.
+    pub(in crate::walk) fn scan_env_moves(&mut self, parent: &[(u32, bool)], decl: &[u32]) -> Result<(), BuildError> {
         for i in 0..self.body.exprs.len() {
             let e = ExprId(u32::try_from(i).map_err(|_| malformed("an expression index past u32"))?);
             if !matches!(self.expr(e)?, Expr::Closure { .. } | Expr::AsyncBlock { .. }) {
                 continue;
             }
             let checked = self.checked;
-            for f in checked.env_fields(e) {
-                if f.is_whole() || f.how != CaptureKind::ByValue {
+            for f in checked.env_fields_by::<crate::layout::BuildEnv>(e) {
+                if f.how != CaptureKind::ByValue {
+                    continue;
+                }
+                if f.is_whole() {
+                    let home = *decl.get(f.base.ix()).ok_or(malformed("a captured binding past `pats`"))?;
+                    let mut c = e.0;
+                    while c != home {
+                        let (up, cond) = *parent.get(c as usize).ok_or(malformed("an expression past `exprs`"))?;
+                        if cond {
+                            *self.needs_flag.get_mut(f.base.ix()).ok_or(malformed("a captured binding past `pats`"))? = true;
+                            break;
+                        }
+                        if up == NO_EXPR {
+                            break;
+                        }
+                        c = up;
+                    }
                     continue;
                 }
                 let t = f.place_ty(checked).ok_or(malformed("a captured place's type past the record's types"))?;
@@ -286,8 +381,14 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// block's is one) is the body's: it joins the outermost drop scope (`Held::EnvPlace`),
     /// held. Refused: a zero-sized environment and a place through a `Box`'s contents.
     pub(in crate::walk) fn bind_env_place(&mut self, closure: ExprId, f: EnvField, at: Option<(Value, i32)>, kind: FnTrait) -> Result<(), BuildError> {
-        let Some(at) = at else {
-            return Err(unsupported(closure, "not lowered: a zero-sized closure environment holding a captured place below its binding"));
+        let at = match at {
+            Some(at) => at,
+            None => {
+                if f.how != CaptureKind::ByValue {
+                    return Err(malformed("a by-reference capture in a zero-sized closure environment"));
+                }
+                self.temp(Repr::None)
+            }
         };
         for i in 0..f.len {
             if f.derefs_box(self.checked, i).ok_or(malformed("a captured place's projection past `capture_projs`"))? {
@@ -297,10 +398,18 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let mut owned = None;
         let place = match f.how {
             CaptureKind::ByRef | CaptureKind::ByMutRef => {
-                let V::Scalar(p) = self.load(Repr::Ptr, at) else {
-                    return Err(malformed("a capture's pointer not a scalar"));
+                let stored_repr = match f.stored {
+                    Some(t) => {
+                        let g = self.ground_ty(t).map_err(|error| Self::ty_err(closure, error))?;
+                        self.repr(g).map_err(|error| Self::ty_err(closure, error))?
+                    }
+                    None => Repr::Ptr,
                 };
-                (p, 0)
+                if stored_repr == Repr::Ptr {
+                    PlaceAt::Indirect(at.0, at.1)
+                } else {
+                    PlaceAt::Unsized(at.0, at.1)
+                }
             }
             CaptureKind::ByValue => {
                 if kind == FnTrait::FnOnce {
@@ -310,7 +419,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                         owned = Some(EnvOwned { g, flag: None, init: true });
                     }
                 }
-                at
+                PlaceAt::Sized(at.0, at.1)
             }
         };
         let j = u32::try_from(self.env_places.env.len()).map_err(|_| malformed("an environment of more than u32 fields"))?;
@@ -400,12 +509,20 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                         c = up;
                     }
                     let up = self.expr_parent.get(c as usize).ok_or(malformed("an expression without a row of parents (`scan_flags` did not run)"))?.0;
-                    !self.use_keeps_state(c, up)
+                    // Unlike a local scrutinee (matched in place), an `EnvPlace` scrutinee of
+                    // `match` or `let` is evaluated by value (`Task::Eval` -> `env_moved`).
+                    let match_or_let_scrutinee = up != NO_EXPR
+                        && usize::try_from(up).ok().and_then(|u| body.exprs.get(u)).is_some_and(|expr| match *expr {
+                            Expr::Match { scrutinee, .. } => scrutinee.0 == c,
+                            Expr::Let { init, .. } => init.0 == c,
+                            _ => false,
+                        });
+                    match_or_let_scrutinee || !self.use_keeps_state(c, up)
                 }
                 Expr::Closure { .. } | Expr::AsyncBlock { .. } if x != owner.0 => {
                     let checked = self.checked;
                     let mut takes = false;
-                    for f in checked.env_fields(ExprId(x)) {
+                    for f in checked.env_fields_by::<crate::layout::BuildEnv>(ExprId(x)) {
                         if !f.is_whole() && f.how == CaptureKind::ByValue && self.outer_field(f) == Some((j, f.len)) {
                             takes = true;
                         }
@@ -431,8 +548,10 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// The owned field `j`'s state and place.
     fn env_owned(&self, j: usize) -> Result<(EnvOwned, (Value, i32)), BuildError> {
         let o = self.env_places.owned.get(j).copied().flatten().ok_or(malformed("a drop-scope entry of an environment field the body does not own"))?;
-        let at = self.env_places.at.get(j).copied().flatten().ok_or(malformed("an owned environment field without its place"))?;
-        Ok((o, at))
+        let Some(PlaceAt::Sized(base, off)) = self.env_places.at.get(j).copied().flatten() else {
+            return Err(malformed("an owned environment field without its place"));
+        };
+        Ok((o, (base, off)))
     }
 
     /// Owned field `j` of the environment is moved out by `e`: its flag cleared, or its static
@@ -534,6 +653,18 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// it out (`env_moved`). Refused: a move out of a field the body does not own (E0507, the
     /// checker's), and a use of a binding above its captured places (the analysis widens those,
     /// capture_places.rs `widen`).
+    /// Materializes a [`PlaceAt::Indirect`] capture pointer on demand so the pointer value never
+    /// crosses a coroutine suspension point.
+    fn resolve_place(&mut self, at: PlaceAt) -> PlaceAt {
+        match at {
+            PlaceAt::Indirect(env, off) => {
+                let p = self.b.load(Ty::PTR, Flags::NONE, env, off, MemAttrs::aligned(3));
+                PlaceAt::Sized(p, 0)
+            }
+            other => other,
+        }
+    }
+
     pub(in crate::walk) fn env_use(&mut self, e: ExprId, adjusted: u32, value: bool) -> Result<bool, BuildError> {
         if self.env_places.env.is_empty() {
             return Ok(false);
@@ -544,27 +675,57 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         match cover(self.checked, &self.env_places.env, &path) {
             Cover::Exact(j) => {
                 let Some(at) = self.env_places.at.get(j).copied().flatten() else { return Ok(false) };
-                if !value {
-                    self.push_val(V::Place(at.0, at.1), None);
-                    return Ok(true);
+                match self.resolve_place(at) {
+                    PlaceAt::Sized(base, off) => {
+                        if !value {
+                            self.push_val(V::Place(base, off), None);
+                            return Ok(true);
+                        }
+                        let repr = self.expr_repr(e)?;
+                        if self.repr_needs_drop(repr) {
+                            self.env_moved(e, j)?;
+                        }
+                        let v = self.load(repr, (base, off));
+                        self.push_val(v, None);
+                        Ok(true)
+                    }
+                    PlaceAt::Unsized(w, woff) => {
+                        if !value {
+                            self.push_val(V::Unsized(w, woff), None);
+                            return Ok(true);
+                        }
+                        Err(unsupported(e, "not lowered: a by-value use of an unsized captured place"))
+                    }
+                    PlaceAt::Indirect(..) => return Err(malformed("unresolved indirect capture place in env_use")),
                 }
-                let repr = self.expr_repr(e)?;
-                if self.repr_needs_drop(repr) {
-                    self.env_moved(e, j)?;
-                }
-                let v = self.load(repr, at);
-                self.push_val(v, None);
-                Ok(true)
             }
             Cover::RefOf(j) => {
                 let Some(at) = self.env_places.at.get(j).copied().flatten() else { return Ok(false) };
-                let p = self.address(at);
-                if value {
-                    self.push_val(V::Scalar(p), None);
-                } else {
-                    let tmp = self.temp(Repr::Ptr);
-                    self.store(V::Scalar(p), Repr::Ptr, tmp)?;
-                    self.push_val(V::Place(tmp.0, tmp.1), None);
+                match self.resolve_place(at) {
+                    PlaceAt::Sized(base, off) => {
+                        let p = self.address((base, off));
+                        if value {
+                            self.push_val(V::Scalar(p), None);
+                        } else {
+                            let tmp = self.temp(Repr::Ptr);
+                            self.store(V::Scalar(p), Repr::Ptr, tmp)?;
+                            self.push_val(V::Place(tmp.0, tmp.1), None);
+                        }
+                    }
+                    PlaceAt::Unsized(w, woff) => {
+                        if value {
+                            self.push_val(V::Place(w, woff), None);
+                        } else {
+                            let slot = self.b.slot(16, 3, SlotKind::Temp);
+                            let to = self.b.slot_addr(slot);
+                            let addr = self.b.load(Ty::PTR, Flags::NONE, w, woff, MemAttrs::aligned(3));
+                            let meta = self.b.load(Ty::I64, Flags::NONE, w, woff + 8, MemAttrs::aligned(3));
+                            self.b.store(Flags::NONE, addr, to, 0, MemAttrs::aligned(3));
+                            self.b.store(Flags::NONE, meta, to, 8, MemAttrs::aligned(3));
+                            self.push_val(V::Place(to, 0), None);
+                        }
+                    }
+                    PlaceAt::Indirect(..) => return Err(malformed("unresolved indirect capture place in env_use")),
                 }
                 Ok(true)
             }

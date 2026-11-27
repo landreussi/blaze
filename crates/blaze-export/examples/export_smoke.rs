@@ -95,9 +95,11 @@ fn main() -> ExitCode {
         entry: Entry::CMain { main: Symbol::of_name("main") },
         panic: Panic::Unwind,
         personality: None,
+        tls: None,
         profile: None,
         natives: None,
         exports: &[],
+        symbol_names: &[],
     };
     let mut file = Vec::new_in(alloc);
     let exported = match export(&program, platform, &mut file, alloc) {

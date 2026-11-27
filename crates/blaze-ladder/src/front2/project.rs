@@ -41,7 +41,7 @@ pub mod every_body;
 
 /// How many constants an array length in one body's heads may name before the body is
 /// refused ([`Refused::Lengths`]): reach.rs's and the census's `MOST_LENS`.
-pub(super) const MOST_LENS: u32 = 64;
+pub(super) const MOST_LENS: u32 = 1024;
 
 /// One body of the program's own crate: a free fn, `const` or `static` (its initializer), or a
 /// fn or `const` member of an impl or a trait (`kind`: [`MemberKind::Fn`] or
@@ -227,7 +227,10 @@ impl<'n> ProjectWorld<'n> {
         let front = Front2::new(names, frame, user, alloc)?;
         let mut store = Store::new(front.index.lang("sized"), frame, alloc);
         store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
-        Ok(ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(alloc), alloc, by_chain: None })
+        let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
+        let prepared = Prepares::new_in(bump);
+        store.prepared = Some(prepared);
+        Ok(ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared, alloc, by_chain: None })
     }
 }
 
@@ -240,7 +243,10 @@ impl<'n> ProjectWorld<'n, &'n source::Records<'n>> {
         let front = Front2::from_records(records, frame, lang_crates)?;
         let mut store = Store::new(front.index.lang("sized"), frame, alloc);
         store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
-        Ok(ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(alloc), alloc, by_chain: None })
+        let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
+        let prepared = Prepares::new_in(bump);
+        store.prepared = Some(prepared);
+        Ok(ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared, alloc, by_chain: None })
     }
 }
 
@@ -257,9 +263,62 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
     /// over the read-only view (`Tables`), so its key map, head store, impl index, constants
     /// and prepared macros are the task's own and nothing is kept from one body to the next.
     pub fn over(front: Front2<'n, S>, alloc: Alloc<'static>) -> ProjectWorld<'n, S> {
+        Self::over_with(front, None, alloc)
+    }
+
+    /// As [`ProjectWorld::over`], sharing a caller-owned `prepared` macro table across a stretch
+    /// of bodies so each body leaves 0 bytes in `front.frame` for `Prepares` and macro definitions
+    /// are compiled once per stretch instead of leaked per body. When `prepared` is `None`,
+    /// allocates a fresh `Prepares` in `front.frame`.
+    pub fn over_with(front: Front2<'n, S>, prepared: Option<&'n Prepares<'n>>, alloc: Alloc<'static>) -> ProjectWorld<'n, S> {
+        Self::over_with_pointers(front, prepared, None, alloc)
+    }
+
+    /// As [`ProjectWorld::over_with`], reusing pre-resolved [`super::receiver::Pointers`] across
+    /// bodies in a stretch so `Box`/`Rc`/`Arc`/`Pin` are not resolved from scratch per body.
+    pub fn over_with_pointers(
+        front: Front2<'n, S>,
+        prepared: Option<&'n Prepares<'n>>,
+        pointers: Option<super::receiver::Pointers>,
+        alloc: Alloc<'static>,
+    ) -> ProjectWorld<'n, S> {
         let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
-        store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
-        ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(alloc), alloc, by_chain: None }
+        store.pointers = pointers.unwrap_or_else(|| super::receiver::Pointers::find(&front.index, front.resolver));
+        let prepared = match prepared {
+            Some(prepared) => prepared,
+            None => {
+                let bump = front.frame.alloc(blaze_own::Erased::new(front.frame)).bump();
+                Prepares::new_in(bump)
+            }
+        };
+        store.prepared = Some(prepared);
+        ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared, alloc, by_chain: None }
+    }
+
+    /// As [`ProjectWorld::over_with_pointers`], reusing an already-populated stretch [`Store`]
+    /// (whose persistent head tables live in `HEADS_STRETCH_FRAME` and whose per-body scratch
+    /// fields have been rebound to `work` via `Store::begin_body_reuse`).
+    pub(super) fn over_with_store(
+        front: Front2<'n, S>,
+        mut store: Store<'n>,
+        prepared: Option<&'n Prepares<'n>>,
+        alloc: Alloc<'static>,
+    ) -> ProjectWorld<'n, S> {
+        let prepared = match prepared {
+            Some(prepared) => prepared,
+            None => {
+                let bump = front.frame.alloc(blaze_own::Erased::new(front.frame)).bump();
+                Prepares::new_in(bump)
+            }
+        };
+        store.prepared = Some(prepared);
+        ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared, alloc, by_chain: None }
+    }
+
+    /// Consumes this per-body world, dropping its per-body `Buckets` and `Consts` and returning
+    /// its reusable [`Store`] and [`super::keys::Keys`].
+    pub(super) fn into_store_and_keys(self) -> (Store<'n>, super::keys::Keys) {
+        (self.store, self.front.keys)
     }
 
     /// The meter the checks file their parts in (front2 tables/cost.rs): a measurement only.
@@ -284,9 +343,9 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
     }
 
     /// How the store's world meets a head it lacks (front2 asks.rs, D161 step 3's seam): under
-    /// `Once` the store's board is made now, from the store's own allocator.
+    /// `Once` the store's board is made now, from the store's per-body work allocator.
     pub fn set_asks(&mut self, met: super::asks::AsksMet) -> Result<(), blaze_core::claim_table::ClaimError> {
-        self.store.asks = super::asks::Asks::of(met, self.store.tys.alloc())?;
+        self.store.asks = super::asks::Asks::of(met, self.store.work_alloc())?;
         Ok(())
     }
 
@@ -298,13 +357,13 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
     /// Capture the definitions the task evaluates, including its local bodies and callees.
     pub fn record_const_texts(&mut self) {
         use super::tables::recorder::{Recorder, RecorderOpts};
-        self.store.maps.const_text_reads = Some(Recorder::new(RecorderOpts { alloc: self.store.tys.alloc() }));
+        self.store.maps.const_text_reads = Some(Recorder::new(RecorderOpts { alloc: self.store.work_alloc() }));
     }
 
     /// A pooled file job shares this world. Each subsequent body must receive
     /// the defining-text reads even for values the job has already computed.
     pub fn record_shared_const_texts(&mut self) {
-        let alloc = self.store.tys.alloc();
+        let alloc = self.store.work_alloc();
         self.store.maps.const_proofs.get_or_insert_with(|| super::heads::ConstProofs::new(alloc));
         self.record_const_texts();
     }
@@ -448,7 +507,7 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         let lowering = Cost::enter(cost, Part::Lower);
         // Boxed, lowered in a frame of its own: this frame stays on the stack under the whole
         // check (blaze-int notes t29 overflow-bt4.txt: 27,728 bytes).
-        let lowered = match lower_boxed(&mut r, prepared, body, alloc) {
+        let mut lowered = match lower_boxed(&mut r, prepared, body, alloc) {
             Ok(b) => b,
             // A required anonymous body's check can stop on a world gap. That is an
             // unanswered input to this body, not a refusal of the constant itself. Keep the
@@ -492,6 +551,28 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
             }
         };
         drop(lowering);
+        if !lowered.typeck.inline_fors.is_empty() {
+            if let Err(err) = super::inline_for::expand_concrete_body(&mut r, prepared, &mut lowered) {
+                match err {
+                    CheckFail::Diags { diags, .. } => {
+                        for (code, at, about) in diags.iter() {
+                            verdict.diagnostics.push(BodyDiagnostic { code: code.code(), text: AString::from_str_in(about, alloc), start: at.start, end: at.end, notes: AVec::new_in(alloc) });
+                        }
+                    }
+                    CheckFail::Gap { gaps, .. } => {
+                        for g in gaps {
+                            verdict.gaps.push(g);
+                        }
+                    }
+                    CheckFail::InlineFor { at, why, .. } => {
+                        verdict.diagnostics.push(BodyDiagnostic { code: "E0277", text: AString::from_str_in(why, alloc), start: at.start, end: at.end, notes: AVec::new_in(alloc) });
+                    }
+                    other => verdict.refused = Some(Refused::Check(other)),
+                }
+                verdict.diagnostics.sort_by_key(|d| (d.start, d.end, d.code));
+                return verdict;
+            }
+        }
         let view = lowered.lowered.view();
         let spell = match Spelling::of(&view) {
             Ok(s) => s,
@@ -521,15 +602,15 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
                 Some(b) => Some((b, seen?)),
                 None => None,
             };
-            let rows = facts_with_buckets(list.questions(), Some(list.rows.column::<1>()), module, written.paths, written.segments, buckets, alloc)?;
+            let rows = super::reads::facts_with_buckets(list.questions(), Some(list.rows.column::<1>()), module, written.paths, written.segments, buckets, alloc)?;
             Ok(BodyReads { rows, reach: Reach::Whole })
         };
         verdict.facts = match (&checked, &asked.finished) {
             (Ok((_, filed)), _) => whole(&filed.reads),
             (Err(_), Some(list)) => whole(list),
             (Err(_), None) => match buckets {
-                Some(b) => seen.and_then(|seen| facts_with_buckets(&asked.questions, None, module, written.paths, written.segments, Some((b, seen)), alloc)),
-                None => facts_with_buckets(&asked.questions, None, module, written.paths, written.segments, None, alloc),
+                Some(b) => seen.and_then(|seen| super::reads::facts_with_buckets(&asked.questions, None, module, written.paths, written.segments, Some((b, seen)), alloc)),
+                None => super::reads::facts_with_buckets(&asked.questions, None, module, written.paths, written.segments, None, alloc),
             }
             .map(|rows| BodyReads { rows, reach: Reach::Asked }),
         };
@@ -551,10 +632,10 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
                     let at = u.at();
                     let text = match *u {
                         blaze_typeck::Undecided::TargetFeatureCall { callee, .. } => {
-                            format!("the call of `{}` is not checked for `unsafe`", super::check::item_shown(&r, callee))
+                            blaze_own::format_in!(alloc, "the call of `{}` is not checked for `unsafe`", super::check::item_shown(&r, callee))
                         }
                     };
-                    verdict.undecided.push(BodyUndecided { cause: u.says(), text: AString::from_str_in(&text, alloc), start: at.start, end: at.end });
+                    verdict.undecided.push(BodyUndecided { cause: u.says(), text, start: at.start, end: at.end });
                 }
                 then(&mut r, &*lowered, &done);
             }
@@ -594,6 +675,138 @@ fn lint_finding<'a, 'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, f: &blaze_ty
         blaze_typeck::TypedFinding::UnsafeOpInUnsafeFn { op, .. } => {
             text.push_str(&super::check::unsafe_op_shown(r, op));
             text.push_str(" is unsafe and requires unsafe block (the body of an `unsafe fn` is no unsafe block in edition 2024)");
+        }
+        blaze_typeck::TypedFinding::Cost { violation, declared, actual, declared_sync, actual_sync, loop_depth, callee, .. } => {
+            use core::fmt::Write as _;
+            use blaze_typeck::CostViolation as V;
+            let callee_shown = |text: &mut AString<'a>, k: blaze_typeck::ItemKey| {
+                let shown = super::item_shown::ItemShown::of(r.names, &*r.keys, k);
+                text.push_str("`");
+                match shown.path() {
+                    Some(path) => text.push_str(path),
+                    None => text.push_str(&shown.boxed()),
+                }
+                text.push_str("`");
+            };
+            match violation {
+                V::MalformedContract => {
+                    text.push_str(
+                        "malformed or duplicate `#[blaze::cost(..)]` contract: expected a complexity class \
+                         (`O(1)`, `amortized O(1)`, `O(log n)`, `O(n)`, `O(n log n)`, `O(n^2)`), optional \
+                         `space = <class>`, optional sync mark (`lock_free` | `atomic` | `locks`), and optional \
+                         `trusted = \"<reason>\"`",
+                    );
+                }
+                V::MalformedLoopMark => {
+                    text.push_str(
+                        "malformed or duplicate `#[blaze::cost(..)]` loop mark: expected `bounded`, `amortized`, \
+                         or `reset` (each optionally with `= \"<reason>\"`)",
+                    );
+                }
+                V::LoopExceedsBudget => {
+                    let _ = write!(
+                        text,
+                        "loop at depth {loop_depth} has time cost {}, exceeding declared `#[blaze::cost({})]`; \
+                         mark the loop `#[blaze::cost(bounded)]` or `#[blaze::cost(amortized)]`, or widen the contract",
+                        actual.name(),
+                        declared.name(),
+                    );
+                }
+                V::CallExceedsBudget => {
+                    text.push_str("call to ");
+                    match callee {
+                        Some(k) => callee_shown(&mut text, k),
+                        None => text.push_str("callee"),
+                    }
+                    let _ = write!(
+                        text,
+                        " at loop depth {loop_depth} has effective time cost {}, exceeding declared `#[blaze::cost({})]`; \
+                         mark the loop `#[blaze::cost(bounded)]` or `#[blaze::cost(amortized)]`, replace the callee, or widen the contract",
+                        actual.name(),
+                        declared.name(),
+                    );
+                }
+                V::DirectRecursion => {
+                    text.push_str("direct recursive call to ");
+                    match callee {
+                        Some(k) => callee_shown(&mut text, k),
+                        None => text.push_str("self"),
+                    }
+                    let _ = write!(
+                        text,
+                        " is not proven within declared `#[blaze::cost({})]`; \
+                         convert to a bounded loop, widen the contract, or annotate `trusted = \"<reason>\"`",
+                        declared.name(),
+                    );
+                }
+                V::SpaceExceedsBudget => {
+                    text.push_str("call to ");
+                    match callee {
+                        Some(k) => callee_shown(&mut text, k),
+                        None => text.push_str("callee"),
+                    }
+                    let _ = write!(
+                        text,
+                        " at space-loop depth {loop_depth} has effective space cost {}, exceeding declared `space = {}`; \
+                         mark the loop `#[blaze::cost(reset)]` or `#[blaze::cost(bounded)]`, replace the callee, or widen the space bound",
+                        actual.name(),
+                        declared.name(),
+                    );
+                }
+                V::SyncExceedsBudget => {
+                    text.push_str("call to ");
+                    match callee {
+                        Some(k) => callee_shown(&mut text, k),
+                        None => text.push_str("callee"),
+                    }
+                    let _ = write!(
+                        text,
+                        " has synchronization cost `{}`, exceeding declared `{}`; \
+                         replace the callee with a `{}` operation or widen the sync contract",
+                        actual_sync.name(),
+                        declared_sync.name(),
+                        declared_sync.name(),
+                    );
+                }
+                V::LockInLoop => {
+                    text.push_str("call to ");
+                    match callee {
+                        Some(k) => callee_shown(&mut text, k),
+                        None => text.push_str("callee"),
+                    }
+                    let _ = write!(
+                        text,
+                        " acquires a lock (`{}`) inside a loop at depth {loop_depth}; \
+                         hoist the lock outside the loop, mark the loop `#[blaze::cost(bounded)]`, or declare `locks` on this function",
+                        actual_sync.name(),
+                    );
+                }
+            }
+        }
+        blaze_typeck::TypedFinding::CapabilityInSansIo { adt, capability, via_adt, borrowed, .. } => {
+            let show_item = |text: &mut AString<'a>, k: blaze_typeck::ItemKey| {
+                let shown = super::item_shown::ItemShown::of(r.names, &*r.keys, k);
+                text.push_str("`");
+                match shown.path() {
+                    Some(path) => text.push_str(path),
+                    None => text.push_str(&shown.boxed()),
+                }
+                text.push_str("`");
+            };
+            show_item(&mut text, adt);
+            text.push_str(" is defined in `#![blaze::sans_io]` and ");
+            if borrowed {
+                text.push_str("borrows");
+            } else {
+                text.push_str("stores");
+            }
+            text.push_str(" `#[blaze::capability]` type ");
+            show_item(&mut text, capability);
+            if let Some(via) = via_adt {
+                text.push_str(" transitively through ");
+                show_item(&mut text, via);
+            }
+            text.push_str(": pass capabilities as method arguments instead of storing them in sans-IO data");
         }
     }
     BodyLintFinding { lint: f.lint(), text, start: at.start, end: at.end }

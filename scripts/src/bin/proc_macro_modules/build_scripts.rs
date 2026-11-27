@@ -294,19 +294,34 @@ fn script_only(manifest: &str) -> String {
 pub(super) fn build_dep_names(manifest: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut inside = false;
+    let mut subtable = false;
     for line in manifest.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
             let header = trimmed.trim_start_matches('[').trim_end_matches(']').trim();
             let rest = header.strip_prefix("build-dependencies").or_else(|| header.split_once(".build-dependencies").map(|(_, rest)| rest));
             inside = rest == Some("");
+            subtable = false;
             if let Some(name) = rest.and_then(|rest| rest.strip_prefix('.')) {
                 names.push(name.trim_matches('"').to_owned());
+                subtable = true;
             }
             continue;
         }
-        if inside && let Some((key, _)) = trimmed.split_once('=') {
-            names.push(key.trim().split('.').next().unwrap_or("").trim_matches('"').to_owned());
+        if subtable && let Some((key, value)) = trimmed.split_once('=') && key.trim() == "package" {
+            names.push(strip_toml_comment(value).trim_matches('"').to_owned());
+            continue;
+        }
+        if inside && let Some((key, value)) = trimmed.split_once('=') {
+            let pkg = inline_entries(value)
+                .and_then(|entries| {
+                    entries.into_iter().find_map(|e| {
+                        let (k, v) = e.split_once('=')?;
+                        (k.trim() == "package").then(|| v.trim().trim_matches('"').to_owned())
+                    })
+                })
+                .unwrap_or_else(|| key.trim().split('.').next().unwrap_or("").trim_matches('"').to_owned());
+            names.push(pkg);
         }
     }
     names.sort();
@@ -314,13 +329,13 @@ pub(super) fn build_dep_names(manifest: &str) -> Vec<String> {
     names
 }
 
-/// What the script's module is built from of the lock, as `name version pin` lines: a
-/// registry or git package's whole closure (the proc-macro mode's); a path package's is its
-/// build-dependencies' closures, since its other dependencies (path packages of the
-/// workspace, which the lock pins nothing of) are not the script's.
-fn script_closure(lock: &str, wanted: &Wanted, origin: &Origin, manifest: &str) -> Result<Vec<String>, Failure> {
-    let (Origin::Path { .. } | Origin::Git { .. }) = origin else { return closure_lines(lock, &wanted.name, &wanted.version) };
+/// What the script's module is built from of the lock, as `name version pin` lines: only its
+/// build-dependencies' closures (never normal library dependencies, which may include patched
+/// path crates the build script never links). A build-dependency that is itself a path package
+/// (e.g. a workspace crate) is pinned by its `files_digest`.
+fn script_closure(lock: &str, wanted: &Wanted, checkout: &Path, alloc: blaze_own::Alloc<'_>, manifest: &str) -> Result<Vec<String>, Failure> {
     let names = build_dep_names(manifest);
+    let members = Members::new(checkout);
     let entry = lock
         .split("[[package]]")
         .skip(1)
@@ -351,9 +366,59 @@ fn script_closure(lock: &str, wanted: &Wanted, origin: &Origin, manifest: &str) 
                 }
             }
         };
-        let pin = checksum(lock, dep_name, &version).ok_or_else(|| Failure::NotLocked { name: dep_name.to_owned(), version: version.clone() })?;
-        lines.push(format!("{dep_name} {version} {pin}"));
-        lines.extend(closure_lines(lock, dep_name, &version)?);
+        if let Some(pin) = checksum(lock, dep_name, &version) {
+            lines.push(format!("{dep_name} {version} {pin}"));
+            lines.extend(closure_lines(lock, dep_name, &version)?);
+        } else {
+            // Walk the path build-dependency and its transitive lock closure, pinning every path
+            // package by `files_digest` and every registry/git package by its lock checksum/source.
+            let mut stack = vec![(dep_name.to_owned(), version)];
+            let mut visited = std::collections::BTreeSet::new();
+            while let Some((cur_name, cur_ver)) = stack.pop() {
+                if !visited.insert((cur_name.clone(), cur_ver.clone())) {
+                    continue;
+                }
+                if let Some(pin) = checksum(lock, &cur_name, &cur_ver) {
+                    lines.push(format!("{cur_name} {cur_ver} {pin}"));
+                    lines.extend(closure_lines(lock, &cur_name, &cur_ver)?);
+                    continue;
+                }
+                let dep_wanted = Wanted { name: cur_name.clone(), version: cur_ver.clone(), features: None };
+                let dir = members.find(&dep_wanted, alloc)?;
+                let digest = files_digest(&dir)?;
+                lines.push(format!("{cur_name} {cur_ver} files:{digest}"));
+                let Some(pkg) = lock
+                    .split("[[package]]")
+                    .skip(1)
+                    .find(|e| e.lines().any(|l| l.trim() == format!("name = {cur_name:?}")) && e.lines().any(|l| l.trim() == format!("version = {cur_ver:?}")))
+                else {
+                    continue;
+                };
+                let deps_list = pkg.find("dependencies = [").map_or("", |at| {
+                    let s = &pkg[at + "dependencies = [".len()..];
+                    &s[..s.find(']').unwrap_or(s.len())]
+                });
+                for sub in deps_list.split(',').map(|it| it.trim().trim_matches('"')).filter(|it| !it.is_empty()) {
+                    let mut p = sub.split(' ');
+                    let sn = p.next().unwrap_or("");
+                    let sv = match p.next() {
+                        Some(v) => v.to_owned(),
+                        None => {
+                            let vs: Vec<String> = lock
+                                .split("[[package]]")
+                                .filter(|e| e.lines().any(|l| l.trim() == format!("name = {sn:?}")))
+                                .filter_map(|e| e.lines().find_map(|l| l.trim().strip_prefix("version = ")).map(|v| v.trim_matches('"').to_owned()))
+                                .collect();
+                            match &vs[..] {
+                                [one] => one.clone(),
+                                _ => return Err(Failure::NotLocked { name: sn.to_owned(), version: "(one version)".to_owned() }),
+                            }
+                        }
+                    };
+                    stack.push((sn.to_owned(), sv));
+                }
+            }
+        }
     }
     lines.sort();
     lines.dedup();
@@ -382,7 +447,7 @@ impl Plan<'_> {
         let (wanted, origin) = (&self.args.crates[at], self.origin(at)?);
         let no_module = |why: String| Failure::NoModule { name: wanted.name.clone(), version: wanted.version.clone(), why };
         let original = self.manifest_of(at)?;
-        let closure = script_closure(&self.lock, wanted, origin, &original)?;
+        let closure = script_closure(&self.lock, wanted, &self.args.checkout, alloc, &original)?;
         // cargo compiles a script with `--cfg feature="x"` for each feature of its unit, so a
         // script's `cfg!(feature = ...)` is fixed in its module: one module per feature set.
         let mut features = wanted.features.clone().ok_or_else(|| {
@@ -485,7 +550,7 @@ impl Plan<'_> {
                 // rustc starts the tools under `lib/rustlib/<host>/bin` (`rust-objcopy`,
                 // `rust-lld`, `gcc-ld`): the pinned toolchain's, read-only.
                 let toolchain_tools = self.tool.sysroot.join("lib").join("rustlib");
-                let writes: [&Path; 4] = [ws.as_path(), target.as_path(), cargo_home.as_path(), tmp.as_path()];
+                let writes: [&Path; 4] = [target.as_path(), ws.as_path(), cargo_home.as_path(), tmp.as_path()];
                 let exec_under: [&Path; 4] = [toolchain_bin.as_path(), toolchain_tools.as_path(), shelf_bin.as_path(), target.as_path()];
                 let builder = NativeBuilder { cargo: Path::new(&self.tool.cargo()).to_owned(), reads: &reads, writes: &writes, exec_under: &exec_under };
                 builder.profile().and_then(|profile| native_sandboxed(argv.clone(), profile))
@@ -500,6 +565,7 @@ impl Plan<'_> {
             Err(why) => return Err(Failure::NoSandbox { why }),
         };
         let mut env = self.env(&self.work.join("cargo-home"));
+        env.push(("SOURCE_DATE_EPOCH".to_owned(), "0".into()));
         let mut flags = vec![format!("--remap-path-prefix={}=/build", self.work.display()), "-Cdebuginfo=0".to_owned()];
         if let Origin::Path { dir, .. } = origin {
             flags.push(format!("--remap-path-prefix={}=/build/path/{}-{}", dir.display(), wanted.name, wanted.version));
@@ -639,18 +705,17 @@ pub(super) fn main_with(text: &str, heap: &blaze_own::Heap) -> i32 {
     i32::from(failed > 0)
 }
 
-/// The confinement of a native script's build (D65, build-scripts.md "Runner 11"): what
-/// `cargo` may read, write and start. Its profile is blaze-build-script's deny-by-default one
-/// ([`blaze_build_script::native::seatbelt_with`], the profile a native script runs under), so
-/// there is one home for it: nothing outside the grant is read, the machine's compilers and
-/// `PATH` included; no network.
+/// The confinement of a native script's build (D65/D177, build-scripts.md "Runner 11"): what
+/// `cargo` may read, write and start. Its profile is rendered by `blaze_roots::seatbelt::render_sbpl`
+/// (the one deny-by-default renderer `bstd::procs::hermetic::seatbelt` uses), so there is one home
+/// for it: nothing outside the grant is read, the machine's compilers and `PATH` included; no network.
 struct NativeBuilder<'p> {
     /// The pinned toolchain's `cargo`: the program `sandbox-exec` starts.
     cargo: PathBuf,
     /// Read with what is under them: the vendored sources, the script's own source folder,
     /// the pinned Rust toolchain, the shelf's clang, the SDK.
     reads: &'p [&'p Path],
-    /// Written (and read): the script's workspace, its target folder, `CARGO_HOME`, `TMPDIR`.
+    /// Written (and read): the target folder, the script's workspace, `CARGO_HOME`, `TMPDIR`.
     writes: &'p [&'p Path],
     /// Any program under them may be started: the toolchain's and the shelf's `bin` (rustc,
     /// the linking clang, `ld64.lld`) and the target folder (the build scripts and proc macros
@@ -665,18 +730,32 @@ fn real_text(path: &Path) -> Result<String, String> {
 }
 
 impl NativeBuilder<'_> {
-    /// The Seatbelt profile's text; every path resolved first.
+    /// The Seatbelt profile's text via `blaze_roots::seatbelt::render_sbpl`; every path resolved first.
     fn profile(&self) -> Result<String, String> {
+        use blaze_roots::seatbelt::{MACOS_SYSTEM, SbplAccess, SbplRule, render_sbpl};
+
         let program = real_text(&self.cargo)?;
         let all = |paths: &[&Path]| paths.iter().map(|p| real_text(p)).collect::<Result<Vec<String>, String>>();
         let (reads, writes, exec_under) = (all(self.reads)?, all(self.writes)?, all(self.exec_under)?);
-        fn refs(list: &[String]) -> Vec<&str> {
-            list.iter().map(String::as_str).collect()
+        let mut rules: Vec<SbplRule<'_>> = Vec::with_capacity(1 + exec_under.len() + reads.len() + writes.len() + MACOS_SYSTEM.len() + 1);
+        rules.push(SbplRule { path: &program, subtree: false, access: SbplAccess::Exec });
+        for folder in &exec_under {
+            rules.push(SbplRule { path: folder, subtree: true, access: SbplAccess::Exec });
         }
-        let (reads, writes, exec_under) = (refs(&reads), refs(&writes), refs(&exec_under));
-        let grant = blaze_build_script::native::Grant { program: &program, exec: &[], read: &reads, write: &writes };
-        let text = blaze_build_script::native::seatbelt_with(&grant, &exec_under, blaze_own::Alloc::global()).map_err(|e| e.to_string())?;
-        Ok(text.as_str().to_owned())
+        for folder in &reads {
+            rules.push(SbplRule { path: folder, subtree: true, access: SbplAccess::Read });
+        }
+        for folder in &writes {
+            rules.push(SbplRule { path: folder, subtree: true, access: SbplAccess::Write });
+        }
+        for system in MACOS_SYSTEM {
+            rules.push(SbplRule { path: system, subtree: true, access: SbplAccess::Read });
+        }
+        rules.push(SbplRule { path: "/dev/null", subtree: false, access: SbplAccess::Write });
+        let mut bytes = render_sbpl(rules.into_iter(), blaze_own::Alloc::global()).map_err(|e| format!("seatbelt profile refused: {e:?}"))?;
+        // Strip the trailing NUL written for C callers.
+        bytes.pop();
+        String::from_utf8(bytes.to_vec()).map_err(|e| format!("seatbelt profile not UTF-8: {e}"))
     }
 }
 

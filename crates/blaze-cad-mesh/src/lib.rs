@@ -25,6 +25,7 @@
 //! | [`canon`] | the canonical triangle order the order-independent algorithms start from |
 //! | [`weld`] | [`weld()`]: triangle soup to an indexed mesh by exact positions, degenerate, duplicate and twin triangles removed |
 //! | [`shade`] | [`vertex_normals`] and [`shade()`]: normals split at a crease angle, at crease marks and at material borders |
+//! | [`uv`] | [`unwrap_uvs`] and [`compute_tangents`]: deterministic chart UV unwrapping, shelf atlas packing with gutter, and MikkTSpace-compatible vertex tangents |
 //! | [`simplify`] | [`decimate()`]: quadric error metrics by edge collapse, creases and borders kept, the error reported (named `decimate` so it is never confused with the kernel's `simplify` of a tape) |
 //! | [`lod`] | [`lod_chain`]: levels of detail with each level's error and its switch distance |
 //! | [`cache`] | [`optimize_vertex_cache`] (Tipsify), [`optimize_vertex_fetch`], [`acmr`] |
@@ -64,6 +65,7 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod bake;
 pub mod cache;
 pub mod canon;
 pub mod check;
@@ -71,6 +73,7 @@ pub mod cluster;
 pub mod contour;
 pub mod decompose;
 pub mod digest;
+pub mod feature;
 pub mod geom;
 pub mod hull;
 pub mod ids;
@@ -81,29 +84,39 @@ mod plant;
 pub mod quant;
 pub mod shade;
 pub mod simplify;
+pub mod uv;
+pub mod uv_project;
 mod vecs;
 pub mod weld;
 
 #[cfg(test)]
 mod tests;
 
+pub use bake::{
+    BakeError, BakeMaskMapOpts, BakeNormalOpts, BakeSurfaceOpts, BakedImage, FieldTransform, SurfaceAlphaMode,
+    bake_sdf_mask_map, bake_sdf_normal_map, bake_sdf_surface, bake_sdf_surface_planted,
+};
 pub use cache::{AcmrOpts, CacheError, CacheOpts, FetchOpts, acmr, optimize_vertex_cache, optimize_vertex_fetch};
 pub use canon::{CanonError, CanonOpts, canonical};
 pub use check::{CheckOpts, Defect, Proof, Verified, check};
 pub use cluster::{Cluster, ClusterCaps, ClusterError, ClusterOpts, Clusters, clusters, clusters_planted};
 pub use contour::{
-    CONTOUR_SCHEMA, MeshError, MeshOpts, MeshStats, Meshed, PieceCache, PieceCacheOpts, QEF_RANK_CUT, RedistanceOpts, RegionKey, mesh,
-    mesh_cached, mesh_planted, solve_redistance, solve_redistance_planted,
+    CONTOUR_SCHEMA, GridSizing, MeshError, MeshOpts, MeshStats, Meshed, PieceCache, PieceCacheOpts, QEF_RANK_CUT, RedistanceOpts,
+    RegionKey, auto_grid, mesh, mesh_cached, mesh_planted, solve_redistance, solve_redistance_planted,
 };
 pub use decompose::{ConvexPiece, DecomposeError, DecomposeOpts, Decomposition, decompose};
 pub use digest::MeshDigest;
+pub use feature::{ClosestTrianglePoint, FeatureProtect, FeatureRegion, FeatureZone, TriangleRegion, closest_point_on_triangle};
 pub use geom::Aabb;
 pub use hull::{Flat, Hull, HullError, HullOpts, convex_hull, convex_hull_planted};
 pub use ids::{MaterialRole, PartId, TriId, VertexId, VertexPair};
 pub use lod::{LodChain, LodError, LodLevel, LodOpts, Projection, lod_chain};
-pub use measure::{Components, MassProps, area, bounds, components, mass_properties};
+pub use measure::{
+    Components, CreaseProfile, CreaseProfileOpts, MassProps, Topology, area, bounds, components, crease_profile, mass_properties,
+    topology,
+};
 pub use mesh::{Column, Columns, Mesh, MeshVecs, MeshView, ShapeError};
-pub use plant::{ClusterPlant, ContourPlant, DecimatePlant, HullPlant, QuantPlant, RedistancePlant};
+pub use plant::{BakePlant, ClusterPlant, ContourPlant, DecimatePlant, HullPlant, QuantPlant, RedistancePlant, UvPlant, UvProjectPlant};
 pub use quant::{
     Dequantize, OCT8_BOUND, OCT16_BOUND, OctBits, OctNormals, QuantError, QuantNormalsOpts, QuantOpts, QuantizedPositions,
     Within, decode_oct8, decode_oct16, encode_oct8, encode_oct16, quantize_normals, quantize_positions,
@@ -111,6 +124,11 @@ pub use quant::{
 };
 pub use shade::{COS_32_DEGREES, ShadeError, ShadeOpts, shade, vertex_normals};
 pub use simplify::{DecimateError, DecimateOpts, DecimateStats, Decimated, Source, Stop, Target, decimate, decimate_planted};
+pub use uv::{UvError, UvMapped, UvOpts, compute_tangents, compute_tangents_planted, unwrap_uvs, unwrap_uvs_planted};
+pub use uv_project::{
+    ProjectUvError, ProjectUvOpts, TangentOpts, UvAxis, UvGrainAxis, UvMode, attach_tangents, attach_tangents_planted,
+    project_uvs, project_uvs_planted,
+};
 pub use weld::{Soup, Twins, WeldError, WeldOpts, Welded, weld};
 
 /// The caps of every algorithm here (D165: a field each, the shipped values one constant, drawn

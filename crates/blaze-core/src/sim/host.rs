@@ -40,6 +40,8 @@ use std::{
     time::Duration,
 };
 
+use blaze_own::Share;
+
 use super::{Of, Rng, Sim, Told};
 use crate::{
     Completion, Dgram, Done, Effect, FileName, IoError, RANDOM_MOST, RECV_MOST, Stream, Tag,
@@ -164,9 +166,11 @@ struct Landed {
 /// A copy of a datagram on its way, arriving at `at`.
 struct Flying {
     at: Duration,
+    from_sock: u64,
     from: SocketAddr,
     to: SocketAddr,
     ecn: Ecn,
+    multicast_loop: bool,
     bytes: Vec<u8>,
 }
 
@@ -497,7 +501,10 @@ impl Sim {
             port => port,
         };
         let local = SocketAddr::new(at.ip(), port);
-        if let Some(other) = self.host.socks.iter().find(|it| clashes(it.local, local)) {
+        let reuse_port = options.tuning.reuse_port.value() == Some(true);
+        if let Some(other) = self.host.socks.iter().find(|it| {
+            clashes(it.local, local) && !(reuse_port && it.options.tuning.reuse_port.value() == Some(true))
+        }) {
             // alloc: an error's message.
             return Done::Failed(IoError(format!(
                 "{local}: address already in use: {:?} is bound at {}",
@@ -550,22 +557,29 @@ impl Sim {
             let why = "sending a datagram marked with ECN on a socket bound without Options::ecn";
             return Done::dgram_failed(batch, false, sock, Some(local), peer, None, why);
         }
+        if options.tuning.broadcast.value() != Some(true)
+            && batch.heads.iter().any(|it| it.peer.ip() == IpAddr::V4(Ipv4Addr::BROADCAST))
+        {
+            let why = "sending a broadcast datagram without SO_BROADCAST";
+            return Done::dgram_failed(batch, false, sock, Some(local), peer, None, why);
+        }
+        let multicast_loop = options.tuning.multicast_loop.value().unwrap_or(true);
         if self.rng.one_in(u64::from(self.faults.fail_one_in)) {
             // A failure part way: the datagrams before a drawn one were sent, as a system call
             // that took some of a batch and refused the rest.
             let taken = self.rng.below(batch.datagrams() as u64) as usize;
-            self.fly(local, &batch, taken);
+            self.fly(sock.0, local, multicast_loop, &batch, taken);
             let why = "injected by the simulation";
             return Done::dgram_failed(batch, false, sock, Some(local), peer, None, why);
         }
-        self.fly(local, &batch, usize::MAX);
+        self.fly(sock.0, local, multicast_loop, &batch, usize::MAX);
         batch.clear();
         Done::SentDatagrams(batch)
     }
 
     /// The first `most` datagrams of `batch` from the socket at `local` put on their way, each
     /// lost, doubled and delayed on its own.
-    fn fly(&mut self, local: SocketAddr, batch: &Batch, most: usize) {
+    fn fly(&mut self, from_sock: u64, local: SocketAddr, multicast_loop: bool, batch: &Batch, most: usize) {
         let net = self.host.net;
         let from = seen_from(local);
         let from = match self.planted(Plant::SenderLies) {
@@ -588,7 +602,7 @@ impl Sim {
                 let at = self.now + delay;
                 let mut copy = Vec::with_capacity_in(bytes.len(), std::alloc::Global);
                 copy.extend_from_slice(bytes);
-                self.host.flying.push(Flying { at, from, to, ecn: head.ecn, bytes: copy });
+                self.host.flying.push(Flying { at, from_sock, from, to, ecn: head.ecn, multicast_loop, bytes: copy });
             }
         }
     }
@@ -694,8 +708,33 @@ impl Sim {
         self.host.flying = left;
         // Stable: two due at once arrive in the order sent.
         landed.sort_by_key(|it| it.at);
-        for Flying { from, to, ecn, bytes, .. } in landed {
-            if let Some(sock) = self.host.socks.iter_mut().find(|it| reaches(it.local, to)) {
+        for Flying { from_sock, from, to, ecn, multicast_loop, bytes, .. } in landed {
+            let is_broadcast = to.ip() == IpAddr::V4(Ipv4Addr::BROADCAST);
+            let multicast_v4 = match to.ip() {
+                IpAddr::V4(ip) if ip.is_multicast() => Some(ip),
+                _ => None,
+            };
+            if is_broadcast || multicast_v4.is_some() {
+                for sock in &mut self.host.socks {
+                    if sock.local.port() != to.port() || !sock.local.is_ipv4() {
+                        continue;
+                    }
+                    if let Some(group) = multicast_v4 {
+                        let joined = sock
+                            .options
+                            .tuning
+                            .multicast_join
+                            .value()
+                            .is_some_and(|m| m.group == group);
+                        if !joined || (!multicast_loop && sock.id == from_sock) {
+                            continue;
+                        }
+                    }
+                    let mut landed_item = Landed { from, to, ecn, bytes: Default::default() };
+                    landed_item.bytes.extend_from_slice(&bytes);
+                    sock.inbox.push_back(landed_item);
+                }
+            } else if let Some(sock) = self.host.socks.iter_mut().find(|it| reaches(it.local, to)) {
                 sock.inbox.push_back(Landed { from, to, ecn, bytes });
             }
         }
@@ -811,7 +850,7 @@ impl Sim {
             };
             let dir = FileName::new(dir).expect("a part of a name is a name");
             // clone: the journal's own name of it, a refcount.
-            self.host.made.insert(slot, dir.clone());
+            self.host.made.insert(slot, dir.share());
             match maker {
                 Maker::Effect => {
                     self.dir_named(super::Named::MadeDir { dir });
@@ -834,7 +873,7 @@ impl Sim {
         self.make_parents(dir, Maker::Outside);
         if let Err(slot) = self.host.made.binary_search(dir) {
             // clone: the disk's own name of it, a refcount.
-            self.host.made.insert(slot, dir.clone());
+            self.host.made.insert(slot, dir.share());
             self.names.retain(|change| !change.named.touches(dir));
         }
     }
@@ -949,7 +988,7 @@ impl Sim {
         }
         let at = self.host.made.binary_search(&dir).expect_err("not made, looked up above");
         // clone: the journal's own name of it, a refcount.
-        self.host.made.insert(at, dir.clone());
+        self.host.made.insert(at, dir.share());
         self.dir_named(super::Named::MadeDir { dir });
         Done::MadeDir
     }
@@ -980,7 +1019,7 @@ impl Sim {
             self.host.made.retain(|it| !it.is_under(dir));
             self.disk.dir_gone(dir);
             // clone: the journal's own name of it, a refcount.
-            self.dir_named(super::Named::RemovedDir { dir: dir.clone() });
+            self.dir_named(super::Named::RemovedDir { dir: dir.share() });
             return Done::RemovedDir;
         }
         match self.host.made.binary_search(dir) {
@@ -988,7 +1027,7 @@ impl Sim {
                 self.host.made.remove(at);
                 self.disk.dir_gone(dir);
                 // clone: the journal's own name of it, a refcount.
-                self.dir_named(super::Named::RemovedDir { dir: dir.clone() });
+                self.dir_named(super::Named::RemovedDir { dir: dir.share() });
                 Done::RemovedDir
             }
             // alloc: an error's message.

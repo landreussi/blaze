@@ -47,14 +47,14 @@ mod tests;
 use blaze_ids::ContentId;
 use blaze_own::Alloc;
 use blaze_typeck::{
-    AdjustKind, BodyView, Checked, Def, ExprId, Fetch, ItemKey, List, PTy, PTys, PatId, PortableTys, Range,
+    AdjustKind, BodyView, Checked, Def, ExprId, Fetch, ItemKey, List, PTy, PTys, PatId, PortableTys, Range, UnionPat,
 };
 
 pub use error::{At, ConstError, Op, PanicPart, Refusal};
 pub use layout::{IntRepr, Layout, LayoutCx, LayoutFacts, Layouts, Missing, ReprAttrs, TagWrite, ValidRange};
 pub use lit::LitError;
 pub use machine::{Answer, Codes, Need, NeedKind, Outcome, Settle, eval_discriminant, eval_len, value_of};
-pub use record::{ConstFn, ConstRecord, DataAlloc, DataRecord, DataReloc, DataTarget, RecordKey};
+pub use record::{ConstFn, ConstRecord, ConstVtable, DataAlloc, DataRecord, DataReloc, DataTarget, RecordKey};
 
 /// The written text of every literal of a body, read where the literal was written: the item's
 /// own text or a macro expansion's (blaze-lower's `View::text_at` of the literal's range). A
@@ -125,6 +125,12 @@ pub struct Typed<'b> {
     /// the expression, the field's index in its variant, the default's key (a constant over
     /// the ADT's generics, read at the expression's type's arguments).
     pub default_fields: (&'b [ExprId], &'b [u32], &'b [ItemKey]),
+    /// Each field a struct or record update `{ a: 1, ..base }` takes from its base, sorted by
+    /// expression then field: the expression, the field's index, its type.
+    pub fru_fields: (&'b [ExprId], &'b [u32], &'b [PTy]),
+    /// Structural union pattern bindings (`UnionPat::Variant` / `UnionPat::Residual`), sorted by
+    /// pattern id.
+    pub union_pats: (&'b [PatId], &'b [UnionPat]),
 }
 
 impl<'b> Typed<'b> {
@@ -146,6 +152,8 @@ impl<'b> Typed<'b> {
             pat_defs: (checked.pat_defs.column::<0>(), checked.pat_defs.column::<1>()),
             const_args: (checked.const_args.column::<0>(), checked.const_args.column::<1>()),
             default_fields: (checked.default_fields.column::<0>(), checked.default_fields.column::<1>(), checked.default_fields.column::<2>()),
+            fru_fields: (checked.fru_fields.column::<0>(), checked.fru_fields.column::<1>(), checked.fru_fields.column::<2>()),
+            union_pats: (checked.union_pats.column::<0>(), checked.union_pats.column::<1>()),
         }
     }
 }
@@ -285,6 +293,15 @@ pub trait ConstWorld: LayoutFacts {
     /// `[closure, (args..)]`, the instance blaze-build's `closure_fn_addr` builds.
     /// An absent method refuses the coercion. A pending lookup names the trait to load.
     fn fn_trait_method(&self, _which: blaze_build::FnTrait) -> FnTraitMethod {
+        FnTraitMethod::Absent
+    }
+
+    /// The `Deref::deref` (`Mutbl::Not`) or `DerefMut::deref_mut` (`Mutbl::Mut`) trait method, as
+    /// `blaze_build::Adts::deref_fn` answers the builder (rule 30: the same item). An overloaded
+    /// dereference adjustment in a constant resolves this trait method at `[Self]` via
+    /// [`ConstWorld::resolve`] and dereferences the reference it returns.
+    /// An absent method refuses the dereference. A pending lookup names the trait to load.
+    fn deref_method(&self, _mutbl: blaze_typeck::Mutbl) -> FnTraitMethod {
         FnTraitMethod::Absent
     }
 

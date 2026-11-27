@@ -22,7 +22,7 @@
 //! surface a manifold, T. K. Dey, H. Edelsbrunner, S. Guha and D. V. Nekhayev, "Topology
 //! preserving edge contraction", 1999); no two triangles on one set of vertices after it (the
 //! tetrahedron case the link condition admits); no triangle's normal turned by 90 degrees or more,
-//! and none made of zero area (NORMAL-FLIP REJECTION).
+//! and no collapse may leave an ill-conditioned face in its fan (NORMAL-FLIP REJECTION).
 //!
 //! ERROR BOUND: a SUCCESSIVE MAP (J. Cohen, M. Olano and D. Manocha, "Appearance-preserving
 //! simplification", SIGGRAPH 1998, its successive mapping), measured against the INPUT, never
@@ -102,6 +102,7 @@
 
 #![blaze::sans_io]
 
+use blaze_math::Vec3;
 use blaze_own::planted::{NoPlant, Planted};
 use blaze_own::{Alloc, AllocFailure, Heap4, Vec};
 
@@ -109,6 +110,7 @@ use blaze_units::Length;
 
 use crate::MeshLimits;
 use crate::check::{CheckOpts, Defect, Proof, Verified, check};
+use crate::feature::{FeatureProtect, FeatureZone};
 use crate::geom::{D3, M3, P3, add, cross, distance, dot, length, length_up, narrow, plus_zeros, scale, solve3, sqrt, sub, tri_normal, unit, wide};
 use crate::ids::{MaterialRole, PartId, TriId, VertexId, VertexPair};
 use crate::mesh::{Column, Mesh, MeshVecs, MeshView, ShapeError, built, empty_vecs};
@@ -125,6 +127,18 @@ pub enum Target {
     /// Collapse every edge whose collapse keeps the two-sided distance bound at most this (the
     /// mesh's positions are metres, so the bound is compared with `as_m()`, one rounding).
     Error(Length),
+    /// Game-asset budget target: collapse freely within `error` (removing flat/coplanar
+    /// redundancy even below `max_triangles`), and if the mesh still exceeds `max_triangles`,
+    /// continue collapsing cheapest-first until `live <= max_triangles` or the two-sided error
+    /// would exceed `max_error` (when `Some`, stopping with [`Stop::ErrorCeiling`]).
+    Budget {
+        /// Geometric accuracy target collapsed freely to eliminate coplanar/redundant triangles.
+        error: Length,
+        /// Per-part triangle budget cap.
+        max_triangles: u32,
+        /// Optional hard two-sided error ceiling that stops decimation before destroying shapes.
+        max_error: Option<Length>,
+    },
 }
 
 /// What is simplified: any shape-checked mesh, or a verified one, whose output is then
@@ -137,10 +151,13 @@ pub enum Source<'v> {
 
 #[blaze::args]
 #[derive(Clone, Copy, Debug)]
-pub struct DecimateOpts<'a, 's> {
+pub struct DecimateOpts<'a, 's, 'z> {
     pub target: Target,
     /// The crease angle the output's normals are split at, as its cosine (see `shade`).
     pub cos_crease: f32,
+    /// Optional spatial feature zones that tighten error/normal bounds and prioritize preserving
+    /// geometry around critical features (keyholes, bevels, mating surfaces).
+    pub zones: &'z [FeatureZone] = &[],
     pub limits: MeshLimits,
     pub alloc: Alloc<'a>,
     pub scratch: Alloc<'s>,
@@ -153,6 +170,9 @@ pub enum Stop {
     Reached,
     /// Every collapse left would break a rule above before the triangle target was met.
     NoValidCollapse,
+    /// For [`Target::Budget`], every remaining collapse before `max_triangles` would exceed
+    /// `max_error`.
+    ErrorCeiling,
 }
 
 #[derive(Debug)]
@@ -244,11 +264,10 @@ const TAU: f64 = 1e-12;
 /// unclaimed.
 const ALLOWANCE: f64 = 1e-9;
 /// The most pieces a live triangle owns before it is frozen into one (module documentation,
-/// MERGING): with merging a triangle owns about one piece per input triangle under it, so this is
-/// reached only by a triangle over more than a thousand input triangles (a large flat face, whose
-/// error, and so its frozen `base`, is near zero), and caps a map's work at
-/// `MAX_REGION · FREEZE` pieces.
-const FREEZE: u32 = 1024;
+/// MERGING): combined with adaptive slack-gated freezing for low-error flat/gently-curved faces,
+/// this keeps worst-case map work tightly bounded on high-resolution CAD meshes while giving
+/// noisy curved surfaces ample headroom before freezing.
+const FREEZE: u32 = 192;
 /// The most triangles a collapse's region may hold (both ends' stars): a larger one is refused. A
 /// vertex of a contoured surface has six neighbours or so, and the prototypes' largest region was
 /// 38; the cap bounds a map's pieces, not the result.
@@ -423,6 +442,12 @@ struct Work<'s, 'v> {
     parts: &'v [PartId],
     roles: &'v [MaterialRole],
     live: u32,
+    /// Per-vertex spatial feature-zone constraints (empty when `DecimateOpts::zones` is empty).
+    has_zones: bool,
+    zone_limit: V<'s, f64>,
+    zone_min_cos_sq: V<'s, f64>,
+    zone_weight: V<'s, f64>,
+    zone_pinned: V<'s, bool>,
 }
 
 /// The candidate queue, with the counter only the planted tie-break reads.
@@ -541,18 +566,47 @@ impl Work<'_, '_> {
     fn contains(&self, t: u32, s: u32) -> bool {
         self.tri[at(t)].contains(&s)
     }
+
+    #[inline]
+    fn edge_limit(&self, a: u32, b: u32) -> f64 {
+        if !self.has_zones {
+            return f64::INFINITY;
+        }
+        self.zone_limit[at(a)].min(self.zone_limit[at(b)])
+    }
+
+    #[inline]
+    fn edge_min_cos_sq(&self, a: u32, b: u32) -> f64 {
+        if !self.has_zones {
+            return 0.0;
+        }
+        self.zone_min_cos_sq[at(a)].max(self.zone_min_cos_sq[at(b)])
+    }
+
+    #[inline]
+    fn edge_weight(&self, a: u32, b: u32) -> f64 {
+        if !self.has_zones {
+            return 1.0;
+        }
+        self.zone_weight[at(a)].max(self.zone_weight[at(b)])
+    }
+
+    #[inline]
+    fn edge_pinned(&self, a: u32, b: u32) -> bool {
+        self.has_zones && (self.zone_pinned[at(a)] || self.zone_pinned[at(b)])
+    }
 }
 
 /// Mesh decimation by edge collapse. Named `decimate`, not `simplify`: blaze-cad-field owns
 /// `simplify` (a tape specialised to a box), one name per concept.
-pub fn decimate<'a>(source: Source<'_>, opts: DecimateOpts<'a, '_>) -> Result<Decimated<'a>, DecimateError> {
+pub fn decimate<'a>(source: Source<'_>, opts: DecimateOpts<'a, '_, '_>) -> Result<Decimated<'a>, DecimateError> {
     decimate_planted(source, opts, NoPlant)
 }
 
 /// [`decimate`] with a planted bug, for the tests' controls.
 pub fn decimate_planted<'a>(
     source: Source<'_>,
-    opts: DecimateOpts<'a, '_>,
+    opts: DecimateOpts<'a, '_, '_>,
     plant: impl Planted<DecimatePlant>,
 ) -> Result<Decimated<'a>, DecimateError> {
     let (view, was_verified) = match source {
@@ -575,10 +629,28 @@ pub fn decimate_planted<'a>(
     if view.colours().is_some() {
         return Err(DecimateError::NotCarried { column: Column::Colours });
     }
-    if let Target::Error(e) = opts.target
-        && e < Length::ZERO
-    {
-        return Err(DecimateError::BadErrorTarget { error: e });
+    match opts.target {
+        Target::Error(e) if e < Length::ZERO => {
+            return Err(DecimateError::BadErrorTarget { error: e });
+        }
+        Target::Budget { error, max_error, .. } => {
+            if error < Length::ZERO {
+                return Err(DecimateError::BadErrorTarget { error });
+            }
+            if let Some(ce) = max_error
+                && (ce < Length::ZERO || ce < error)
+            {
+                return Err(DecimateError::BadErrorTarget { error: ce });
+            }
+        }
+        _ => {}
+    }
+    for z in opts.zones {
+        if let Some(me) = z.max_error
+            && me < Length::ZERO
+        {
+            return Err(DecimateError::BadErrorTarget { error: me });
+        }
     }
     let s = opts.scratch;
     let spots = spots(view.positions(), s)?;
@@ -689,6 +761,43 @@ pub fn decimate_planted<'a>(
             largest = largest.max(f64::from(x).abs());
         }
     }
+    let has_zones = !opts.zones.is_empty();
+    let (zone_limit, zone_min_cos_sq, zone_weight, zone_pinned) = if has_zones {
+        let mut zl: V<'_, f64> = Vec::try_with_capacity_in(at(n), s)?;
+        let mut zc: V<'_, f64> = Vec::try_with_capacity_in(at(n), s)?;
+        let mut zw: V<'_, f64> = Vec::try_with_capacity_in(at(n), s)?;
+        let mut zp: V<'_, bool> = Vec::try_with_capacity_in(at(n), s)?;
+        for q in pos.iter() {
+            let p3 = Vec3::new(f64::from(q[0]), f64::from(q[1]), f64::from(q[2]));
+            let mut lim = f64::INFINITY;
+            let mut mcs = 0.0f64;
+            let mut wt = 1.0f64;
+            let mut pin = false;
+            for z in opts.zones {
+                if z.region.contains(p3) {
+                    if let Some(me) = z.max_error {
+                        lim = lim.min(me.as_m());
+                    }
+                    if let Some(mc) = z.min_cos_sq {
+                        mcs = mcs.max(mc.clamp(0.0, 0.9999));
+                    }
+                    if z.cost_weight.is_finite() && z.cost_weight > 1.0 {
+                        wt = wt.max(z.cost_weight);
+                    }
+                    if z.protect == FeatureProtect::Pinned {
+                        pin = true;
+                    }
+                }
+            }
+            push(&mut zl, lim)?;
+            push(&mut zc, mcs)?;
+            push(&mut zw, wt)?;
+            push(&mut zp, pin)?;
+        }
+        (zl, zc, zw, zp)
+    } else {
+        (Vec::new_in(s), Vec::new_in(s), Vec::new_in(s), Vec::new_in(s))
+    };
     let mut w = Work {
         pos,
         quad,
@@ -709,6 +818,11 @@ pub fn decimate_planted<'a>(
         parts: view.parts(),
         roles: view.roles(),
         live: triangles,
+        has_zones,
+        zone_limit,
+        zone_min_cos_sq,
+        zone_weight,
+        zone_pinned,
     };
     let mut lists = Lists {
         star_a: Vec::new_in(s),
@@ -740,11 +854,16 @@ pub fn decimate_planted<'a>(
     // The largest accepted collapse's error (module documentation, ERROR BOUND), metres.
     let mut error_bound = 0.0f64;
     let mut stats = DecimateStats::default();
-    // The most a map's pieces may err before it stops and the collapse is refused: the target
-    // less the allowance the admission adds back.
-    let limit = match opts.target {
+    let mut over_ceiling: u64 = 0;
+    // For `Target::Budget`, Phase 1 runs strictly under `error` so all flat/coplanar and low-error
+    // collapses happen BEFORE any above-`error` budget collapse is ever considered; only if
+    // `w.live > max_triangles` after Phase 1 empties does Phase 2 re-seed live edges under
+    // `max_error` and collapse cheapest-first down to `max_triangles`.
+    let mut budget_phase2 = false;
+    let mut active_limit = match opts.target {
         Target::Error(e) => e.as_m() - w.allowance,
         Target::Triangles(_) => f64::INFINITY,
+        Target::Budget { error, .. } => error.as_m() - w.allowance,
     };
     let mut queue = Queue { heap: Heap4::new_in(s), pushed: 0, plant };
     if queue.plant.has(DecimatePlant::TieByInsertion) {
@@ -772,13 +891,52 @@ pub fn decimate_planted<'a>(
         }
     }
     let stop = loop {
-        if let Target::Triangles(most) = opts.target
-            && w.live <= most
-        {
-            break Stop::Reached;
+        match opts.target {
+            Target::Triangles(most) if w.live <= most => break Stop::Reached,
+            Target::Budget { max_triangles, .. } if budget_phase2 && w.live <= max_triangles => break Stop::Reached,
+            _ => {}
         }
         let Some(c) = queue.heap.pop() else {
-            break if matches!(opts.target, Target::Error(_)) { Stop::Reached } else { Stop::NoValidCollapse };
+            match opts.target {
+                Target::Error(_) => break Stop::Reached,
+                Target::Triangles(_) => break Stop::NoValidCollapse,
+                Target::Budget { max_triangles, max_error, .. } => {
+                    if w.live <= max_triangles {
+                        break Stop::Reached;
+                    }
+                    if !budget_phase2 {
+                        // Phase 1 finished above `max_triangles`: transition to Phase 2 and re-seed
+                        // every live undirected edge once in deterministic `(lo, hi)` order.
+                        budget_phase2 = true;
+                        active_limit = max_error.map_or(f64::INFINITY, |ce| ce.as_m() - w.allowance);
+                        for v in 0..n {
+                            if w.parent[at(v)] != v || w.head[at(v)] == NONE {
+                                continue;
+                            }
+                            w.star(v, &mut lists.star_a)?;
+                            lists.neighbours.clear();
+                            let mut last = NONE;
+                            for side in lists.star_a.iter() {
+                                if side.0 > v && side.0 != last {
+                                    push(&mut lists.neighbours, side.0)?;
+                                    last = side.0;
+                                }
+                            }
+                            for ni in 0..lists.neighbours.len() {
+                                let x = lists.neighbours[ni];
+                                w.star(x, &mut lists.star_b)?;
+                                queue.offer_from_stars(&w, (v, x), &lists.star_a, &lists.star_b)?;
+                            }
+                        }
+                        continue;
+                    }
+                    break if over_ceiling > 0 {
+                        Stop::ErrorCeiling
+                    } else {
+                        Stop::NoValidCollapse
+                    };
+                }
+            }
         };
         if w.version[at(c.lo)] != c.ver_lo || w.version[at(c.hi)] != c.ver_hi {
             continue;
@@ -791,7 +949,18 @@ pub fn decimate_planted<'a>(
             continue;
         };
         // `evaluate` left both ends' stars in `star_a` and `star_b`, reused directly by `valid`.
-        if !valid(&w, &mut lists, &plan)? {
+        // In error-bounded simplification (and Phase 1 of `Target::Budget`), reject bevel-folding
+        // collapses that twist a surviving triangle's normal past ~22.8° (`cos² = 0.85`), and
+        // tighten further inside any marked `FeatureZone`. In aggressive triangle-budget reduction
+        // (`Target::Triangles` / Phase 2), fall back to hemisphere non-flip (`dot > 0`) outside
+        // feature zones while still honoring any zone's explicit `min_cos_sq`.
+        let base_min_cos_sq: f64 = match opts.target {
+            Target::Error(_) => 0.85,
+            Target::Budget { .. } if !budget_phase2 => 0.85,
+            _ => 0.0,
+        };
+        let min_cos_sq = base_min_cos_sq.max(w.edge_min_cos_sq(plan.keep, plan.gone));
+        if !valid(&w, &mut lists, &plan, min_cos_sq)? {
             continue;
         }
         // `valid` left both ends' live corners in `ring_a` (`keep`) and `ring_b` (`gone`).
@@ -800,26 +969,80 @@ pub fn decimate_planted<'a>(
             stats.over_region += 1;
             continue;
         }
-        let Some(step) = remap(&w, &mut lists, &plan, limit, &mut stats, queue.plant)? else {
+        let edge_zlim = w.edge_limit(plan.keep, plan.gone);
+        let edge_pinned = w.edge_pinned(plan.keep, plan.gone);
+        let zone_cap = if edge_zlim.is_finite() {
+            match opts.target {
+                Target::Error(_) => edge_zlim,
+                Target::Budget { .. } if !budget_phase2 => edge_zlim,
+                _ => {
+                    if edge_pinned {
+                        edge_zlim
+                    } else {
+                        edge_zlim * 2.0
+                    }
+                }
+            }
+        } else {
+            f64::INFINITY
+        };
+        let eff_limit = if zone_cap.is_finite() { active_limit.min(zone_cap - w.allowance) } else { active_limit };
+        let Some(step) = remap(&w, &mut lists, &plan, eff_limit, &mut stats, queue.plant)? else {
             continue;
         };
         let err = step + w.allowance;
-        if let Target::Error(e) = opts.target
-            && !(err <= e.as_m())
-        {
+        if zone_cap.is_finite() && !(err <= zone_cap) {
             stats.over_error += 1;
+            if budget_phase2 {
+                over_ceiling += 1;
+            }
             continue;
+        }
+        match opts.target {
+            Target::Error(e) if !(err <= e.as_m()) => {
+                stats.over_error += 1;
+                continue;
+            }
+            Target::Budget { error, max_error, .. } => {
+                if !budget_phase2 {
+                    if !(err <= error.as_m()) {
+                        stats.over_error += 1;
+                        continue;
+                    }
+                } else if let Some(ce) = max_error
+                    && !(err <= ce.as_m())
+                {
+                    stats.over_error += 1;
+                    over_ceiling += 1;
+                    continue;
+                }
+            }
+            _ => {}
         }
         collapse(&mut w, &mut lists, &plan)?;
         stats.collapses += 1;
         error_bound = error_bound.max(err);
         // A merge may err up to the target, or for a triangle target up to the bound so far: it
-        // never raises that one.
+        // never raises that one. Inside a `FeatureZone`, also cap merges by the zone's limit.
         let merge_limit = match opts.target {
-            Target::Error(_) => limit,
-            Target::Triangles(_) => error_bound - w.allowance,
+            Target::Error(_) => eff_limit,
+            Target::Triangles(_) => (error_bound - w.allowance).min(eff_limit),
+            Target::Budget { .. } => {
+                if !budget_phase2 {
+                    eff_limit
+                } else {
+                    (error_bound - w.allowance).min(eff_limit)
+                }
+            }
         };
-        let merged = place(&mut w, &mut lists, merge_limit, &mut stats, s)?;
+        let freeze_ref = if eff_limit.is_finite() {
+            eff_limit
+        } else if active_limit.is_finite() {
+            active_limit
+        } else {
+            error_bound.max(w.allowance * 1e4)
+        };
+        let merged = place(&mut w, &mut lists, merge_limit, freeze_ref, &mut stats, s)?;
         error_bound = error_bound.max(merged + w.allowance);
         w.star(plan.keep, &mut lists.star_a)?;
         lists.neighbours.clear();
@@ -1011,7 +1234,15 @@ fn evaluate_stars(
     if cost.is_nan() {
         return None;
     }
-    let cost = if cost > 0.0 { cost } else { 0.0 };
+    let mut cost = if cost > 0.0 { cost } else { 0.0 };
+    if w.has_zones {
+        let weight = w.edge_weight(a, b);
+        if weight > 1.0 {
+            // Bias critical/pinned edges behind equal-cost non-critical edges so flat faces
+            // outside marked features collapse before marked keyholes, bevels, or mating surfaces.
+            cost = (cost + 1e-18) * weight;
+        }
+    }
     let (keep, gone) = match place {
         Place::AtB => (b, a),
         _ => (a, b),
@@ -1019,9 +1250,10 @@ fn evaluate_stars(
     Some(Plan { keep, gone, shared: fa.edge_tris, p, q, cost })
 }
 
-/// The link condition, no duplicate triangle after, no normal flipped or made zero.
+/// The link condition, no duplicate triangle after, no normal flipped or folded past
+/// `acos(sqrt(min_cos_sq))` (or 90° when `min_cos_sq == 0.0`), and no nearly collinear triangle.
 /// Reuses the sorted stars `evaluate` left in `lists.star_a` and `lists.star_b`.
-fn valid(w: &Work<'_, '_>, lists: &mut Lists<'_>, plan: &Plan) -> Result<bool, AllocFailure> {
+fn valid(w: &Work<'_, '_>, lists: &mut Lists<'_>, plan: &Plan, min_cos_sq: f64) -> Result<bool, AllocFailure> {
     let (a, b) = (plan.keep, plan.gone);
     let shared = plan.shared;
     // Distinct neighbours of each, the other end left out, counted in common.
@@ -1072,8 +1304,24 @@ fn valid(w: &Work<'_, '_>, lists: &mut Lists<'_>, plan: &Plan) -> Result<bool, A
                     moved[k] = a;
                 }
             }
-            let after = tri_normal(corners[0], corners[1], corners[2]);
-            if after == [0.0; 3] || !(dot(before, after) > 0.0) {
+            let ab = sub(corners[1], corners[0]);
+            let ac = sub(corners[2], corners[0]);
+            let bc = sub(corners[2], corners[1]);
+            let after = cross(ab, ac);
+            let area_sq = dot(after, after);
+            let (ab_sq, ac_sq, bc_sq) = (dot(ab, ab), dot(ac, ac), dot(bc, bc));
+            // Twice-area squared divided by the adjacent squared edge lengths is sin²(angle).
+            // Check the worst corner. A positive f64 area alone admits slivers whose normal
+            // loses most of its precision when the exported f32 corners are transformed.
+            let max_edge_product = (ab_sq * ac_sq).max(bc_sq * ab_sq.max(ac_sq));
+            if area_sq <= f64::from(f32::EPSILON) * max_edge_product {
+                return Ok(false);
+            }
+            let d = dot(before, after);
+            if !(d > 0.0) {
+                return Ok(false);
+            }
+            if min_cos_sq > 0.0 && !(d * d >= min_cos_sq * dot(before, before) * area_sq) {
                 return Ok(false);
             }
             if moved[0] > moved[1] {
@@ -1132,10 +1380,56 @@ fn remap(
     // The corners a map reads: the region's pieces' (a map that stops early reads fewer; counted
     // whole, so the count is a bound).
     let mut corners = 0u64;
+    let mut max_base = 0.0f64;
     for &(_, slot) in lists.region.iter() {
         let (first, count) = w.own[at(slot)];
         for pi in first..first + count {
-            corners += u64::from(w.pieces[at(pi)].len);
+            let pc = w.pieces[at(pi)];
+            corners += u64::from(pc.len);
+            max_base = worst(max_base, pc.base);
+        }
+    }
+    if !(max_base <= limit) {
+        return Ok(Some(max_base));
+    }
+    // Preserve material-role and part boundary curves within `limit`: a collapse that slides a
+    // role-border corner along a flat plane has zero geometric Hausdorff error but drags the
+    // material seam sideways across the face.
+    if limit.is_finite() {
+        let np = wide(plan.p);
+        let mut border_shift = 0.0f64;
+        for (v, star) in [(plan.keep, &lists.star_a), (plan.gone, &lists.star_b)] {
+            let pv = wide(w.pos[at(v)]);
+            let moved = sub(pv, np);
+            if dot(moved, moved) == 0.0 {
+                continue;
+            }
+            for group in star.chunk_by(|x, y| x.0 == y.0) {
+                let nb = group[0].0;
+                if nb == plan.keep || nb == plan.gone || group.len() != 2 {
+                    continue;
+                }
+                let role_or_part = w.roles[at(group[0].1)] != w.roles[at(group[1].1)]
+                    || w.parts[at(group[0].1)] != w.parts[at(group[1].1)];
+                if !role_or_part {
+                    continue;
+                }
+                let pn = wide(w.pos[at(nb)]);
+                let seg = sub(pn, np);
+                let seg_len = length(seg);
+                let mut shift = if seg_len > 1e-12 {
+                    length(cross(moved, seg)) / seg_len
+                } else {
+                    length(moved)
+                };
+                if dot(sub(pn, pv), seg) < 0.0 {
+                    shift = shift.max(length(moved));
+                }
+                border_shift = worst(border_shift, shift);
+            }
+        }
+        if !(border_shift <= limit) {
+            return Ok(Some(border_shift));
         }
     }
     if plant.has(DecimatePlant::MeasuresEverything) {
@@ -1716,6 +2010,7 @@ fn place<'s>(
     w: &mut Work<'s, '_>,
     lists: &mut Lists<'_>,
     limit: f64,
+    freeze_ref: f64,
     stats: &mut DecimateStats,
     s: Alloc<'s>,
 ) -> Result<f64, AllocFailure> {
@@ -1789,7 +2084,17 @@ fn place<'s>(
             }
             j = k;
         }
-        if count > FREEZE {
+        // Adaptive slack-gated freezing (sound by the triangle inequality):
+        // - Near-flat / beveled faces carrying `<= 5%` of `freeze_ref` freeze at 12 pieces so
+        //   large architectural walls, frames, and cleats stay O(1) pieces per triangle even under
+        //   tight sub-millimetre tolerances or Phase-2 budget reduction.
+        // - Gently curved faces carrying `<= 25%` of `freeze_ref` freeze at 48 pieces, retaining
+        //   >= 75% headroom for curved cylinders/rounds while eliminating piece-list blowups.
+        // - High-error curved triangles keep full per-source merging up to `FREEZE`.
+        let low_tol = (w.allowance * 1000.0).max(if freeze_ref.is_finite() { freeze_ref * 0.05 } else { 0.0 });
+        let mid_tol = if freeze_ref.is_finite() { freeze_ref * 0.25 } else { 0.0 };
+        let flat_freeze = (count >= 12 && most <= low_tol) || (count >= 48 && mid_tol > 0.0 && most <= mid_tol);
+        if count > FREEZE || flat_freeze {
             w.pieces.truncate(at(first));
             w.corr.truncate(corr_start);
             let start = len32(w.corr.len());
@@ -2052,6 +2357,13 @@ fn collapse(w: &mut Work<'_, '_>, lists: &mut Lists<'_>, plan: &Plan) -> Result<
     w.head[at(gone)] = NONE;
     w.pos[at(keep)] = plan.p;
     w.quad[at(keep)] = plan.q;
+    if w.has_zones {
+        let (k, g) = (at(keep), at(gone));
+        w.zone_limit[k] = w.zone_limit[k].min(w.zone_limit[g]);
+        w.zone_min_cos_sq[k] = w.zone_min_cos_sq[k].max(w.zone_min_cos_sq[g]);
+        w.zone_weight[k] = w.zone_weight[k].max(w.zone_weight[g]);
+        w.zone_pinned[k] |= w.zone_pinned[g];
+    }
     w.parent[at(gone)] = keep;
     w.version[at(keep)] += 1;
     w.version[at(gone)] += 1;

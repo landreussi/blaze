@@ -121,7 +121,7 @@ pub const STORE: Row = home(crate::clean::HOME_STORE, "the store root: this blaz
 
 /// THE TABLE. A row's path is its writer's constant where the writer names it whole, else the
 /// writer's parts joined (the test below holds each equal to its writer's).
-pub const LAYOUT: [Row; 21] = [
+pub const LAYOUT: [Row; 22] = [
     CHECKOUT,
     Row {
         place: Place::Checkout,
@@ -152,6 +152,12 @@ pub const LAYOUT: [Row; 21] = [
         "the journal helpers' sockets, `<16 hex>.sock`, in a folder made the user's alone (mode 0700; blaze-watch helper.rs `SOCKET_FOLDER`)",
         true,
         Scope::Kept(Why::LiveHelper),
+    ),
+    home(
+        ".blaze/v2/daemon",
+        "an old home's resident daemon sockets (retired; removed by `blaze clean --all`)",
+        true,
+        Scope::All,
     ),
     home(".blaze/v2/shared", "an old home's store (store.rs `OLD_HOME`): reported, never read", true, Scope::All),
     home(".blaze/v2/own", "an old home's store (store.rs `OLD_HOME`): reported, never read", true, Scope::All),
@@ -257,6 +263,23 @@ mod tests {
         assert_eq!(journal.scope, Scope::Kept(Why::LiveHelper), "a live helper's socket would be removed");
         for row in LAYOUT.iter() {
             std::println!("{:?} {} {:?} rebuildable={}: {}", row.place, row.path, row.scope, row.rebuildable, row.holds);
+        }
+    }
+
+    /// A home written by a previous layout (with or without `.blaze/v2/daemon`) still has every
+    /// pre-existing row accounted for, and `.blaze/v2/daemon` is cleaned by `--all`.
+    #[test]
+    fn previous_layout_without_daemon_folder_is_handled() {
+        let blaze = crate::store::HOME_FOLDER;
+        let daemon = row_of(Place::Home, &std::format!("{blaze}/v2/daemon/0123456789abcdef.sock")).expect("the retired daemon's socket row");
+        assert_eq!(daemon.scope, Scope::All);
+        for prev in [
+            ".blaze/v2/journal/0123456789abcdef.sock",
+            ".blaze/v2/shared",
+            ".blaze/v2/own",
+            ".blaze/v2/roster",
+        ] {
+            assert!(row_of(Place::Home, prev).is_some(), "previous layout path {prev} must stay recognized");
         }
     }
 }

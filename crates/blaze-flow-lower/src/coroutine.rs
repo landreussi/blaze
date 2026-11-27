@@ -77,7 +77,7 @@ use crate::identity::{Identity, Role};
 use crate::{At, AwaitUnrelated, BodyOut, External, Facts, Form, Lower, MOST_POSITIONS, Refusal, Region, Task, TyD, range_of};
 
 /// An async block's body lowered as its own flow.
-pub struct LoweredAsync<A: Allocator + Clone> {
+pub struct LoweredAsync<A: Allocator + Copy> {
     pub flow: Flow<A>,
     /// Per local of `flow`, its type in `ck.types` (`PTy`).
     pub local_ty: Vec<PTy, A>,
@@ -110,7 +110,7 @@ pub struct LoweredAsync<A: Allocator + Clone> {
 }
 
 /// The body of async block `block` (an `Expr::AsyncBlock` of `body`) as its own flow.
-pub fn lower_async<A: Allocator + Clone, F: Facts>(
+pub fn lower_async<A: Allocator + Copy, F: Facts>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     block: ExprId,
@@ -122,7 +122,7 @@ pub fn lower_async<A: Allocator + Clone, F: Facts>(
 
 /// [`lower_async`] under the call rule `R`; with `logged` (the oracle's comparing lowering,
 /// lib.rs `lower_with`) each call's record into `log`, kept on a refusal too.
-pub(crate) fn lower_async_with<A: Allocator + Clone, F: Facts, R: crate::one_call::CallRule>(
+pub(crate) fn lower_async_with<A: Allocator + Copy, F: Facts, R: crate::one_call::CallRule>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     block: ExprId,
@@ -132,32 +132,62 @@ pub(crate) fn lower_async_with<A: Allocator + Clone, F: Facts, R: crate::one_cal
     log: &mut Option<crate::builder::Log<A>>,
 ) -> Result<LoweredAsync<A>, Refusal> {
     let range = range_of(body, block);
-    let inner = match body.exprs.get(block.ix()) {
-        Some(Expr::AsyncBlock { body: inner, .. }) => *inner,
+    let (inner, closure_params) = match body.exprs.get(block.ix()) {
+        Some(Expr::AsyncBlock { body: inner, .. }) => (*inner, None),
+        // Async closure witness lowering (`!R::RELATES`, RFC 3668): lowers the call future's body
+        // with its captures and parameters so `exact_interior` and `stalled_goals` compute the
+        // exact `Send`/`Sync` interior of `async |..| { .. }` instead of leaving its coroutine row
+        // a superset (unblocks `reth_e2e_test_utils::E2ETestSetupBuilder::build` and callers).
+        Some(Expr::Closure { is_async: true, params, body: inner, .. }) if !R::RELATES => {
+            let Some(params) = body.pat_lists.get(params.range()) else {
+                return Err(Refusal { form: Form::Malformed, range });
+            };
+            let Some(row) = ck.closures.column::<0>().iter().position(|&c| c == block) else {
+                return Err(Refusal { form: Form::Malformed, range });
+            };
+            let Some(&sig) = ck.closures.column::<2>().get(row) else {
+                return Err(Refusal { form: Form::Malformed, range });
+            };
+            let tys = ck.types.view();
+            let (inputs, output): (&[PTy], PTy) = match tys.node(sig) {
+                Ok(PNode::FnPtr(l, _)) => match tys.list(l) {
+                    Ok(all) if all.len() == params.len() + 1 => (&all[..params.len()], all[params.len()]),
+                    _ => return Err(Refusal { form: Form::Malformed, range }),
+                },
+                _ => return Err(Refusal { form: Form::Malformed, range }),
+            };
+            (*inner, Some((params, inputs, output)))
+        }
         _ => return Err(Refusal { form: Form::Malformed, range }),
     };
     // Only expressions evaluated by this block contribute suspension points. Evaluating a
     // closure or nested async block constructs its captures; its body has a flow of its own.
-    let mut l: Lower<'_, '_, F, A, R> = Lower::new(body, ck, facts, alloc.clone())?;
+    let mut l: blaze_own::Box<Lower<'_, '_, F, A, R>, A> = Lower::new_nested(body, ck, facts, inner, alloc);
     if logged {
-        l.b.start_log(alloc.clone());
+        l.b.start_log(alloc);
         l.per_call = true;
     }
     l.async_root = Some(block);
-    let mut externals: Vec<(blaze_flow::Origin, External), A> = Vec::new_in(alloc.clone());
-    let ran = l.run_async(block, inner, &mut externals);
+    let mut externals: Vec<(blaze_flow::Origin, External), A> = Vec::new_in(alloc);
+    let ran = l.run_async(block, inner, closure_params, &mut externals);
     let ran = l.finish_held(ran);
     *log = l.b.take_log();
     ran?;
-    // `'static`, made when the walk first met it (`Lower::universal`), as closure.rs does.
-    if let Some(&(_, st)) = l.uni.iter().find(|(r, _)| *r == Region::Static) {
-        externals.push((st, External::Static));
+    // `'static` and any universal lifetime parameters of the enclosing fn met during the walk
+    // (`Lower::universal`), as closure.rs does.
+    for &(r, o) in l.uni.iter() {
+        match r {
+            Region::Static => externals.push((o, External::Static)),
+            Region::Param(i) => externals.push((o, External::OwnerParam(i))),
+            Region::Late { .. } => {}
+        }
     }
-    let flow = l.b.finish().map_err(|_| Refusal { form: Form::Builder, range })?;
+    let b = core::mem::replace(&mut l.b, crate::builder::Builder::new(crate::FlowBuilder::new_in(1, 0, alloc)));
+    let flow = b.finish().map_err(|_| Refusal { form: Form::Builder, range })?;
     if l.local_ty.len() != flow.locals as usize {
         return Err(Refusal { form: Form::Malformed, range });
     }
-    let mut local_ty = Vec::new_in(alloc.clone());
+    let mut local_ty = Vec::new_in(alloc);
     let mut local_wrap = Vec::new_in(alloc);
     for t in l.local_ty.iter() {
         local_ty.push(t.ty);
@@ -170,7 +200,9 @@ pub(crate) fn lower_async_with<A: Allocator + Clone, F: Facts, R: crate::one_cal
     if l.identity.len() != flow.locals as usize {
         return Err(Refusal { form: Form::Malformed, range });
     }
-    Ok(LoweredAsync { flow, local_ty, point_of: l.points, local_wrap, identity: l.identity, range, externals, coarse: l.coarse.get() })
+    let point_of = core::mem::replace(&mut l.points, Vec::new_in(alloc));
+    let identity = core::mem::replace(&mut l.identity, Vec::new_in(alloc));
+    Ok(LoweredAsync { flow, local_ty, point_of, local_wrap, identity, range, externals, coarse: l.coarse.get() })
 }
 
 /// An async block's WITNESS (typeck.md "Witness records", W1): what its state stores, region-
@@ -183,11 +215,11 @@ pub(crate) fn lower_async_with<A: Allocator + Clone, F: Facts, R: crate::one_cal
 /// related, so a borrow check over it would pass what it must refuse. Only the facts a witness
 /// is read for leave it: [`AsyncWitness::interior_parts`], [`AsyncWitness::state_recipe`],
 /// [`AsyncWitness::saved`] and the per-local columns.
-pub struct AsyncWitness<A: Allocator + Clone> {
+pub struct AsyncWitness<A: Allocator + Copy> {
     lowered: LoweredAsync<A>,
 }
 
-impl<A: Allocator + Clone> AsyncWitness<A> {
+impl<A: Allocator + Copy> AsyncWitness<A> {
     /// Per local, its type in `ck.types` ([`LoweredAsync::local_ty`]).
     pub fn local_ty(&self) -> &[PTy] {
         &self.lowered.local_ty
@@ -243,7 +275,7 @@ impl<A: Allocator + Clone> AsyncWitness<A> {
 /// not know (`InlineAsm`, `UnknownAdt`, `TypeNode`, `Bound`, `Malformed`), each by name; never a
 /// region reason (`CallHiddenInput`, `CallOutlivesUnread`, `RegionsUnread`, a `OneRule` count,
 /// `ClosureSigUnaligned`). The borrow check keeps [`lower_async`].
-pub fn lower_async_witness<A: Allocator + Clone, F: Facts>(
+pub fn lower_async_witness<A: Allocator + Copy, F: Facts>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     block: ExprId,
@@ -273,7 +305,7 @@ pub(crate) enum InteriorPlant {
 /// `out` does not hold as the record does is refused by name ([`Form::InteriorTable`]). The
 /// Reference's rule (typeck's rules/coroutine.rs doc lines 11-12): "Its auto traits (`Send`,
 /// `Sync`) are its interior's: its captures and every value live across an `.await`."
-pub fn interior<A: Allocator + Clone>(
+pub fn interior<A: Allocator + Copy>(
     lowered: &LoweredAsync<A>,
     ck: &Checked<'_>,
     block: ExprId,
@@ -284,7 +316,7 @@ pub fn interior<A: Allocator + Clone>(
 }
 
 #[cfg(test)]
-pub(crate) fn interior_planted<A: Allocator + Clone>(
+pub(crate) fn interior_planted<A: Allocator + Copy>(
     lowered: &LoweredAsync<A>,
     ck: &Checked<'_>,
     block: ExprId,
@@ -310,11 +342,11 @@ pub struct InteriorPart {
 /// with a table of its own (front2 opaque_auto.rs) copies each `ty` and makes the wraps there.
 /// A local or capture whose type the record does not hold is refused by name
 /// ([`Form::Malformed`]).
-pub fn interior_parts<A: Allocator + Clone>(lowered: &LoweredAsync<A>, ck: &Checked<'_>, block: ExprId, alloc: A) -> Result<Vec<InteriorPart, A>, Refusal> {
+pub fn interior_parts<A: Allocator + Copy>(lowered: &LoweredAsync<A>, ck: &Checked<'_>, block: ExprId, alloc: A) -> Result<Vec<InteriorPart, A>, Refusal> {
     parts_with(lowered, ck, block, false, alloc)
 }
 
-fn parts_with<A: Allocator + Clone>(
+fn parts_with<A: Allocator + Copy>(
     lowered: &LoweredAsync<A>,
     ck: &Checked<'_>,
     block: ExprId,
@@ -327,9 +359,9 @@ fn parts_with<A: Allocator + Clone>(
     if lowered.local_ty.len() != flow.locals as usize || lowered.local_wrap.len() != flow.locals as usize {
         return Err(refuse(Form::Malformed));
     }
-    let saved = blaze_flow::suspend::saved(flow, alloc.clone()).map_err(|_| refuse(Form::Bound))?;
+    let saved = blaze_flow::suspend::saved(flow, alloc).map_err(|_| refuse(Form::Bound))?;
     let record = ck.types.view();
-    let mut parts: Vec<InteriorPart, A> = Vec::new_in(alloc.clone());
+    let mut parts: Vec<InteriorPart, A> = Vec::new_in(alloc);
     // The saved locals; the arguments are the captures, taken below by their kind.
     for l in flow.args + 1..flow.locals {
         if !every_local && !saved.is_saved(Local(l)) {
@@ -372,7 +404,7 @@ fn parts_with<A: Allocator + Clone>(
     Ok(unique)
 }
 
-fn interior_with<A: Allocator + Clone>(
+fn interior_with<A: Allocator + Copy>(
     lowered: &LoweredAsync<A>,
     ck: &Checked<'_>,
     block: ExprId,
@@ -382,12 +414,12 @@ fn interior_with<A: Allocator + Clone>(
 ) -> Result<PTy, Refusal> {
     let range = lowered.range;
     let refuse = |form: Form| Refusal { form, range };
-    let parts = parts_with(lowered, ck, block, every_local, alloc.clone())?;
+    let parts = parts_with(lowered, ck, block, every_local, alloc)?;
     let record = ck.types.view();
     if out.view().len() < record.len() {
         return Err(refuse(Form::InteriorTable));
     }
-    let mut tys: Vec<PTy, A> = Vec::new_in(alloc.clone());
+    let mut tys: Vec<PTy, A> = Vec::new_in(alloc);
     for p in parts.iter() {
         same_in(record.get(p.ty), out.view().get(p.ty)).ok_or(refuse(Form::InteriorTable))?;
         let t = match p.wrap {
@@ -415,26 +447,27 @@ fn same_in(record: Option<&PNode>, out: Option<&PNode>) -> Option<()> {
     }
 }
 
-impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_, F, A, R> {
+impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, F, A, R> {
     /// The walk of an async block's body `inner`: as `run`, with the block's captures as the
     /// arguments and its output as the return place. `externals` receives what each capture's
     /// and the output's placeholder stands for in the block's maker ([`LoweredAsync::externals`]).
-    fn run_async(&mut self, block: ExprId, inner: ExprId, externals: &mut Vec<(blaze_flow::Origin, External), A>) -> Result<(), Refusal> {
+    fn run_async(
+        &mut self,
+        block: ExprId,
+        inner: ExprId,
+        closure_params: Option<(&[PatId], &[PTy], PTy)>,
+        externals: &mut Vec<(blaze_flow::Origin, External), A>,
+    ) -> Result<(), Refusal> {
         let ck = self.ck;
-        // The block's captures, in row order: argument `1 + k` is row `k`.
-        let mut rows: Vec<(PatId, CaptureKind), A> = Vec::new_in(self.alloc.clone());
-        {
-            let firsts = ck.captures.column::<0>();
-            let pats = ck.captures.column::<1>();
-            let kinds = ck.captures.column::<2>();
-            for i in 0..firsts.len() {
-                if firsts[i] == block {
-                    rows.push((pats[i], kinds[i]));
-                }
-            }
+        // The block's captures, in environment-field order: argument `1 + k` is field `k`.
+        self.env_now.clear();
+        self.field_places.clear();
+        for f in ck.env_fields_by::<blaze_typeck::Places>(block) {
+            self.env_now.push(f);
         }
-        let nu = rows.len() as u32;
-        self.b.replace(blaze_flow::FlowBuilder::new_in(1 + nu, nu, self.alloc.clone()));
+        let mut rows: Vec<(PatId, CaptureKind), A> = Vec::new_in(self.alloc);
+        let Ok(nu) = u32::try_from(self.env_now.len()) else { return self.refuse(Form::Bound, block) };
+        self.b.replace(blaze_flow::FlowBuilder::new_in(1 + nu, nu, self.alloc));
         self.nargs = nu;
         let entry = self.b.block();
         self.ret_block = self.b.block();
@@ -442,36 +475,47 @@ impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_,
         self.scope_marks.push(0);
         self.scope_temps.push((self.temps.len() as u32, self.temp_marks.len() as u32));
         // The next position of the future value (`External::Capture`): a capture by reference
-        // is its reference then its variable's type's positions, one by value its type's, the
-        // order `Lower::npos` of `PNode::Future` counts and `closure_value` lays them in. An
+        // is its reference then its captured place's type's positions, one by value its type's,
+        // the order `Lower::npos` of `PNode::Future` counts and `closure_value` lays them in. An
         // async block is polled through `Pin<&mut Self>` and owns its captures, so no capture
         // is reached through a per-call environment reference (closure.rs `External::Env`).
         let mut value_at = 0u32;
-        for k in 0..rows.len() {
-            let (p, kind) = rows[k];
-            let t = match ck.local_ty.get(p.ix()) {
-                Some(&t) => t,
-                None => return self.refuse_pat(Form::Malformed, p),
-            };
+        for k in 0..self.env_now.len() {
+            let f = self.env_now[k];
+            let kind = f.how;
             let l = Local(1 + k as u32);
             let first = self.origs.len() as u32;
-            match kind {
-                CaptureKind::ByValue => {
-                    self.new_local_with(TyD::of(t), true, Some(l), block)?;
-                    if let Some(slot) = self.pat_local.get_mut(p.ix()) {
-                        *slot = l.0;
-                    } else {
-                        return self.refuse_pat(Form::Malformed, p);
+            if f.is_whole() {
+                let p = f.base;
+                rows.push((p, kind));
+                let t = match ck.local_ty.get(p.ix()) {
+                    Some(&t) => t,
+                    None => return self.refuse_pat(Form::Malformed, p),
+                };
+                match kind {
+                    CaptureKind::ByValue => {
+                        self.new_local_with(TyD::of(t), true, Some(l), block)?;
+                        if !self.set_pat_local(p, l.0) {
+                            return self.refuse_pat(Form::Malformed, p);
+                        }
+                    }
+                    CaptureKind::ByRef | CaptureKind::ByMutRef => {
+                        let m = if kind == CaptureKind::ByRef { Mutbl::Not } else { Mutbl::Mut };
+                        let rt = TyD { wrap: Some(m), ty: t };
+                        self.new_local_with(rt, true, Some(l), block)?;
+                        let at = self.place_of(l);
+                        let place = self.project(at, rt, Proj::Deref, TyD::of(t), false, block)?;
+                        self.upvar_places.push((p, place, TyD::of(t)));
                     }
                 }
-                CaptureKind::ByRef | CaptureKind::ByMutRef => {
-                    let m = if kind == CaptureKind::ByRef { Mutbl::Not } else { Mutbl::Mut };
-                    let rt = TyD { wrap: Some(m), ty: t };
-                    self.new_local_with(rt, true, Some(l), block)?;
-                    let at = self.place_of(l);
-                    let place = self.project(at, rt, Proj::Deref, TyD::of(t), false, block)?;
-                    self.upvar_places.push((p, place, TyD::of(t)));
-                }
+            } else {
+                let through = match kind {
+                    CaptureKind::ByValue => None,
+                    CaptureKind::ByRef => Some(Mutbl::Not),
+                    CaptureKind::ByMutRef => Some(Mutbl::Mut),
+                };
+                let Ok(k32) = u32::try_from(k) else { return self.refuse(Form::Bound, block) };
+                self.place_upvar(block, k32, f, through)?;
             }
             let made = self.origs.len() as u32;
             for o in first..made {
@@ -484,30 +528,72 @@ impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_,
         // placeholder is known to outlive every one of them (the output may hold what a capture
         // by reference points to; a loan of the block's own locals or by-value captures is not
         // known to outlive it and is refused, as a returned reference to a local is).
-        let out = match self.node(self.expr_ty(block)?, block)? {
-            PNode::Future(fe, out, _) if fe == block => out,
-            _ => return self.refuse(Form::TypeNode, block),
+        let out = match closure_params {
+            Some((_, _, output)) => match self.node(output, block)? {
+                PNode::Future(_, out, _) => out,
+                _ => output,
+            },
+            None => match self.node(self.expr_ty(block)?, block)? {
+                PNode::Future(fe, out, _) if fe == block => out,
+                _ => return self.refuse(Form::TypeNode, block),
+            },
         };
         let upvar_origins = self.origs.len();
         self.new_local_with(TyD::of(out), true, Some(Local(0)), block)?;
         let all = self.origs.len();
-        // The output's positions: no position of the future value holds them (`npos` of
-        // `PNode::Future` counts the captures only), so a requirement naming one cannot be
-        // stated at the block expression ([`crate::requirement`] gives `None`: refused by name).
-        for o in upvar_origins..all {
-            externals.push((self.origs[o], External::Sig));
-        }
-        if (all - upvar_origins) as u64 * upvar_origins as u64 > u64::from(MOST_POSITIONS) {
-            return self.refuse(Form::Bound, block);
-        }
-        if block == self.body.root && self.body.coroutine.is_some() {
+        let is_async_fn_root = block == self.body.root && self.body.coroutine.is_some();
+        if is_async_fn_root {
+            for o in upvar_origins..all {
+                externals.push((self.origs[o], External::Sig));
+            }
             // An `async fn`'s root block: its captures are the fn's parameters and its value
             // the written return type, both the signature's (`async_fn_root`).
             self.async_fn_root(&rows, block)?;
+        } else if <R::Grain as crate::grain::Grain>::SLOTS {
+            // Under the slot grain, an async block's `PNode::Future` carries its output slots
+            // right after its captures (like a closure's `SigSlot::Owner` slots), so any
+            // capture-to-output relation the body actually needs is emitted as a `Requirement`
+            // (`Need::Capture -> Need::Sig`) rather than assuming every capture outlives every
+            // output slot (which falsely required `'b: 'static` when an `async move` captures
+            // `&'b R` alongside `&'static Heap` and returns `Output<'static>`).
+            for (k, o) in (upvar_origins..all).enumerate() {
+                externals.push((self.origs[o], External::SigOwner(k as u32)));
+            }
         } else {
+            for o in upvar_origins..all {
+                externals.push((self.origs[o], External::Sig));
+            }
+            if (all - upvar_origins) as u64 * upvar_origins as u64 > u64::from(MOST_POSITIONS) {
+                return self.refuse(Form::Bound, block);
+            }
             for u in 0..upvar_origins {
                 for o in upvar_origins..all {
                     self.b.known(self.origs[u], self.origs[o]);
+                }
+            }
+        }
+        // Async closure parameters: allocated as locals past `flow.args` so `blaze_flow::saved`
+        // tracks whether each parameter crosses a suspension and `parts_with` includes saved
+        // parameters in the call future's exact interior while dropping ones freed before `.await`.
+        if let Some((params, inputs, _)) = closure_params {
+            for (i, &p) in params.iter().enumerate() {
+                let Some(&inp) = inputs.get(i) else {
+                    return self.refuse_pat(Form::Malformed, p);
+                };
+                let ty = TyD::of(inp);
+                let l = self.new_local_with(ty, true, None, block)?;
+                self.b.stmt(StmtKind::StorageLive(l), self.span(block));
+                let pl = self.place_of(l);
+                self.b.assign(pl, blaze_flow::Operand::Const, self.span(block));
+                self.vars.push(l);
+                match self.body.pats.get(p.ix()) {
+                    Some(blaze_typeck::Pat::Bind { ann, sub: None, .. }) if ann.by_ref.is_none() => {
+                        if !self.set_pat_local(p, l.0) {
+                            return self.refuse_pat(Form::Malformed, p);
+                        }
+                        self.name_local(l, Identity::Binding(p));
+                    }
+                    _ => self.bind_pattern(p, crate::Val { at: At::Place(pl), ty })?,
                 }
             }
         }
@@ -631,8 +717,15 @@ impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_,
         }
         self.temps.pop();
         self.drop_local(fut, e)?;
-        self.temps.push(r);
-        self.push_place(rp, out);
+        if out.wrap.is_none() && matches!(self.node(out.ty, e)?, PNode::Never) {
+            self.b.stmt(StmtKind::StorageDead(r), span);
+            self.b.stmt(StmtKind::Unreachable, span);
+            self.fresh();
+            self.vals.push(crate::Val { at: At::Const, ty: out });
+        } else {
+            self.temps.push(r);
+            self.push_place(rp, out);
+        }
         Ok(())
     }
 
@@ -659,10 +752,27 @@ impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_,
             self.unify(&[fp, rp]);
             return Ok(());
         }
-        if held == operand && matches!(self.node(held, e)?, PNode::Future(..)) {
+        if held == operand
+            && let PNode::Future(_, out_ty, _) = self.node(held, e)?
+        {
+            let (fi, ri) = (self.info(fp), self.info(rp));
+            if <R::Grain as crate::grain::Grain>::SLOTS && fi.exact && ri.exact && ri.len <= fi.len {
+                let nout = ri.len;
+                let out_start = fi.start + (fi.len - nout);
+                if nout > 0 {
+                    self.with_variances(TyD::of(out_ty), e, |this, vs| {
+                        if vs.len() as u32 != nout {
+                            return this.refuse(Form::Malformed, e);
+                        }
+                        this.relate_by(out_start, ri.start, vs);
+                        Ok(())
+                    })?;
+                }
+                return Ok(());
+            }
             // The block's body proved each capture outlives each position of its value; equal
             // both ways (and the captures to each other) is stricter: noted.
-            let (f, r) = (self.info(fp).len, self.info(rp).len);
+            let (f, r) = (fi.len, ri.len);
             if r > 0 && f + r > 2 {
                 self.coarse_step(Form::Unified { why: crate::Unified::AsyncBlockOutput }, e);
             }
@@ -680,7 +790,7 @@ impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_,
     }
 }
 
-impl<'b, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'b, '_, F, A, R> {
+impl<'b, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'b, '_, F, A, R> {
     /// The root block of an `async fn`, its captures (`rows`, arguments `1..`) and return place
     /// (its value) laid: the Reference, "Async functions": `async fn f(x: &u8) -> T` is "roughly
     /// equivalent to" `fn f<'a>(x: &'a u8) -> impl Future<Output = T> + 'a`, its body an `async
@@ -719,10 +829,10 @@ impl<'b, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'b,
         if !sig.well_formed() || sig.inputs() as usize != body.params.len() {
             return self.refuse(Form::SigUnaligned, block);
         }
-        let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc.clone());
+        let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
         // The written return type's column over the block's value's own type (`lay_over`); a
         // hidden position is a placeholder of its own below.
-        let mut written: Vec<Option<Region>, A> = Vec::new_in(self.alloc.clone());
+        let mut written: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
         let out_ty = self.local_ty[0].ty;
         if !self.lay_over(written_col.ty(), out_ty, written_col.as_slice(), &mut written, block)? {
             return self.refuse(Form::SigUnaligned, block);
@@ -778,7 +888,7 @@ impl<'b, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'b,
             self.b.known(u, o);
         }
         // The implied bounds of the captures' and the value's types (`&'a T`: `T: 'a`).
-        let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
+        let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc);
         for l in 0..=rows.len() {
             let (start, _) = self.local_origs[l];
             let t = self.local_ty[l];

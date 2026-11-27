@@ -28,7 +28,7 @@ fn check(source: &str, cases: &[(&str, &[&str])]) {
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).expect("fixture crates");
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, alloc).expect("fixture names");
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("fixture names");
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
     let mut world = ProjectWorld::new(&names, &frame, &files, alloc).expect("front2");
     let bodies = world.bodies(alloc);
@@ -66,11 +66,11 @@ impl<T> Option<T> {
     fn unwrap(self) -> T { match self { Some(t) => t, None => loop {} } }
 }
 struct CountInspector;
-fn through(value: Option<&(dyn Inspector<u8> + 'static)>) -> Option<&CountInspector> {
+fn through<'a>(value: Option<&'a (dyn Inspector<u8> + 'static)>) -> Option<&'a CountInspector> {
     value.unwrap().downcast_ref::<CountInspector>()
 }
 trait OtherInspector: NonStaticAny {}
-fn without_deref(value: &(dyn OtherInspector + 'static)) -> Option<&CountInspector> {
+fn without_deref<'a>(value: &'a (dyn OtherInspector + 'static)) -> Option<&'a CountInspector> {
     value.downcast_ref::<CountInspector>()
 }
 "#;

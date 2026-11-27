@@ -8,16 +8,16 @@
 
 #![blaze::sans_io]
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, HashMap, Map, MapOpts, Set, SetOpts};
 use blaze_own::{Alloc, Soa, Vec};
 use core::mem::DropGuard;
 
 use crate::body::BodyView;
-use crate::columns::{AdjustKind, CaptureKind};
+use crate::columns::{AdjustKind, CaptureKind, UnionPat};
 use crate::diag::{About, At, Because, DiagCode, PendingDiag, PendingGoal};
 use crate::error::{CheckError, Limit, Malformed, Stop};
 use crate::ids::{
-    ExprId, FloatTy, IntTy, ItemKey, LangItem, Mutbl, Name, PatId, StmtId, UintTy,
+    ExprId, FloatTy, IntTy, ItemKey, LangItem, List, Mutbl, Name, PatId, RecordSchema, StmtId, UintTy,
 };
 use crate::portable::{PNode, PTy, PTys};
 use crate::rules::async_fn::Witness;
@@ -178,6 +178,185 @@ pub(crate) enum Flow {
     Done(Ty),
 }
 
+/// Threshold above which field/variant name lookups switch from zero-alloc linear scans
+/// (faster in L1 cache) to O(1) `blaze_hash::Map` / `Set` lookups.
+pub(crate) const NAME_HASH_THRESHOLD: usize = 16;
+
+/// Trait for items carrying a field `Name`, shared by [`FieldNameSet`].
+pub(crate) trait HasFieldName {
+    fn field_name(&self) -> Name;
+}
+
+impl HasFieldName for crate::body::FieldInit {
+    #[inline]
+    fn field_name(&self) -> Name {
+        self.name
+    }
+}
+
+impl HasFieldName for crate::body::FieldPat {
+    #[inline]
+    fn field_name(&self) -> Name {
+        self.name
+    }
+}
+
+impl HasFieldName for Name {
+    #[inline]
+    fn field_name(&self) -> Name {
+        *self
+    }
+}
+
+/// O(1) membership oracle over a field-initializer or field-pattern slice when `len > 16`,
+/// keeping a zero-alloc linear scan for small slices (`<= 16`).
+pub(crate) enum FieldNameSet<'s, 'a, T> {
+    Linear(&'s [T]),
+    Hashed(Set<Name, FixedState, Alloc<'a>>),
+}
+
+impl<'s, 'a, T: HasFieldName> FieldNameSet<'s, 'a, T> {
+    pub(crate) fn new(items: &'s [T], alloc: Alloc<'a>) -> Self {
+        if items.len() <= NAME_HASH_THRESHOLD {
+            FieldNameSet::Linear(items)
+        } else {
+            let mut set = Set::new(SetOpts { hasher: FixedState, alloc, capacity: Some(items.len()) });
+            for item in items {
+                set.insert(item.field_name());
+            }
+            FieldNameSet::Hashed(set)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn contains(&self, name: Name) -> bool {
+        match self {
+            FieldNameSet::Linear(items) => items.iter().any(|item| item.field_name() == name),
+            FieldNameSet::Hashed(set) => set.contains(&name),
+        }
+    }
+}
+
+/// Key for lazily cached `Name -> first index` maps on [`Machine`] for large ADTs and records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum NameIndexKey {
+    AdtFields(ItemKey, u32),
+    AdtVariants(ItemKey),
+    Record(RecordSchema),
+}
+
+/// Adjustments in the order made, paired with an intrusive per-`ExprId` LIFO linked list
+/// (`head`/`prev`) so per-expression queries (`has`, `last_ty`, `rows_rev`) are O(1) while
+/// `push` and `truncate` remain O(1) per row.
+///
+/// Implements read-only `Deref<Target = Soa<...>>` and intentionally no `DerefMut` so every
+/// mutation goes through `push`, `truncate`, `set_kind`, or `set_kind_ty`.
+pub(crate) struct AdjustLog<'a> {
+    rows: Soa<(ExprId, AdjustKind, Ty), Alloc<'a>>,
+    head: Vec<u32, Alloc<'a>>,
+    prev: Vec<u32, Alloc<'a>>,
+    expr_count: usize,
+}
+
+impl<'a> AdjustLog<'a> {
+    pub(crate) fn new_in(expr_count: usize, alloc: Alloc<'a>) -> Self {
+        AdjustLog {
+            rows: Soa::new_in(alloc),
+            head: Vec::new_in(alloc),
+            prev: Vec::new_in(alloc),
+            expr_count,
+        }
+    }
+
+    pub(crate) fn push(&mut self, row: (ExprId, AdjustKind, Ty)) {
+        let idx = self.rows.len() as u32;
+        let e = row.0;
+        self.rows.push(row);
+        if self.head.is_empty() && self.expr_count != 0 {
+            self.head.resize(self.expr_count, u32::MAX);
+        }
+        let prev = if let Some(slot) = self.head.get_mut(e.ix()) {
+            let p = *slot;
+            *slot = idx;
+            p
+        } else {
+            u32::MAX
+        };
+        self.prev.push(prev);
+    }
+
+    pub(crate) fn truncate(&mut self, len: usize) {
+        if len < self.rows.len() {
+            let es = self.rows.column::<0>();
+            for i in (len..es.len()).rev() {
+                let prev = self.prev.pop().unwrap_or(u32::MAX);
+                if let Some(slot) = self.head.get_mut(es[i].ix()) {
+                    *slot = prev;
+                }
+            }
+            self.rows.truncate(len);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn set_kind(&mut self, i: usize, kind: AdjustKind) {
+        self.rows.column_mut::<1>()[i] = kind;
+    }
+
+    #[inline]
+    pub(crate) fn set_kind_ty(&mut self, i: usize, kind: AdjustKind, ty: Ty) {
+        self.rows.column_mut::<1>()[i] = kind;
+        self.rows.column_mut::<2>()[i] = ty;
+    }
+
+    #[inline]
+    pub(crate) fn has(&self, e: ExprId) -> bool {
+        self.head.get(e.ix()).copied().is_some_and(|h| h != u32::MAX)
+    }
+
+    #[inline]
+    pub(crate) fn last_ty(&self, e: ExprId) -> Option<Ty> {
+        let h = self.head.get(e.ix()).copied().filter(|&h| h != u32::MAX)?;
+        self.rows.column::<2>().get(h as usize).copied()
+    }
+
+    /// Row indices of `e` in reverse chronological order (most recent first).
+    #[inline]
+    pub(crate) fn rows_rev(&self, e: ExprId) -> AdjustRowsRev<'_> {
+        let cur = self.head.get(e.ix()).copied().unwrap_or(u32::MAX);
+        AdjustRowsRev { prev: &self.prev, cur }
+    }
+}
+
+impl<'a> core::ops::Deref for AdjustLog<'a> {
+    type Target = Soa<(ExprId, AdjustKind, Ty), Alloc<'a>>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.rows
+    }
+}
+
+/// Iterator over an expression's adjustment row indices, most recent first.
+pub(crate) struct AdjustRowsRev<'r> {
+    prev: &'r [u32],
+    cur: u32,
+}
+
+impl Iterator for AdjustRowsRev<'_> {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        if self.cur == u32::MAX {
+            return None;
+        }
+        let idx = self.cur as usize;
+        self.cur = self.prev.get(idx).copied().unwrap_or(u32::MAX);
+        Some(idx)
+    }
+}
+
 /// A coercion site with several sources (`CoerceMany`): `if`/`else`, `match` arms, a block's
 /// tail and its breaks, a loop's breaks, a body's returns.
 #[derive(Clone, Copy, Debug)]
@@ -185,6 +364,10 @@ pub(crate) struct CoerceMany {
     pub expected: Ty,
     pub final_ty: Option<Ty>,
     pub pushed: u32,
+    /// First index into `Machine::coerce_sources` for this site (`u32::MAX` when empty).
+    pub first_source: u32,
+    /// Last index into `Machine::coerce_sources` for this site (`u32::MAX` when empty).
+    pub last_source: u32,
 }
 
 /// An enclosing loop or block that a `break` may leave (`BreakableCtxt`).
@@ -254,6 +437,19 @@ pub(crate) struct MachineSnapshot<S> {
     fru_fields: usize,
     default_fields: usize,
     union_fields: usize,
+    union_pats: usize,
+    inferred_err_coercions: usize,
+    deferred_try_obs: usize,
+}
+
+/// Per-match narrowing state for a structural union scrutinee (`rules/control.rs`).
+pub(crate) struct MatchNarrow<'a> {
+    /// Original union member list of the scrutinee (after optional ref-peeling).
+    pub orig_members: TyList,
+    /// Uncovered indices into `orig_members`, in original order.
+    pub remaining: Vec<u32, Alloc<'a>>,
+    /// Default binding mode accumulated from peeling references off the scrutinee.
+    pub peeled_mode: u32,
 }
 
 /// Where an overloaded dereference is asked ([`Machine::overloaded_deref_at`]).
@@ -294,6 +490,11 @@ pub(crate) struct Lowered<'a> {
 pub(crate) enum Lower {
     /// A world's answer: parameter `i` is `args[i]`; a hole is malformed.
     Args(TyList),
+    /// Like [`Lower::Args`], for probing an impl's where-clauses (`interior_clauses_of`):
+    /// normalizes projections immediately via `ty.normalize` (falling back to the rigid
+    /// `TyView::Alias`) rather than emitting unbound fresh variables + pending projection
+    /// obligations that are never selected inside a probe.
+    NormalizedArgs(TyList),
     /// A defining body's coroutine record. A bare future expression belongs to
     /// that body and cannot be interpreted as an expression of the reader.
     CoroutineArgs { args: TyList, owner: ItemKey, ordinal: u32 },
@@ -346,8 +547,8 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     pub pat_ty: Vec<Ty, Alloc<'a>>,
     pub local_ty: Vec<Ty, Alloc<'a>>,
     // Sparse results, rows read whole.
-    /// Adjustments in the order made; scanned by expression (a receiver's autoref).
-    pub adjust: Soa<(ExprId, AdjustKind, Ty), Alloc<'a>>,
+    /// Adjustments in the order made, indexed by expression via an intrusive LIFO list.
+    pub adjust: AdjustLog<'a>,
     pub callees: Vec<(ExprId, ItemKey, TyList), Alloc<'a>>,
     /// What each value or struct path resolved to, at its expression or pattern.
     pub defs: Vec<(At, Def), Alloc<'a>>,
@@ -420,15 +621,24 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     /// Each field expression whose field is a union's (rules/field.rs), in walk order: read by
     /// the unsafety pass (rules/unsafety.rs), which sorts it.
     pub union_fields: Vec<ExprId, Alloc<'a>>,
+    /// Structural union pattern bindings/narrowings (rules/pat.rs, rules/control.rs); rolled back
+    /// with a probe and written back sorted as `Checked::union_pats`.
+    pub union_pats: Vec<(PatId, UnionPat), Alloc<'a>>,
+    /// Per-match narrowing stack for structural union scrutinees (`rules/control.rs`).
+    pub match_narrow: Vec<MatchNarrow<'a>, Alloc<'a>>,
+    /// Registered structural record schemas -> ranges into `record_names`.
+    pub record_schemas: Vec<(RecordSchema, List), Alloc<'a>>,
+    /// Canonical sorted field names referenced by `record_schemas`.
+    pub record_names: Vec<Name, Alloc<'a>>,
     /// What the unsafety pass could not decide (rules/unsafety.rs): written back as
     /// `Checked::undecided`, never a pass and never an error.
     pub undecided: Vec<crate::rules::unsafety::Undecided, Alloc<'a>>,
     pub coerce_many: Vec<CoerceMany, Alloc<'a>>,
-    /// Each coercion site's value sources so far, `(site, expression)`, in push order; a `!`
-    /// source is not listed. Read when the site's fn items meet at a fn pointer
-    /// (rules/coerce_lub.rs): each earlier source then records `ReifyFnPointer` (rustc's
-    /// `CoerceMany::pushed` expressions).
-    pub coerce_sources: Vec<(u32, ExprId), Alloc<'a>>,
+    /// Each coercion site's value sources so far, `(expression, next_idx)`, linked in push order
+    /// from `CoerceMany::first_source` (`u32::MAX` terminates); a `!` source is not listed.
+    pub coerce_sources: Vec<(ExprId, u32), Alloc<'a>>,
+    /// Lazily cached `Name -> first index` maps for ADTs/variants/records with `> 16` entries.
+    name_index: Map<NameIndexKey, Map<Name, u32, FixedState, Alloc<'a>>, FixedState, Alloc<'a>>,
     pub breaks: Vec<BreakCtx, Alloc<'a>>,
     /// The innermost body's return site (the fn's, or a closure's).
     pub ret_sites: Vec<u32, Alloc<'a>>,
@@ -472,6 +682,20 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     /// the projection goals [`Machine::unify`] defers, so one that fails later is a finding at
     /// the expression, pattern or statement that related the types (rule 19).
     pub place: Cause,
+    /// When the owner's return signature contains any `_` placeholder (`-> _`, `-> Option<_>`,
+    /// `-> Result<T, _>`), the lowered output type whose finalized concrete type is exported as
+    /// `Checked::inferred_output`.
+    pub inferred_output_ty: Option<Ty>,
+    /// When the owner's return signature is `Result<T, _>` (or `T ! _`), the inference variable
+    /// representing the error slot while collecting error members from `Err(...)` and `?`.
+    pub inferred_err_var: Option<Ty>,
+    /// Coercions into `inferred_err_var` deferred until `finish_body` so multiple distinct error
+    /// types unify into a single canonical error union instead of forcing the first error type.
+    pub inferred_err_coercions: Vec<(Option<ExprId>, Ty), Alloc<'a>>,
+    /// `FromResidual::from_residual` predicate registrations deferred until `inferred_err_var` is
+    /// finalized in `finish_body`, preventing `impl<T> From<T> for T` from binding `inferred_err_var`
+    /// prematurely to the first `?` error type.
+    pub deferred_try_obs: Vec<(ItemKey, TyList, Cause), Alloc<'a>>,
 }
 
 impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
@@ -523,7 +747,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             reached,
             pat_ty,
             local_ty,
-            adjust: Soa::new_in(alloc),
+            adjust: AdjustLog::new_in(body.exprs.len(), alloc),
             callees: Vec::new_in(alloc),
             defs: Vec::new_in(alloc),
             const_args: Vec::new_in(alloc),
@@ -553,9 +777,43 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             index_mut: Vec::new_in(alloc),
             typed_findings: Vec::new_in(alloc),
             union_fields: Vec::new_in(alloc),
+            union_pats: Vec::new_in(alloc),
+            match_narrow: Vec::new_in(alloc),
+            record_schemas: {
+                let mut rs = Vec::new_in(alloc);
+                let mut rn_len = 0u32;
+                for (schema, names) in body.types.record_schemas() {
+                    if rs.iter().any(|&(s, _)| s == schema) {
+                        continue;
+                    }
+                    let len = u32::try_from(names.len()).map_err(|_| CheckError::Limit(Limit::Table))?;
+                    let list = if len == 0 {
+                        List::EMPTY
+                    } else {
+                        let start = rn_len;
+                        rn_len = rn_len.checked_add(len).ok_or(CheckError::Limit(Limit::Table))?;
+                        List { start, len }
+                    };
+                    rs.push((schema, list));
+                }
+                rs
+            },
+            record_names: {
+                let mut rn = Vec::new_in(alloc);
+                let mut seen: Vec<RecordSchema, Alloc<'a>> = Vec::new_in(alloc);
+                for (schema, names) in body.types.record_schemas() {
+                    if seen.contains(&schema) {
+                        continue;
+                    }
+                    seen.push(schema);
+                    rn.extend_from_slice(names);
+                }
+                rn
+            },
             undecided: Vec::new_in(alloc),
             coerce_many: Vec::new_in(alloc),
             coerce_sources: Vec::new_in(alloc),
+            name_index: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
             breaks: Vec::new_in(alloc),
             ret_sites: Vec::new_in(alloc),
             async_sites: Vec::new_in(alloc),
@@ -571,6 +829,10 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             pending_witnesses: Vec::new_in(alloc),
             stalled: Vec::new_in(alloc),
             place: Cause::Body,
+            inferred_output_ty: None,
+            inferred_err_var: None,
+            inferred_err_coercions: Vec::new_in(alloc),
+            deferred_try_obs: Vec::new_in(alloc),
             alloc,
         })
     }
@@ -760,7 +1022,13 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     pub(crate) fn new_coerce_many(&mut self, expected: Ty) -> Result<u32, Stop> {
         let at = u32::try_from(self.coerce_many.len())
             .map_err(|_| CheckError::Limit(Limit::Table))?;
-        self.coerce_many.push(CoerceMany { expected, final_ty: None, pushed: 0 });
+        self.coerce_many.push(CoerceMany {
+            expected,
+            final_ty: None,
+            pushed: 0,
+            first_source: u32::MAX,
+            last_source: u32::MAX,
+        });
         Ok(at)
     }
 
@@ -799,7 +1067,16 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 if let Some(e) = e
                     && !self.is_never(ty)
                 {
-                    self.coerce_sources.push((site, e));
+                    let idx = u32::try_from(self.coerce_sources.len())
+                        .map_err(|_| CheckError::Limit(Limit::Table))?;
+                    self.coerce_sources.push((e, u32::MAX));
+                    let entry = &mut self.coerce_many[site as usize];
+                    if entry.first_source == u32::MAX {
+                        entry.first_source = idx;
+                    } else {
+                        self.coerce_sources[entry.last_source as usize].1 = idx;
+                    }
+                    entry.last_source = idx;
                 }
             }
             None => {
@@ -1164,8 +1441,15 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             if witness == Witness::Fixed
                 && (err.kind == crate::ty::FulfillErrorKind::Unsatisfied || (ambiguity && ambiguous))
                 && err.because.is_none()
-                && let crate::ty::Goal::Trait { trait_, args } = err.obligation.goal
-                && let Some((w, leaf)) = self.interior_candidate(trait_, args)?
+                && let Some((trait_, args, proj)) = match err.obligation.goal {
+                    crate::ty::Goal::Trait { trait_, args } => Some((trait_, args, None)),
+                    crate::ty::Goal::Projection { trait_, args, name, term } => {
+                        let resolved = self.ty.shallow_resolve(term);
+                        (!matches!(self.ty.view(resolved), TyView::Infer(_))).then_some((trait_, args, Some((name, term))))
+                    }
+                    _ => None,
+                }
+                && let Some((w, leaf)) = self.interior_candidate(trait_, args, proj)?
             {
                 // Several suspect clauses (or one naming the probe's variables): no one clause
                 // can be re-asked on the exact interior, so the gap.
@@ -1214,6 +1498,25 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                         self.stalled.push(crate::stalled::PendingStalled { trait_: row_trait, ty: row_ty, diag });
                         continue;
                     }
+                    (crate::stalled::Interior::Defer, Witness::LocalFlow, crate::ty::Goal::Projection { trait_, args, name, term })
+                        if let Some((lt, la)) = nested =>
+                    {
+                        let ty = self.ty.list_get(args, 0);
+                        let leaf = Some(PendingGoal::Trait { trait_: lt, args: la });
+                        let diag = PendingDiag::unmet(
+                            DiagCode::Unsatisfied,
+                            at,
+                            Some(ty),
+                            PendingGoal::Projection { trait_, args, name, term },
+                            leaf,
+                        );
+                        self.stalled.push(crate::stalled::PendingStalled {
+                            trait_: lt,
+                            ty: self.ty.list_get(la, 0),
+                            diag,
+                        });
+                        continue;
+                    }
                     _ => return Err(self.witness_gap_of(witness, at).into()),
                 }
             }
@@ -1244,6 +1547,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                                 self.errors += 1;
                                 self.diags.push(PendingDiag::because(code, at, Because::Generic(cond), found, None));
                             }
+                            crate::ty::Goal::ForFields { container, .. } => self.diag(code, at, About::found(container)),
                         }
                     }
                 }
@@ -1255,6 +1559,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                             crate::ty::Goal::Trait { args, .. } if self.ty.list_len(args) > 0 => {
                                 Some(self.ty.list_get(args, 0))
                             }
+                            crate::ty::Goal::ForFields { container, .. } => Some(container),
                             _ => None,
                         };
                         self.errors += 1;
@@ -1294,6 +1599,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                             self.errors += 1;
                             self.diags.push(PendingDiag::because(DiagCode::Unsatisfied, at, Because::False(cond), found, None));
                         }
+                        crate::ty::Goal::ForFields { container, .. } => self.diag(DiagCode::Unsatisfied, at, About::found(container)),
                     },
                 },
             }
@@ -1371,12 +1677,13 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         Ok(Some(crate::diag::PendingWhy { start, len, leaf }))
     }
 
-    /// The list `l` of `types` under the impl arguments `iargs`, each type resolved.
+    /// The list `l` of `types` under the impl arguments `iargs`, each projection normalized
+    /// immediately and each type resolved (called inside a probe).
     fn lower_resolved(&mut self, types: PTys<'_>, l: crate::ids::List, iargs: TyList) -> Result<TyList, Stop> {
         let parts = types.list(l)?;
         let mut tys: blaze_own::Vec<Ty, Alloc<'a>> = blaze_own::Vec::with_capacity_in(parts.len(), self.alloc);
         for &p in parts {
-            let t = self.lower(types, p, Lower::Args(iargs), Cause::Body)?;
+            let t = self.lower(types, p, Lower::NormalizedArgs(iargs), Cause::Body)?;
             tys.push(self.ty.resolve(t)?);
         }
         Ok(self.ty.mk_list(&tys)?)
@@ -1436,7 +1743,12 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     /// impl fails by a decided clause (or one the initial capture fails), and the goal's
     /// failure is a finding. One level: a clause that is itself no auto trait is not looked
     /// under (rustc reports such a goal with no leaf either).
-    fn interior_candidate(&mut self, trait_: ItemKey, args: TyList) -> Result<Option<(Witness, Option<(ItemKey, TyList)>)>, Stop> {
+    fn interior_candidate(
+        &mut self,
+        trait_: ItemKey,
+        args: TyList,
+        proj: Option<(Name, Ty)>,
+    ) -> Result<Option<(Witness, Option<(ItemKey, TyList)>)>, Stop> {
         if self.ty.list_len(args) == 0 {
             return Ok(None);
         }
@@ -1445,7 +1757,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         let Some(shape) = self.shape(self_ty) else { return Ok(None) };
         let impls = self.reads.impls_of(trait_, shape)?;
         for &imp in impls {
-            let found = self.probe(|m| m.interior_clauses_of(imp, trait_, args))?;
+            let found = self.probe(|m| m.interior_clauses_of(imp, trait_, args, proj))?;
             if found.is_some() {
                 return Ok(found);
             }
@@ -1454,9 +1766,25 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     }
 
     /// [`Self::interior_candidate`] for one impl, in the caller's probe.
-    fn interior_clauses_of(&mut self, imp: ItemKey, trait_: ItemKey, args: TyList) -> Result<Option<(Witness, Option<(ItemKey, TyList)>)>, Stop> {
+    fn interior_clauses_of(
+        &mut self,
+        imp: ItemKey,
+        trait_: ItemKey,
+        args: TyList,
+        proj: Option<(Name, Ty)>,
+    ) -> Result<Option<(Witness, Option<(ItemKey, TyList)>)>, Stop> {
         let before_impl = self.ty.var_mark();
         let Some((iargs, true)) = self.instantiate_for_leaf(imp, trait_, args)? else { return Ok(None) };
+        if let Some((name, term)) = proj {
+            let Some(h) = self.reads.impl_header(imp)? else { return Ok(None) };
+            let Some(&(_, assoc_ty)) = h.assoc_types.iter().find(|&&(n, _)| n == name) else {
+                return Ok(None);
+            };
+            let lowered = self.lower(h.types, assoc_ty, Lower::NormalizedArgs(iargs), Cause::Body)?;
+            if !self.ty.unify(term, lowered)? {
+                return Ok(None);
+            }
+        }
         let wc = self.reads.predicates(imp)?;
         let mut suspects = 0u32;
         let mut first: Option<(Witness, ItemKey, TyList)> = None;
@@ -1507,6 +1835,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         if root != raw_root && self.ty.ty_flags(root).is_empty() {
             return Ok(root);
         }
+        let mut selected_without_progress = false;
         if flags.has(TyFlags::HAS_INFER) && matches!(self.ty.view(root), TyView::Infer(_) | TyView::ConstInfer(_)) {
             if matches!(usage, AliasUse::Equality) {
                 return Ok(root);
@@ -1532,11 +1861,15 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             }
             let view = self.ty.view(t);
             if !expanded && matches!(view, TyView::Infer(_) | TyView::ConstInfer(_)) {
-                if matches!(usage, AliasUse::Shape(_)) {
+                if matches!(usage, AliasUse::Shape(_)) && !selected_without_progress {
                     self.select()?;
                     let resolved = self.ty.shallow_resolve(t);
                     if resolved != t {
                         work.push((resolved, false));
+                    } else {
+                        // `select()` reached fixpoint without resolving `t`; subsequent unbound
+                        // vars in the same walk cannot make progress until new relations arrive.
+                        selected_without_progress = true;
                     }
                 }
                 // An unbound variable is its own replacement.
@@ -1616,6 +1949,8 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         };
         match view {
             TyView::Tuple(l)
+            | TyView::Record(_, l)
+            | TyView::Union(l)
             | TyView::Adt(_, l)
             | TyView::FnDef(_, l)
             | TyView::FnPtr(l, _)
@@ -1699,6 +2034,8 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         use TyView::*;
         let rebuilt = match view {
             Tuple(l) => Tuple(self.normalized_list(l, done, items)?),
+            Record(s, l) => Record(s, self.normalized_list(l, done, items)?),
+            Union(l) => Union(self.normalized_list(l, done, items)?),
             Ref(m, t) => Ref(m, self.normalized_child(t, done)),
             Ptr(m, t) => Ptr(m, self.normalized_child(t, done)),
             Array(e, n) => Array(self.normalized_child(e, done), self.normalized_child(n, done)),
@@ -1809,6 +2146,9 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             fru_fields: self.fru_fields.len(),
             default_fields: self.default_fields.len(),
             union_fields: self.union_fields.len(),
+            union_pats: self.union_pats.len(),
+            inferred_err_coercions: self.inferred_err_coercions.len(),
+            deferred_try_obs: self.deferred_try_obs.len(),
         }
     }
 
@@ -1838,6 +2178,9 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         self.fru_fields.truncate(s.fru_fields);
         self.default_fields.truncate(s.default_fields);
         self.union_fields.truncate(s.union_fields);
+        self.union_pats.truncate(s.union_pats);
+        self.inferred_err_coercions.truncate(s.inferred_err_coercions);
+        self.deferred_try_obs.truncate(s.deferred_try_obs);
     }
 
     /// Runs `f` in a snapshot that is always rolled back (`probe`).
@@ -2071,6 +2414,13 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             PNode::Str => TyView::Str,
             PNode::Never => TyView::Never,
             PNode::Tuple(l) => TyView::Tuple(self.lowered_list(memo, types, l)?),
+            PNode::Record(s, l) => {
+                if let Some(names) = types.record_names(s) {
+                    self.register_record_schema(s, names)?;
+                }
+                TyView::Record(s, self.lowered_list(memo, types, l)?)
+            }
+            PNode::Union(l) => TyView::Union(self.lowered_list(memo, types, l)?),
             PNode::Ref(m, t) => TyView::Ref(m, Self::lowered(memo, t)?),
             PNode::Ptr(m, t) => TyView::Ptr(m, Self::lowered(memo, t)?),
             // A hole for a length (`[u8; _]`) is a const variable, not the type variable the
@@ -2131,7 +2481,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 TyView::CoroutineOf { owner, ordinal, args, output, interior }
             }
             PNode::Param(i) => match mode {
-                Lower::Args(args) | Lower::CoroutineArgs { args, .. } => {
+                Lower::Args(args) | Lower::NormalizedArgs(args) | Lower::CoroutineArgs { args, .. } => {
                     let len = self.ty.list_len(args);
                     if i >= len {
                         // `Machine::lower` fills in its caller.
@@ -2143,7 +2493,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 Lower::Body | Lower::Assumed => TyView::Param(i),
             },
             PNode::ConstParam(i) => match mode {
-                Lower::Args(args) | Lower::CoroutineArgs { args, .. } => {
+                Lower::Args(args) | Lower::NormalizedArgs(args) | Lower::CoroutineArgs { args, .. } => {
                     let len = self.ty.list_len(args);
                     if i >= len {
                         let site = crate::error::ParamSite::Lower { at: None };
@@ -2156,6 +2506,15 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             PNode::ConstValue { ty, bits } => TyView::ConstValue { ty: Self::lowered(memo, ty)?, bits },
             PNode::Alias { trait_, name, args } if matches!(mode, Lower::Assumed) => {
                 TyView::Alias { trait_, name, args: self.lowered_list(memo, types, args)? }
+            }
+            PNode::Alias { trait_, name, args } if matches!(mode, Lower::NormalizedArgs(_)) => {
+                let args = self.lowered_list(memo, types, args)?;
+                match self.ty.normalize(trait_, args, name, &mut self.reads)? {
+                    Some(crate::ty::Normalized::Certain(t) | crate::ty::Normalized::Ambiguous(t)) => {
+                        return Ok(self.ty.resolve(t)?);
+                    }
+                    None => TyView::Alias { trait_, name, args },
+                }
             }
             PNode::Alias { trait_, name, args } => {
                 let args = self.lowered_list(memo, types, args)?;
@@ -2187,11 +2546,120 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             PNode::Foreign(k) => TyView::Foreign(k),
             PNode::Infer => match mode {
                 Lower::Body => return self.fresh(),
-                Lower::Args(_) | Lower::CoroutineArgs { .. } | Lower::Assumed => return Err(CheckError::Malformed(Malformed::HoleInAnswer).into()),
+                Lower::Args(_) | Lower::NormalizedArgs(_) | Lower::CoroutineArgs { .. } | Lower::Assumed => {
+                    return Err(CheckError::Malformed(Malformed::HoleInAnswer).into());
+                }
             },
             PNode::Error => TyView::Error,
         };
         self.mk(view)
+    }
+
+    /// Registers `schema -> sorted_names` on this machine (idempotent).
+    pub(crate) fn register_record_schema(&mut self, schema: RecordSchema, sorted_names: &[Name]) -> Result<(), Stop> {
+        if self.record_schemas.iter().any(|&(s, _)| s == schema) {
+            return Ok(());
+        }
+        let len = u32::try_from(sorted_names.len()).map_err(|_| CheckError::Limit(Limit::Table))?;
+        let list = if len == 0 {
+            List::EMPTY
+        } else {
+            let start = u32::try_from(self.record_names.len()).map_err(|_| CheckError::Limit(Limit::Table))?;
+            self.record_names.extend_from_slice(sorted_names);
+            List { start, len }
+        };
+        self.record_schemas.push((schema, list));
+        Ok(())
+    }
+
+    /// Canonical sorted field names for `schema`, if known to this machine.
+    pub(crate) fn record_names(&self, schema: RecordSchema) -> Option<&[Name]> {
+        let &(_, list) = self.record_schemas.iter().find(|&&(s, _)| s == schema)?;
+        if list.len == 0 {
+            return Some(&[]);
+        }
+        self.record_names.get(list.range())
+    }
+
+    /// Canonical field index of `name` in `schema`, if known. Uses a zero-alloc linear scan for
+    /// `<= 16` fields and a lazily cached `Map` for `> 16` fields.
+    pub(crate) fn record_field_index(&mut self, schema: RecordSchema, name: Name) -> Option<u32> {
+        let &(_, list) = self.record_schemas.iter().find(|&&(s, _)| s == schema)?;
+        if list.len == 0 {
+            return None;
+        }
+        let range = list.range();
+        if range.len() <= NAME_HASH_THRESHOLD {
+            let names = self.record_names.get(range)?;
+            return names.iter().position(|&n| n == name).and_then(|i| u32::try_from(i).ok());
+        }
+        let key = NameIndexKey::Record(schema);
+        if let Some(map) = self.name_index.get(&key) {
+            return map.get(&name).copied();
+        }
+        let names = self.record_names.get(range)?;
+        let mut map = Map::new(MapOpts { hasher: FixedState, alloc: self.alloc, capacity: Some(names.len()) });
+        for (i, &n) in names.iter().enumerate() {
+            if let Ok(idx) = u32::try_from(i) {
+                map.entry(n).or_insert(idx);
+            }
+        }
+        let out = map.get(&name).copied();
+        self.name_index.insert(key, map);
+        out
+    }
+
+    /// First field index with `name` in `declared` (for `(adt, variant)`): zero-alloc linear scan
+    /// for `<= 16` fields, lazily cached `Map` for `> 16` fields.
+    pub(crate) fn find_adt_field(
+        &mut self,
+        adt: ItemKey,
+        variant: u32,
+        declared: &[crate::world::Field],
+        name: Name,
+    ) -> Option<u32> {
+        if declared.len() <= NAME_HASH_THRESHOLD {
+            return declared.iter().position(|d| d.name == name).and_then(|i| u32::try_from(i).ok());
+        }
+        let key = NameIndexKey::AdtFields(adt, variant);
+        if let Some(map) = self.name_index.get(&key) {
+            return map.get(&name).copied();
+        }
+        let mut map = Map::new(MapOpts { hasher: FixedState, alloc: self.alloc, capacity: Some(declared.len()) });
+        for (i, d) in declared.iter().enumerate() {
+            if let Ok(idx) = u32::try_from(i) {
+                map.entry(d.name).or_insert(idx);
+            }
+        }
+        let out = map.get(&name).copied();
+        self.name_index.insert(key, map);
+        out
+    }
+
+    /// First variant index with `name` in `variants` (for `adt`): zero-alloc linear scan for
+    /// `<= 16` variants, lazily cached `Map` for `> 16` variants.
+    pub(crate) fn find_adt_variant(
+        &mut self,
+        adt: ItemKey,
+        variants: &[crate::world::Variant],
+        name: Name,
+    ) -> Option<u32> {
+        if variants.len() <= NAME_HASH_THRESHOLD {
+            return variants.iter().position(|v| v.name == name).and_then(|i| u32::try_from(i).ok());
+        }
+        let key = NameIndexKey::AdtVariants(adt);
+        if let Some(map) = self.name_index.get(&key) {
+            return map.get(&name).copied();
+        }
+        let mut map = Map::new(MapOpts { hasher: FixedState, alloc: self.alloc, capacity: Some(variants.len()) });
+        for (i, v) in variants.iter().enumerate() {
+            if let Ok(idx) = u32::try_from(i) {
+                map.entry(v.name).or_insert(idx);
+            }
+        }
+        let out = map.get(&name).copied();
+        self.name_index.insert(key, map);
+        out
     }
 
     /// A written type of the body.
@@ -2257,9 +2725,22 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         self.mk_list(&v)
     }
 
+    /// The active unresolved root of `self.inferred_err_var`, if still an inference variable.
+    pub(crate) fn active_inferred_err_var(&mut self) -> Option<Ty> {
+        let ev = self.inferred_err_var?;
+        let r = self.ty.shallow_resolve(ev);
+        self.is_ty_var(r).then_some(r)
+    }
+
     /// Registers `item`'s where-clauses, instantiated with `args`
     /// (`add_required_obligations_for_hir`).
     pub(crate) fn register_predicates(&mut self, item: ItemKey, args: TyList, cause: Cause) -> Result<(), Stop> {
+        if self.inferred_err_var.is_some()
+            && self.reads.lang_path(LangItem::TryTraitFromResidual)? == Some(Def::Fn(item))
+        {
+            self.deferred_try_obs.push((item, args, cause));
+            return Ok(());
+        }
         let preds = self.reads.predicates(item)?;
         for (nth, clause) in preds.clauses.iter().enumerate() {
             let Some(goal) = self.clause_goal(preds.types, *clause, args, cause)? else { continue };
@@ -2290,6 +2771,11 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 term: self.lower(types, term, Lower::Args(args), cause)?,
             },
             PClause::Const { cond, args: l } => Goal::ConstHolds { cond, args: self.lower_list(types, l, args, cause)? },
+            PClause::ForFields { container, trait_, args: l } => Goal::ForFields {
+                container: self.lower(types, container, Lower::Args(args), cause)?,
+                trait_,
+                args: self.lower_list(types, l, args, cause)?,
+            },
             PClause::TypeOutlives { .. } | PClause::RegionOutlives { .. } => return Ok(None),
         }))
     }
@@ -2311,8 +2797,12 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     fn lowered_projection(&mut self, trait_: ItemKey, name: Name, args: TyList, mode: Lower, cause: Cause) -> Result<Ty, Stop> {
         let term = self.fresh()?;
         self.ty.register(Obligation { goal: Goal::Projection { trait_, args, name, term }, cause })?;
-        if let (Lower::Args(_), Cause::Expr(e)) = (mode, cause) {
-            self.projected.push((e, trait_, Some(name), args));
+        if let Lower::Args(_) = mode {
+            match cause {
+                Cause::Expr(e) => self.projected.push((e, trait_, Some(name), args)),
+                Cause::Pat(_) => self.projected.push((self.body.root, trait_, Some(name), args)),
+                _ => {}
+            }
         }
         if self.sig_rows && matches!(mode, Lower::Body) {
             self.projected.push((self.body.root, trait_, Some(name), args));
@@ -2421,6 +2911,8 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             TyView::Str => Shape::Str,
             TyView::Never => Shape::Never,
             TyView::Tuple(l) => Shape::Tuple(self.ty.list_len(l)),
+            TyView::Record(s, l) => Shape::Record(s.0, self.ty.list_len(l)),
+            TyView::Union(l) => Shape::Union(self.ty.list_len(l)),
             TyView::Ref(m, _) => Shape::Ref(m),
             TyView::Ptr(m, _) => Shape::Ptr(m),
             TyView::Array(..) => Shape::Array,
@@ -2464,9 +2956,10 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             let (next, overloaded) = match self.view(cur) {
                 TyView::Ref(_, t) => (t, false),
                 TyView::Ptr(_, t) if raw_ptrs => (t, false),
-                // An object can itself implement Deref, e.g. `impl Deref for dyn Inspector`.
-                // Its Target is another receiver step with its own inherent methods.
-                TyView::Adt(..) | TyView::Param(_) | TyView::Opaque(..) | TyView::Dynamic(_) => {
+                // An object or rigid associated type projection can itself implement Deref, e.g.
+                // `impl Deref for dyn Inspector` or `type Guard<'a, T>: DerefMut<Target = T>`.
+                // Its Target is another receiver step with its own inherent methods and fields.
+                TyView::Adt(..) | TyView::Param(_) | TyView::Opaque(..) | TyView::Alias { .. } | TyView::Dynamic(_) => {
                     match self.overloaded_deref_at(cur, DerefAt::Autoderef)? {
                         Some(t) => (t, true),
                         None => return Ok((steps, false)),

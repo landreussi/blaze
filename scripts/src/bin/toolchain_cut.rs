@@ -95,7 +95,11 @@ impl Files<'_> {
     fn read(&self, path: &str) -> Option<String> {
         match self {
             Files::Disk(anchor) => std::fs::read_to_string(anchor.join(path)).ok(),
-            Files::Pack(view) => view.find(path).and_then(|f| String::from_utf8(f.bytes.to_vec()).ok()),
+            Files::Pack(view) => view
+                .read(path, std::alloc::Global)
+                .ok()
+                .flatten()
+                .and_then(|f| String::from_utf8(f.bytes.as_slice().to_vec()).ok()),
         }
     }
 
@@ -110,8 +114,8 @@ impl Files<'_> {
             Files::Pack(view) => {
                 let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
                 let mut seen = BTreeMap::new();
-                for file in view.files() {
-                    let Some(rest) = file.path.strip_prefix(prefix.as_str()) else { continue };
+                for entry in view.entries() {
+                    let Some(rest) = entry.path.strip_prefix(prefix.as_str()) else { continue };
                     match rest.split_once('/') {
                         Some((name, _)) => seen.insert(name.to_string(), true),
                         None => seen.insert(rest.to_string(), false),
@@ -153,14 +157,26 @@ fn layout(files: &Files<'_>, start: &str, alloc: Alloc<'static>) -> Result<Units
     Err(format!("{start}: no layout after 64 passes"))
 }
 
-/// A target's cfgs as rustc printed them for the pinned nightly, from the recorded answers: as
+/// A target's cfgs from the recorded answers (`pins/answers/rustc.json`, plus blaze's own
+/// targets in `pins/answers/own_targets.json` such as `wasm64-blaze-wasip1`): as
 /// blaze-unit-graph takes them, and as the record holds them ((name, value), sorted, each once).
 fn target_desc(tree: &Path, triple: &str, alloc: Alloc<'static>) -> (TargetDesc<'static>, Vec<(String, Option<String>)>) {
-    let path = tree.join(blaze_pins::ANSWERS_PATH);
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
-    let data: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
-    let Some(target) =data.get("targets").and_then(|t| t.get(triple)) else {
-        fail(&format!("{}: no recorded answers for the target `{triple}`", path.display()))
+    let mut found = None;
+    for rel in [blaze_pins::ANSWERS_PATH, blaze_pins::OWN_TARGETS_PATH] {
+        let path = tree.join(rel);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
+        let data: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
+        if let Some(target) = data.get("targets").and_then(|t| t.get(triple)) {
+            found = Some((path, target.clone()));
+            break;
+        }
+    }
+    let Some((path, target)) = found else {
+        fail(&format!(
+            "{} / {}: no recorded answers for the target `{triple}`",
+            tree.join(blaze_pins::ANSWERS_PATH).display(),
+            tree.join(blaze_pins::OWN_TARGETS_PATH).display(),
+        ))
     };
     let strs = |key: &str| -> Vec<String> {
         target.get(key).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect()).unwrap_or_default()
@@ -190,16 +206,22 @@ fn target_desc(tree: &Path, triple: &str, alloc: Alloc<'static>) -> (TargetDesc<
     (TargetDesc::new(triple, cfg, alloc), atoms)
 }
 
-/// The targets the pinned nightly's answers are recorded for: the keys of `rustc.json`'s
-/// `targets` (the same file `target_desc` reads a target's cfgs from).
+/// The targets whose answers are recorded in `rustc.json` and `own_targets.json` (the same files
+/// `target_desc` reads a target's cfgs from).
 fn recorded_targets(tree: &Path) -> Vec<String> {
-    let path = tree.join(blaze_pins::ANSWERS_PATH);
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
-    let data: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
-    let Some(targets) =data.get("targets").and_then(|t| t.as_object()) else {
-        fail(&format!("{}: no `targets` object", path.display()))
-    };
-    targets.keys().cloned().collect()
+    let mut out = Vec::new();
+    for rel in [blaze_pins::ANSWERS_PATH, blaze_pins::OWN_TARGETS_PATH] {
+        let path = tree.join(rel);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
+        let data: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
+        let Some(targets) = data.get("targets").and_then(|t| t.as_object()) else {
+            fail(&format!("{}: no `targets` object", path.display()))
+        };
+        out.extend(targets.keys().cloned());
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Which tree a crate is from.
@@ -255,7 +277,7 @@ fn answer(side: &mut Side, id: LockId, registry: &Path, alloc: Alloc<'static>) -
             }
             let (pack, _) = unpack::crate_record(name, &version, sha256, &archive, &UnpackLimits::REAL, alloc)
                 .unwrap_or_else(|e| fail(&format!("{what}: {}", blaze_text::Shown(&e))));
-            let pack: &'static [u8] = pack.leak();
+            let pack: &'static [u8] = pack.leak_static();
             let view = PackView::open_verified(pack).unwrap_or_else(|e| fail(&format!("{what}: {}", blaze_text::Shown(&e))));
             let units = layout(&Files::Pack(view), "", alloc).unwrap_or_else(|e| fail(&format!("{what}: {e}")));
             side.packs.insert(id, pack);
@@ -514,7 +536,7 @@ fn tree_pack(what: &str, files: &[(String, Vec<u8>, Mode)], alloc: Alloc<'static
     for (path, bytes, mode) in files {
         builder.file(path, *mode, bytes).unwrap_or_else(|e| fail(&format!("{what}: {path}: {}", blaze_text::Shown(&e))));
     }
-    builder.finish().unwrap_or_else(|e| fail(&format!("{what}: {}", blaze_text::Shown(&e)))).leak()
+    builder.finish().unwrap_or_else(|e| fail(&format!("{what}: {}", blaze_text::Shown(&e)))).leak_static()
 }
 
 /// A crate's key across targets: its tree and its lock id there.
@@ -713,11 +735,35 @@ fn main() {
     }
     let resolved = started.elapsed();
 
+    // Deduplicate vendored registry crates in `library/` against identical SHA-256 registry packs
+    // already unpacked from `.crate` archives on the workspace side (e.g., `libc`), so the shelf
+    // keeps one content-addressed pack instead of two copies (tree + crate).
+    let mut ws_registry_by_pin: BTreeMap<(String, String, String), &'static [u8]> = BTreeMap::new();
+    for (&ws_id, &pack) in &workspace.packs {
+        let p = workspace.lock.package(ws_id);
+        if let Checksum::Sha256(hex) = &p.checksum {
+            ws_registry_by_pin.insert((p.name.as_str().to_string(), p.version.to_string(), hex.as_str().to_string()), pack);
+        }
+    }
+    let mut shared_packs: BTreeMap<CrateKey, &'static [u8]> = BTreeMap::new();
+    for (key, row) in facts.iter_mut() {
+        if key.0 == Origin::Library {
+            let p = library.lock.package(key.1);
+            if matches!(p.source, LockSource::Registry { .. })
+                && let Checksum::Sha256(hex) = &p.checksum
+                && let Some(&pack) = ws_registry_by_pin.get(&(p.name.as_str().to_string(), p.version.to_string(), hex.as_str().to_string()))
+            {
+                row.5.clear();
+                shared_packs.insert(*key, pack);
+            }
+        }
+    }
+
     // The packs, one per crate: a registry crate's from its `.crate`; a tree crate's folder,
     // with what its sources reach outside it (`crate_files`), at paths relative to its tree.
     let mut tree_packs: BTreeMap<CrateKey, &'static [u8]> = BTreeMap::new();
     for (key, facts) in &facts {
-        if key.0 == Origin::Workspace && workspace.packs.contains_key(&key.1) {
+        if (key.0 == Origin::Workspace && workspace.packs.contains_key(&key.1)) || shared_packs.contains_key(key) {
             continue;
         }
         let top = match key.0 {
@@ -728,6 +774,9 @@ fn main() {
         tree_packs.insert(*key, tree_pack(&format!("{} {} ({})", facts.0, facts.1, facts.5), &files, alloc));
     }
     let pack_of = |key: &CrateKey| -> (&'static [u8], u8) {
+        if let Some(&pack) = shared_packs.get(key) {
+            return (pack, 1);
+        }
         match (key.0, workspace.packs.get(&key.1)) {
             (Origin::Workspace, Some(pack)) => (pack, 1),
             _ => (tree_packs[key], 3),
@@ -781,7 +830,7 @@ fn main() {
             cfg.extend(u.features.iter().map(|f| ("feature", Some(f.as_str()))));
             // Every module file of the crate, from its root (an `extern crate` asks for its
             // crate in any module: bstd's `extern crate std;` is in `mod rt`).
-            let file = |p: &str| view.find(p).and_then(|f| std::str::from_utf8(f.bytes).ok());
+            let file = |p: &str| view.read_str_slice(p, frame).ok().flatten();
             let read = crate_facts(&path, file, &cfg, alloc).unwrap_or_else(|e| fail(&format!("{triple}: {name} {version} (root {path}): {e}")));
             u.sysroot = Some(read.sysroot);
             if u.kind == UnitKind::Lib && !u.for_host {

@@ -68,11 +68,13 @@ use core::fmt;
 use std::alloc::Allocator;
 
 use blaze_core::{Driver, Mapping};
+use blaze_own::Share;
 use blaze_ids::ContentId;
 use blaze_keyed::kind::{Namespace, ReservedTag};
 use blaze_keyed::store::{ENTRY, Generation};
 
 use super::arena::ArenaView;
+use super::bloom::{BloomMapped, BloomRef};
 use super::core::Plain;
 use super::format::{self, Entry, Segment};
 use super::lent::{Lent, LentError};
@@ -151,12 +153,14 @@ pub(crate) enum SnapshotPlant {
     ShortWatermark,
 }
 
-/// One listed segment: its manifest row (where its index lies), its mapping, shared, and the
-/// proof its [`super::verified::Verified`] gave when the snapshot was taken.
+/// One listed segment: its manifest row (where its index lies), its mapping, shared, the
+/// proof its [`super::verified::Verified`] gave when the snapshot was taken, and its optional
+/// verified per-segment Bloom filter for O(1) negative rejection.
 struct Listed {
     seg: Segment,
     map: Mapping,
     proof: Proof,
+    bloom: Option<BloomRef>,
 }
 
 /// A record read through a snapshot with the store's proof beside its bytes: the bytes lie in a
@@ -187,6 +191,9 @@ pub struct Proved<'s> {
 pub struct Snapshot<A: Allocator> {
     /// In probe order: the namespaces read, in order; within one, the generation's probe order.
     listed: Vec<Listed, A>,
+    /// Shared mapped `bloom` sidecar and lazy per-slot atomic verification states (one handle per
+    /// snapshot, zero per-segment `Mapping` clones).
+    bloom_mapped: Option<BloomMapped>,
     generation: u64,
     plant: SnapshotPlant,
     /// `Visibility::InArena`: what the take saw of the shared arena of puts not yet committed
@@ -211,21 +218,25 @@ impl<A: Allocator> Snapshot<A> {
         if !plain.whole() && plant != SnapshotPlant::SkipsMapAll {
             return Err(SnapshotError::NotWhole { generation });
         }
-        let segments: usize = plain.reads().iter().map(|space| in_space(plain, *space).count()).sum();
+        let reads = plain.reads();
+        let segments: usize = reads.iter().map(|&space| in_space(plain, space).count()).sum();
         if segments > SNAPSHOT_SEGMENTS_MOST {
             return Err(SnapshotError::TooManySegments { generation, segments, most: SNAPSHOT_SEGMENTS_MOST });
         }
         let mut listed = Vec::new_in(alloc);
         listed.try_reserve_exact(segments).map_err(|_| SnapshotError::Alloc { segments })?;
         let branded = Generation(generation);
-        for space in plain.reads() {
-            for at in in_space(plain, *space) {
+        let bloom_mapped = plain.bloom_shared_mapped();
+        for &space in reads {
+            for at in in_space(plain, space) {
                 let verified = plain.mapped_at(at);
+                let seg = *verified.seg();
+                let bloom = plain.bloom_ref_for(&seg);
                 // Within the reserve: no reallocation.
-                listed.push(Listed { seg: *verified.seg(), map: verified.mapping().clone(), proof: verified.proof(branded) });
+                listed.push(Listed { seg, map: verified.mapping().share(), proof: verified.proof(branded), bloom });
             }
         }
-        Ok(Snapshot { listed, generation, plant, arena: None })
+        Ok(Snapshot { listed, bloom_mapped, generation, plant, arena: None })
     }
 
     /// This snapshot with `view` of the shared arena beside its segments.
@@ -273,6 +284,14 @@ impl<A: Allocator> Snapshot<A> {
             }
         }
         for listed in self.listed.iter() {
+            if listed.seg.count == 0 {
+                continue;
+            }
+            if let Some(bloom) = &listed.bloom
+                && !bloom.may_contain(self.bloom_mapped.as_ref(), &key.0.0)
+            {
+                continue;
+            }
             let file = listed.map.bytes();
             let run = listed.seg.run(file);
             let Some(i) = self.find(run, &key.0) else { continue };
@@ -312,7 +331,11 @@ impl<A: Allocator> Snapshot<A> {
 /// The indexes (in `plain`'s maps) of the generation's mapped, proved local segments of `space`,
 /// in its probe order: the rows `Plain::find_in` probes for that namespace, in its order.
 fn in_space<P: Allocator + Clone>(plain: &Plain<P>, space: Namespace) -> impl Iterator<Item = usize> + '_ {
-    plain.view.iter().filter_map(move |&row| plain.mapped_row(row)).filter(move |&at| plain.mapped_at(at).seg().namespace == space)
+    plain
+        .view
+        .iter()
+        .filter(move |&&row| plain.row_namespace(row) == Some(space))
+        .filter_map(move |&row| plain.mapped_row(row))
 }
 
 /// The planted bug [`SnapshotPlant::ShortPrefix`]: a bisection that compares the first eight

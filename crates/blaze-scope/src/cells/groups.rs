@@ -207,7 +207,7 @@ pub fn write_groups<'a, N: crate::Name>(
 ) -> Result<AVec<'a, NameGroup<'a>>, GroupsError> {
     let mut out: AVec<'a, NameGroup<'a>> = AVec::with_capacity_in(shapes.len(), alloc);
     for shape in shapes.iter() {
-        let mut reads = shape.reads.clone();
+        let mut reads = shape.reads.clone_in(alloc);
         reads.extend(shape.calls.iter().map(|&call| GroupRead::Expansion {
             call,
             seen: made(call).map_or(GroupSeen::Absent, |text| GroupSeen::Digest(ContentId::of(EXPANSION_DOMAIN, text.as_bytes()))),
@@ -220,7 +220,7 @@ pub fn write_groups<'a, N: crate::Name>(
         cells_read.sort_unstable();
         let bytes = record(&shape.members, &shape.own, &reads, done, alloc)?;
         let id = ContentId::of(GROUP_DOMAIN, &bytes);
-        out.push(NameGroup { members: shape.members.clone(), reads, own: shape.own.clone(), defines: shape.defines.clone(), cells_read, bytes, id });
+        out.push(NameGroup { members: shape.members.clone_in(alloc), reads, own: shape.own.clone_in(alloc), defines: shape.defines.clone_in(alloc), cells_read, bytes, id });
     }
     Ok(out)
 }
@@ -789,57 +789,96 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         if let Some(&d) = memo.get(&m) {
             return d;
         }
+        struct Frame<'a> {
+            cur: ModId,
+            frags: AVec<'a, (Option<ItemKey>, FragId)>,
+            ready: bool,
+        }
+        let mut stack: AVec<'a, Frame<'a>> = AVec::new_in(self.alloc);
         let of = &frags_of[m as usize];
-        let mut frags: AVec<'_, (Option<ItemKey>, FragId)> = AVec::with_capacity_in(of.len(), self.alloc);
+        let mut root_frags: AVec<'a, (Option<ItemKey>, FragId)> = AVec::with_capacity_in(of.len(), self.alloc);
         // An expansion's fragment by its call's key; the module's text first.
-        frags.extend(of.iter().map(|&f| (expansion_of.get(&f).copied(), f)));
-        frags.sort_unstable_by_key(|(call, _)| *call);
-        let mut b: AVec<'_, u8> = AVec::new_in(self.alloc);
-        for &(call, f) in frags.iter() {
-            b.push(0xFF);
-            if let Some(k) = call {
-                b.extend_from_slice(&k.0.0);
+        root_frags.extend(of.iter().map(|&f| (expansion_of.get(&f).copied(), f)));
+        root_frags.sort_unstable_by_key(|(call, _)| *call);
+        stack.push(Frame { cur: m, frags: root_frags, ready: false });
+        while let Some(frame) = stack.pop() {
+            if memo.contains_key(&frame.cur) {
+                continue;
             }
-            for &(_, slot) in self.frags[f as usize].slots.iter() {
-                match slot {
-                    Slot::Rules(name, def, export) => {
-                        b.push(1);
-                        let name = name.as_ref().as_bytes();
-                        b.extend_from_slice(&(name.len() as u32).to_le_bytes());
-                        b.extend_from_slice(name);
-                        b.extend_from_slice(&def.key.0.0);
-                        b.push(u8::from(export));
-                    }
-                    Slot::Mod(child, macro_use) => {
-                        b.push(2);
-                        b.extend_from_slice(&self.modules[child as usize].key.0.0);
-                        b.push(u8::from(macro_use));
-                        let c = &self.modules[child as usize];
-                        if macro_use && !c.foreign && !c.unread {
-                            // Its sequence, flattened into `m`'s: read here, or its record's
-                            // (in `memo`); none held is absent (write.rs counts it unknown).
-                            let d = match memo.get(&child) {
-                                Some(&d) => d,
-                                None if c.text != FragId::MAX && child != m => self.textual_digest(child, frags_of, expansion_of, memo),
-                                None => ABSENT,
-                            };
-                            b.extend_from_slice(&d.0);
+            if !frame.ready {
+                let mut children: AVec<'a, ModId> = AVec::new_in(self.alloc);
+                for &(_, f) in frame.frags.iter() {
+                    if let Some(frag) = usize::try_from(f).ok().and_then(|i| self.frags.get(i)) {
+                        for &(_, slot) in frag.slots.iter() {
+                            if let Slot::Mod(child, true) = slot
+                                && let Some(c) = usize::try_from(child).ok().and_then(|i| self.modules.get(i))
+                                && !c.foreign
+                                && !c.unread
+                                && c.text != FragId::MAX
+                                && child != frame.cur
+                                && !memo.contains_key(&child)
+                            {
+                                children.push(child);
+                            }
                         }
                     }
-                    Slot::Call(j) => {
-                        let it = &self.items[j as usize];
-                        b.push(3);
-                        if let Some(at) = it.call {
-                            b.extend_from_slice(&at.key.0.0);
+                }
+                if !children.is_empty() {
+                    stack.push(Frame { cur: frame.cur, frags: frame.frags, ready: true });
+                    for &child in children.iter().rev() {
+                        if let Some(of) = usize::try_from(child).ok().and_then(|i| frags_of.get(i)) {
+                            let mut cf: AVec<'a, (Option<ItemKey>, FragId)> = AVec::with_capacity_in(of.len(), self.alloc);
+                            cf.extend(of.iter().map(|&f| (expansion_of.get(&f).copied(), f)));
+                            cf.sort_unstable_by_key(|(call, _)| *call);
+                            stack.push(Frame { cur: child, frags: cf, ready: false });
                         }
-                        b.push(u8::from(it.grown));
+                    }
+                    continue;
+                }
+            }
+            let mut b: AVec<'_, u8> = AVec::new_in(self.alloc);
+            for &(call, f) in frame.frags.iter() {
+                b.push(0xFF);
+                if let Some(k) = call {
+                    b.extend_from_slice(&k.0.0);
+                }
+                for &(_, slot) in self.frags[f as usize].slots.iter() {
+                    match slot {
+                        Slot::Rules(name, def, export) => {
+                            b.push(1);
+                            let name = name.as_ref().as_bytes();
+                            b.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                            b.extend_from_slice(name);
+                            b.extend_from_slice(&def.key.0.0);
+                            b.push(u8::from(export));
+                        }
+                        Slot::Mod(child, macro_use) => {
+                            b.push(2);
+                            b.extend_from_slice(&self.modules[child as usize].key.0.0);
+                            b.push(u8::from(macro_use));
+                            let c = &self.modules[child as usize];
+                            if macro_use && !c.foreign && !c.unread {
+                                // Its sequence, flattened into `m`'s: read here, or its record's
+                                // (in `memo`); none held is absent (write.rs counts it unknown).
+                                let d = memo.get(&child).copied().unwrap_or(ABSENT);
+                                b.extend_from_slice(&d.0);
+                            }
+                        }
+                        Slot::Call(j) => {
+                            let it = &self.items[j as usize];
+                            b.push(3);
+                            if let Some(at) = it.call {
+                                b.extend_from_slice(&at.key.0.0);
+                            }
+                            b.push(u8::from(it.grown));
+                        }
                     }
                 }
             }
+            let d = ContentId::of(TEXTUAL_DOMAIN, &b);
+            memo.insert(frame.cur, d);
         }
-        let d = ContentId::of(TEXTUAL_DOMAIN, &b);
-        memo.insert(m, d);
-        d
+        memo.get(&m).copied().unwrap_or(ABSENT)
     }
 }
 

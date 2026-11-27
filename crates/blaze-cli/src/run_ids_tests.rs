@@ -139,7 +139,7 @@ fn ids_after(toolchain: ToolchainId, table: &Table, outs: &[(Name, ContentId)], 
     let tools = tools();
     let today = SortedToday::new(outs).unwrap_or_else(|e| panic!("{e}"));
     let tree = [Edge::Walked(Name::units()), Edge::Part { parent: Name::units(), child: main_body().file }];
-    RunIds::new(&cx, toolchain, table, &tools, &[main_body()], &tree, &mut Looked(today), previous, Most::USUAL, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("{e}"))
+    RunIds::new(&cx, toolchain, table, &tools, &[main_body()], &tree, &mut Looked(today), previous, Most::USUAL, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// `RunIds` of `table` under `toolchain`, the store empty, the graph and main's owners known.
@@ -253,9 +253,9 @@ fn an_errors_row_with_no_error_is_refused() {
     let row = HEADER + crates * CRATE_ROW;
     bytes[row + 56] = VerdictTag::Errors as u8;
     bytes[row + 60..row + 64].copy_from_slice(&0u32.to_le_bytes());
-    assert!(matches!(RunIds::read(&bytes, heap.alloc()), Err(TableError::NoErrors { at: 0 })), "no error: refused");
+    assert!(matches!(RunIds::read(&bytes, blaze_own::testing::bump()), Err(TableError::NoErrors { at: 0 })), "no error: refused");
     bytes[row + 60..row + 64].copy_from_slice(&1u32.to_le_bytes());
-    let read = RunIds::read(&bytes, heap.alloc()).unwrap_or_else(|e| panic!("{e}"));
+    let read = RunIds::read(&bytes, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(read.checked(main_body().item), Some(Checked::Errors { errors: NonZeroU32::MIN, first: 0 }), "control: one error");
 }
 
@@ -294,11 +294,91 @@ fn a_locked_crate_on_the_checkout_is_refused_by_name() {
     let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
     let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("a root context");
     let tools = tools();
-    match RunIds::new(&cx, ToolchainId([7; 32]), &t, &tools, &[], &[], &mut Looked(SortedToday::EMPTY), None, Most::USUAL, blaze_own::testing::heap().alloc()) {
+    match RunIds::new(&cx, ToolchainId([7; 32]), &t, &tools, &[], &[], &mut Looked(SortedToday::EMPTY), None, Most::USUAL, blaze_own::testing::bump()) {
         Err(RunIdsError::LockedReadsWorkspace { krate: "b", dep: "app" }) => {}
         Err(other) => panic!("refused otherwise: {other}"),
         Ok(_) => panic!("a locked crate on the checkout was keyed"),
     }
+}
+
+/// Under a scoped start, a locked crate outside the active unit closure that depends on a
+/// checkout crate (e.g. a `[patch.crates-io]` vendor crate) is skipped rather than refusing the
+/// whole start; when that locked crate IS in scope, it is still refused by name.
+#[test]
+fn a_scoped_run_ids_skips_out_of_scope_locked_crate_on_the_checkout() {
+    let mut t = table([1; 32]);
+    t.0[3].deps = &[4];
+    let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
+    let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("a root context");
+    let tools = tools();
+    let heap = blaze_own::testing::heap();
+    let out_of_scope = crate::engine_check::ScopedUnits::from_allowed(&[true, true, true, false, true], heap.alloc());
+    let ids = RunIds::new_scoped(&cx, ToolchainId([7; 32]), &t, Some(&out_of_scope), &tools, &[], &[], &mut Looked(SortedToday::EMPTY), None, Most::USUAL, blaze_own::testing::bump())
+        .unwrap_or_else(|e| panic!("out-of-scope locked crate blocked scoped RunIds: {e}"));
+    assert_eq!(ids.grain(item(DEP_A, 1)), Some(Grain::Dependency), "in-scope locked crate is keyed");
+    assert_eq!(ids.grain(item(APP, 1)), Some(Grain::Workspace), "in-scope checkout crate is keyed");
+    assert_eq!(ids.grain(item(DEP_B, 1)), None, "out-of-scope locked crate is omitted from the scoped table");
+    let in_scope = crate::engine_check::ScopedUnits::from_allowed(&[true, true, true, true, true], heap.alloc());
+    match RunIds::new_scoped(&cx, ToolchainId([7; 32]), &t, Some(&in_scope), &tools, &[], &[], &mut Looked(SortedToday::EMPTY), None, Most::USUAL, blaze_own::testing::bump()) {
+        Err(RunIdsError::LockedReadsWorkspace { krate: "b", dep: "app" }) => {}
+        Err(other) => panic!("control refused otherwise: {other}"),
+        Ok(_) => panic!("control: in-scope locked crate on the checkout was keyed"),
+    }
+}
+
+/// A locked crate depending on a non-member checkout dependency (`Place::CheckoutDep`, e.g. a
+/// `[patch.crates-io]` vendored crate) is keyed coarsely as `Grain::Dependency`, and both its
+/// digest and the checkout dep's digest move when the checkout dep's inputs change.
+#[test]
+fn a_locked_crate_on_a_checkout_dep_is_keyed_and_moves_with_it() {
+    struct DepAnswer {
+        scope: Name,
+        digest: Option<[u8; 32]>,
+    }
+    impl Today for DepAnswer {
+        fn out(&self, _name: Name) -> Option<ContentId> {
+            None
+        }
+        fn cell(&self, _name: Name, _cell: Cell) -> Option<ContentId> {
+            None
+        }
+    }
+    impl Answer for DepAnswer {
+        fn open(&mut self, _cx: &Cx, _name: Name, _seen: &mut dyn FnMut(Seen<'_>) -> Result<(), RunIdsError<'static>>) -> Result<bool, RunIdsError<'static>> {
+            Ok(false)
+        }
+        fn skipped(&self, _file: Name) -> bool {
+            false
+        }
+        fn body(&mut self, _cx: &Cx, _check: Name, _tool: Tool, _known: Option<(ContentId, Name)>, out: &mut BodyScratch<'_>) -> Result<Option<BodyFacts>, RunIdsError<'static>> {
+            out.clear();
+            Ok(None)
+        }
+        fn checkout_dep_digest(&self, scope: Name, _alloc: Alloc<'_>) -> Result<Option<[u8; 32]>, RunIdsError<'static>> {
+            Ok((scope == self.scope).then_some(self.digest).flatten())
+        }
+    }
+    const VENDOR: u8 = 6;
+    let mut t = table([1; 32]);
+    t.0.push(Row { byte: VENDOR, name: "vendor_dep", place: Place::CheckoutDep, deps: &[1] });
+    t.0[3].deps = &[5]; // locked crate `b` depends on `vendor_dep`
+    let scope = blaze_drive::key::crate_scope_name(&CrateItemKey(ContentId([VENDOR; 32])));
+    let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
+    let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("a root context");
+    let tools = tools();
+    let run = |digest: Option<[u8; 32]>| {
+        let mut ans = DepAnswer { scope, digest };
+        RunIds::new(&cx, ToolchainId([7; 32]), &t, &tools, &[], &[], &mut ans, None, Most::USUAL, blaze_own::testing::bump())
+    };
+    let before = run(Some([0x11; 32])).unwrap_or_else(|e| panic!("before: {e}"));
+    let after = run(Some([0x22; 32])).unwrap_or_else(|e| panic!("after: {e}"));
+    assert_eq!(before.grain(item(VENDOR, 1)), Some(Grain::Dependency));
+    assert_eq!(before.grain(item(DEP_B, 1)), Some(Grain::Dependency));
+    let b_before = before.body_check(item(DEP_B, 1)).expect("b before");
+    let b_after = after.body_check(item(DEP_B, 1)).expect("b after");
+    assert_ne!(b_before.reads[0].digest, b_after.reads[0].digest, "checkout dep change must move locked crate digest");
+    // Control: missing checkout dep digest is refused by name, never guessed.
+    assert!(matches!(run(None), Err(RunIdsError::Unplaced { krate: "vendor_dep", .. })));
 }
 
 /// A body whose file's `Owners` out (or the `UnitGraph`'s) the command does not know today is
@@ -369,7 +449,7 @@ fn a_written_table_reads_back_equal() {
     let built = tables();
     for ids in built.iter() {
         let bytes = ids.write(heap.alloc());
-        let back = RunIds::read(&bytes, heap.alloc()).unwrap_or_else(|e| panic!("{e}"));
+        let back = RunIds::read(&bytes, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(answers(&back), answers(ids), "the record answers as the built table does");
         assert_eq!(&back.write(heap.alloc())[..], &bytes[..], "a rewrite is the same bytes");
     }
@@ -429,7 +509,7 @@ fn a_table_is_put_at_its_certificate_and_absent_is_none() {
     assert_eq!(store.0[0].0, table_key(cert, ToolchainId([7; 32]), &tools));
     assert_eq!(&store.0[0].1[..], &ids.write(heap.alloc())[..]);
     assert_ne!(table_key(cert, ToolchainId([8; 32]), &tools), store.0[0].0, "control: the toolchain is in the key");
-    match RunIds::from_record(&cx, &mut Empty, cert, ToolchainId([7; 32]), &tools, heap.alloc()) {
+    match RunIds::from_record(&cx, &mut Empty, cert, ToolchainId([7; 32]), &tools, blaze_own::testing::bump()) {
         Ok(None) => {}
         Ok(Some(_)) => panic!("a table was read from an empty store"),
         Err(e) => panic!("refused: {e}"),
@@ -441,7 +521,7 @@ fn a_table_is_put_at_its_certificate_and_absent_is_none() {
 fn a_broken_table_is_a_typed_error() {
     let heap = blaze_own::testing::heap();
     let bytes = ids(ToolchainId([7; 32]), &table([1; 32])).write(heap.alloc()).to_vec();
-    let read = |b: &[u8]| RunIds::read(b, heap.alloc()).err();
+    let read = |b: &[u8]| RunIds::read(b, blaze_own::testing::bump()).err();
     assert!(matches!(read(&bytes[..HEADER - 1]), Some(TableError::Short { .. })), "shorter than the header");
     assert!(matches!(read(&bytes[..bytes.len() - 1]), Some(TableError::Size { .. })), "truncated rows");
     let mut longer = bytes.clone();
@@ -663,14 +743,14 @@ fn a_nested_fn_is_keyed_by_the_check_that_covered_it() {
     outs.sort_by_key(|(name, _)| *name);
     let today = SortedToday::new(&outs).unwrap_or_else(|e| panic!("{e}"));
     let tools = tools();
-    let ids = RunIds::new(&cx, ToolchainId([7; 32]), &table([1; 32]), &tools, &walk.bodies, &walk.edges, &mut Looked(today), None, Most::USUAL, heap.alloc()).unwrap_or_else(|e| panic!("{e}"));
+    let ids = RunIds::new(&cx, ToolchainId([7; 32]), &table([1; 32]), &tools, &walk.bodies, &walk.edges, &mut Looked(today), None, Most::USUAL, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("{e}"));
     let key = |low: u64| ids.body_check(item(APP, low)).map(|b| b.key);
     let tool = tools[Kind::BodyCheck.index()];
     let outer_key = looked_key(tool, f.outer_check, outer_text, f.main_rs, GRAPH_OUT, OWNERS_OUT);
     assert_eq!((key(OUTER), key(INNER)), (Some(outer_key), Some(outer_key)), "the nested fn is keyed by the check that covered it");
     assert_ne!(key(HELPER), Some(outer_key), "another check, another key");
     assert!(key(HELPER).is_some());
-    let back = RunIds::read(&ids.write(heap.alloc()), heap.alloc()).map(|t| t.workspace_rows(heap.alloc()).to_vec()).unwrap_or_else(|e| panic!("{e}"));
+    let back = RunIds::read(&ids.write(heap.alloc()), blaze_own::testing::bump()).map(|t| t.workspace_rows(heap.alloc()).to_vec()).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(back, rows_of(&walk), "the table names each row's check, text and file");
     assert_eq!(key(13), None, "control: a fn no record covers has no row");
 }
@@ -689,7 +769,7 @@ fn a_forward_walk_crosses_what_it_did_not_reach_by_the_last_table() {
     let full = workspace_of(&cx, &mut f.answer, tool, &[], None, heap.alloc()).unwrap_or_else(|e| panic!("{e}"));
     let known = outs(false);
     let today = SortedToday::new(&known).unwrap_or_else(|e| panic!("{e}"));
-    let last = RunIds::new(&cx, ToolchainId([7; 32]), &table([1; 32]), &tools, &full.bodies, &full.edges, &mut Looked(today), None, Most::USUAL, heap.alloc()).unwrap_or_else(|e| panic!("{e}"));
+    let last = RunIds::new(&cx, ToolchainId([7; 32]), &table([1; 32]), &tools, &full.bodies, &full.edges, &mut Looked(today), None, Most::USUAL, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("{e}"));
     let mut forward = Held(f.answer.0.into_iter().filter(|(name, _, _)| *name == f.main_rs || *name == f.outer_check).collect());
     let walk = workspace_of(&cx, &mut forward, tool, &[], Some(&last), heap.alloc()).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(rows_of(&walk), rows_of(&full), "the same bodies");
@@ -889,7 +969,7 @@ fn each_unit_that_holds_a_body_has_its_own_row_at_its_view() {
     held.0.push(Row { byte: BIN, name: "pkg (bin)", place: Place::Checkout, deps: &[] });
     let today = SortedToday::new(&[]).unwrap_or_else(|e| panic!("{e}"));
     let tools = tools();
-    let ids = RunIds::new(&cx, ToolchainId([7; 32]), &held, &tools, &walk.bodies, &walk.edges, &mut Looked(today), None, Most::USUAL, heap.alloc()).unwrap_or_else(|e| panic!("{e}"));
+    let ids = RunIds::new(&cx, ToolchainId([7; 32]), &held, &tools, &walk.bodies, &walk.edges, &mut Looked(today), None, Most::USUAL, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("{e}"));
     match ids.runnable(item(LIB_TEST, 1)) {
         Err(NotRunnable::NoRow(no_row)) => assert!(std::format!("{no_row}").contains("no row at this unit's view"), "{no_row}"),
         other => panic!("planted: the test build's f was {other:?}"),
@@ -1025,7 +1105,7 @@ fn members_ids(n: usize, most: Most) -> Result<RunIds<'static>, RunIdsError<'sta
     let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("a root context");
     let (table, bodies) = members(n);
     let table: &'static Table = std::boxed::Box::leak(std::boxed::Box::new(table));
-    RunIds::new(&cx, ToolchainId([7; 32]), table, &tools(), &bodies, &[], &mut Cleanly, None, most, blaze_own::testing::heap().alloc())
+    RunIds::new(&cx, ToolchainId([7; 32]), table, &tools(), &bodies, &[], &mut Cleanly, None, most, blaze_own::testing::bump())
 }
 
 /// What a run that reaches members 0 and 1 sees, by `R`: each one's gate, its id (key and
@@ -1103,14 +1183,14 @@ fn a_planted_cap_is_a_typed_error() {
     bodies.push(member_body(member(2), 2));
     bodies.push(member_body(member(2), 3));
     let tiny = Most { bodies: 4, reads: Most::USUAL.reads };
-    match RunIds::new(&cx, ToolchainId([7; 32]), &table, &tools(), &bodies, &[], &mut Cleanly, None, tiny, blaze_own::testing::heap().alloc()) {
+    match RunIds::new(&cx, ToolchainId([7; 32]), &table, &tools(), &bodies, &[], &mut Cleanly, None, tiny, blaze_own::testing::bump()) {
         Err(RunIdsError::TooManyBodies { krate, rows, count, most }) => {
             assert_eq!((krate, rows, count, most), ("member2", 3, 10, 4), "names the crate, its rows, the count and the cap");
         }
         Err(other) => panic!("refused otherwise: {other}"),
         Ok(_) => panic!("10 bodies past a cap of 4 were taken"),
     }
-    let ids = RunIds::new(&cx, ToolchainId([7; 32]), &table, &tools(), &bodies, &[], &mut Cleanly, None, Most::USUAL, blaze_own::testing::heap().alloc())
+    let ids = RunIds::new(&cx, ToolchainId([7; 32]), &table, &tools(), &bodies, &[], &mut Cleanly, None, Most::USUAL, blaze_own::testing::bump())
         .unwrap_or_else(|e| panic!("control: {e}"));
     let (source, asked) = (Counted::new(None), Asked::default());
     let few = Most { bodies: Most::USUAL.bodies, reads: 2 };
@@ -1131,11 +1211,11 @@ fn a_body_row_of_the_last_form_is_a_typed_error() {
     let crates = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
     let mut old = bytes.clone();
     old[HEADER + crates * CRATE_ROW + 52] = 1;
-    assert!(matches!(RunIds::read(&old, heap.alloc()).err(), Some(TableError::BodyPadding { at: 0 })), "a body row's zero bytes");
+    assert!(matches!(RunIds::read(&old, blaze_own::testing::bump()).err(), Some(TableError::BodyPadding { at: 0 })), "a body row's zero bytes");
     let mut header = bytes.clone();
     header[28] = 1;
-    assert!(matches!(RunIds::read(&header, heap.alloc()).err(), Some(TableError::Padding)), "the header's zero bytes");
-    assert!(RunIds::read(&bytes, heap.alloc()).is_ok(), "control");
+    assert!(matches!(RunIds::read(&header, blaze_own::testing::bump()).err(), Some(TableError::Padding)), "the header's zero bytes");
+    assert!(RunIds::read(&bytes, blaze_own::testing::bump()).is_ok(), "control");
 }
 
 // --- A constructor's row is its ADT's head task's (engine_heads.rs `ctor_facts`) ---
@@ -1213,10 +1293,10 @@ fn a_constructor_is_keyed_and_gated_by_its_adts_head_task() {
 
     let tools = tools();
     let ids_of = |bodies: &[WorkspaceBody], edges: &[Edge], checked: Checked| {
-        RunIds::new(&cx, ToolchainId([7; 32]), &table([1; 32]), &tools, bodies, edges, &mut HeadFacts { head, checked }, None, Most::USUAL, heap.alloc()).unwrap_or_else(|e| panic!("{e}"))
+        RunIds::new(&cx, ToolchainId([7; 32]), &table([1; 32]), &tools, bodies, edges, &mut HeadFacts { head, checked }, None, Most::USUAL, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("{e}"))
     };
     let clean = ids_of(&walk.bodies, &walk.edges, Checked::Clean);
-    let back = RunIds::read(&clean.write(heap.alloc()), heap.alloc()).map(|t| t.workspace_rows(heap.alloc()).to_vec()).unwrap_or_else(|e| panic!("{e}"));
+    let back = RunIds::read(&clean.write(heap.alloc()), blaze_own::testing::bump()).map(|t| t.workspace_rows(heap.alloc()).to_vec()).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(back.iter().find(|row| row.item == ctor).map(|row| row.check), Some(head), "the table read back names the head task, its kind with it");
     let (source, asked) = (Counted::new(None), Asked::default());
     let clean = clean.reading::<ByNeed>(ReadsFrom::new(&source, &asked, Most::USUAL)).unwrap_or_else(|e| panic!("{e}"));

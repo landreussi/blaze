@@ -53,7 +53,6 @@ use blaze_build_script::c_tasks_built::Report;
 use blaze_build_script::c_tasks_tree::{self, FIXED_ENV, TREE_LINES, TreeError, TreeExit, TreeJob, TreeRan, TreeRunner};
 use blaze_build_script::host_tools::{self, HostTool};
 use blaze_build_script::key::HostToolKey;
-use blaze_build_script::native::Grant;
 use blaze_build_script::outputs::{FileLimits, Outputs, OutputsRef, StoredFile};
 use blaze_core::wait::Deadline;
 use blaze_ids::ContentId;
@@ -211,7 +210,8 @@ pub fn run_tasks<'a, 'b>(
             keyed.extend(sources.iter().filter(|laid| laid.guest != roots.out).map(|laid| (laid.guest, laid.digest)));
             let inputs = c_tasks_tree::TreeInputs { toolchain, tools: trees.keys, os_build: trees.os_build, sources: &keyed, runner: TREE_RUNNER };
             let mut runner = ShelfTree { setting, sources, roots, tools: trees, demand };
-            let done = c_tasks_tree::run_tree(package, outputs, &roots, &tree_requests, &inputs, &mut runner, store, alloc).map_err(TasksError::Tree)?;
+            let area = FileArea { folder: setting.area };
+            let done = c_tasks_tree::run_tree(package, outputs, &roots, &tree_requests, &inputs, &mut runner, &area, store, alloc).map_err(TasksError::Tree)?;
             done.files
         }
     };
@@ -223,9 +223,10 @@ pub fn run_tasks<'a, 'b>(
     let facts = DiskFacts::new(alloc);
     let today = GuestToday { laid: sources, facts: &facts };
     let state_today = |state: u32| c_tasks::StateToday { outputs, state, rest: &today };
+    let area_ro = FileArea { folder: setting.area };
     let mut looked: AVec<'a, Looked> = Vec::with_capacity_in(units.len(), alloc);
     for unit in units.iter() {
-        looked.push(c_tasks::look(package, unit, toolchain, &state_today(unit.state), store, alloc).map_err(TasksError::Task)?);
+        looked.push(c_tasks::look(package, unit, toolchain, &state_today(unit.state), &area_ro, store, alloc).map_err(TasksError::Task)?);
     }
     let mut jobs: Vec<Job<'b>, SharedAlloc<'static>> = Vec::new_in(setting.heap.shared());
     for (at, one) in looked.iter().enumerate() {
@@ -287,7 +288,7 @@ pub fn run_tasks<'a, 'b>(
         let (pre, free_slot) = match looked[at] {
             Looked::Hit(file) => {
                 report.found += 1;
-                objects.push(file);
+                objects.push(file.file());
                 continue;
             }
             Looked::Miss { pre, free_slot } => (pre, free_slot),
@@ -603,16 +604,12 @@ pub struct TreeTools<'t> {
 /// `read_apple_userland`, the one place it is read). Held in `alloc` for the command. A program
 /// whose path is not its real path is refused: the grant names real paths (Seatbelt matches
 /// them), and a link's target could change under an equal key.
-pub fn tree_tools<'a>(package: &str, host: &'static str, shelf: &str, alloc: Alloc<'a>) -> Result<TreeTools<'a>, AString<'a>> {
+pub fn tree_tools<'a>(package: &str, host: &'static str, shelf: &str, bump: blaze_own::Bump<'a>) -> Result<TreeTools<'a>, AString<'a>> {
+    let alloc = bump.alloc();
     let words = |text: std::string::String| String::from_str_in(&text, alloc);
-    let leak = |text: &str| -> &'a str {
-        let bytes: &'a mut [u8] = Vec::from_slice_in(text.as_bytes(), alloc).leak();
-        // A copy of a `str`'s bytes is UTF-8.
-        core::str::from_utf8(bytes).unwrap_or_default()
-    };
     let table = host_tools::host_tools(blaze_pins::CLANG_JSON, host, alloc).map_err(|e| words(format!("the host tools' table: {e}")))?;
     let tools: AVec<'a, HostTool<'static>> = host_tools::granted(&table, package, alloc);
-    let mut keys: AVec<'a, HostToolKey<'a>> = Vec::new_in(alloc);
+    let mut keys: blaze_own::BVec<'a, HostToolKey<'a>> = Vec::new_in(bump);
     for tool in tools.iter() {
         for (at, program) in tool.programs_in(shelf, alloc).into_iter().enumerate() {
             let program = program.as_str();
@@ -622,16 +619,17 @@ pub fn tree_tools<'a>(package: &str, host: &'static str, shelf: &str, alloc: All
             }
             let bytes = std::fs::read(program).map_err(|e| words(format!("{program}: {e}")))?;
             let name = match at {
-                0 => leak(tool.name),
-                _ => leak(&format!("{}+{program}", tool.name)),
+                0 => bump.alloc_str(tool.name),
+                _ => bump.alloc_str(&format!("{}+{program}", tool.name)),
             };
             keys.push(HostToolKey::of(tool, name, blaze_sha256::digest(&bytes)));
         }
     }
     let text = crate::fact_pins::read_apple_userland(alloc).map_err(|e| words(format!("the OS build: {e}")))?;
     let userland = blaze_build_script::fact_pins::apple_userland(text.plist.as_str(), text.darwin_release.as_str()).map_err(|e| words(format!("the OS build: {e}")))?;
-    let os_build = leak(userland.build_version);
-    Ok(TreeTools { tools: tools.leak(), keys: keys.leak(), os_build })
+    let os_build = bump.alloc_str(userland.build_version);
+    let tools_slice = bump.alloc_slice_copy(&tools);
+    Ok(TreeTools { tools: tools_slice, keys: keys.into_bump_slice(), os_build })
 }
 
 /// The digest of what a crate's tree is run with beyond its record (its tools, the OS build,
@@ -857,22 +855,26 @@ impl TreeRunner for ShelfTree<'_> {
         // the tree built (D112), each granted tool and what it starts; read the roots; write
         // the tree's folder alone.
         let runs_out_dir = host_tools::runs_out_dir(self.tools.tools);
-        let linker: &[&str] = if runs_out_dir { &["bin/ld64.lld", "bin/lld"] } else { &[] };
+        let linker: &[&str] = if runs_out_dir { &["bin/ld64.lld", "bin/ld.lld", "bin/lld"] } else { &[] };
         let mut held: AVec<'a, AString<'a>> = Vec::new_in(alloc);
         for name in ["bin/clang-23", "bin/clang", "bin/clang++", "bin/llvm-ar"].iter().chain(linker) {
-            held.push(joined(&[shelf, "/", name], alloc));
+            let path = joined(&[shelf, "/", name], alloc);
+            if Path::new(path.as_str()).exists() {
+                held.push(path);
+            }
         }
         for tool in self.tools.tools {
-            held.extend(tool.programs_in(shelf, alloc));
+            for program in tool.programs_in(shelf, alloc) {
+                if Path::new(program.as_str()).exists() {
+                    held.push(program);
+                }
+            }
         }
         let mut exec: AVec<'a, &str> = Vec::with_capacity_in(held.len(), alloc);
         exec.extend(held.iter().map(|program| program.as_str()));
         let read_roots = self.read_roots(alloc);
-        let mut reads: AVec<'a, &str> = Vec::with_capacity_in(read_roots.len(), alloc);
-        reads.extend(read_roots.iter().map(|(folder, _)| *folder));
         let out_only = [out.as_str()];
         let exec_under: &[&str] = if runs_out_dir { &out_only } else { &[] };
-        let writes = [folder.as_str()];
 
         // 4. The roots: each read folder a tree root by its digest, the tree's folder the
         // output root (`out` and `tmp` under it).
@@ -886,7 +888,7 @@ impl TreeRunner for ShelfTree<'_> {
         let output = RootId(u8::try_from(root_list.len()).map_err(|_| fail(&["more than 255 folders read by a process tree"]))?);
         root_list.push(Root { name: "a process tree's folder", kind: RootKind::Output });
         mounts.push(Mount { spelling: folder.as_bytes(), root: output });
-        let files = OutDir { root: output, folder: folder.as_str() };
+        let files = OutDir { root: output, folder: folder.as_str(), package_root: None };
 
         // 5. The world, its clock and the hermetic capability: one deadline for every step.
         let (world, _) = native_world(std::path::Path::new(setting.work)).map_err(|e| fail(&["the tree's world: ", &e.to_string()]))?;
@@ -958,30 +960,17 @@ impl TreeRunner for ShelfTree<'_> {
             if !set(&vars, "RANLIB") {
                 vars.push((String::from_str_in("RANLIB", alloc), joined(&[shelf, "/bin/llvm-ar s"], alloc)));
             }
-            let mut maps: AString<'a> = String::new_in(alloc);
-            for (guest, host) in shown.iter() {
-                maps.push_str(" -ffile-prefix-map=");
-                maps.push_str(host);
-                maps.push('=');
-                maps.push_str(guest);
-            }
-            maps.push_str(" -Wno-unused-command-line-argument");
-            // The maps on the flags the tree's compiles take (`CFLAGS` always, `CXXFLAGS` when
-            // the script set it): no host folder reaches an object's debug information.
-            for flags in ["CFLAGS", "CXXFLAGS"] {
-                match vars.iter().rposition(|(name, _)| name.as_str() == flags) {
-                    Some(at) => vars[at].1.push_str(maps.as_str()),
-                    None if flags == "CFLAGS" => vars.push((String::from_str_in(flags, alloc), String::from_str_in(maps.as_str().trim_start(), alloc))),
-                    None => {}
-                }
-            }
+            // The maps on every compiler flag var the tree's compiles may take (`CFLAGS`,
+            // `CXXFLAGS`, `CPPFLAGS`, `ASFLAGS`), whether set or unset: no host folder reaches
+            // any C, C++, preprocessed, or assembly object's debug information (rule 25, rule 54).
+            inject_prefix_map_flags(&mut vars, &shown, alloc);
             for (name, value) in tool_env.iter() {
-                vars.push((name.clone(), value.clone()));
+                vars.push((name.clone_in(alloc), value.clone_in(alloc)));
             }
             vars.push((String::from_str_in("MACOSX_DEPLOYMENT_TARGET", alloc), String::from_str_in(blaze_build_script::toolchain::MACOS_MIN, alloc)));
-            vars.push((String::from_str_in("PATH", alloc), path_value.clone()));
+            vars.push((String::from_str_in("PATH", alloc), path_value.clone_in(alloc)));
             vars.push((String::from_str_in("SDKROOT", alloc), String::from_str_in(sdk, alloc)));
-            vars.push((String::from_str_in("TMPDIR", alloc), tmp.clone()));
+            vars.push((String::from_str_in("TMPDIR", alloc), tmp.clone_in(alloc)));
             for (name, value) in FIXED_ENV {
                 vars.push((String::from_str_in(name, alloc), String::from_str_in(value, alloc)));
             }
@@ -995,9 +984,6 @@ impl TreeRunner for ShelfTree<'_> {
                 }
             }
 
-            // The grant said as the Seatbelt profile would say it, before anything runs.
-            blaze_build_script::native::seatbelt_with(&Grant { program: program.as_str(), exec: &exec, read: &reads, write: &writes }, exec_under, alloc)
-                .map_err(|why| fail(&["the Seatbelt grant of a process tree: ", &why.to_string()]))?;
             let roots = Roots::new(&root_list).map_err(|_| fail(&["the roots of a process tree were refused"]))?;
             let now = clock.now().since_start();
             let left = ends.saturating_sub(now);
@@ -1088,9 +1074,46 @@ impl TreeRunner for ShelfTree<'_> {
     }
 }
 
+/// Compiler flag environment variables that a process tree (`configure`, `make`, `cmake`) may
+/// pass to `clang`/`clang++` when compiling C, C++, preprocessed, or assembly translation units.
+/// Every variable receives `-ffile-prefix-map=<host>=<guest>` whether or not the script already
+/// set it so no host work directory leaks into debug information (rule 25, rule 54).
+const PREFIX_MAP_FLAG_VARS: [&str; 4] = ["CFLAGS", "CXXFLAGS", "CPPFLAGS", "ASFLAGS"];
+
+/// Injects `-ffile-prefix-map=<host>=<guest>` (for every `(guest, host)` pair in `shown`) and
+/// `-Wno-unused-command-line-argument` into every variable in [`PREFIX_MAP_FLAG_VARS`], appending
+/// to an existing entry or inserting a new one when unset.
+fn inject_prefix_map_flags<'a>(
+    vars: &mut AVec<'a, (AString<'a>, AString<'a>)>,
+    shown: &[(&str, &str)],
+    alloc: Alloc<'a>,
+) {
+    let mut maps: AString<'a> = String::new_in(alloc);
+    for (guest, host) in shown.iter() {
+        maps.push_str(" -ffile-prefix-map=");
+        maps.push_str(host);
+        maps.push('=');
+        maps.push_str(guest);
+    }
+    maps.push_str(" -Wno-unused-command-line-argument");
+    let trimmed = maps.as_str().trim_start();
+    for flags in PREFIX_MAP_FLAG_VARS {
+        match vars.iter().rposition(|(name, _)| name.as_str() == flags) {
+            Some(at) => {
+                if vars[at].1.is_empty() {
+                    vars[at].1.push_str(trimmed);
+                } else {
+                    vars[at].1.push_str(maps.as_str());
+                }
+            }
+            None => vars.push((String::from_str_in(flags, alloc), String::from_str_in(trimmed, alloc))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tree_spelling_tests {
-    use super::{shelf_program, to_guest, to_host};
+    use super::{AString, AVec, PREFIX_MAP_FLAG_VARS, String, Vec, inject_prefix_map_flags, shelf_program, to_guest, to_host};
 
     /// A guest folder is made its host folder where a word or a flag's letters begin with it,
     /// never inside a word or a longer name; shown again, the host folders are their guests.
@@ -1112,5 +1135,36 @@ mod tree_spelling_tests {
         assert_eq!(shelf_program("g++"), Some("bin/clang++"));
         assert_eq!(shelf_program("ar"), Some("bin/llvm-ar"));
         assert_eq!(shelf_program("ccache"), None);
+    }
+
+    #[test]
+    fn prefix_map_flags_are_injected_into_cxxflags_and_siblings_when_unset_and_set() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let shown = [("/out", "/h/work/abc-123-0/out"), ("/package", "/h/pkg")];
+        let expected_maps = "-ffile-prefix-map=/h/work/abc-123-0/out=/out -ffile-prefix-map=/h/pkg=/package -Wno-unused-command-line-argument";
+
+        // 1. All flag vars initially unset: CFLAGS, CXXFLAGS, CPPFLAGS, ASFLAGS all get the prefix maps.
+        let mut unset: AVec<'_, (AString<'_>, AString<'_>)> = Vec::new_in(alloc);
+        inject_prefix_map_flags(&mut unset, &shown, alloc);
+        for var in PREFIX_MAP_FLAG_VARS {
+            let found = unset.iter().find(|(k, _)| k.as_str() == var).map(|(_, v)| v.as_str());
+            assert_eq!(found, Some(expected_maps), "{var} must receive prefix-map flags when initially unset");
+        }
+
+        // 2. CXXFLAGS already set (plus empty CPPFLAGS): preserves existing flags, appends maps,
+        //    and still inserts unset siblings cleanly.
+        let mut preset: AVec<'_, (AString<'_>, AString<'_>)> = Vec::new_in(alloc);
+        preset.push((String::from_str_in("CXXFLAGS", alloc), String::from_str_in("-O2 -std=c++17", alloc)));
+        preset.push((String::from_str_in("CPPFLAGS", alloc), String::from_str_in("", alloc)));
+        inject_prefix_map_flags(&mut preset, &shown, alloc);
+        let lookup = |name: &str| preset.iter().rev().find(|(k, _)| k.as_str() == name).map(|(_, v)| v.as_str());
+        assert_eq!(
+            lookup("CXXFLAGS"),
+            Some("-O2 -std=c++17 -ffile-prefix-map=/h/work/abc-123-0/out=/out -ffile-prefix-map=/h/pkg=/package -Wno-unused-command-line-argument"),
+            "existing CXXFLAGS must be preserved with prefix-map appended"
+        );
+        assert_eq!(lookup("CPPFLAGS"), Some(expected_maps), "empty CPPFLAGS gets prefix-map without leading space");
+        assert_eq!(lookup("CFLAGS"), Some(expected_maps), "unset CFLAGS receives prefix-map");
+        assert_eq!(lookup("ASFLAGS"), Some(expected_maps), "unset ASFLAGS receives prefix-map");
     }
 }

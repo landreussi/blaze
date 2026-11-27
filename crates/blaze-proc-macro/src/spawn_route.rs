@@ -158,7 +158,24 @@ pub(crate) enum Route<'s> {
 /// there is one, else a refusal. Decided from text alone. Not found is first, so a name the
 /// shim was told is missing is never answered here either (`found_covers_every_answered_route`
 /// in the tests holds that every name a later arm answers is found).
+#[cfg(test)]
 pub(crate) fn route<'s>(name: &'s str, args: &'s [&'s str], c_mode: CMode, found: bool, has_executor: bool) -> Route<'s> {
+    route_with_stdin(name, args, false, c_mode, found, has_executor)
+}
+
+/// Like [`route`], additionally excluding `Fact::CcProbe` when `has_stdin` is true or `program`
+/// is path-qualified (`program.contains('/')`) so nonempty-stdin and explicit-path compiler
+/// invocations stay on the ordinary compiler route instead of being redirected to pinned clang-23.
+pub(crate) fn route_with_stdin<'s>(
+    program: &'s str,
+    args: &'s [&'s str],
+    has_stdin: bool,
+    c_mode: CMode,
+    found: bool,
+    has_executor: bool,
+) -> Route<'s> {
+    let name = program.rsplit('/').next().unwrap_or(program);
+    let is_path_qualified = program.contains('/');
     if !found {
         return Route::NotFound;
     }
@@ -172,10 +189,12 @@ pub(crate) fn route<'s>(name: &'s str, args: &'s [&'s str], c_mode: CMode, found
     if shell_git || git_words(name, args).is_some() {
         return Route::Git;
     }
-    if let Some(fact) = facts::question(name, args) {
+    if let Some(fact) = facts::question(name, args)
+        && !((has_stdin || is_path_qualified) && matches!(fact, Fact::CcProbe { .. }))
+    {
         return Route::Fact(fact);
     }
-    if probe::is_deferred_tool(name, args) && c_mode == CMode::Deferred {
+    if (probe::is_deferred_tool(program, args) || (has_stdin && probe::is_c_tool(name))) && c_mode == CMode::Deferred {
         return Route::Deferred;
     }
     if has_executor { Route::Executor } else { Route::Refused }
@@ -387,6 +406,23 @@ pub fn is_fact_reply(subject: &str, alloc: Alloc<'_>) -> bool {
     crate::fact_pins::fact_now(subject, None, alloc) != crate::fact_pins::FactNow::NotAFact
 }
 
+/// Checks the observed digest of a derived fact's reply against what the pins (and optional C
+/// probe cache) answer now. Propagates host/deadline failures from computing the live C-probe
+/// runtime closure identity instead of turning them into a cache miss.
+pub fn fact_reply_matches_with_probes<'a>(
+    subject: &str,
+    observed: Option<ContentId>,
+    pins: Option<&FactPins>,
+    c_probes: Option<&crate::probe_clang::CScriptProbes>,
+    alloc: Alloc<'a>,
+) -> Result<bool, blaze_own::AString<'a>> {
+    if observed.is_none() || !is_fact_reply(subject, alloc) {
+        return Ok(false);
+    }
+    Ok(crate::fact_pins::fact_now_with_probes(subject, pins, c_probes, alloc)?
+        == crate::fact_pins::FactNow::Answer(observed))
+}
+
 /// Checks the observed digest of a derived fact's reply against what the pins answer now
 /// (the deterministic pkg-config database with its nonzero "not found" reply, the pinned
 /// `sw_vers`, the pinned clang's version text). A native caller also has to identify the image
@@ -400,7 +436,7 @@ pub fn fact_reply_matches(subject: &str, observed: Option<ContentId>, pins: Opti
 
 /// A file's digest in a spawn request (`present`).
 pub(crate) fn file_digest(bytes: &[u8]) -> ContentId {
-    ContentId::of("blaze v2 spawn file 1", bytes)
+    blaze_spawn::digest::file_digest(bytes)
 }
 
 /// The served tree's digest, the coarse proof covering every file under `/workspace`: each
@@ -412,7 +448,7 @@ pub(crate) fn tree_digest(files: &[(String, Vec<u8>)]) -> ContentId {
         bytes.extend_from_slice(path.as_bytes());
         bytes.extend_from_slice(&file_digest(file).0);
     }
-    ContentId::of("blaze v2 spawn tree 1", &bytes)
+    ContentId::of(blaze_spawn::digest::TREE_DOMAIN, &bytes)
 }
 
 /// 64 lowercase hex digits.
@@ -443,6 +479,50 @@ impl Files for SpawnFiles<'_> {
         let rel = path.strip_prefix(self.out_dir).and_then(|rest| rest.strip_prefix('/'))?;
         self.sandbox.out.get(rel).and_then(|held| held.as_deref())
     }
+}
+
+/// Normalizes `cwd_override` (relative to `mount` when not starting with `/`) and returns
+/// whether it denotes the exact same guest directory as `mount`, so spellings like `.`, `./`,
+/// `/package/.`, or `sub/..` are not spuriously refused.
+pub(crate) fn same_guest_dir(cwd_override: &str, mount: &str) -> bool {
+    const MAX_PARTS: usize = 64;
+    fn push_parts<'a>(path: &'a str, out: &mut [&'a str; MAX_PARTS], len: &mut usize) -> bool {
+        for seg in path.split('/') {
+            if seg.is_empty() || seg == "." {
+                continue;
+            }
+            if seg == ".." {
+                *len = len.saturating_sub(1);
+                continue;
+            }
+            let Some(slot) = out.get_mut(*len) else {
+                return false;
+            };
+            *slot = seg;
+            *len += 1;
+        }
+        true
+    }
+    if cwd_override.is_empty() {
+        return false;
+    }
+    let mut norm_mount = [""; MAX_PARTS];
+    let mut mount_len = 0usize;
+    if !push_parts(mount, &mut norm_mount, &mut mount_len) {
+        return cwd_override == mount;
+    }
+    let mut norm_cwd = [""; MAX_PARTS];
+    let mut cwd_len = 0usize;
+    if !cwd_override.starts_with('/') {
+        if let (Some(dst), Some(src)) = (norm_cwd.get_mut(..mount_len), norm_mount.get(..mount_len)) {
+            dst.copy_from_slice(src);
+        }
+        cwd_len = mount_len;
+    }
+    if !push_parts(cwd_override, &mut norm_cwd, &mut cwd_len) {
+        return cwd_override == mount;
+    }
+    cwd_len == mount_len && norm_cwd.get(..cwd_len) == norm_mount.get(..mount_len)
 }
 
 impl ScriptSandbox {
@@ -510,10 +590,11 @@ impl ScriptSandbox {
         self.deliver(program, spawned.modes, answer.code, answer.stdout.as_bytes(), answer.stderr.as_bytes())
     }
 
-    /// A compiler probe, answered from pins/answers/clang.json (`c_tasks_probe`) by the host's
-    /// clang pin, in every `CMode` (a check and a run see one answer): nothing runs and nothing
-    /// is recorded (the table's digest is in the base key), and a probe the table does not
-    /// answer stops the script with the row to add (rule 3).
+    /// A compiler probe, answered strictly through the command's
+    /// [`crate::probe_clang::CScriptProbes`] strategy seam and content-addressed cache
+    /// (`c_tasks_probe::resolve`), recording a per-probe read
+    /// (`cc-probe\n<answerer>\n<clang>\n<sdk>\n<key>` -> canonical reply digest before `unspell`).
+    /// Never silently switches to an offline table when `c_probes` is absent (rule 3).
     fn spawn_probe(&mut self, program: &str, args: &[String], spawned: &Decoded) -> Result<(), Stop> {
         let script = Arc::clone(&self.script);
         let refused = |why: String| SpawnRefusal::Fact { program: program.to_owned(), args: args.to_vec(), why };
@@ -527,20 +608,99 @@ impl ScriptSandbox {
             Ok(pin) => pin.sha256,
             Err(why) => return Err(self.refuse(Refusal::Spawn(refused(why.to_string())))),
         };
-        let table = match c_tasks_probe::Table::parse(blaze_pins::CLANG_ANSWERS_JSON.as_bytes(), alloc) {
-            Ok(table) => table,
-            Err(why) => return Err(self.refuse(Refusal::Spawn(refused(why.to_string())))),
-        };
         let owned_env = child_env(&script.env, spawned);
         let env: Vec<(&str, &str)> = owned_env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let sdk = env.iter().find(|(k, _)| *k == "SDKROOT").map_or("", |(_, v)| *v);
+        let mount = script.cwd();
+        let out_dir = script.out_dir();
+        // `cc-rs` spawns compiler flag probes (`flag_check.c`) with `.current_dir(OUT_DIR)`.
+        // `c_tasks_probe` refuses any relative or non-`OUT_DIR` file argument, so both `mount`
+        // and `out_dir` are hermetic probe working directories (rule 21).
+        if let Some(ref cwd_override) = spawned.cwd
+            && !same_guest_dir(cwd_override.as_str(), mount.as_str())
+            && !same_guest_dir(cwd_override.as_str(), out_dir)
+        {
+            return Err(self.refuse(Refusal::Spawn(refused(format!(
+                "compiler probe current_dir `{cwd_override}` differs from script cwd `{mount}` and OUT_DIR `{out_dir}` (rule 21)"
+            )))));
+        }
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let probe = c_tasks_probe::Spawn { program, args: &arg_refs, env: &env, out_dir: script.out_dir(), sdk, stdin: &spawned.stdin };
         let out = &self.out;
-        let held = |name: &str| out.get(name).and_then(|held| held.as_deref()).map(blaze_sha256::digest);
-        match table.answer(&clang, &probe, held, alloc) {
-            Ok(answer) => self.deliver(program, spawned.modes, answer.code, answer.stdout.as_bytes(), answer.stderr.as_bytes()),
-            Err(why) => Err(self.refuse(Refusal::Spawn(refused(why.to_string())))),
+        let held_digest = |name: &str| out.get(name).and_then(|held| held.as_deref()).map(blaze_sha256::digest);
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let table = match c_tasks_probe::Table::parse(blaze_pins::CLANG_ANSWERS_JSON.as_bytes(), alloc) {
+                Ok(table) => table,
+                Err(why) => return Err(self.refuse(Refusal::Spawn(refused(why.to_string())))),
+            };
+            let probe = c_tasks_probe::Spawn {
+                program,
+                args: &arg_refs,
+                env: &env,
+                out_dir: script.out_dir(),
+                sdk,
+                mount: mount.as_str(),
+                sdk_id: "",
+                stdin: &spawned.stdin,
+            };
+            match table.answer(&clang, &probe, held_digest, alloc) {
+                Ok(answer) => self.deliver(program, spawned.modes, answer.code, answer.stdout.as_bytes(), answer.stderr.as_bytes()),
+                Err(why) => Err(self.refuse(Refusal::Spawn(refused(why.to_string())))),
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let mut held_bytes = |name: &str| out.get(name).and_then(|held| held.as_deref());
+
+            // Oversized probe inputs (exceeding `MAX_PROBE_INPUT_BYTES`) fail explicitly with the
+            // named bound error in every `CMode` (rule 3: never silently switch executors or defer).
+            if crate::probe_clang::has_oversized_probe_input(&arg_refs, script.out_dir(), &mut held_bytes, alloc) {
+                return Err(self.refuse(Refusal::Spawn(refused(format!(
+                    "compiler probe input exceeds {} bytes (rule 3)",
+                    crate::probe_clang::MAX_PROBE_INPUT_BYTES
+                )))));
+            }
+
+            match &script.c_probes {
+                Some(crate::probe_clang::CProbeSetting::Ready(c_probes)) => {
+                    let configured_sdk = c_probes.sdk_dir.as_ref();
+                    if sdk != configured_sdk {
+                        return Err(self.refuse(Refusal::Spawn(refused(format!(
+                            "compiler probe SDKROOT `{sdk}` does not match configured command SDK `{configured_sdk}` (rule 21)"
+                        )))));
+                    }
+                    let probe = c_tasks_probe::Spawn {
+                        program,
+                        args: &arg_refs,
+                        env: &env,
+                        out_dir: script.out_dir(),
+                        sdk,
+                        mount: mount.as_str(),
+                        sdk_id: &c_probes.sdk_id,
+                        stdin: &spawned.stdin,
+                    };
+                    let cache = crate::probe_clang::CacheAdapter(&*c_probes.records);
+                    let resolved = match c_tasks_probe::resolve(&*c_probes.answerer, &cache, &clang, &probe, held_digest, &mut held_bytes, alloc) {
+                        Ok(resolved) => resolved,
+                        Err(why) => return Err(self.refuse(Refusal::Spawn(refused(why.as_str().to_owned())))),
+                    };
+                    let subject = facts::cc_probe_subject(&resolved.answerer_id, &clang, &c_probes.sdk_digest, &resolved.key, alloc);
+                    let code = resolved.answered.code;
+                    let stdout = resolved.answered.stdout.as_bytes().to_vec();
+                    let stderr = resolved.answered.stderr.as_bytes().to_vec();
+                    let subject_owned = subject.as_str().to_owned();
+                    self.record(subject_owned, Some(resolved.canonical_digest));
+                    self.deliver(program, spawned.modes, code, &stdout, &stderr)
+                }
+                Some(crate::probe_clang::CProbeSetting::Unavailable(why)) => {
+                    Err(self.refuse(Refusal::Spawn(refused(why.as_ref().to_owned()))))
+                }
+                None => Err(self.refuse(Refusal::Spawn(refused(
+                    "no C compiler probe setting configured on this Script (rule 3)".to_owned(),
+                )))),
+            }
         }
     }
 
@@ -566,9 +726,18 @@ impl ScriptSandbox {
                 return Err(self.refuse(Refusal::Spawn(SpawnRefusal::Executor(format!("`{program}`: the command names no guest userland for a Linux tool")))));
             }
         };
-        let Tree::Mem { files: tree, .. } = &script.tree else {
+        let Tree::Mem { files: tree, submodules, .. } = &script.tree else {
             return Err(self.refuse(Refusal::Spawn(SpawnRefusal::TreeOnDisk { program: program.to_owned(), args: args.to_vec() })));
         };
+        if let Some((sub, commit)) = submodules.first() {
+            let mut hex = blaze_own::AString::new_in(alloc);
+            for byte in commit {
+                let _ = core::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));
+            }
+            return Err(self.refuse(Refusal::Spawn(SpawnRefusal::Executor(format!(
+                "`{program}`: package contains unpopulated git submodule `{sub}` at commit {hex}; executor spawns refuse unpopulated submodules"
+            )))));
+        }
         let out_dir = script.out_dir();
         let text = |value: &str| blaze_own::String::from_str_in(value, alloc);
 

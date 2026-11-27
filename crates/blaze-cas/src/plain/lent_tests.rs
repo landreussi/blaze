@@ -237,3 +237,237 @@ fn a_commit_frees_every_put_no_get_lent() {
         println!("lent: {} bytes held before the commit, {} after (the lent chunk), {} chunks freed", before.held_bytes, after.held_bytes, lent.counts().freed_chunks);
     }
 }
+
+fn reached_cfg(n: u64, cap_bytes: u64, root: &blaze_mem::Frame) -> PlainConfig<&blaze_mem::Frame> {
+    PlainConfig { cap_bytes, nonce: 900 + n, liveness: super::super::Liveness::Reached, ..cfg(n, root) }
+}
+
+/// O(1) `renew_root` refreshes TTL without probing/re-hashing held names, preserves held names
+/// past the original TTL, returns `Fresh` within `TOUCH_NS`, and returns `Missing` for absent or
+/// expired roots.
+#[test]
+fn renew_root_refreshes_ttl_preserves_held_names_and_misses_absent_or_expired() {
+    use core::time::Duration;
+    use super::super::core::{GRACE_NS, LEASE_NS, ROOT_LIFE_NS, Renewed, TOUCH_NS};
+
+    let root = super::super::test_root();
+    let sim = Sim::new(401, Faults::default());
+    let mut store = Driven::with(sim, Path::new("/sim"), reached_cfg(1, u64::MAX, &root), &root).expect("open");
+    let k1 = key(4001);
+    let k2 = key(4002);
+    store.put(k1, Namespace::LOCAL, TAG, &value(4001)).expect("put k1");
+    store.put(k2, Namespace::LOCAL, TAG, &value(4002)).expect("put k2");
+    let root_key = store.root_for("answer", &[k1, k2], ROOT_LIFE_NS).expect("root_for");
+    store.release_lease();
+    let c1 = store.commit_with(&[]).expect("commit 1");
+    let gen1 = c1.generation;
+    let lent = Lent::new(store, &root);
+
+    // Absent root -> Missing.
+    assert_eq!(lent.renew_root("does-not-exist", ROOT_LIFE_NS), Renewed::Missing);
+
+    // Within TOUCH_NS of creation -> Fresh, no commit flip, 0 extra root probes.
+    let probes_before = lent.put_tally().disk.root_probes;
+    assert_eq!(lent.renew_root("answer", ROOT_LIFE_NS), Renewed::Fresh(root_key));
+    let c_noop = lent.commit().expect("noop commit");
+    assert_eq!(c_noop.generation, gen1, "fresh renewal owes no flip");
+    assert_eq!(lent.put_tally().disk.root_probes, probes_before, "renew_root probes 0 keys");
+
+    // Advance past TOUCH_NS (5 days), still well within ROOT_LIFE_NS (14 days).
+    let mut store = lent.into_store();
+    store.driver().advance(Duration::from_nanos(TOUCH_NS * 5));
+    let lent = Lent::new(store, &root);
+    let probes_before = lent.put_tally().disk.root_probes;
+    assert_eq!(lent.renew_root("answer", ROOT_LIFE_NS), Renewed::Extended(root_key));
+    let c2 = lent.commit().expect("renew commit");
+    assert!(c2.generation > gen1, "extended renewal flips manifest");
+    assert!(c2.segments.is_empty(), "renew_root writes no new segment");
+    assert_eq!(lent.put_tally().disk.root_probes, probes_before, "extended renewal probes 0 keys");
+
+    // Advance past original expiry (T0 + 15 days), still before renewed expiry (T0 + 19 days).
+    let mut store = lent.into_store();
+    store.driver().advance(Duration::from_nanos(ROOT_LIFE_NS - TOUCH_NS * 4));
+    let mut sim = store.into_driver();
+    sim.advance(Duration::from_nanos(LEASE_NS.max(GRACE_NS)));
+    let mut store = Driven::with(sim, Path::new("/sim"), reached_cfg(2, u64::MAX, &root), &root).expect("reopen");
+    store.fold_slice().expect("fold_slice");
+    store.release_lease();
+    store.commit_with(&[]).expect("commit after fold");
+    assert!(store.get(&k1).expect("get k1").is_some(), "renewed root preserves k1 past original TTL");
+    assert!(store.get(&k2).expect("get k2").is_some(), "renewed root preserves k2 past original TTL");
+    assert_eq!(store.core().root_named("answer"), Some(root_key), "root still live");
+
+    // Advance past renewed expiry -> renew_root returns Missing (never resurrects expired root).
+    store.driver().advance(Duration::from_nanos(ROOT_LIFE_NS));
+    assert_eq!(store.renew_root("answer", ROOT_LIFE_NS), Renewed::Missing);
+}
+
+/// Lazy `live_roots` in `Plain::reused`: commits with brand-new keys succeed without scanning
+/// existing roots, while commits reusing an unrooted committed key still detect and protect it.
+#[test]
+fn reused_handles_fresh_and_reused_committed_keys_identically() {
+    use core::time::Duration;
+    use super::super::core::{LEASE_NS, ROOT_LIFE_NS};
+
+    let root = super::super::test_root();
+    let sim = Sim::new(402, Faults::default());
+    let mut store = Driven::with(sim, Path::new("/sim"), reached_cfg(1, u64::MAX, &root), &root).expect("open");
+
+    // Commit an existing indexed root and an unrooted committed record.
+    let existing_k = key(5001);
+    let unrooted_k = key(5002);
+    store.put(existing_k, Namespace::LOCAL, TAG, &value(5001)).expect("put existing");
+    store.put(unrooted_k, Namespace::LOCAL, TAG, &value(5002)).expect("put unrooted");
+    let idx = store.index(&[existing_k]).expect("index");
+    store.root_through("existing", &[idx], ROOT_LIFE_NS).expect("root_through");
+    store.release_lease();
+    store.commit_with(&[]).expect("commit 1");
+
+    // 1. Fresh-only commit (like a 2-key journal checkpoint): zero collisions with existing segments.
+    let fresh_k = key(5003);
+    store.put(fresh_k, Namespace::LOCAL, TAG, &value(5003)).expect("put fresh");
+    store.root_for("checkpoint", &[fresh_k], ROOT_LIFE_NS).expect("root checkpoint");
+    store.commit_with(&[]).expect("commit fresh");
+    let found = store.get(&fresh_k).expect("get").expect("present");
+    assert_eq!(store.got(found).bytes, &value(5003)[..]);
+
+    // 2. Commit that reuses the unrooted committed key `unrooted_k`: `reused` lazily loads
+    // `live_roots` on the `find_in` hit, finds it unreached, and keeps it intact across sweep.
+    let sim = store.into_driver();
+    let mut store = Driven::with(sim, Path::new("/sim"), reached_cfg(2, u64::MAX, &root), &root).expect("reopen");
+    store.root_for("reuser", &[unrooted_k], ROOT_LIFE_NS).expect("root reuser");
+    store.commit_with(&[]).expect("commit reuser");
+
+    store.driver().advance(Duration::from_nanos(LEASE_NS) + Duration::from_secs(1));
+    store.fold_slice().expect("fold");
+    store.release_lease();
+    store.commit_with(&[]).expect("commit after fold");
+    let found = store.get(&unrooted_k).expect("get").expect("present");
+    assert_eq!(store.got(found).bytes, &value(5002)[..]);
+    let found = store.get(&existing_k).expect("get").expect("present");
+    assert_eq!(store.got(found).bytes, &value(5001)[..]);
+    let found = store.get(&fresh_k).expect("get").expect("present");
+    assert_eq!(store.got(found).bytes, &value(5003)[..]);
+}
+
+/// Many unexpired roots sharing many indexes stay O(unique keys + roots) in `Plain::reused` and
+/// `compute_reach` (no O(keys × roots × indexes) blowup), while still protecting an unrooted
+/// committed key reused through a new index.
+#[test]
+fn reused_dedups_shared_indexes_across_many_roots() {
+    use core::time::Duration;
+    use super::super::core::{LEASE_NS, ROOT_LIFE_NS};
+
+    let root = super::super::test_root();
+    let sim = Sim::new(404, Faults::default());
+    let mut store = Driven::with(sim, Path::new("/sim"), reached_cfg(1, u64::MAX, &root), &root).expect("open");
+
+    const INDEXES: usize = 32;
+    const KEYS_PER_INDEX: usize = 64;
+    let mut shared_indexes = [key(0); INDEXES];
+    for (idx_i, slot) in shared_indexes.iter_mut().enumerate() {
+        let mut keys = [key(0); KEYS_PER_INDEX];
+        for (key_j, key_slot) in keys.iter_mut().enumerate() {
+            let id = 10_000 + (idx_i * KEYS_PER_INDEX + key_j) as u32;
+            let k = key(id);
+            store.put(k, Namespace::LOCAL, TAG, &value(id)).expect("put");
+            *key_slot = k;
+        }
+        *slot = store.index(&keys).expect("index");
+    }
+    let unrooted_k = key(99_999);
+    store.put(unrooted_k, Namespace::LOCAL, TAG, &value(99_999)).expect("put unrooted");
+    for r in 0..32u32 {
+        store.root_through(&format!("shared-{r}"), &shared_indexes, ROOT_LIFE_NS).expect("root_through");
+    }
+    store.release_lease();
+    store.commit_with(&[]).expect("commit 1");
+
+    // Reopen and commit a new indexed root sharing all 32 indexes plus a new index reusing `unrooted_k`.
+    let sim = store.into_driver();
+    let mut store = Driven::with(sim, Path::new("/sim"), reached_cfg(2, u64::MAX, &root), &root).expect("reopen");
+    let extra_idx = store.index(&[unrooted_k]).expect("extra index");
+    let mut new_indexes = [key(0); INDEXES + 1];
+    new_indexes[..INDEXES].copy_from_slice(&shared_indexes);
+    new_indexes[INDEXES] = extra_idx;
+    store.root_through("new-shared", &new_indexes, ROOT_LIFE_NS).expect("root_through new");
+    store.commit_with(&[]).expect("commit new");
+
+    // Advance past lease and sweep: both shared keys and the reused unrooted key survive.
+    store.driver().advance(Duration::from_nanos(LEASE_NS) + Duration::from_secs(1));
+    store.fold_slice().expect("fold");
+    store.release_lease();
+    store.commit_with(&[]).expect("commit after fold");
+    let found = store.get(&unrooted_k).expect("get unrooted").expect("present");
+    assert_eq!(store.got(found).bytes, &value(99_999)[..]);
+    let sample = key(10_000);
+    let found = store.get(&sample).expect("get sample").expect("present");
+    assert_eq!(store.got(found).bytes, &value(10_000)[..]);
+}
+
+/// `needs_housekeeping` is `false` on a clean sealed bounded store and `true` in each trigger
+/// condition: unsealed local segment, total bytes over cap, expired root, tier count exceeding
+/// `K`, and expired retired file.
+#[test]
+fn needs_housekeeping_clean_and_each_trigger_condition() {
+    use super::super::core::{GRACE_NS, ROOT_LIFE_NS, TIER_SEGMENTS_MOST};
+
+    let root = super::super::test_root();
+    let sim = Sim::new(403, Faults::default());
+    let mut store = Driven::with(sim, Path::new("/sim"), reached_cfg(1, 10 << 20, &root), &root).expect("open");
+
+    let k0 = key(6000);
+    store.put(k0, Namespace::LOCAL, TAG, &value(6000)).expect("put k0");
+    store.root_for("keep", &[k0], ROOT_LIFE_NS).expect("root keep");
+    store.release_lease();
+    store.commit_with(&[]).expect("commit 1");
+    let now = store.driver().wall_ns();
+
+    // Trigger 0: newly committed unsealed local segment triggers housekeeping so detached GC
+    // barrier-seals it for O(1) post-reboot verification.
+    assert!(store.needs_housekeeping(now), "unsealed local segment triggers housekeeping");
+    store.seal().expect("seal 1");
+    let now = store.driver().wall_ns();
+
+    // Clean sealed bounded store -> false.
+    assert!(!store.needs_housekeeping(now), "clean sealed store with 1 segment needs no housekeeping");
+
+    // Trigger 1: total bytes over cap -> true; back under cap -> false.
+    store.core_mut().set_cap(1);
+    assert!(store.needs_housekeeping(now), "over cap triggers housekeeping");
+    store.core_mut().set_cap(10 << 20);
+    assert!(!store.needs_housekeeping(now), "back under cap clears housekeeping");
+
+    // Trigger 2: expired root -> true.
+    let expires = store.core().roots_expiring()[0].2;
+    assert!(!store.needs_housekeeping(expires - 1), "unexpired root does not trigger");
+    assert!(store.needs_housekeeping(expires), "expired root triggers housekeeping");
+
+    // Trigger 3: tier exceeds K (TIER_SEGMENTS_MOST = 4).
+    let mut keys = [k0; TIER_SEGMENTS_MOST + 1];
+    for i in 1..=TIER_SEGMENTS_MOST {
+        let k = key(6000 + i as u32);
+        keys[i] = k;
+        store.put(k, Namespace::LOCAL, TAG, &value(6000 + i as u32)).expect("put");
+        store.root_for("keep", &keys[..=i], ROOT_LIFE_NS).expect("root");
+        store.release_lease();
+        store.commit_with(&[]).expect("commit");
+        store.seal().expect("seal");
+        let t = store.driver().wall_ns();
+        let segs = store.core().segments().len();
+        if segs <= TIER_SEGMENTS_MOST {
+            assert!(!store.needs_housekeeping(t), "{segs} sealed segments in tier 0 (<= K) needs no housekeeping");
+        } else {
+            assert!(store.needs_housekeeping(t), "{segs} segments in tier 0 (> K) triggers housekeeping");
+        }
+    }
+
+    // Compact merges tier 0 back to 1 segment and retires the old ones; seal seals the merged segment.
+    store.compact(1).expect("compact");
+    store.seal().expect("seal after compact");
+    let after_compact = store.driver().wall_ns();
+    assert!(!store.needs_housekeeping(after_compact), "freshly compacted sealed store (retired within grace) needs no housekeeping");
+
+    // Trigger 4: expired retired file past GRACE_NS -> true.
+    assert!(store.needs_housekeeping(after_compact + GRACE_NS), "retired file past grace triggers housekeeping");
+}

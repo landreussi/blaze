@@ -188,6 +188,17 @@ impl<T, A: Allocator> Vec<T, A> {
         // SAFETY: slots `len..capacity` are in the buffer; `MaybeUninit` needs no value there.
         unsafe { slice::from_raw_parts_mut(self.buf.ptr().add(self.len).cast(), spare) }
     }
+}
+
+impl<A: Allocator> Vec<u8, A> {
+    /// Open a zero-pre-zeroing [`crate::ByteCursor`] appending into this vector's spare capacity.
+    #[inline]
+    pub fn byte_cursor(&mut self) -> crate::ByteCursor<'_, A> {
+        crate::ByteCursor::new(self)
+    }
+}
+
+impl<T, A: Allocator> Vec<T, A> {
 
     /// Room for at least `additional` more values, growing by at least twice its capacity.
     #[inline]
@@ -224,6 +235,7 @@ impl<T, A: Allocator> Vec<T, A> {
         self.buf.shrink_to(min_capacity.max(self.len));
     }
 
+    #[blaze::cost(amortized O(1))]
     #[inline]
     pub fn push(&mut self, value: T) {
         if self.len == self.buf.capacity() {
@@ -235,6 +247,7 @@ impl<T, A: Allocator> Vec<T, A> {
     }
 
     /// Pushes `value`, or gives it back with the [`AllocFailure`] when there is no room.
+    #[blaze::cost(amortized O(1))]
     pub fn try_push(&mut self, value: T) -> Result<(), Refused<T>> {
         if let Err(why) = self.buf.try_reserve(self.len, 1) {
             return Err(Refused { value, why });
@@ -245,6 +258,7 @@ impl<T, A: Allocator> Vec<T, A> {
         Ok(())
     }
 
+    #[blaze::cost(O(1))]
     #[inline]
     pub fn pop(&mut self) -> Option<T> {
         if self.len == 0 {
@@ -451,6 +465,7 @@ impl<T, A: Allocator> Vec<T, A> {
     /// The index of the first value equal to `needle`, by a linear scan: blaze-memchr's vector
     /// search for `u8`, `i8` and `bool`, `==` per value otherwise ([`Find`]). For repeated
     /// lookups keep the values sorted (`SortedSet`) or in a map.
+    #[blaze::cost(O(n), space = O(1))]
     #[inline]
     pub fn scan_for(&self, needle: &T) -> Option<usize>
     where
@@ -672,14 +687,35 @@ impl<T, A: Allocator> Vec<T, A> {
     }
 
     /// Gives up the values for as long as the allocator lives; nothing is freed.
-    pub fn leak<'a>(self) -> &'a mut [T]
+    /// Freezes this bump-allocated vector into a mutable slice tied to the arena's lifetime `'a`.
+    ///
+    /// Only compiles for bulk-reclaimed [`BumpAlloc`](crate::BumpAlloc) arenas (`&Frame`,
+    /// `ArenaLocal`, `&Inline`, `Bump<'a>`) — never `Global` or `Heap` — so memory is reclaimed
+    /// in O(1) when the arena drops. As with bump arenas, elements' `Drop` impls are not run.
+    #[inline]
+    pub fn into_bump_slice<'a>(self) -> &'a mut [T]
     where
-        A: 'a,
+        A: crate::BumpAlloc + 'a,
     {
         let mut me = ManuallyDrop::new(self);
         let len = me.len;
-        // SAFETY: the buffer is never freed (the vector is forgotten) and lives as long as `A`
-        // can be named; its first `len` slots hold values.
+        // SAFETY: `A: BumpAlloc + 'a` guarantees the buffer lives for `'a` and is reclaimed in
+        // bulk when the arena drops; `me` is not dropped and its first `len` slots hold values.
+        unsafe { slice::from_raw_parts_mut(me.as_mut_ptr(), len) }
+    }
+
+    /// Permanently leaks this `'static`-backed vector for the remainder of the process.
+    ///
+    /// Only valid for intentional process-lifetime OS hooks (such as POSIX `environ` or a
+    /// global unwind registry). For scoped arenas, use [`Vec::into_bump_slice`] instead.
+    pub fn leak_static(self) -> &'static mut [T]
+    where
+        A: 'static,
+    {
+        let mut me = ManuallyDrop::new(self);
+        let len = me.len;
+        // SAFETY: the vector is forgotten so the buffer lives for `'static`; its first `len`
+        // slots are initialized.
         unsafe { slice::from_raw_parts_mut(me.as_mut_ptr(), len) }
     }
 }
@@ -871,6 +907,7 @@ impl<T, A: Allocator> Vec<T, A> {
     }
 
     #[deprecated(note = "a linear scan: use `scan_for(needle).is_some()`")]
+    #[blaze::cost(O(n), space = O(1))]
     #[inline]
     pub fn contains(&self, needle: &T) -> bool
     where
@@ -880,6 +917,7 @@ impl<T, A: Allocator> Vec<T, A> {
     }
 
     #[deprecated(note = "a linear scan: use `scan_for`")]
+    #[blaze::cost(O(n), space = O(1))]
     #[inline]
     pub fn position(&self, needle: &T) -> Option<usize>
     where

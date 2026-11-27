@@ -631,9 +631,17 @@ fn shown_segments(path: &str) -> impl Iterator<Item = &str> {
 /// `]` in it is neither a comment nor an attribute's end. A loop over bytes that cuts only at
 /// ASCII bytes, so every slice is on a char boundary.
 pub(crate) fn impl_shown(header: &str) -> String {
-    let bytes = header.as_bytes();
     let mut out = String::with_capacity(header.len() + 2);
-    out.push('<');
+    write_impl_shown(header, &mut out);
+    out
+}
+
+/// Writes `header` as a single-line `<...>` impl segment into `out` without allocating:
+/// outer attributes and comments before the first token are skipped, and each internal run of
+/// whitespace and comments collapses to one space.
+pub(crate) fn write_impl_shown(header: &str, out: &mut dyn fmt::Write) {
+    let bytes = header.as_bytes();
+    let _ = out.write_char('<');
     let mut at = 0usize;
     // Whitespace or a comment stands since the last token byte copied.
     let mut gap = false;
@@ -666,7 +674,7 @@ pub(crate) fn impl_shown(header: &str) -> String {
             }
         }
         if gap && !lead {
-            out.push(' ');
+            let _ = out.write_char(' ');
         }
         gap = false;
         lead = false;
@@ -679,10 +687,9 @@ pub(crate) fn impl_shown(header: &str) -> String {
                 at += 1;
             }
         }
-        out.push_str(&header[start..at]);
+        let _ = out.write_str(&header[start..at]);
     }
-    out.push('>');
-    out
+    let _ = out.write_char('>');
 }
 
 /// The byte after the string literal whose opening `"` is at `at` (its escapes skipped); the
@@ -813,12 +820,12 @@ pub fn check_fail_class<'n, S: NamesSource<'n>>(names: S, keys: &Keys, e: &super
         CheckFail::Check { error, .. } => format!("the checker stopped: {}", check_error_class(&path, error)),
         CheckFail::Diags { .. } => String::from("the check found errors"),
         // The first hole of the last round, its item by path.
-        CheckFail::Rounds { last, .. } => match last.first() {
+        CheckFail::Rounds { rounds, last, .. } => match last.first() {
             Some(q) => match super::body_reads::question_item(q) {
-                Some(k) => format!("still asking after {} rounds ({} of {})", super::check::MOST_ROUNDS, debug_class(&format!("{q:?}"), 1), path(k)),
-                None => format!("still asking after {} rounds ({})", super::check::MOST_ROUNDS, debug_class(&format!("{q:?}"), 1)),
+                Some(k) => format!("still asking after {rounds} rounds ({} of {})", debug_class(&format!("{q:?}"), 1), path(k)),
+                None => format!("still asking after {rounds} rounds ({})", debug_class(&format!("{q:?}"), 1)),
             },
-            None => format!("still asking after {} rounds", super::check::MOST_ROUNDS),
+            None => format!("still asking after {rounds} rounds"),
         },
         CheckFail::Const { shown, error, .. } => format!("the constant `{shown}` an array length names has no value ({})", debug_class(&format!("{error:?}"), 2)),
         CheckFail::Resolve { item, error, .. } => {
@@ -832,6 +839,7 @@ pub fn check_fail_class<'n, S: NamesSource<'n>>(names: S, keys: &Keys, e: &super
             format!("instance resolution of the call of {} failed: {why}", path(*item))
         }
         CheckFail::ReadsDiffer { .. } => String::from("checked again, the body read other answers than its first check (rule 21)"),
+        CheckFail::InlineFor { why, .. } => (*why).into(),
     }
 }
 

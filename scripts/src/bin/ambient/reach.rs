@@ -12,6 +12,10 @@
 //!     blaze run -q -p scripts --bin ambient -- '{"command": "reach-report"}'
 //!     blaze run -q -p scripts --bin ambient -- '{"command": "reach-sites"}'
 
+use super::heap::{
+    ColumnSpec, RatchetCounts, RatchetSite, TableListError, TablePolicy, added_since, check_table_problems, entry_file, load_table_rows,
+    parse_table_rows, render_table, report_problems, row_text, tally_table, write_table,
+};
 use super::*;
 
 /// What ambient.rs's `DOC` says of the reach ratchet, appended to it in the usage error.
@@ -227,13 +231,17 @@ pub(super) enum ReachUse {
     MainOs,
     /// `Io` as a parameter's type in a `fn main` signature (D104: a whole world asked for).
     MainIo,
+    /// `&Io` / `&'a Io` / `&bstd::Io` / `&bstd::io::Io` as a parameter or field type outside
+    /// `blaze-std` (D104: take specific capabilities like `&Out`, `&Fs`, `&Clock`, `&Env`, `&Host`,
+    /// `CxSpawn` instead of borrowing the whole world).
+    IoRef,
 }
 
 impl ReachUse {
     const fn column(self) -> Column {
         match self {
             ReachUse::Call(it) => it.column,
-            ReachUse::MainOs | ReachUse::MainIo => Column::World,
+            ReachUse::MainOs | ReachUse::MainIo | ReachUse::IoRef => Column::World,
         }
     }
 
@@ -244,6 +252,7 @@ impl ReachUse {
             ReachUse::Call(Call { prev: None, word, .. }) => format!("`{word}()`"),
             ReachUse::MainOs => "`Os::process()`".to_owned(),
             ReachUse::MainIo => "`Io` in a `fn main` signature".to_owned(),
+            ReachUse::IoRef => "`&Io` parameter or field (pass specific capabilities like `&Out`, `&Fs`, `&Clock`, `CxSpawn`)".to_owned(),
         }
     }
 }
@@ -317,6 +326,49 @@ fn typed_here(text: &str, at: usize, end: usize) -> bool {
     before.ends_with(':') && !before.ends_with("::")
 }
 
+/// Whether the word at bytes `at..end` of `text` stands as a borrowed `&Io` / `&'a Io` /
+/// `&mut Io` / `&bstd::io::Io` parameter or struct field type: after `:` and `&` (optionally
+/// `'lifetime`, `mut`, and path segments), before `,`, `)`, or `}`. Local `struct Io` / `trait Io`
+/// types defined in the same file are ignored unless qualified with `bstd::`.
+fn borrowed_io_here(text: &str, at: usize, end: usize, has_local_io: bool) -> bool {
+    if !text[end..].trim_start().starts_with([',', ')', '}']) {
+        return false;
+    }
+    let mut before = text[..at].trim_end();
+    let mut qualified_bstd = false;
+    let mut qualified = false;
+    // Bounded: each turn takes one `segment::` off the end.
+    while let Some(rest) = before.strip_suffix("::") {
+        qualified = true;
+        let rest = rest.trim_end();
+        let word = trailing_word(rest);
+        if word == "bstd" {
+            qualified_bstd = true;
+        }
+        if word.is_empty() {
+            break;
+        }
+        before = rest[..rest.len() - word.len()].trim_end();
+    }
+    if has_local_io && !qualified_bstd {
+        return false;
+    }
+    if qualified && !qualified_bstd {
+        return false;
+    }
+    if trailing_word(before) == "mut" {
+        before = before[..before.len() - 3].trim_end();
+    }
+    let word = trailing_word(before);
+    if !word.is_empty() && before[..before.len() - word.len()].ends_with('\'') {
+        before = before[..before.len() - word.len() - 1].trim_end();
+    }
+    let Some(before) = before.strip_suffix('&').map(str::trim_end) else {
+        return false;
+    };
+    before.ends_with(':') && !before.ends_with("::")
+}
+
 /// Each reach in `text`, test code included ([`scan_file`] splits it): its line (from 1) and
 /// what it is, in order. Comments, strings and characters are skipped as [`item_end`] skips
 /// them.
@@ -331,6 +383,8 @@ pub(super) fn reach_uses(text: &str) -> Vec<(usize, ReachUse)> {
     let mut main: Option<(usize, usize)> = None;
     // The parameter list of the last `fn main` read, at any depth.
     let mut params: Option<(usize, usize)> = None;
+    // Local private `struct Io` / `trait Io` / `enum Io` / `type Io` definitions (not `bstd::Io`).
+    let has_local_io = text.contains("struct Io") || text.contains("trait Io") || text.contains("enum Io") || text.contains("type Io");
     // Bounded: every turn moves `at` forward, to the end of the text at most.
     while at < bytes.len() {
         let next = bytes.get(at + 1).copied();
@@ -354,6 +408,8 @@ pub(super) fn reach_uses(text: &str) -> Vec<(usize, ReachUse)> {
                 }
                 let found = if word == "Io" && params.is_some_and(|(from, to)| from < at && at < to) {
                     typed_here(text, at, end).then_some(ReachUse::MainIo)
+                } else if word == "Io" && borrowed_io_here(text, at, end, has_local_io) {
+                    Some(ReachUse::IoRef)
                 } else {
                     reach_use_of(text, at, end).map(|it| {
                         let in_main = main.is_some_and(|(from, to)| from < at && at < to);
@@ -374,18 +430,11 @@ pub(super) fn reach_uses(text: &str) -> Vec<(usize, ReachUse)> {
     out
 }
 
-/// One reach in the tree.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct ReachSite {
-    /// Relative to the root.
-    path: String,
-    line: usize,
-    /// Never [`ReachUse::MainOs`]: [`count_reach`] drops or turns it.
-    what: ReachUse,
-}
+/// One reach in the tree (`what` is never [`ReachUse::MainOs`]: [`count_reach`] drops or turns it).
+type ReachSite = RatchetSite<ReachUse>;
 
 /// Each crate's reaches outside test code and in it, in file and line order.
-type ReachCounts = BTreeMap<String, (Vec<ReachSite>, Vec<ReachSite>)>;
+type ReachCounts = RatchetCounts<ReachUse>;
 
 fn count_reach(root: &Path) -> Result<ReachCounts, TreeError> {
     let Walked { scanned, skipped, .. } = walk(root)?;
@@ -398,12 +447,14 @@ fn count_reach(root: &Path) -> Result<ReachCounts, TreeError> {
         let path = parts.join("/");
         let whole_test = skipped.contains(&path);
         let krate = crate_of(root, &parts, &mut manifests);
+        let is_bstd = krate == "blaze-std";
         let (outside, inside) = out.entry(krate).or_default();
         // An entry file's `fn main` takes the OS root freely: that is where it is taken.
-        let entry = super::heap::entry_file(&path);
+        let entry = entry_file(&path);
         let kept = |what: ReachUse| match what {
             ReachUse::MainOs if entry => None,
             ReachUse::MainOs => Some(ReachUse::Call(&OS_PROCESS)),
+            ReachUse::IoRef if is_bstd => None,
             other => Some(other),
         };
         for (line, what) in &found.reach {
@@ -423,70 +474,37 @@ fn count_reach(root: &Path) -> Result<ReachCounts, TreeError> {
 }
 
 fn tally_reach(sites: &[ReachSite]) -> ReachRow {
-    let mut row = [0; 6];
-    for it in sites {
-        row[it.what.column().at()] += 1;
-    }
-    row
-}
-
-fn row_text(row: ReachRow) -> String {
-    row.map(|n| n.to_string()).join("\t")
+    tally_table(sites, |it| it.column().at())
 }
 
 /// The list as `reach-write` writes it: the header, then a row for each crate with a reach
 /// outside test code, sorted.
 fn render_reach(counts: &ReachCounts) -> String {
-    let mut out = REACH_HEADER.to_owned();
-    for (krate, (outside, _)) in counts {
-        let row = tally_reach(outside);
-        if row != [0; 6] {
-            out.push_str(&format!("{krate}\t{}\n", row_text(row)));
-        }
-    }
-    out
+    render_table(REACH_HEADER, counts, tally_reach)
 }
 
-/// A row of the list that is not one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ReachListError {
-    NotARow { line: usize, text: String },
-    TwoRows { line: usize, krate: String },
+const fn reach_column(c: Column) -> ColumnSpec {
+    ColumnSpec { name: c.name(), what: c.what(), instead: c.instead() }
 }
 
-impl fmt::Display for ReachListError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ReachListError::NotARow { line, text } => write!(
-                f,
-                "{REACH_LIST}:{line}: `{text}` is not `<crate><TAB><clock><TAB><env><TAB><random><TAB><exit><TAB><world><TAB><test_root>`"
-            ),
-            ReachListError::TwoRows { line, krate } => write!(f, "{REACH_LIST}:{line}: a second row for `{krate}`"),
-        }
-    }
-}
+static REACH_POLICY: TablePolicy<6> = TablePolicy {
+    list: REACH_LIST,
+    scope: "outside tests",
+    moved_noun: "call",
+    rule: "rule 75",
+    write_cmd: "reach-write",
+    columns: [
+        reach_column(COLUMNS[0]),
+        reach_column(COLUMNS[1]),
+        reach_column(COLUMNS[2]),
+        reach_column(COLUMNS[3]),
+        reach_column(COLUMNS[4]),
+        reach_column(COLUMNS[5]),
+    ],
+};
 
-fn parse_reach_rows(text: &str) -> Result<BTreeMap<String, ReachRow>, ReachListError> {
-    let mut rows = BTreeMap::new();
-    for (at, line) in text.split('\n').enumerate() {
-        if line.trim().is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let bad = || ReachListError::NotARow { line: at + 1, text: line.to_owned() };
-        let cells: Vec<&str> = line.split('\t').collect();
-        let [krate, rest @ ..] = cells.as_slice() else { return Err(bad()) };
-        if krate.is_empty() || rest.len() != COLUMNS.len() {
-            return Err(bad());
-        }
-        let mut row = [0; 6];
-        for (cell, it) in row.iter_mut().zip(rest) {
-            *cell = it.parse().map_err(|_| bad())?;
-        }
-        if rows.insert((*krate).to_owned(), row).is_some() {
-            return Err(ReachListError::TwoRows { line: at + 1, krate: (*krate).to_owned() });
-        }
-    }
-    Ok(rows)
+fn parse_reach_rows(text: &str) -> Result<BTreeMap<String, ReachRow>, TableListError> {
+    parse_table_rows(&REACH_POLICY, text)
 }
 
 /// What is over its row (each a refusal, the line `reach-check` prints after `ambient: `) and
@@ -496,43 +514,14 @@ fn reach_problems(
     rows: &BTreeMap<String, ReachRow>,
     added: Option<&BTreeMap<String, BTreeSet<usize>>>,
 ) -> (Vec<String>, Vec<String>) {
-    let (mut over, mut under) = (Vec::new(), Vec::new());
-    let crates: BTreeSet<&String> = counts.keys().chain(rows.keys()).collect();
-    for krate in crates {
-        let sites = counts.get(krate).map_or(&[][..], |(outside, _)| outside.as_slice());
-        let now_row = tally_reach(sites);
-        let held_row = rows.get(krate).copied().unwrap_or([0; 6]);
-        for column in COLUMNS {
-            let (now, held) = (now_row[column.at()], held_row[column.at()]);
-            let name = column.name();
-            if now > held {
-                let of_kind = sites.iter().filter(|it| it.what.column() == column);
-                let shown = |it: &ReachSite| format!("{}:{} {}", it.path, it.line, it.what.shown());
-                let named: Vec<String> = match added {
-                    Some(added) => {
-                        of_kind.filter(|it| added.get(&it.path).is_some_and(|lines| lines.contains(&it.line))).map(shown).collect()
-                    }
-                    None => of_kind.take(3).map(shown).collect(),
-                };
-                let new = match (added, named.is_empty()) {
-                    (Some(_), true) => "none is on a line added since the base: a call moved in, or a file git does not track".to_owned(),
-                    (Some(_), false) => format!("new: {}", named.join(", ")),
-                    (None, _) => format!("first: {}", named.join(", ")),
-                };
-                over.push(format!(
-                    "`{krate}` has {now} {} outside tests, over its row's `{name}` {held} in {REACH_LIST} ({new}): {} (rule 75)",
-                    column.what(),
-                    column.instead()
-                ));
-            } else if now < held {
-                under.push(format!(
-                    "`{krate}` has {now} {} outside tests, under its row's `{name}` {held} in {REACH_LIST}: lower it (command `reach-write`)",
-                    column.what()
-                ));
-            }
-        }
-    }
-    (over, under)
+    check_table_problems(
+        &REACH_POLICY,
+        counts,
+        rows,
+        added,
+        |it| it.column().at(),
+        |it| format!("{}:{} {}", it.path, it.line, it.what.shown()),
+    )
 }
 
 fn summary(row: ReachRow) -> String {
@@ -574,38 +563,17 @@ pub(super) fn main_with(command: &str, base: Option<&str>, root: &Path) {
         println!("{SCRIPT}: outside tests {}; in tests {}", summary(totals(|it| &it.0)), summary(totals(|it| &it.1)));
         return;
     }
-    let listed = read_text(&root.join(REACH_LIST));
-    let rows = match &listed {
-        Some(text) => parse_reach_rows(text).unwrap_or_else(|e| fail(SCRIPT, &e.to_string())),
-        None if command == "reach-write" => BTreeMap::new(),
-        None => fail(SCRIPT, &format!("{REACH_LIST} could not be read: every crate is held to its row there (command `reach-write` makes it)")),
-    };
+    let (listed, rows) = load_table_rows(&REACH_POLICY, root, command == "reach-write");
     if command == "reach-write" {
         // The first write takes the tree as it stands; after it, rows only fall.
-        if listed.is_some() {
-            let (over, _) = reach_problems(&counts, &rows, None);
-            if !over.is_empty() {
-                let lines: Vec<String> = over.iter().map(|w| format!("{SCRIPT}: {w}")).collect();
-                eprintln!("{}\n{SCRIPT}: {REACH_LIST} is not written: the list only falls", lines.join("\n"));
-                std::process::exit(1);
-            }
-        }
-        if let Err(e) = std::fs::write(root.join(REACH_LIST), render_reach(&counts)) {
-            fail(SCRIPT, &format!("{REACH_LIST} is not written: {e}"));
-        }
+        let over = if listed.is_some() { reach_problems(&counts, &rows, None).0 } else { Vec::new() };
+        write_table(REACH_LIST, root, &over, &render_reach(&counts));
         println!("{SCRIPT}: wrote {REACH_LIST}: outside tests {}", summary(totals(|it| &it.0)));
         return;
     }
-    let added = base.map(|base| super::heap::added_since(root, base).unwrap_or_else(|e| fail(SCRIPT, &e.to_string())));
+    let added = base.map(|base| added_since(root, base).unwrap_or_else(|e| fail(SCRIPT, &e.to_string())));
     let (over, under) = reach_problems(&counts, &rows, added.as_ref());
-    for note in &under {
-        println!("{SCRIPT}: {note}");
-    }
-    if !over.is_empty() {
-        let lines: Vec<String> = over.iter().map(|w| format!("{SCRIPT}: {w}")).collect();
-        eprintln!("{}", lines.join("\n"));
-        std::process::exit(1);
-    }
+    report_problems(&over, &under);
     println!("{SCRIPT}: outside tests {}, each crate at or under its row in {REACH_LIST}", summary(totals(|it| &it.0)));
 }
 
@@ -665,6 +633,14 @@ pub(super) fn selftest() {
                  const T: &str = \"fn main(cx: &Cx, io: Io)\";\nfn main(_: &mut Io, n: IoKind) {}\n";
     let found = reach_uses(mains);
     expect(found == vec![(1, ReachUse::MainIo), (7, ReachUse::MainIo)], &format!("`Io` in a `main` signature: {found:?}"));
+
+    // D104: `&Io` parameters and fields are denied outside `blaze-std`; specific capabilities pass.
+    let io_refs = "fn bad(io: &Io) {}\nfn bad_path(io: &'a bstd::io::Io) {}\nstruct Bad<'a> { io: &'a Io }\nfn good(out: &Out, fs: &Fs) {}\n";
+    let found = reach_uses(io_refs);
+    expect(
+        found == vec![(1, ReachUse::IoRef), (2, ReachUse::IoRef), (3, ReachUse::IoRef)],
+        &format!("`&Io` parameters and fields are caught: {found:?}"),
+    );
 
     // The list: over is refused naming the added line; under is a note; it reads back.
     let site = |line| ReachSite { path: "crates/a/src/lib.rs".to_owned(), line, what: instant };

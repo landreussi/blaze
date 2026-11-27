@@ -549,6 +549,28 @@ pub const WORDINGS: &[Wording] = &[
         args: 1,
         kind: Kind::Told,
     },
+    // A dependency declared in a member's `Cargo.toml` that none of that member's checked targets
+    // reference (blaze-cli unused_deps.rs `UNUSED_DEPENDENCY`).
+    Wording {
+        area: Area::Cli,
+        number: 48,
+        name: "unused-dependency",
+        headline: "dependency {code:0} is declared in {code:1} of {code:2} but never referenced",
+        label: "unused dependency; remove this line",
+        args: 3,
+        kind: Kind::Warning,
+    },
+    // An internal workspace member whose `std` is Rust's `std` while
+    // `[workspace.metadata.blaze] std = "bstd"` requires bstd (blaze-cli units.rs `STD_NOT_BSTD`).
+    Wording {
+        area: Area::Cli,
+        number: 49,
+        name: "std-not-bstd",
+        headline: "workspace member {code:0} uses Rust edition {code:1} (`std`), but `[workspace.metadata.blaze] std = \"bstd\"` requires bstd",
+        label: "set `edition = \"blaze-2026.11\"` (or `[workspace.package] edition = \"blaze-2026.11\"`)",
+        args: 2,
+        kind: Kind::Error,
+    },
     Wording {
         area: Area::Drive,
         number: 0xC0F6,
@@ -635,6 +657,10 @@ pub enum HelpKind {
     Tied,
     /// A manifest line naming the toolchain's crate again, deleted: `{0}` the name it gave.
     ToolchainLine,
+    /// A mechanical fix from a lint rule: `{0}` names the rule.
+    LintFix,
+    /// A manifest line naming an unused dependency, deleted: `{0}` the dependency key.
+    UnusedDependencyLine,
 }
 
 /// One help's words.
@@ -670,6 +696,18 @@ pub const HELPS: &[HelpWording] = &[
         kind: HelpKind::ToolchainLine,
         name: "help-toolchain-line",
         template: "under edition blaze-2026.11 the package is given {code:0} with no line",
+        args: 1,
+    },
+    HelpWording {
+        kind: HelpKind::LintFix,
+        name: "help-lint-fix",
+        template: "mechanical fix for lint {code:0}",
+        args: 1,
+    },
+    HelpWording {
+        kind: HelpKind::UnusedDependencyLine,
+        name: "help-unused-dependency-line",
+        template: "remove unused dependency {code:0}",
         args: 1,
     },
 ];

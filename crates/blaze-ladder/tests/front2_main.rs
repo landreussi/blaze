@@ -80,7 +80,7 @@ fn shared_records_hold_no_body_type() {
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: BODY }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
         let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
@@ -90,7 +90,7 @@ fn shared_records_hold_no_body_type() {
         found.whole(1).unwrap_or_else(|| panic!("`{n}` not named")).key
     };
     let (sorts, copies) = (key("sorts"), key("copies"));
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let sized = front.index.lang("sized");
     // Each fn of `order` lowered and checked in turn over one store; the outcomes by fn.
     let mut run = |order: &[blaze_id::ItemKey]| -> Vec<(blaze_id::ItemKey, String)> {
@@ -134,7 +134,7 @@ fn a_macro_written_member_checks() {
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: BODY }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
         let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
@@ -144,7 +144,7 @@ fn a_macro_written_member_checks() {
     let main = found.whole(1).unwrap_or_else(|| panic!("`most` not named")).key;
     let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let mut buckets = None;
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let body = lower_fn(&names, prepared, &mut front.keys, &mut store, main).unwrap_or_else(|e| panic!("lowering `most`: {e}"));
     let view = body.lowered.view();
     let spell = Spelling::of(&view).unwrap_or_else(|e| panic!("spelling `most`: {e:?}"));
@@ -182,7 +182,7 @@ fn a_plain_main_is_std_mains_input() {
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     assert!(names.notes(0).is_empty(), "crate 0's notes: {:?}", names.notes(0));
     let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &["main"] }, Alloc::global())
         .unwrap_or_else(|e| panic!("`main` after std::main: {e}"));
@@ -211,7 +211,7 @@ fn his_main_through_the_checker() {
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let resolved = start.elapsed();
     let crate_names: Vec<&str> = crates.iter().map(|c| c.name).collect();
 
@@ -238,7 +238,7 @@ fn his_main_through_the_checker() {
     out.push_str(&format!("probe: `Ok` is {ok_shown:?}, in some enums row: {in_any:?}; `Result`'s row: {row_keys:?}\n"));
     // The walk: his main lowered and checked, `REACHABLE:` and `BUILDS:`; a lowering that fails
     // is its `WORK LIST (lowering ..)` line and nothing more (the walk returns before any hook).
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let world = World { names: &names, frame: &frame, survey_frame: &survey_frame, prepared, sources: &sources, crate_names: &crate_names, body_sources: None, receivers: Receivers::NotLookedUp };
     let ask = Ask { roots: &[main], build_from: BuildFrom::Main, read: RootRead::Callees, label: "his main" };
     let mut his = HisMain { names: &names, crate_names: &crate_names, frame: &frame, sources: &sources, main, ok };
@@ -333,6 +333,10 @@ impl<'n> WalkHooks<'n> for HisMain<'n> {
                         }
                         blaze_typeck::PClause::Const { .. } | blaze_typeck::PClause::RegionOutlives { .. } => {}
                         blaze_typeck::PClause::TypeOutlives { ty, .. } => roots.push(ty),
+                        blaze_typeck::PClause::ForFields { container, args, .. } => {
+                            roots.push(container);
+                            roots.extend_from_slice(tys.list(args).unwrap_or(&[]));
+                        }
                     }
                 }
                 s
@@ -586,7 +590,7 @@ fn second() {
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let crate_names: Vec<&str> = crates.iter().map(|c| c.name).collect();
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the walk's frame");
     let survey_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the survey's frame");
@@ -596,7 +600,7 @@ fn second() {
         found.whole(1).unwrap_or_else(|| panic!("`{name}` not named")).key
     };
     let (first, second) = (key("first"), key("second"));
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let world = World { names: &names, frame: &frame, survey_frame: &survey_frame, prepared, sources: &files, crate_names: &crate_names, body_sources: None, receivers: Receivers::Found };
     let ask = Ask { roots: &[first, second, first], build_from: BuildFrom::Roots, read: RootRead::Callees, label: "two roots" };
     let mut out = String::new();
@@ -620,14 +624,16 @@ fn report(mut out: String, start: Instant) {
 }
 
 /// D104: every blaze `main` is `std::main`'s input, through the run path's front half
-/// (`run::build_new` over the installed toolchain), each as far as it gets. The owner's hello
-/// builds; a `main` that asks a whole world is refused in the words `Grant`'s
-/// `#[diagnostic::on_unimplemented]` gives, which name what to write instead. With
-/// `FRONT2_ENTRY_LIST` set, the lines are written there.
+/// (`run::build_stubbed` over the installed toolchain, matching `blaze run` and
+/// `front2_hello_manifest`), each as far as it gets. The owner's hello builds; a `main` that asks
+/// a whole world is refused in the words `Grant`'s `#[diagnostic::on_unimplemented]` gives, which
+/// name what to write instead. With `FRONT2_ENTRY_LIST` set, the lines are written there.
 #[test]
 fn the_entry_programs_as_far_as_each_gets() {
-    use blaze_ladder::run::{NewFront, build_new};
-    let home = std::env::var("HOME").expect("HOME is set");
+    use blaze_ladder::program_texts::ProgramTexts;
+    use blaze_ladder::run::{NewFront, build_stubbed};
+    use std::{env, fs, thread};
+    let home = env::var("HOME").expect("HOME is set");
     let shelf = format!("{home}/.blaze/v2/toolchain");
     // `Io` is in no prelude (D104): the old shape names it by path, so the refusal is `Grant`'s,
     // not an unresolved name.
@@ -640,34 +646,67 @@ fn the_entry_programs_as_far_as_each_gets() {
     ];
     let mut out = String::from("ENTRY PROGRAMS (D104, edition blaze-2026.11):\n");
     // Every row runs and is printed; what each missed is said at the end, all together.
+    let alloc = blaze_own::testing::heap().alloc();
+    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let rows = thread::scope(|s| {
+        let mut handles = blaze_own::Vec::with_capacity_in(programs.len(), alloc);
+        for (shape, text) in programs {
+            let shelf = shelf.as_str();
+            let tc = &tc;
+            handles.push(s.spawn(move || {
+                let files = [SourceFile { path: "src/main.rs", text }];
+                let new = NewFront { package: "entry", edition: EDITION, shelf: Some(shelf), overflow: blaze_build::OverflowChecks::On };
+                let got = ProgramTexts::new(&files, "src/main.rs", new, tc, blaze_build::Panic::Unwind).and_then(|texts| {
+                    let user = texts.user();
+                    let inputs = Inputs::new(&user, tc).map_err(blaze_ladder::run::RunError::Crates)?;
+                    let crates = inputs.crates();
+                    let names = inputs
+                        .resolve(&crates, blaze_own::testing::bump())
+                        .map_err(|e| blaze_ladder::run::RunError::Names { shown: format!("{e}").into_boxed_str() })?;
+                    build_stubbed(&names, &files, &texts, blaze_own::Alloc::global())
+                });
+                let line = match &got {
+                    Ok(_) => "BUILT (front, checker and builder: no refusal)".to_string(),
+                    Err(e) => format!("REFUSED: {e}"),
+                };
+                let cut = line.floor_char_boundary(600.min(line.len()));
+                let out_line = format!("{shape}: {}\n", &line[..cut]);
+                let miss = match shape {
+                    "main(cx: &Cx, out: Out)" if got.is_err() => Some(format!("the owner's hello builds: {line}")),
+                    "main(cx: &Cx, io: Io)" => match got {
+                        Ok(_) => Some("a `main` taking a whole `Io` is refused, not built".into()),
+                        Err(refused) => {
+                            let shown = format!("{refused}");
+                            // Without d104-A-6 the words are the bare goal `Io: Grant`; with `impl Grant
+                            // for Io` left in bstd it builds.
+                            if !shown.contains("`main` cannot take a `Io`") || !shown.contains("cannot be asked for") {
+                                Some(format!("the `Io` row is refused in `Grant`'s words, naming what to write: {shown}"))
+                            } else {
+                                None
+                            }
+                        }
+                    },
+                    _ => None,
+                };
+                (out_line, miss)
+            }));
+        }
+        let mut collected = blaze_own::Vec::with_capacity_in(handles.len(), alloc);
+        for h in handles {
+            collected.push(h.join().unwrap());
+        }
+        collected
+    });
     let mut missed: Vec<String> = Vec::new();
-    for (shape, text) in programs {
-        let files = [SourceFile { path: "src/main.rs", text }];
-        let got = build_new(&files, "src/main.rs", NewFront { package: "entry", edition: EDITION, shelf: Some(&shelf), overflow: blaze_build::OverflowChecks::On }, blaze_own::Alloc::global());
-        let line = match &got {
-            Ok(_) => "BUILT (front, checker and builder: no refusal)".to_string(),
-            Err(e) => format!("REFUSED: {e}"),
-        };
-        out.push_str(&format!("{shape}: {}\n", line.chars().take(600).collect::<String>()));
-        match shape {
-            "main(cx: &Cx, out: Out)" if got.is_err() => missed.push(format!("the owner's hello builds: {line}")),
-            "main(cx: &Cx, io: Io)" => match got {
-                Ok(_) => missed.push(String::from("a `main` taking a whole `Io` is refused, not built")),
-                Err(refused) => {
-                    let shown = format!("{refused}");
-                    // Without d104-A-6 the words are the bare goal `Io: Grant`; with `impl Grant
-                    // for Io` left in bstd it builds.
-                    if !shown.contains("`main` cannot take a `Io`") || !shown.contains("cannot be asked for") {
-                        missed.push(format!("the `Io` row is refused in `Grant`'s words, naming what to write: {shown}"));
-                    }
-                }
-            },
-            _ => {}
+    for (out_line, miss) in rows {
+        out.push_str(&out_line);
+        if let Some(m) = miss {
+            missed.push(m);
         }
     }
     print!("{out}");
-    if let Ok(path) = std::env::var("FRONT2_ENTRY_LIST") {
-        std::fs::write(&path, &out).unwrap_or_else(|e| panic!("writing the entry list to {path}: {e}"));
+    if let Ok(path) = env::var("FRONT2_ENTRY_LIST") {
+        fs::write(&path, &out).unwrap_or_else(|e| panic!("writing the entry list to {path}: {e}"));
     }
     assert!(missed.is_empty(), "{} of the entry programs missed:\n{}", missed.len(), missed.join("\n"));
 }

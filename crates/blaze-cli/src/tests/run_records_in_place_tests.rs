@@ -86,7 +86,7 @@ fn stored() -> std::vec::Vec<Stored> {
     let g = blaze_own::testing::heap().alloc();
     let inputs = [input("app", "/0/app/lib.rs", &[("lib", 1)]), input("lib", "/1/lib/lib.rs", &[("base", 2)]), input("base", "/2/base/lib.rs", &[])];
     let sysroot = Sysroot { core: None, alloc: None, std: None, bstd: None };
-    let names: Names<'static> = blaze_scope::resolve::resolve_crates(&inputs, sysroot, &Files, &blaze_scope::task::Serial, g).unwrap_or_else(|e| panic!("the three crates' names: {e:?}"));
+    let names: Names<'static> = blaze_scope::resolve::resolve_crates(&inputs, sysroot, &Files, &blaze_scope::task::Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("the three crates' names: {e:?}"));
     let mut out = std::vec::Vec::new();
     for c in names.crates().iter() {
         let n = blaze_scope::names_record::encode(c, g).unwrap_or_else(|e| panic!("names record of `{}`: {e:?}", c.name));
@@ -193,7 +193,7 @@ fn the_runs_reader_reads_each_crates_sections_in_place() {
         }
     }
     store.place.commit().unwrap_or_else(|e| panic!("the commit: {e:?}"));
-    let mut read = EngineRecords::new();
+    let mut read = EngineRecords::new(g);
     let mut sections_read = 0u64;
     for one in crates.iter() {
         let records = read.records(&cx, &mut store, &one.input, one.key, g).unwrap_or_else(|e| panic!("in place: {e}"));
@@ -224,20 +224,23 @@ fn the_runs_reader_reads_each_crates_sections_in_place() {
     println!("run records: 3 crates read in place ({} section bytes, 0 copied), a second ask a hit", after.sections);
 }
 
-/// (d) A record this command put and did not commit is lent from the arena: the reader refuses
-/// it BY NAME (`ReadError::NotInPlace`, the arena), never copies it to an aligned place (rule
-/// 3). This is why main.rs commits the request's puts before the run reads its names.
+/// (d) Under `Visibility::AfterCommit`, a record this command put and did not commit is lent from
+/// the unshared arena: the reader refuses it BY NAME (`ReadError::NotInPlace`, the arena), never
+/// copies it to an aligned place (rule 3). Under the live `Visibility::InArena` default, the same
+/// uncommitted record lives in the 16-byte-aligned shared arena and reads in place with 0 copies.
 /// CONTROL: the same record after the commit reads (the test above).
 #[test]
 fn a_record_still_in_the_arena_is_refused_by_name() {
     let (_io, cx) = root_cx(43);
     let g: Alloc<'static> = blaze_own::testing::heap().alloc();
     let crates = stored();
-    let lent = process(Sim::new(43, Faults::default()), 1);
+    let cfg = config(FileName::new("store").expect("a name"), &StoreSettings::default(), Facts { boot: Some(1), nonce: 9101 }, g);
+    let driven = blaze_cas::plain::Driven::with(Sim::new(43, Faults::default()), std::path::Path::new("/"), cfg, g).expect("the store opens");
+    let lent = Lent::with_visibility(driven, g, blaze_cas::plain::Visibility::AfterCommit);
     let mut store = Placed { place: PlainPlace::new(&lent, false), gets: 0 };
     let one = &crates[2];
     store.put(&cx, one.input.at, &one.whole).unwrap_or_else(|e| panic!("the put: {e}"));
-    let mut read = EngineRecords::new();
+    let mut read = EngineRecords::new(g);
     match read.records(&cx, &mut store, &one.input, one.key, g) {
         Err(error @ ReadError::NotInPlace { why: NotInPlace::Arena { .. }, .. }) => {
             let ReadError::NotInPlace { name, .. } = &error else { unreachable!() };
@@ -248,6 +251,15 @@ fn a_record_still_in_the_arena_is_refused_by_name() {
         Ok(_) => panic!("an uncommitted record was read: from the arena, not the mapping"),
     }
     assert_eq!(read.counts().copied, 0, "the refusal copied");
+
+    // Companion check under the live `Visibility::InArena` default: the uncommitted put is read
+    // directly from the 16-byte-aligned shared arena with zero copies.
+    let live = process(Sim::new(43, Faults::default()), 2);
+    let mut live_store = Placed { place: PlainPlace::new(&live, false), gets: 0 };
+    live_store.put(&cx, one.input.at, &one.whole).unwrap_or_else(|e| panic!("the put: {e}"));
+    let mut live_read = EngineRecords::new(g);
+    let _ = live_read.records(&cx, &mut live_store, &one.input, one.key, g).unwrap_or_else(|e| panic!("InArena read: {e}"));
+    assert_eq!(live_read.counts().copied, 0, "InArena read copied");
 }
 
 /// (d) A section that does not start at a multiple of sixteen is the typed refusal naming the
@@ -258,7 +270,7 @@ fn a_record_still_in_the_arena_is_refused_by_name() {
 #[test]
 fn a_misaligned_section_is_refused_by_name() {
     let g: Alloc<'static> = blaze_own::testing::heap().alloc();
-    let base: &'static [u8] = blaze_scope::resolve::aligned(&[7u8; 64], g);
+    let base: &'static [u8] = blaze_scope::resolve::aligned(&[7u8; 64], blaze_own::testing::bump());
     let name: Name = blaze_drive::key::crate_scope_name(&CrateItemKey(ContentId::of("blaze-cli run records in place test crate", b"bent")));
     let mut counts = crate::engine_records::ReadCounts::default();
     let whole = <InPlace as Route>::section(name, "names section", &base[..32], &mut counts, g).unwrap_or_else(|e| panic!("CONTROL: an aligned section was refused: {e}"));
@@ -307,25 +319,50 @@ impl OpenTree for Counted {
 /// job_texts.rs `Packs`, the one interface a job reads trees by.
 #[test]
 fn a_tree_opens_at_the_first_read_of_a_text_from_it() {
+    let (_io, cx) = root_cx(46);
     let frame = Frame::new(bstd::mem::Tag::Other).expect("a frame");
     let opener = Counted { packs: [pack(1), pack(2)], opens: core::cell::Cell::new(0) };
     let seen = TreesSeen::default();
     let lazy = LazyTrees::new(&opener, 3, &seen, &frame);
     let packs: Packs<'_> = Packs::from(&lazy);
     assert_eq!(seen.opened(), (0, 3), "a tree was opened before any read");
-    let text = packs.tree(1).and_then(|view| view.find("src/lib.rs")).map(|file| file.bytes);
+    let text = packs.tree(&cx, &frame, 1).and_then(|view| view.read_slice("src/lib.rs", &frame).ok().flatten());
     assert_eq!(text, Some(&b"pub fn tree_1() {}\n"[..]), "tree 1's text");
     assert_eq!(seen.opened(), (1, 3), "one read of tree 1 opened other trees");
-    assert!(packs.tree(1).is_some() && packs.tree(0).is_none(), "tree 1 again, and tree 0 is the checkout");
+    assert!(packs.tree(&cx, &frame, 1).is_some() && packs.tree(&cx, &frame, 0).is_none(), "tree 1 again, and tree 0 is the checkout");
     assert_eq!((opener.opens.get(), seen.opened()), (1, (1, 3)), "a second read of tree 1 opened it again");
     assert!(seen.refused().is_none(), "a refusal before any failed open");
-    assert!(packs.tree(3).is_none() && packs.tree(3).is_none(), "a tree that could not be opened was served");
+    assert!(packs.tree(&cx, &frame, 3).is_none() && packs.tree(&cx, &frame, 3).is_none(), "a tree that could not be opened was served");
     assert_eq!(opener.opens.get(), 2, "a refused tree was opened again at its second read");
     assert!(seen.refused().is_some_and(|why| why.starts_with("tree 3 of the crate list")), "the refusal was not kept: {:?}", seen.refused());
-    assert!(packs.tree(4).is_none(), "a tree past the list's");
+    assert!(packs.tree(&cx, &frame, 4).is_none(), "a tree past the list's");
     assert_eq!(seen.opened(), (2, 3));
     // CONTROL: the opened slice, every tree before any read, serves the same text.
     let views = [pack(1), pack(2)];
     let open: Packs<'_> = Packs::from(&views[..]);
-    assert_eq!(open.tree(1).and_then(|view| view.find("src/lib.rs")).map(|file| file.bytes), text, "the two schedules serve other texts");
+    assert_eq!(open.tree(&cx, &frame, 1).and_then(|view| view.read_slice("src/lib.rs", &frame).ok().flatten()), text, "the two schedules serve other texts");
+}
+
+#[test]
+fn exports_cache_serves_repeat_reads_without_store_gets() {
+    let (_io, cx) = root_cx(47);
+    let g: Alloc<'static> = blaze_own::testing::heap().alloc();
+    let crates = stored();
+    let lent = process(Sim::new(47, Faults::default()), 1);
+    let mut store = Placed { place: PlainPlace::new(&lent, false), gets: 0 };
+    for one in crates.iter() {
+        store.put(&cx, one.input.at, &one.whole).unwrap_or_else(|e| panic!("put: {e}"));
+    }
+    store.place.commit().unwrap_or_else(|e| panic!("commit: {e:?}"));
+    let mut read = EngineRecords::new(g);
+    let first = read.exports::<crate::engine_records::InPlace>(&cx, &mut store, &crates[0].input, g).expect("first exports read");
+    assert_eq!(store.gets, 1, "first read hits the store once");
+    for _ in 0..10 {
+        let again = read.exports::<crate::engine_records::InPlace>(&cx, &mut store, &crates[0].input, g).expect("cached exports read");
+        assert_eq!(again.exports.as_ptr(), first.exports.as_ptr(), "cached borrow points to same mapping");
+    }
+    assert_eq!(store.gets, 1, "repeat exports reads never hit the store again");
+    assert_eq!(read.counts().records, 1);
+    assert_eq!(read.counts().hits, 10);
+    assert_eq!(read.counts().copied, 0);
 }

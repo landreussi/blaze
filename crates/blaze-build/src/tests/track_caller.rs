@@ -143,3 +143,238 @@ fn a_fn_shim_passes_its_fn_methods_definition_site() {
     assert!(refused.contains("`Adts::def_site`"), "{refused}");
     println!("track caller: a fn item's Fn* shim passes its Fn* method's definition site");
 }
+
+/// Where `callee` is defined (`Adts::def_site`): item-relative.
+const CALLEE_DEF_SITE: crate::CallerSite<'static> = crate::CallerSite { file: "src/lib.rs", item: CALLEE, offset: 17 };
+
+/// Builds `ReifyShim` for `CALLEE` (`fn(u32) -> u32`) using `blaze_own::testing::heap().alloc()`.
+fn build_reify(tracked: bool, site: bool) -> Result<Built<blaze_own::Alloc<'static>>, crate::BuildError> {
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut w = TestWorld::new();
+    let str_ref = w.ref_(Mutbl::Not, PNode::Str);
+    w.strukt(20, "Location", &[("filename", str_ref), ("line", U32), ("col", U32)]);
+    w.location = Some(LOCATION);
+    w.func(3, "callee", &[U32], U32);
+    if tracked {
+        w.tracked.push(CALLEE);
+    }
+    w.def_site = site.then_some(CALLEE_DEF_SITE);
+    let mut ground = PortableTys::new_in(alloc);
+    let sig = w.sig(CALLEE).expect("callee's signature");
+    let body = BodyBuf::new();
+    let mut subst = Subst { args: &[], ground: &mut ground, scratch: alloc };
+    let built = crate::build_reify_shim(CALLEE, &sig, &mut subst, &TestAdts { world: &w, body: &body }, alloc)?;
+    blaze_lir::verify(built.func.view()).unwrap_or_else(|error| panic!("does not verify: {error}"));
+    Ok(built)
+}
+
+/// Taking a `#[track_caller]` fn as a fn pointer references `REIFY_SHIM_ITEM([FnDef(CALLEE, [])])`
+/// instead of `CALLEE` directly; taking an untracked fn references `CALLEE` directly.
+#[test]
+fn reifying_a_tracked_fn_references_its_reify_shim() {
+    let alloc = blaze_own::testing::heap().alloc();
+    for tracked in [true, false] {
+        let mut w = TestWorld::new();
+        let str_ref = w.ref_(Mutbl::Not, PNode::Str);
+        w.strukt(20, "Location", &[("filename", str_ref), ("line", U32), ("col", U32)]);
+        w.location = Some(LOCATION);
+        w.func(1, "main", &[U32], U32);
+        w.func(3, "callee", &[U32], U32);
+        if tracked {
+            w.tracked.push(CALLEE);
+        }
+        let mut b = BodyBuf::new();
+        let x = b.bind("x");
+        b.params.push(x);
+        let u32_t = b.types.intern(U32).expect("intern u32");
+        let fl = b.types.intern_list(&[u32_t, u32_t]).expect("intern fn ptr list");
+        let fn_ty = b.types.intern(PNode::FnPtr(fl, blaze_typeck::FnPtrHeader::RUST)).expect("intern fn ptr");
+        let f = b.bind("f");
+        let c_path = b.path("callee");
+        let c_expr = b.e(Expr::Path(c_path));
+        let f_e = b.local(f);
+        let x_e = b.local(x);
+        let args = b.exprs_list(&[x_e]);
+        let call = b.e(Expr::Call { callee: f_e, args });
+        let root = b.block(&[Stmt::Let { pat: f, ty: Some(fn_ty), init: Some(c_expr), else_: None }], Some(call));
+
+        let view = b.view(MAIN, root);
+        let mut ty = InferCtx::new_in(alloc);
+        let checked = match blaze_typeck::check(&view, &w, &mut ty, &Needs::new_in(alloc), alloc) {
+            Ok(Outcome::Done(c)) => c,
+            Ok(Outcome::Need(n)) => panic!("check needed {:?}", n.questions),
+            Err(error) => panic!("check failed: {error:?}"),
+        };
+        assert!(checked.diags.is_empty(), "diags: {:?}", checked.diags);
+        let sig = w.sig(MAIN).expect("main sig");
+        let mut ground = PortableTys::new_in(alloc);
+        let mut subst = Subst { args: &[], ground: &mut ground, scratch: alloc };
+        let built = crate::build(&view, &checked, &sig, &mut subst, &TestAdts { world: &w, body: &b }, alloc)
+            .unwrap_or_else(|e| panic!("{e}"));
+        blaze_lir::verify(built.func.view()).expect("verifies");
+        assert_eq!(built.refs.len(), 1, "one func ref");
+        if tracked {
+            assert_eq!(built.refs[0].item, crate::REIFY_SHIM_ITEM, "tracked fn reifies to REIFY_SHIM_ITEM");
+            let inner = crate::reify_shim_of(built.refs[0], ground.view()).expect("reify_shim_of decodes");
+            assert_eq!(inner, Instance { item: CALLEE, args: List::EMPTY });
+        } else {
+            assert_eq!(built.refs[0], Instance { item: CALLEE, args: List::EMPTY }, "untracked fn reifies directly");
+        }
+    }
+}
+
+/// Checks whether `view`'s own signature has exact `want_params` and `want_rets`.
+fn has_own_sig(view: blaze_lir::func::View<'_>, want_params: &[Ty], want_rets: &[Ty]) -> bool {
+    let s = view.sig(SigId(view.head.sig));
+    s.params.len() == want_params.len()
+        && s.params.iter().zip(want_params).all(|(p, &w)| Ty(p.ty) == w)
+        && s.rets.len() == want_rets.len()
+        && s.rets.iter().zip(want_rets).all(|(r, &w)| Ty(r.ty) == w)
+}
+
+/// Checks whether some `Call` / `Invoke` in `view` has exact `want_params` and `want_rets`.
+fn has_direct_call_sig(view: blaze_lir::func::View<'_>, want_params: &[Ty], want_rets: &[Ty]) -> bool {
+    use blaze_lir::Op;
+    (0..view.len()).any(|inst| {
+        let mut o = view.operands(inst);
+        let sig = match view.op(inst) {
+            Op::Call | Op::Invoke | Op::TailCall => {
+                let _callee = o.reference();
+                o.sig()
+            }
+            _ => return false,
+        };
+        let s = view.sig(sig);
+        s.params.len() == want_params.len()
+            && s.params.iter().zip(want_params).all(|(p, &w)| Ty(p.ty) == w)
+            && s.rets.len() == want_rets.len()
+            && s.rets.iter().zip(want_rets).all(|(r, &w)| Ty(r.ty) == w)
+    })
+}
+
+/// `build_reify_shim` produces a plain fn-pointer signature (no hidden `Location` param) that
+/// materializes a `Location` row for the fn's OWN definition site and calls the tracked fn with
+/// that location passed last; refuses with `Adts::def_site` when no definition site is given.
+#[test]
+fn a_reify_shim_passes_its_fns_own_definition_site() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let shim = build_reify(true, true).unwrap_or_else(|e| panic!("{e}"));
+    let view = shim.func.view();
+    let text = blaze_lir::print(view);
+    // Own signature has NO hidden location param: `(i32) -> i32`.
+    assert!(has_own_sig(view, &[Ty::I32], &[Ty::I32]), "reify shim takes no hidden location: {text}");
+    // Direct call to `CALLEE` passes the hidden location LAST: `(i32, ptr) -> i32`.
+    assert_eq!(shim.refs.as_slice(), &[Instance { item: CALLEE, args: List::EMPTY }], "{text}");
+    assert!(has_direct_call_sig(view, &[Ty::I32, Ty::PTR], &[Ty::I32]), "reify shim calls callee with hidden location last: {text}");
+    let mut rows = blaze_own::Vec::new_in(alloc);
+    for d in (0..view.datas.len() as u32).map(blaze_lir::func::DataId) {
+        if !view.data_positions_of(d).is_empty() {
+            rows.push(d);
+        }
+    }
+    assert_eq!(rows.len(), 1, "one `Location` row: {text}");
+    let positions = view.data_positions_of(rows[0]);
+    assert_eq!(positions.len(), 2, "a line and a column: {text}");
+    for p in positions {
+        assert_eq!((p.item_key(), p.site), (CALLEE_DEF_SITE.item.0, CALLEE_DEF_SITE.offset), "callee's own def site: {text}");
+        let bytes = view.data_bytes_of(rows[0]);
+        assert_eq!(&bytes[p.offset as usize..p.offset as usize + 4], &[0; 4], "no absolute line or column: {text}");
+    }
+
+    let Err(refused) = build_reify(true, false) else { panic!("a tracked fn's reify shim with no def_site must be refused") };
+    assert!(format!("{refused}").contains("`Adts::def_site`"), "{refused}");
+
+    // Also verify a generic `#[track_caller]` fn with aggregate parameter and sret aggregate return.
+    let mut w = TestWorld::new();
+    let str_ref = w.ref_(Mutbl::Not, PNode::Str);
+    w.strukt(20, "Location", &[("filename", str_ref), ("line", U32), ("col", U32)]);
+    w.location = Some(LOCATION);
+    w.strukt(25, "Pair", &[("a", PNode::Uint(UintTy::U64)), ("b", PNode::Uint(UintTy::U64))]);
+    let pair = PNode::Adt(ItemKey(25), List::EMPTY);
+    w.generic_func(3, "gen_callee", 1, &[PNode::Param(0)], PNode::Param(0));
+    w.tracked.push(CALLEE);
+    w.def_site = Some(CALLEE_DEF_SITE);
+    let mut ground = PortableTys::new_in(alloc);
+    let pair_g = ground.intern(pair).expect("intern pair");
+    let sig = w.sig(CALLEE).expect("gen_callee sig");
+    let body = BodyBuf::new();
+    let mut subst = Subst { args: &[pair_g], ground: &mut ground, scratch: alloc };
+    let gen_shim = crate::build_reify_shim(CALLEE, &sig, &mut subst, &TestAdts { world: &w, body: &body }, alloc)
+        .unwrap_or_else(|e| panic!("generic agg reify shim failed: {e}"));
+    blaze_lir::verify(gen_shim.func.view()).expect("generic agg reify shim verifies");
+    let gview = gen_shim.func.view();
+    let gtext = blaze_lir::print(gview);
+    // Own sig: `(sret: ptr, arg: ptr) -> ()`; call sig: `(sret: ptr, arg: ptr, loc: ptr) -> ()`.
+    assert!(has_own_sig(gview, &[Ty::PTR, Ty::PTR], &[]), "sret + agg arg, no location: {gtext}");
+    assert!(has_direct_call_sig(gview, &[Ty::PTR, Ty::PTR, Ty::PTR], &[]), "generic agg reify shim calls callee with (sret, arg, loc): {gtext}");
+}
+
+/// `build_test_report_shim` (test.md, piece 8) builds an `extern "C" fn(i32, ptr) -> i32` shim
+/// that calls a monomorphic `#[test]` fn, forwards its returned value (scalar, pair, or sret
+/// aggregate) to `<R as Termination>::report`, and returns the resulting 1-byte `ExitCode`
+/// zero-extended to `i32`; diverging (`-> !`) tests emit `AfterDivergingCall` unreachable.
+#[test]
+fn test_report_shim_builds_for_exit_code_sret_and_never() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut w = TestWorld::new();
+    // 1-byte `ExitCode(u8)` struct matching `std::process::ExitCode`.
+    w.strukt(30, "ExitCode", &[("code", PNode::Uint(UintTy::U8))]);
+    let exit_code = PNode::Adt(ItemKey(30), List::EMPTY);
+    // 24-byte aggregate (sret on AArch64), matching `Result<(), String>`.
+    w.strukt(31, "BigResult", &[
+        ("a", PNode::Uint(UintTy::U64)),
+        ("b", PNode::Uint(UintTy::U64)),
+        ("c", PNode::Uint(UintTy::U64)),
+    ]);
+    let big_result = PNode::Adt(ItemKey(31), List::EMPTY);
+    // `trait Termination { fn report(self) -> ExitCode; }`
+    let report_item = ItemKey(40);
+    w.generic_func(40, "report", 1, &[PNode::Param(0)], exit_code);
+    // Test returning `ExitCode` (1-byte scalar agg)
+    let test_exit = ItemKey(41);
+    w.generic_func(41, "test_exit", 0, &[], exit_code);
+    // Test returning `BigResult` (24-byte sret agg)
+    let test_big = ItemKey(42);
+    w.generic_func(42, "test_big", 0, &[], big_result);
+    // Diverging test returning `!`
+    let test_never = ItemKey(43);
+    w.generic_func(43, "test_never", 0, &[], PNode::Never);
+
+    let body = BodyBuf::new();
+    let report_sig = w.sig(report_item).expect("report sig");
+
+    // 1. 1-byte `ExitCode` return.
+    let mut ground = PortableTys::new_in(alloc);
+    let exit_sig = w.sig(test_exit).expect("test_exit sig");
+    let mut subst = Subst { args: &[], ground: &mut ground, scratch: alloc };
+    let built_exit = crate::build_test_report_shim(test_exit, &exit_sig, report_item, &report_sig, &mut subst, &TestAdts { world: &w, body: &body }, alloc)
+        .unwrap_or_else(|e| panic!("test_exit report shim failed: {e}"));
+    blaze_lir::verify(built_exit.func.view()).expect("test_exit report shim verifies");
+    let exit_text = blaze_lir::print(built_exit.func.view());
+    assert!(has_own_sig(built_exit.func.view(), &[Ty::I32, Ty::PTR], &[Ty::I32]), "c-main sig: {exit_text}");
+    assert_eq!(built_exit.refs.len(), 2, "calls test and Termination::report: {exit_text}");
+    assert_eq!(built_exit.refs[0], Instance { item: test_exit, args: List::EMPTY });
+    assert_eq!(built_exit.refs[1].item, report_item);
+
+    // 2. 24-byte sret aggregate return.
+    let mut ground = PortableTys::new_in(alloc);
+    let big_sig = w.sig(test_big).expect("test_big sig");
+    let mut subst = Subst { args: &[], ground: &mut ground, scratch: alloc };
+    let built_big = crate::build_test_report_shim(test_big, &big_sig, report_item, &report_sig, &mut subst, &TestAdts { world: &w, body: &body }, alloc)
+        .unwrap_or_else(|e| panic!("test_big report shim failed: {e}"));
+    blaze_lir::verify(built_big.func.view()).expect("test_big report shim verifies");
+    let big_text = blaze_lir::print(built_big.func.view());
+    assert!(has_own_sig(built_big.func.view(), &[Ty::I32, Ty::PTR], &[Ty::I32]), "c-main sig: {big_text}");
+    assert_eq!(built_big.refs.len(), 2, "calls test_big and Termination::report: {big_text}");
+    assert_eq!(built_big.refs[0], Instance { item: test_big, args: List::EMPTY });
+    assert_eq!(built_big.refs[1].item, report_item);
+
+    // 3. Diverging `-> !` return does not call `Termination::report` (unreachable after test call).
+    let mut ground = PortableTys::new_in(alloc);
+    let never_sig = w.sig(test_never).expect("test_never sig");
+    let mut subst = Subst { args: &[], ground: &mut ground, scratch: alloc };
+    let built_never = crate::build_test_report_shim(test_never, &never_sig, report_item, &report_sig, &mut subst, &TestAdts { world: &w, body: &body }, alloc)
+        .unwrap_or_else(|e| panic!("test_never report shim failed: {e}"));
+    blaze_lir::verify(built_never.func.view()).expect("test_never report shim verifies");
+    assert_eq!(built_never.refs.as_slice(), &[Instance { item: test_never, args: List::EMPTY }]);
+}

@@ -231,6 +231,7 @@ fn main() {
         Box::leak(Box::new(blaze_mem::Frame::with_reserve(1 << 36, blaze_mem::Tag::Usercode).expect("the entry's frame")));
     let erased: &'static blaze_own::Erased<&'static blaze_mem::Frame> = Box::leak(Box::new(blaze_own::Erased::new(frame)));
     let alloc: Alloc<'static> = erased.handle();
+    let bump: blaze_own::Bump<'static> = erased.bump();
     let bytes = std::fs::read(root.join("Cargo.lock")).unwrap_or_else(|e| panic!("{}: {e}", root.join("Cargo.lock").display()));
     let lock: &'static Lock<'static> = match Lock::read(&bytes, alloc) {
         Ok(lock) => Box::leak(Box::new(lock)),
@@ -243,13 +244,13 @@ fn main() {
     let mut roots = AVec::new_in(alloc);
     let mut members = Vec::new();
     // Each member's folder, checkout-relative: where the world finds a path package's files.
-    let mut paths: Vec<(LockId, &'static str)> = Vec::new();
+    let mut paths: Vec<blaze_world::CheckoutPath<'static>> = Vec::new();
     for m in ws.members.iter() {
         if let Some(id) = lock.named(&m.name).find(|id| matches!(lock.package(*id).source, LockSource::Path)) {
             roots.push(id);
             member_dirs.insert(id, m.dir.as_str().to_owned());
             members.push((id, Package::from_member(m, alloc)));
-            paths.push((id, Box::leak(m.dir.as_str().to_owned().into_boxed_str())));
+            paths.push(blaze_world::CheckoutPath { id, dir: Box::leak(m.dir.as_str().to_owned().into_boxed_str()), kind: blaze_world::PathKind::Member });
         }
     }
     let ask: &'static Ask<'static> =
@@ -283,11 +284,11 @@ fn main() {
     let home = std::env::var("HOME").unwrap_or_else(|_| panic!("HOME is not set: the pinned toolchain is read from $HOME/.blaze/v2/toolchain"));
     let checkout: &'static blaze_world::Checkout = Box::leak(Box::new(blaze_world::Checkout::new(root.clone())));
     let world: &'static blaze_world::World<'static> = {
-        let mut packages = blaze_world::Fetched { store: &mut sources, paths: &paths, lock, alloc };
+        let mut packages = blaze_world::Fetched { store: &mut sources, paths: &paths, lock, alloc: bump };
         let mut shelf = DirShelf(format!("{home}/.blaze/v2/toolchain"));
-        let listed = blaze_world::open_list(&mut shelf, blaze_toolchain::PINNED, TARGET, graph, lock, &mut packages, alloc).unwrap_or_else(|e| panic!("the crate list: {e}"));
+        let listed = blaze_world::open_list(&mut shelf, blaze_toolchain::PINNED, TARGET, graph, lock, &mut packages, bump).unwrap_or_else(|e| panic!("the crate list: {e}"));
         let listed: &'static blaze_world::Listed<'static, &'static [u8]> = Box::leak(Box::new(listed));
-        Box::leak(Box::new(blaze_world::world(graph, lock, listed, &mut packages, checkout, alloc).unwrap_or_else(|e| panic!("the world: {e}"))))
+        Box::leak(Box::new(blaze_world::world(graph, lock, listed, &mut packages, checkout, bump).unwrap_or_else(|e| panic!("the world: {e}"))))
     };
 
     let runtime = script_runtime(&store);
@@ -320,10 +321,13 @@ fn main() {
         host: TARGET,
         table: Arc::clone(&setup.table),
         probes: None,
+        c_probes: None,
         c_mode: CMode::Deferred,
         mode: blaze_build_script::toolchain::Mode::Check,
         native: setup.native.as_ref().ok().map(|run| run.setting()),
         spawn_setting: Arc::clone(&setup.spawn),
+        files_digest: None,
+        deps_digest: None,
     };
     let units = &graph.units;
     let mut trees: BTreeMap<LockId, (Tree, ScriptRoot)> = BTreeMap::new();
@@ -390,7 +394,13 @@ fn main() {
                         }
                         LockSource::Path | LockSource::Registry { .. } => None,
                     };
-                    (mem_tree(view.files().map(|f| (f.path, f.bytes)), dir.as_str(), git), ScriptRoot::package())
+                    let mut decoded = blaze_own::Vec::with_capacity_in(view.len(), alloc);
+                    for e in view.entries() {
+                        if let Ok(b) = e.read_in(alloc) {
+                            decoded.push((e.path, b));
+                        }
+                    }
+                    (mem_tree(decoded.iter().map(|(p, b)| (*p, b.as_slice())), dir.as_str(), git), ScriptRoot::package())
                 }
             })
             .clone();
@@ -405,7 +415,7 @@ fn main() {
                     println!("    given DEP_{}_{}={value:?}", links.to_uppercase().replace('-', "_"), key.to_uppercase().replace('-', "_"));
                 }
             }
-            given.push(GivenRun { script: input, links, outputs, tree: tree.clone(), root: root.clone(), direct });
+            given.push(GivenRun { script: input, links, outputs, tree: blaze_own::Share::share(tree), root: blaze_own::Share::share(root), direct });
         }
         // The one choice point (D112), made by the run itself: said here for the census.
         if let Runner::Native { because } = placed(graph, script, setting.mode, alloc) {
@@ -413,7 +423,7 @@ fn main() {
             println!("  native (its closure holds {} {}, D112)", because.name.as_str(), because.version.as_str());
         }
         let started = Instant::now();
-        let ran = match outputs_given(&runtime, &setting, graph, script, None, tree.clone(), folder.clone(), &given, alloc) {
+        let ran = match outputs_given(&runtime, &setting, graph, script, None, blaze_own::Share::share(&tree), blaze_own::Share::share(&folder), &given, alloc) {
             Ok(ran) => ran,
             Err(error) => {
                 println!("  run: {error}");
@@ -456,7 +466,7 @@ fn main() {
                 o.encode(&mut encoded);
                 record.extend_from_slice(&encoded);
             }
-            runs.insert(script, (record, tree.clone(), folder.clone()));
+            runs.insert(script, (record, tree, folder));
         }
         if let Some(dir) = &export {
             export_record(dir, &store, unit, served.for_host, o, alloc);

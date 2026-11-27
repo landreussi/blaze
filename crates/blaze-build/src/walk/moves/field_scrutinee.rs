@@ -41,7 +41,7 @@ use blaze_typeck::{ExprId, Pat, PatId};
 use super::super::{Walk, malformed};
 use crate::BuildError;
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// The local `e` is a part of: `e` a place path of one or more steps from a local, each a
     /// struct or tuple field or a `Box`'s contents (an overloaded `*b` of a box, a base's
     /// autoderef through boxes), through parentheses, with no adjustment on `e` itself: the
@@ -77,7 +77,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// (a copy moves nothing, and its build does not change).
     pub(in crate::walk) fn owned_field_scrutinee(&mut self, scrutinee: ExprId) -> Result<Option<PatId>, BuildError> {
         let Some(x) = self.field_chain_local(scrutinee)? else { return Ok(None) };
-        if self.owned.get(x.ix()).copied().flatten().is_none() {
+        if !self.local_is_owned(x) {
             return Ok(None);
         }
         let t = self.adjusted_ty(scrutinee)?;

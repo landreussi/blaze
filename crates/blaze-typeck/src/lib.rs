@@ -81,20 +81,22 @@ mod toy;
 
 use blaze_own::Alloc;
 
-pub use infer::{InferCtx, InferSnapshot};
+pub use infer::{InferCtx, InferCtxIn, InferSnapshot};
 pub use replay::{Replay, replay};
 pub use instance::{ResolveError, Resolved, holds, normalize_projection, resolve_instance, select_impl};
 pub use drop_impl::adt_drop_impl;
 pub use rules::async_fn::{EXTERNAL_WITNESS_GAP, INTERIOR_GAP};
 pub use rules::args_inline::{ArgsMisuse, TypedFinding};
+pub use rules::capability::{CapabilityFinding, check_adt_capabilities};
+pub use rules::cost::{CostViolation, EffectiveCost, effective_cost, loop_effective_cost};
 pub use rules::unsafety::Undecided;
 pub use stalled::{Stalled, StalledDecision, StalledError, check_deferring, decide_stalled, decide_stalled_listed};
 pub use asks::{Ask, AskLog, Clock, Order, QUESTION_KINDS, R_THRESHOLD, Restarts, Solve, Tally, entries_histogram, question_kind, restarts};
 pub use body::{
-    Anchor, Arm, BinOp, BindAnn, BodyPath, BodyView, Capture, CoroutineKind, Expr, FieldInit, FieldPat, FmtTrait, FmtUse,
-    IntSuffix, Lit, Pat, Segment, Stmt, StructBase, UnOp,
+    Anchor, Arm, BinOp, BindAnn, BodyPath, BodyView, Capture, ClosureParamRegion, CoroutineKind, Expr, FieldInit, FieldPat,
+    FmtTrait, FmtUse, IntSuffix, Lit, LoopCost, Pat, Segment, Stmt, StructBase, UnOp, WrittenRegion,
 };
-pub use columns::{AdjustKind, Adjusts, Callees, CaptureKind, CapturePlaceRows, CaptureProjs, Captures, Checked, Closures, ConstArgs, DefaultFields, ExprDefs, Fields, FruFields, PatConstArgs, PatDefs};
+pub use columns::{AdjustKind, Adjusts, Callees, CaptureKind, CapturePlaceRows, CaptureProjs, Captures, Checked, Closures, ConstArgs, DefaultFields, ExprDefs, Fields, FruFields, PatConstArgs, PatDefs, UnionPat, UnionPats};
 pub use columns::CoroutineWitness;
 pub use columns::SigFrom;
 pub use env_fields::{ActiveEnv, CaptureProj, EnvField, EnvFields, EnvRule, Places, WholeBindings};
@@ -109,13 +111,16 @@ pub use filed::Filed;
 pub use hash::{ContentHash, StableHasher};
 pub use ids::{
     Abi, Edition, ExprId, FloatTy, FnPtrHeader, IntTy, ItemKey, LangItem, List, Mutbl, Name, PatId, PathIdx, Range,
-    Safety, ScopeId, StmtId, UintTy,
+    RecordSchema, Safety, ScopeId, StmtId, UintTy,
 };
-pub use portable::{Full, MAX_OBJECT_PREDS, MAX_PATTERN_RANGES, OwnTys, PNode, PTy, PTys, PortableTys, Stable, canonical_ranges, object_principal};
+pub use portable::{
+    Full, MAX_OBJECT_PREDS, MAX_PATTERN_RANGES, MAX_PATTERN_SET_MEMBERS, OwnTys, PNode, PTy, PTys,
+    PortableTys, Stable, canonical_const_set, canonical_ranges, node_shape, object_principal,
+};
 pub use ty::{Cause, ClosureKind, FulfillError, FulfillErrorKind, Goal, Obligation, Ty, TyList, TyView, TypeCtx, Var, VarKind};
 pub use world::{
-    Adt, AdtKind, AliasDef, ArgsAfterSelf, Asking, SplitSelf, AssocGenerics, AssocItem, AssocKind, AssocParent, AssocTyDef, ClosureFacts, CoroutineFacts, ConstHolds, ConstParams, CtorKind, Def, Fetch, Field, FnSig,
-    Hidden, ImplHeader, ImplPolarity, InteriorIs, Missing, Needs, PClause, PathRes, Predicates, Prim, Question, ReadList, Reads, RecordKind, Seal, Shape,
+    Adt, AdtKind, AliasDef, ArgsAfterSelf, Asking, SplitSelf, AssocGenerics, AssocItem, AssocKind, AssocParent, AssocTyDef, ClosureFacts, CoroutineFacts, ConstHolds, ConstParams, CostClass, CostContract, CtorKind, Def, Fetch, Field, FnSig,
+    Hidden, ImplHeader, ImplPolarity, InteriorIs, Missing, Needs, PClause, PathRes, Predicates, Prim, Question, ReadList, Reads, RecordKind, Seal, Shape, SyncCost,
     TraitDef, TraitDefaults, TraitFlags, TraitMembers, TypeAttrs, DiscrRepr, Variant, World, ground_args_digest,
 };
 
@@ -296,5 +301,9 @@ fn walk<W: World, C: TypeCtx>(m: &mut Machine<'_, '_, '_, '_, W, C>) -> Result<(
     // The typed lints, over the settled types (rules/args_inline.rs).
     m.args_inline(output)?;
     // What only `unsafe` code may do, over the settled types and callees (rules/unsafety.rs).
-    m.unsafety()
+    m.unsafety()?;
+    // Opt-in checked complexity cost contracts (`#[blaze::cost(..)]`, rules/cost.rs).
+    m.cost_contract()?;
+    // Sans-IO capability firewall (`#[blaze::capability]` in `#![blaze::sans_io]` ADTs).
+    m.capability_in_sans_io()
 }

@@ -50,7 +50,7 @@ use super::super::{Shape, V, Walk, malformed};
 use super::At;
 use crate::BuildError;
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Binds `v`, the binder's own value of pattern `root`'s type, to irrefutable pattern
     /// `root`, by a work list. Every form outside "Refutability"'s irrefutable ones, and every
     /// irrefutable one not built here, is refused by name.
@@ -91,8 +91,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     pub(super) fn bind_pattern_at(&mut self, root: PatId, at: At, owned: bool) -> Result<(), BuildError> {
         // (pattern, its part's place, whether the part is the binder's own: not behind a
         // reference the pattern followed).
-        let mut todo: Vec<(PatId, At, bool), A> = Vec::new_in(self.alloc.clone());
-        let mut parts: Vec<(PatId, At), A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<(PatId, At, bool), A> = Vec::new_in(self.alloc);
+        let mut parts: Vec<(PatId, At), A> = Vec::new_in(self.alloc);
         todo.push((root, at, owned));
         while let Some((p, at, owned)) = todo.pop() {
             let pat = self.pat(p)?;
@@ -148,7 +148,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                     a.by_ref = false;
                     todo.push((inner, a, false));
                 }
-                Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Slice { .. } | Pat::Path(_) => {
+                Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Record { .. } | Pat::Slice { .. } | Pat::Path(_) => {
                     let behind = matches!(self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))?, PNode::Ref(..));
                     let a = self.peel(p, at)?;
                     let owned = owned && !behind;
@@ -267,8 +267,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// or-pattern, a variant of an enum with another inhabited variant or a path to a constant
     /// (`only_variant`), a slice pattern over a slice `[T]` (its length untested). The same
     /// refusals `bind_pattern_at` makes on its way.
-    fn refuse_refutable(&mut self, root: PatId) -> Result<(), BuildError> {
-        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+    pub(super) fn refuse_refutable(&mut self, root: PatId) -> Result<(), BuildError> {
+        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
         todo.push(root);
         while let Some(p) = todo.pop() {
             let elems = match self.pat(p)? {
@@ -309,6 +309,11 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                     self.only_variant(p, g)?;
                     continue;
                 }
+                Pat::Record { fields, .. } => {
+                    let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a record pattern's fields past `field_pats`"))?;
+                    todo.extend(fps.iter().map(|fp| fp.pat));
+                    continue;
+                }
                 Pat::Or { .. } => {
                     return Err(BuildError::UnsupportedPat { pat: p, what: "an or-pattern in a `let` or parameter pattern" });
                 }
@@ -336,7 +341,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// (each binds from a value there is none of) are refused by name.
     pub(in crate::walk) fn declare_let(&mut self, pat: PatId) -> Result<(), BuildError> {
         self.refuse_refutable(pat)?;
-        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
         todo.push(pat);
         while let Some(p) = todo.pop() {
             let elems = match self.pat(p)? {
@@ -354,7 +359,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 Pat::Ref { .. } => {
                     return Err(BuildError::UnsupportedPat { pat: p, what: "a `&` pattern in a `let` without an initializer" });
                 }
-                Pat::Struct { fields, .. } => {
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                     let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
                     todo.extend(fps.iter().rev().map(|fp| fp.pat));
                     continue;
@@ -389,20 +394,35 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// function's exit the bindings drop first, last declared first, then what is left of the
     /// argument, its parts in declaration order (walk/moves.rs `drop_moved`).
     pub(in crate::walk) fn bind_param(&mut self, p: PatId, v: V, g: PTy) -> Result<(), BuildError> {
-        let leaves = !matches!(self.pat(p)?, Pat::Bind { .. })
-            && self.needs_drop(g).map_err(|error| Self::pat_ty_err(p, error))?
-            && self.let_leaves_drops(p)?;
-        if !leaves {
+        let has_ref = self.pat_has_ref_bind(p)?;
+        let drops = self.needs_drop(g).map_err(|error| Self::pat_ty_err(p, error))?;
+        let leaves = !matches!(self.pat(p)?, Pat::Bind { .. }) && drops && self.let_leaves_drops(p)?;
+        if !leaves && !has_ref {
             self.bind_value_of(p, v, g)?;
             return self.own_pat(p);
         }
         self.refuse_refutable(p)?;
-        let V::Place(base, off) = v else { return Err(malformed("a parameter that needs drop not held in memory")) };
+        let (base, off) = match v {
+            V::Place(base, off) => (base, off),
+            other if !drops => {
+                let repr = self.repr(g).map_err(|error| Self::pat_ty_err(p, error))?;
+                let (size, align) = self.size_align(repr);
+                let slot = self.b.slot(size, align, blaze_lir::func::SlotKind::Named);
+                let at = (self.b.slot_addr(slot), 0);
+                self.store(other, repr, at)?;
+                at
+            }
+            _ => return Err(malformed("a parameter that needs drop not held in memory")),
+        };
         let m = self.matches.len() as u32;
-        self.own_param(m, (base, off), g);
-        self.move_arm(m, p, false);
+        if drops {
+            self.own_param(m, (base, off), g);
+            self.move_arm(m, p, false);
+        }
         let bound = self.bind_tested(p, At { at: (base, off), g, by_ref: false, copy: false });
-        self.move_arm_end();
+        if drops {
+            self.move_arm_end();
+        }
         bound
     }
 
@@ -412,7 +432,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     fn left_out_drops(&mut self, p: PatId, g: PTy) -> Result<bool, BuildError> {
         let pat = self.pat(p)?;
         let variant = match pat {
-            Pat::Tuple { .. } => 0,
+            Pat::Tuple { .. } | Pat::Record { .. } => 0,
             Pat::TupleStruct { .. } | Pat::Struct { .. } => {
                 Self::def_variant(self.pat_def(p)).ok_or(malformed("a variant pattern the check did not resolve"))?
             }
@@ -438,7 +458,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                     }
                 }
             }
-            Pat::Struct { fields, .. } => {
+            Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                 for row in first..first + len {
                     let name = self.layout_fields[row as usize].0;
                     let named = self
@@ -459,14 +479,42 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         Ok(false)
     }
 
+    /// Whether pattern `root` contains an or-pattern (`Pat::Or`), e.g. an exhaustive
+    /// `let (A { x } | B { x }) = v;` destructuring (built by tests + unreachable miss).
+    pub(in crate::walk) fn pat_has_or(&self, root: PatId) -> Result<bool, BuildError> {
+        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
+        todo.push(root);
+        while let Some(p) = todo.pop() {
+            match self.pat(p)? {
+                Pat::Or { .. } => return Ok(true),
+                Pat::Bind { sub, .. } => todo.extend(sub),
+                Pat::Ref { inner, .. } => todo.push(inner),
+                Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } => {
+                    let subs = self.body.pat_lists.get(elems.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?;
+                    todo.extend(subs.iter().copied());
+                }
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
+                    let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
+                    todo.extend(fps.iter().map(|fp| fp.pat));
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
     /// Whether `let pat = init;` owns its initializer's parts (the module doc's "Ownership"):
     /// `pat` is neither a binding nor `_` (walk.rs `stmt` builds those), does not borrow
     /// `init`'s place (ref_bind.rs), and leaves unbound a part that needs drop
-    /// (`let_leaves_drops`). A pure fact of the body, asked by walk.rs `scan_flags` (the
-    /// local's field flags), `stmt` (`init` pushed as a scrutinee) and `Task::Let` (bound by
-    /// `bind_let_owned`): all three answers are the same.
+    /// (`let_leaves_drops`), or contains an irrefutable or-pattern (`pat_has_or`). A pure fact
+    /// of the body, asked by walk.rs `scan_flags` (the local's field flags), `stmt` (`init`
+    /// pushed as a scrutinee) and `Task::Let` (bound by `bind_let_owned`): all three answers are
+    /// the same.
     pub(in crate::walk) fn let_owns_parts(&mut self, pat: PatId, init: ExprId) -> Result<bool, BuildError> {
-        if matches!(self.pat(pat)?, Pat::Bind { .. } | Pat::Wild) || self.let_borrows_place(pat, init)? {
+        if self.pat_has_or(pat)? {
+            return Ok(true);
+        }
+        if matches!(self.pat(pat)?, Pat::Bind { .. } | Pat::Wild) || self.pat_has_ref_bind(pat)? {
             return Ok(false);
         }
         // An initializer that needs no drop (a reference the pattern peels: the check records
@@ -485,7 +533,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// binding's subpattern is not looked into: a by-value binding takes the whole part, and
     /// a `ref` one borrows it (ref_bind.rs builds that `let`).
     fn let_leaves_drops(&mut self, root: PatId) -> Result<bool, BuildError> {
-        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
         todo.push(root);
         while let Some(p) = todo.pop() {
             let pat = self.pat(p)?;
@@ -507,7 +555,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                     let subs = self.body.pat_lists.get(elems.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?;
                     todo.extend(subs.iter().copied());
                 }
-                Pat::Struct { fields, .. } => {
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                     if let PNode::Ref(..) = self.ground_node(g).map_err(|error| Self::pat_ty_err(p, error))? {
                         continue;
                     }
@@ -535,12 +583,26 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// declaration order, as `own_pat` does ("Destructors": variables drop in reverse order of
     /// declaration). Returns where they start in `scope_pats` (for `place_super_let`).
     pub(in crate::walk) fn bind_let_owned(&mut self, pat: PatId, init: ExprId, v: V) -> Result<usize, BuildError> {
-        // `bind_tested` tests nothing: what would make the pattern refutable is refused first.
-        self.refuse_refutable(pat)?;
-        let srepr = self.adjusted_repr(init)?;
+        let has_or = self.pat_has_or(pat)?;
+        if !has_or {
+            // `bind_tested` tests nothing: what would make the pattern refutable is refused first.
+            self.refuse_refutable(pat)?;
+        }
+        let srepr = if matches!(v, V::Unsized(..)) { crate::walk::Repr::None } else { self.adjusted_repr(init)? };
         let m = self.matches.len() as u32;
         let at = self.owned_place(m, init, init, v, srepr)?;
         let from = self.scope_pats.len();
+        if has_or {
+            let pass = self.create();
+            let fail = self.create();
+            self.move_arm(m, pat, false);
+            let tested = self.test_pat(pat, at, pass, fail);
+            self.move_arm_end();
+            tested?;
+            self.begin(fail);
+            self.unreachable_of(blaze_code::record::TrapKind::MatchNoArm, Some(init));
+            self.begin(pass);
+        }
         self.move_arm(m, pat, false);
         let bound = self.bind_tested(pat, at);
         self.move_arm_end();

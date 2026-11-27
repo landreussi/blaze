@@ -20,7 +20,7 @@
 use std::path::Path;
 
 use bstd::args::ArgList;
-use bstd::cx::Cx;
+use bstd::cx::{Cx, CxSpawn};
 use bstd::env::Vars;
 use bstd::fs::{Content, Dir, Durable, FsError, FsKind, ReadWrite};
 use bstd::io::{Io, Limits, NativeWorld, OpenError};
@@ -47,6 +47,14 @@ use crate::{
 const SEAL: &str = "blaze expansion record seal 1";
 const SEAL_LEN: usize = 32;
 
+/// Verifies a sealed record file's trailing [`SEAL`] and returns its unsealed body bytes, or
+/// `None` if the file is truncated or its seal does not match.
+pub fn unseal_record(bytes: &[u8]) -> Option<&[u8]> {
+    let body_len = bytes.len().checked_sub(SEAL_LEN)?;
+    let (body, seal) = bytes.split_at_checked(body_len)?;
+    (ContentId::of(SEAL, body).0 == seal).then_some(body)
+}
+
 /// How long one record read or publish may take (rule 18): a record is a small file, so a
 /// minute is a hang, failed by the effect layer naming the record.
 const RECORD_BUDGET: Duration = Duration::from_secs(60);
@@ -61,16 +69,12 @@ enum Held {
     Replaced,
 }
 
-/// The records' one home: a directory of the effect layer, with the world it came from.
-///
-/// It holds the world (`Io`), not a task's `Cx`: a `Cx` is one task's and not `Sync`, while
-/// the store is shared by every worker expanding, and `blaze_expand::ExpandCx::run_proc_macro`
-/// hands no `Cx` down (its 25 implementors sit in six lanes' crates). So each read or publish
-/// is its own root context from this world, ending [`RECORD_BUDGET`] from its start: the
-/// authority is passed in (rule 75); what it lacks is the caller's cancel (DEBT: when a run
-/// carries its task's `Cx`, it takes that one; NOTES.md of bstd-1116).
+/// The records' one home: a directory of the effect layer, a narrow `CxSpawn` capability to create
+/// per-operation root contexts without holding a whole `Io`, and the machine's boot id (when known)
+/// so whole-table vouchers stay valid within one boot.
 pub struct OnDir {
-    pub io: Io,
+    pub cx: CxSpawn,
+    pub boot: Option<blaze_core::Boot>,
     pub dir: Dir<ReadWrite>,
 }
 
@@ -80,7 +84,69 @@ impl OnDir {
     }
 
     fn cx(&self, name: &RecordName) -> Result<Cx, FilesError> {
-        self.io.cx(RECORD_BUDGET, TASK_FRAME).map_err(|_| FilesError::Stopped { name: *name })
+        self.cx.cx(RECORD_BUDGET, TASK_FRAME).map_err(|_| FilesError::Stopped { name: *name })
+    }
+
+    /// Reads `name` directly into `alloc`, returning `Ok(None)` without allocating if the file is
+    /// absent, exceeds `max_bytes`, or has a missing/mismatched trailing [`SEAL`].
+    fn read_sealed_bounded<'a>(
+        &self,
+        name: &RecordName,
+        max_bytes: u64,
+        single_read_plant: bool,
+        alloc: Alloc<'a>,
+    ) -> Result<Option<AVec<'a, u8>>, FilesError> {
+        let cx = self.cx(name)?;
+        let file = match self.dir.open_read(&cx, &Self::path(name)?) {
+            Ok(file) => file,
+            Err(error) if error.kind == FsKind::NotFound => return Ok(None),
+            Err(error) => return Err(FilesError::Effect(error)),
+        };
+        let len_u64 = match file.len(&cx) {
+            Ok(len) => len,
+            Err(error) if error.kind == FsKind::NotFound => return Ok(None),
+            Err(error) => return Err(FilesError::Effect(error)),
+        };
+        if len_u64 > max_bytes {
+            return Ok(None);
+        }
+        let len = usize::try_from(len_u64).map_err(|_| FilesError::Stopped { name: *name })?;
+        let cap = len.checked_add(1).ok_or(FilesError::Stopped { name: *name })?;
+        let mut bytes = AVec::with_capacity_in(cap, alloc);
+        bytes.resize(cap, 0u8);
+        // Loop until `cap` (`len + 1`, proving file growth) or a zero-length read proves true EOF
+        // so short positional reads on FUSE/network filesystems never truncate a valid record and
+        // trigger a false corruption repair.
+        let mut filled = 0usize;
+        while filled < cap {
+            let step_off = u64::try_from(filled).map_err(|_| FilesError::Stopped { name: *name })?;
+            let Some(dst) = bytes.as_mut_slice().get_mut(filled..) else {
+                break;
+            };
+            let n = file.read_into(dst, step_off).wait(&cx).map_err(FilesError::Effect)?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+            if single_read_plant {
+                break;
+            }
+        }
+        if filled > len {
+            return Err(FilesError::OtherBytes { name: *name });
+        }
+        bytes.truncate(filled);
+        let Some(body_len) = bytes.len().checked_sub(SEAL_LEN) else {
+            return Ok(None);
+        };
+        let Some((body, seal)) = bytes.as_slice().split_at_checked(body_len) else {
+            return Ok(None);
+        };
+        if ContentId::of(SEAL, body).0 != seal {
+            return Ok(None);
+        }
+        bytes.truncate(body_len);
+        Ok(Some(bytes))
     }
 
     /// The bytes at `name`, in a buffer of the file's own length (no frame, no fixed block: a
@@ -120,6 +186,56 @@ impl OnDir {
     fn publish(&self, name: &RecordName, whole: &[u8]) -> Result<(), FilesError> {
         let cx = self.cx(name)?;
         self.dir.publish(&cx, &Self::path(name)?, Content::bytes(whole), Durable::No).map(|_| ()).map_err(FilesError::Effect)
+    }
+
+    /// `name` published atomically ONLY if absent (compare-and-publish via `Effect::Link`),
+    /// returning `Ok(true)` if created or `Ok(false)` if another file already occupies `name`.
+    fn publish_if_absent(&self, name: &RecordName, whole: &[u8]) -> Result<bool, FilesError> {
+        let cx = self.cx(name)?;
+        self.dir.publish_if_absent(&cx, &Self::path(name)?, Content::bytes(whole), Durable::No).map_err(FilesError::Effect)
+    }
+
+    /// Acquires an exclusive advisory file lock under the record store for serializing
+    /// corrupted/oversized record repair across concurrent commands.
+    fn lock_exclusive(&self, name: &RecordName) -> Result<bstd::fs::FileLock, FilesError> {
+        let cx = self.cx(name)?;
+        self.dir.lock_exclusive(&cx, &Self::path(name)?).map_err(FilesError::Effect)
+    }
+
+    /// Reads and seal-verifies `name` (bounded at `max_bytes`) through `guard`'s opened root
+    /// capability so the read and lock always target the exact same directory inode.
+    fn read_sealed_bounded_under_lock<'a>(
+        &self,
+        guard: &bstd::fs::FileLock,
+        name: &RecordName,
+        max_bytes: u64,
+        single_read_plant: bool,
+        alloc: Alloc<'a>,
+    ) -> Result<Option<AVec<'a, u8>>, FilesError> {
+        let cx = self.cx(name)?;
+        let mut bytes = match guard.read_bounded(&cx, &Self::path(name)?, max_bytes, single_read_plant, alloc).map_err(FilesError::Effect)? {
+            bstd::fs::BoundedRead::Absent | bstd::fs::BoundedRead::Oversized => return Ok(None),
+            bstd::fs::BoundedRead::Grew => return Err(FilesError::OtherBytes { name: *name }),
+            bstd::fs::BoundedRead::Whole(bytes) => bytes,
+        };
+        let Some(body_len) = bytes.len().checked_sub(SEAL_LEN) else {
+            return Ok(None);
+        };
+        let Some((body, seal)) = bytes.as_slice().split_at_checked(body_len) else {
+            return Ok(None);
+        };
+        if ContentId::of(SEAL, body).0 != seal {
+            return Ok(None);
+        }
+        bytes.truncate(body_len);
+        Ok(Some(bytes))
+    }
+
+    /// Atomically publishes `whole` at `name` through `guard`'s opened root capability so the
+    /// publish and lock always target the exact same directory inode.
+    fn publish_under_lock(&self, guard: &bstd::fs::FileLock, name: &RecordName, whole: &[u8]) -> Result<(), FilesError> {
+        let cx = self.cx(name)?;
+        guard.publish_unsynced(&cx, &Self::path(name)?, whole).map_err(FilesError::Effect)
     }
 
     /// [`RecordPlant::FramedPublish`]'s write: `whole` copied into the task's frame, then
@@ -181,10 +297,15 @@ pub enum FilesError {
     OtherBytes { name: RecordName },
     /// The task's frame refused the bytes of `name`'s record.
     Stopped { name: RecordName },
+    /// Both the primary record repair operation and releasing its repair lock failed.
+    RepairAndUnlock {
+        op: blaze_own::Box<FilesError, blaze_own::SharedAlloc<'static>>,
+        unlock: blaze_own::Box<FilesError, blaze_own::SharedAlloc<'static>>,
+    },
 }
 
-impl std::fmt::Display for FilesError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for FilesError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             FilesError::World(error) => write!(f, "the records' folder: {error}"),
             FilesError::NoTree => f.write_str("the records' world has no file tree"),
@@ -192,6 +313,29 @@ impl std::fmt::Display for FilesError {
             FilesError::Name { name } => write!(f, "the record name {name} is no path under the store"),
             FilesError::Stopped { name } => write!(f, "the record {name}: the task's frame refused its bytes"),
             FilesError::OtherBytes { name } => write!(f, "the record {name} holds other bytes than its put's (rule 21)"),
+            FilesError::RepairAndUnlock { op, unlock } => {
+                write!(f, "{op}; releasing repair lock also failed: {unlock}")
+            }
+        }
+    }
+}
+
+/// Combines a locked record-repair outcome with the result of releasing its repair lock so an
+/// unlock failure is never discarded when the repair itself also failed.
+fn combine_repair_and_unlock(
+    result: Result<(), FilesError>,
+    unlocked: Result<(), FilesError>,
+) -> Result<(), FilesError> {
+    match (result, unlocked) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(unlock)) => Err(unlock),
+        (Err(op), Ok(())) => Err(op),
+        (Err(op), Err(unlock)) => {
+            let shared = blaze_own::SharedAlloc::global();
+            Err(FilesError::RepairAndUnlock {
+                op: blaze_own::Box::new_in(op, shared),
+                unlock: blaze_own::Box::new_in(unlock, shared),
+            })
         }
     }
 }
@@ -209,6 +353,18 @@ pub enum RecordPlant {
     /// A crate's results table is copied into the task's frame before it is published: a
     /// table longer than the frame is refused ([`table`]'s hundred-megabyte test).
     FramedPublish,
+    /// `put_c_probe` blindly overwrites an existing valid record via `publish` instead of using
+    /// atomic compare-and-publish (`publish_if_absent` + `OtherBytes` on conflict). Never taken
+    /// except by the durable-state DST planted-bug control (rule 23).
+    BlindOverwrite,
+    /// `put_c_probe` repairs a corrupted/oversized record without acquiring the exclusive repair
+    /// lock (`Effect::Lock`), allowing two concurrent repairers to silently overwrite each other.
+    /// Never taken except by the concurrent-repair DST planted-bug control (rule 23).
+    UnserializedRepair,
+    /// `read_sealed_bounded` stops after a single `read_into` call instead of accumulating short
+    /// positional reads until `cap` or EOF, causing a valid record under `Sim::short_reads` to be
+    /// misclassified as corrupt and overwritten. Never taken except by the short-read DST control.
+    SingleReadCProbe,
 }
 
 /// The folder store of records: each file the record's bytes then their [`SEAL`], published
@@ -228,21 +384,20 @@ pub struct DirStore {
 
 impl DirStore {
     /// The expansion records, `proc-macro/records` beneath the store's folder `store`.
-    pub fn expansions(io: &Io, store: &Dir<ReadWrite>) -> DirStore {
-        DirStore::within(io, store, "proc-macro/records")
+    pub fn expansions(cx: CxSpawn, boot: Option<blaze_core::Boot>, store: &Dir<ReadWrite>) -> DirStore {
+        DirStore::within(cx, boot, store, "proc-macro/records")
     }
 
     /// The spawn answers' records (`spawn_records::Recorded`), `build-script/records` beneath the
     /// store's folder `store`. A script run itself is kept by no store here: its only cache is
     /// the command's `Script` task record (D115).
-    pub fn build_scripts(io: &Io, store: &Dir<ReadWrite>) -> DirStore {
-        DirStore::within(io, store, "build-script/records")
+    pub fn build_scripts(cx: CxSpawn, boot: Option<blaze_core::Boot>, store: &Dir<ReadWrite>) -> DirStore {
+        DirStore::within(cx, boot, store, "build-script/records")
     }
 
-    fn within(io: &Io, store: &Dir<ReadWrite>, at: &'static str) -> DirStore {
+    fn within(cx: CxSpawn, boot: Option<blaze_core::Boot>, store: &Dir<ReadWrite>, at: &'static str) -> DirStore {
         let at = BPath::new(at).expect("a records folder's name is a relative path by construction");
-        // clone: the world, a refcount.
-        DirStore::on(OnDir { io: io.clone(), dir: store.subdir(&at) }, RecordPlant::None)
+        DirStore::on(OnDir { cx, boot, dir: store.subdir(&at) }, RecordPlant::None)
     }
 
     /// The expansion records under `<store>/proc-macro/records`, over a world opened here.
@@ -251,7 +406,7 @@ impl DirStore {
     /// caller makes [`DirStore::expansions`] from its own.
     pub fn new(store: &Path) -> DirStore {
         match native_world(store) {
-            Ok((io, root)) => DirStore::expansions(&io, &root),
+            Ok((io, root)) => DirStore::expansions(io.spawner(), io.boot().ok(), &root),
             Err(error) => panic!("the expansion records at {}: {error}", store.display()),
         }
     }
@@ -286,9 +441,9 @@ impl DirStore {
         Self::named(kind, key)
     }
 
-    /// `<folder><64 hex of key>`: `folder` is one of the store's (at most seven bytes).
+    /// `<folder><64 hex of key>`: `folder` is one of the store's (at most eight bytes).
     fn named(kind: &[u8], key: &ContentId) -> RecordName {
-        let mut name = RecordName { bytes: [0; 71], len: 0 };
+        let mut name = RecordName { bytes: [0; 72], len: 0 };
         name.bytes[..kind.len()].copy_from_slice(kind);
         let mut at = kind.len();
         for byte in key.0 {
@@ -301,21 +456,30 @@ impl DirStore {
     }
 }
 
-/// A record's file name, `list/<64 hex>` or `answer/<64 hex>`, inline: no allocation a lookup.
+/// A record's file name, `list/<64 hex>`, `answer/<64 hex>`, or `c-probe/<64 hex>`, inline: no allocation a lookup.
 #[derive(Clone, Copy, Debug)]
 pub struct RecordName {
-    bytes: [u8; 71],
+    bytes: [u8; 72],
     len: u8,
 }
 
 impl RecordName {
+    fn from_ascii(raw: &[u8]) -> RecordName {
+        let mut bytes = [0u8; 72];
+        let n = raw.len().min(bytes.len());
+        if let (Some(dst), Some(src)) = (bytes.get_mut(..n), raw.get(..n)) {
+            dst.copy_from_slice(src);
+        }
+        RecordName { bytes, len: u8::try_from(n).unwrap_or(72) }
+    }
+
     pub fn as_str(&self) -> &str {
         core::str::from_utf8(&self.bytes[..usize::from(self.len)]).expect("a record name is ASCII by construction")
     }
 }
 
-impl std::fmt::Display for RecordName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for RecordName {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(self.as_str())
     }
 }
@@ -362,6 +526,77 @@ impl DirStore {
     /// (rule 21), equal bytes are no write.
     pub(crate) fn put_probe(&self, key: &ContentId, bytes: &[u8]) -> Result<(), FilesError> {
         self.put_at(Self::named(b"probe/", key), bytes)
+    }
+
+    /// A build script's C compiler probe's answer record (`c_tasks_probe::encode_answer`):
+    /// `c-probe/<64 hex of the canonical ProbeKey>`, bounded at [`crate::probe_clang::MAX_RECORD_BYTES`]
+    /// before allocating.
+    pub(crate) fn get_c_probe<'a>(&self, key: &ContentId, alloc: Alloc<'a>) -> Result<Option<AVec<'a, u8>>, FilesError> {
+        let single_read = self.plant == RecordPlant::SingleReadCProbe;
+        self.files.read_sealed_bounded(&Self::named(b"c-probe/", key), crate::probe_clang::MAX_RECORD_BYTES, single_read, alloc)
+    }
+
+    /// Keeps a C compiler probe's answer record using atomic compare-and-publish
+    /// (`publish_if_absent` via `Effect::Link`):
+    /// - Absent: atomically created once without racing any concurrent writer.
+    /// - Present and valid: equal bytes succeed; different bytes fail with [`FilesError::OtherBytes`]
+    ///   (rule 21) so nondeterministic answers are never silently overwritten.
+    /// - Present and torn/corrupted/oversized (`> MAX_RECORD_BYTES`): rejected before allocating
+    ///   and replaced atomically via `publish`, followed by bounded re-verification.
+    pub(crate) fn put_c_probe(&self, key: &ContentId, bytes: &[u8]) -> Result<(), FilesError> {
+        let name = Self::named(b"c-probe/", key);
+        let frame = blaze_mem::Frame::new(blaze_mem::Tag::Other).map_err(|_| FilesError::Stopped { name })?;
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        let mut whole = blaze_own::Vec::with_capacity_in(bytes.len() + SEAL_LEN, alloc);
+        whole.extend_from_slice(bytes);
+        whole.extend_from_slice(&ContentId::of(SEAL, bytes).0);
+        if self.plant == RecordPlant::BlindOverwrite {
+            return self.files.publish(&name, whole.as_slice());
+        }
+        if self.files.publish_if_absent(&name, whole.as_slice())? {
+            return Ok(());
+        }
+        let single_read = self.plant == RecordPlant::SingleReadCProbe;
+        if let Some(held) = self.files.read_sealed_bounded(&name, crate::probe_clang::MAX_RECORD_BYTES, single_read, alloc)? {
+            return if held.as_slice() == bytes { Ok(()) } else { Err(FilesError::OtherBytes { name }) };
+        }
+        self.repair_c_probe_after_invalid(&name, bytes, alloc)
+    }
+
+    /// Repair path taken after `publish_if_absent` saw an existing entry and the initial bounded
+    /// read found it invalid (torn/corrupted/oversized): acquires `c-probe/.repair.lock`, re-checks
+    /// under the lock so a concurrent valid repair is never overwritten, and atomically publishes.
+    fn repair_c_probe_after_invalid(&self, name: &RecordName, bytes: &[u8], alloc: Alloc<'_>) -> Result<(), FilesError> {
+        let mut whole = blaze_own::Vec::with_capacity_in(bytes.len() + SEAL_LEN, alloc);
+        whole.extend_from_slice(bytes);
+        whole.extend_from_slice(&ContentId::of(SEAL, bytes).0);
+        let lock_name = RecordName::from_ascii(b"c-probe/.repair.lock");
+        let repair_guard = if self.plant == RecordPlant::UnserializedRepair {
+            None
+        } else {
+            Some(self.files.lock_exclusive(&lock_name)?)
+        };
+        let single_read = self.plant == RecordPlant::SingleReadCProbe;
+        let result = if let Some(guard) = repair_guard.as_ref() {
+            match self.files.read_sealed_bounded_under_lock(guard, name, crate::probe_clang::MAX_RECORD_BYTES, single_read, alloc) {
+                Ok(Some(held)) => {
+                    if held.as_slice() == bytes { Ok(()) } else { Err(FilesError::OtherBytes { name: *name }) }
+                }
+                Ok(None) => self.files.publish_under_lock(guard, name, whole.as_slice()),
+                Err(err) => Err(err),
+            }
+        } else {
+            self.files.publish(name, whole.as_slice())
+        };
+        if let Some(guard) = repair_guard {
+            let unlocked = match self.files.cx(&lock_name) {
+                Ok(unlock_cx) => guard.unlock(&unlock_cx).map_err(FilesError::Effect),
+                Err(err) => Err(err),
+            };
+            return combine_repair_and_unlock(result, unlocked);
+        }
+        result
     }
 
     /// The record at `name`, its seal checked: `None` when absent or torn.
@@ -536,9 +771,13 @@ fn stream_pieces(stream: &TokenStream<'_>, mut out: impl FnMut(&[u8])) {
 /// The version of what the host gives a macro (the bridge server, the sandbox's answers, the
 /// streams a call passes): in every expansion's base key, so a change to it never reads an
 /// answer an older host made. 2: an attribute without arguments is given an empty stream (1
-/// gave none, and every such macro's client panicked reading it). Here, beside the key, so a
-/// build without the runtime computes the same keys.
-pub const HOST_VERSION: u32 = 2;
+/// gave none, and every such macro's client panicked reading it). 3: native bridge preserves
+/// token spans / `TokenOrigin` hygiene and empty attribute streams. 4: native bridge remaps host
+/// `CARGO_MANIFEST_DIR` back to virtual mount root in emitted string literals (D60/D96). 5: native
+/// bridge materializes all safe relative files of `Files::Listed` into `$CARGO_MANIFEST_DIR`, not
+/// only `Cargo.toml`. 6: native bridge preserves non-invisible root subtree delimiters
+/// (`Paren`/`Brace`/`Bracket`) in `FlatTree` replies (e.g. `paste::paste! {{ ... }}`).
+pub const HOST_VERSION: u32 = 6;
 
 /// The base of `call`'s record: computed from text, before the run.
 pub fn base_key(module_wasm_sha256: &str, export: &Exported, edition: Edition, call: &ProcCall<'_>) -> ContentId {

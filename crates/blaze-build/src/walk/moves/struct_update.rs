@@ -33,13 +33,15 @@ use super::super::{Held, Repr, Shape, Task, V, Walk, malformed, unsupported};
 use super::Step;
 use crate::BuildError;
 
-impl<'x, A: Allocator + Clone> Walk<'x, '_, '_, A> {
+impl<'x, A: Allocator + Copy> Walk<'x, '_, '_, A> {
     /// The written fields of struct update `e` (the body's, not borrowed from the walk), and
     /// its base.
     fn update_parts(&self, e: ExprId) -> Result<(&'x [FieldInit], ExprId), BuildError> {
         let body: &'x blaze_typeck::BodyView<'x> = self.body;
-        let Expr::Struct { fields, base: blaze_typeck::StructBase::Expr(base), .. } = self.expr(e)? else {
-            return Err(malformed("a struct update that is not a struct expression with a base"));
+        let (fields, base) = match self.expr(e)? {
+            Expr::Struct { fields, base: blaze_typeck::StructBase::Expr(base), .. }
+            | Expr::Record { fields, base: blaze_typeck::StructBase::Expr(base) } => (fields, base),
+            _ => return Err(malformed("a struct update that is not a struct expression with a base")),
         };
         let inits = body.field_inits.get(fields.range()).ok_or(malformed("a struct update's fields past `field_inits`"))?;
         Ok((inits, base))
@@ -71,7 +73,11 @@ impl<'x, A: Allocator + Clone> Walk<'x, '_, '_, A> {
                 if self.layouts[l as usize].is_union {
                     return Err(malformed("a struct update of a union (only a struct takes a base)"));
                 }
-                let variant = Self::def_variant(self.expr_def(e)).ok_or(malformed("a struct update the check did not resolve to a struct"))?;
+                let variant = if matches!(self.expr(e)?, Expr::Record { .. }) {
+                    0
+                } else {
+                    Self::def_variant(self.expr_def(e)).ok_or(malformed("a struct update the check did not resolve to a struct"))?
+                };
                 let (first, len, tag) = self.variant_rows(l, variant)?;
                 let at = self.temp(repr);
                 self.write_tag(tag, variant, at);
@@ -107,7 +113,11 @@ impl<'x, A: Allocator + Clone> Walk<'x, '_, '_, A> {
         let Repr::Agg(l) = self.expr_repr(e)? else {
             return Err(malformed("a struct update built as other than an aggregate"));
         };
-        let variant = Self::def_variant(self.expr_def(e)).ok_or(malformed("a struct update the check did not resolve to a struct"))?;
+        let variant = if matches!(self.expr(e)?, Expr::Record { .. }) {
+            0
+        } else {
+            Self::def_variant(self.expr_def(e)).ok_or(malformed("a struct update the check did not resolve to a struct"))?
+        };
         let (first, len, _) = self.variant_rows(l, variant)?;
         let Repr::Agg(bl) = self.adjusted_repr(base)? else {
             return Err(malformed("a struct update's base held as other than an aggregate"));
@@ -160,7 +170,7 @@ impl<'x, A: Allocator + Clone> Walk<'x, '_, '_, A> {
             }
             self.moves.steps.push(Step::Field(row));
             let Some(bit) = self.part_bit(mask, start, len + 1, 0, Some(e))? else {
-                return Err(unsupported(e, "a struct update moving out more than 64 parts of one local (its word)"));
+                return Err(unsupported(e, "a struct update moving out more than 256 parts of one local (its bitset)"));
             };
             self.clear_bit(mask, bit);
             return Ok(());
@@ -180,6 +190,12 @@ impl<'x, A: Allocator + Clone> Walk<'x, '_, '_, A> {
                 // Unreachable code: nothing runs, nothing is held (`Task::Spill` held nothing).
                 return Ok(());
             }
+            let t = self.adjusted_ty(base)?;
+            let g = self.ground_ty(t).map_err(|error| Self::ty_err(base, error))?;
+            if !self.needs_drop(g).map_err(|error| Self::ty_err(base, error))? {
+                // A temporary whose own type needs no drop (e.g. `ManuallyDrop<T>`) was never held.
+                return Ok(());
+            }
             return Err(unsupported(e, "a struct update moving a field out of a temporary base not held to its statement's end (an extended temporary)"));
         };
         let mask = match self.scope_pats[i] {
@@ -188,10 +204,7 @@ impl<'x, A: Allocator + Clone> Walk<'x, '_, '_, A> {
             _ => {
                 let t = self.adjusted_ty(base)?;
                 let g = self.ground_ty(t).map_err(|error| Self::ty_err(base, error))?;
-                let slot = self.b.slot(8, 3, SlotKind::Named);
-                let fa = self.b.slot_addr(slot);
-                let all = self.b.iconst(Ty::I64, u128::from(u64::MAX));
-                self.b.store(Flags::NONE, all, fa, 0, MemAttrs::aligned(3));
+                let slot = self.new_temp_mask(src, base);
                 self.scope_pats[i] = Held::Moved { at: src, g, mask: slot };
                 slot
             }
@@ -199,7 +212,7 @@ impl<'x, A: Allocator + Clone> Walk<'x, '_, '_, A> {
         let start = self.moves.steps.len() as u32;
         self.moves.steps.push(Step::Field(row));
         let Some(bit) = self.part_bit(mask, start, 1, 0, Some(e))? else {
-            return Err(unsupported(e, "a struct update moving out more than 64 parts of one temporary (its word)"));
+            return Err(unsupported(e, "a struct update moving out more than 256 parts of one temporary (its bitset)"));
         };
         self.clear_bit(mask, bit);
         Ok(())
@@ -211,7 +224,11 @@ impl<'x, A: Allocator + Clone> Walk<'x, '_, '_, A> {
     pub(in crate::walk) fn scan_update_moves(&mut self) -> Result<(), BuildError> {
         for i in 0..self.body.exprs.len() {
             let e = ExprId(i as u32);
-            let Expr::Struct { base: blaze_typeck::StructBase::Expr(base), .. } = self.expr(e)? else { continue };
+            let base = match self.expr(e)? {
+                Expr::Struct { base: blaze_typeck::StructBase::Expr(base), .. }
+                | Expr::Record { base: blaze_typeck::StructBase::Expr(base), .. } => base,
+                _ => continue,
+            };
             if !self.adjust_rows(base).is_empty() {
                 continue;
             }

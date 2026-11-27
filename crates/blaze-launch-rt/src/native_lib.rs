@@ -244,21 +244,33 @@ pub struct Loaded {
     pub inits: u32,
 }
 
+/// One declared native word slot paired with whether `Down::Native` newly numbered it.
+/// Newly numbered slots must be stubbed before their thunks are written into the image;
+/// slots declared earlier in the run (during lazy loading) already have a stub or published
+/// body and must NOT be re-stubbed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NativeWordSlot {
+    pub slot: SlotId,
+    pub is_new: bool,
+}
+
 /// The load's order (the module's steps 1 to 4).
 pub struct NativeLoad;
 
 impl NativeLoad {
-    /// Stubs each declared slot through `memory`, opens the record, checks the descriptor,
+    /// Stubs each newly declared slot through `memory`, opens the record, checks the descriptor,
     /// fills word i with `memory.thunk(slot_i)`, then each pointer row's cell with its word's
     /// thunk. `slots[i]` is the local slot of the parent's pair i.
     pub fn start<N: Natives, M: Memory>(
         record: RecordId,
-        slots: &[SlotId],
+        slots: &[NativeWordSlot],
         natives: &mut N,
         memory: &mut M,
     ) -> Result<Loaded, RunModeError> {
-        for &slot in slots {
-            memory.stub(slot)?;
+        for &word in slots {
+            if word.is_new {
+                memory.stub(word.slot)?;
+            }
         }
         let base = natives.open(record).map_err(RunModeError::Native)?;
         let d = natives.descriptor(record).map_err(RunModeError::Native)?;
@@ -272,8 +284,9 @@ impl NativeLoad {
         if d.words != declared {
             return refuse(NativeError::Words { record, image: d.words, declared });
         }
-        for (index, &slot) in slots.iter().enumerate() {
-            natives.write_word(base + d.word_at + 8 * index as u64, memory.thunk(slot));
+        for (index, &word) in slots.iter().enumerate() {
+            let offset = u64::try_from(index).unwrap_or(u64::MAX).saturating_mul(8);
+            natives.write_word(base + d.word_at + offset, memory.thunk(word.slot));
         }
         // Checked whole before the first cell is written: a refused row leaves no half-filled
         // data behind (the process stops on the error anyway, but nothing ran with it).
@@ -288,27 +301,33 @@ impl NativeLoad {
         }
         for row in 0..d.pointers {
             let r = natives.pointer_row(base + d.pointer_at + POINTER_ROW_LEN * u64::from(row));
-            natives.write_word(base + r.at, memory.thunk(slots[r.word as usize]));
+            let word_idx = usize::try_from(r.word).unwrap_or(usize::MAX);
+            natives.write_word(base + r.at, memory.thunk(slots[word_idx].slot));
         }
         Ok(Loaded { record, base, inits_at: base + d.init_at, inits: d.inits })
     }
 }
 
 /// Binds C name `name` (code record symbol `symbol`, named by record `record`) through the
-/// loaded library: its address. `natives` is `None` before the parent's `Native` was loaded.
-pub fn bind<N: Natives>(natives: Option<&mut N>, record: RecordId, symbol: CodeSymbol, name: &str) -> Result<u64, RunModeError> {
+/// loaded library: its address (or 0 when `weak` is true and no library defines it). `natives`
+/// is `None` before the parent's `Native` was loaded.
+pub fn bind<N: Natives>(natives: Option<&mut N>, record: RecordId, symbol: CodeSymbol, name: &str, weak: bool) -> Result<u64, RunModeError> {
     let Some(natives) = natives else {
         return Err(RunModeError::NoNativeLibrary { symbol });
     };
     if name.len() >= NAME_MOST || name.as_bytes().contains(&0) {
         return Err(RunModeError::Outside { record, symbol, name: CName::new(name), why: "its name is longer than 511 bytes or holds a NUL" });
     }
-    natives.lookup(name).ok_or(RunModeError::Outside {
-        record,
-        symbol,
-        name: CName::new(name),
-        why: "neither the program's native library nor a library it loads defines it (`dlsym` on its handle)",
-    })
+    match natives.lookup(name) {
+        Some(address) => Ok(address),
+        None if weak => Ok(0),
+        None => Err(RunModeError::Outside {
+            record,
+            symbol,
+            name: CName::new(name),
+            why: "neither the program's native library nor a library it loads defines it (`dlsym` on its handle)",
+        }),
+    }
 }
 
 /// The store's file of `id` under `folder` (no trailing `/`), NUL-terminated, in `out`: its
@@ -347,9 +366,16 @@ pub struct DlNatives {
     /// The open image, once [`Natives::open`] succeeded. Never closed: the program's code runs
     /// from it until the process ends.
     handle: *mut c_void,
+    /// Set by [`DlNatives::open_record`] when the initial thread pre-opened the image so
+    /// `DT_NEEDED` constructors ran on the initial thread before `main`.
+    opened: Option<(RecordId, u64)>,
     said: [u8; SAID_MOST],
     said_len: usize,
 }
+
+// SAFETY: `dlopen` returns an opaque process-global handle valid for `dlsym` from any thread, and
+// ownership of `DlNatives` transfers exclusively once from the initial thread to the control thread.
+unsafe impl Send for DlNatives {}
 
 impl DlNatives {
     /// `folder` is the store's folder, without a trailing `/`; refused when a record's path
@@ -361,7 +387,22 @@ impl DlNatives {
         }
         let mut copy = [0u8; PATH_MOST];
         copy[..folder.len()].copy_from_slice(folder);
-        Ok(DlNatives { folder: copy, folder_len: folder.len(), handle: core::ptr::null_mut(), said: [0; SAID_MOST], said_len: 0 })
+        Ok(DlNatives { folder: copy, folder_len: folder.len(), handle: core::ptr::null_mut(), opened: None, said: [0; SAID_MOST], said_len: 0 })
+    }
+
+    /// Opens `record` from `folder` immediately on the calling thread (so any `DT_NEEDED` library
+    /// constructors execute on the process's initial thread before `main`), returning a `DlNatives`
+    /// whose subsequent [`Natives::open`] for `record` reuses the already-open handle.
+    pub fn open_record(folder: &[u8], record: RecordId) -> Result<DlNatives, RunModeError> {
+        let mut natives = DlNatives::new(folder)?;
+        match natives.open(record) {
+            Ok(base) => {
+                natives.opened = Some((record, base));
+                Ok(natives)
+            }
+            Err(NativeError::Open { record }) => Err(RunModeError::Native(open_refused(record, natives.said()))),
+            Err(why) => Err(RunModeError::Native(why)),
+        }
     }
 
     /// The `dlerror` text of the last failed `dlopen`, for the driver's message.
@@ -391,6 +432,12 @@ impl DlNatives {
 
 impl Natives for DlNatives {
     fn open(&mut self, record: RecordId) -> Result<u64, NativeError> {
+        if let Some((preopened, base)) = self.opened.take() {
+            if preopened == record {
+                return Ok(base);
+            }
+            return Err(NativeError::Twice { record });
+        }
         if !self.handle.is_null() {
             return Err(NativeError::Twice { record });
         }
@@ -506,44 +553,80 @@ impl Natives for DlNatives {
     }
 }
 
-/// Runs the library's initializers in order on the calling thread: the process's first thread,
-/// after the entry is numbered and before it is called (NATIVE.md 3.4, 3.7).
-#[cfg(target_os = "macos")]
-pub fn run_inits(loaded: Loaded) -> Result<(), RunModeError> {
-    use blaze_sys::posix::proc::{_NSGetArgc, _NSGetArgv, _NSGetEnviron};
+/// Runs the library's initializers in order on the calling thread with the pre-captured process
+/// `argc`/`argv` (allocation-free and lock-free, safe to invoke from a lazy stub resolver).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn run_inits_with(loaded: Loaded, argc: core::ffi::c_int, argv: *const *const core::ffi::c_char) -> Result<(), RunModeError> {
+    if loaded.inits == 0 {
+        return Ok(());
+    }
     use core::ffi::{c_char, c_int};
     type Init = extern "C" fn(c_int, *const *const c_char, *const *const c_char);
-    // SAFETY: `_NSGetArgc`, `_NSGetArgv`, `_NSGetEnviron` (<crt_externs.h>) return the
-    // process's own argc, argv and environ, set up by dyld before any code ran; the program
-    // runs in this process, so they are its arguments (the entry's `argv` is the same list).
-    let (argc, argv, envp) = unsafe { (*_NSGetArgc(), *_NSGetArgv(), *_NSGetEnviron()) };
+    #[cfg(target_os = "macos")]
+    let (argc, argv, envp) = {
+        use blaze_sys::posix::proc::{_NSGetArgc, _NSGetArgv, _NSGetEnviron};
+        // SAFETY: `_NSGetArgc`, `_NSGetArgv`, `_NSGetEnviron` (<crt_externs.h>) return the
+        // process's own argc, argv and environ, set up by dyld before any code ran; the program
+        // runs in this process, so they are its arguments (the entry's `argv` is the same list).
+        unsafe {
+            let envp: *const *const c_char = (*_NSGetEnviron()).cast_const().cast();
+            if argv.is_null() {
+                (*_NSGetArgc(), (*_NSGetArgv()).cast_const().cast(), envp)
+            } else {
+                (argc, argv, envp)
+            }
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let (argc, argv, envp) = {
+        unsafe extern "C" {
+            static environ: *const *const c_char;
+        }
+        const EMPTY_ARGV: [*const c_char; 1] = [core::ptr::null()];
+        let (argc, argv) = if argv.is_null() { (0, EMPTY_ARGV.as_ptr()) } else { (argc, argv) };
+        // SAFETY: `run_inits_with` is called only on the process's initial thread before guest
+        // execution begins (images with C initializers load eagerly), so `environ` is immutable
+        // process startup state live for the process's life.
+        let envp = unsafe { environ };
+        (argc, argv, envp)
+    };
     for index in 0..loaded.inits {
         let cell = loaded.inits_at + 8 * u64::from(index);
-        // SAFETY: init cell `index < inits` of the image's `__blaze_inits`, 8-aligned and
-        // readable for the image's life; dyld rebased it at `dlopen` (W3 makes every init cell
-        // a rebase fixup), so it holds an absolute address in the image's text.
+        // SAFETY: init cell `index < inits` of the image's `__blaze_inits` / `.data.blaze_inits`,
+        // 8-aligned and readable for the image's life; dyld (rebase fixup) or ld.so
+        // (`R_AARCH64_RELATIVE`, native_so.rs) rebased it at `dlopen`, so it holds an absolute
+        // address in the image's text.
         let address = unsafe { (cell as *const u64).read_volatile() };
         if address == 0 {
             return Err(RunModeError::Native(NativeError::NullInit { record: loaded.record, index }));
         }
-        // SAFETY: a C initializer of a member the program's link pulled (`__mod_init_func`'s
-        // entry, moved to `__blaze_inits`). dyld calls these as `void (int argc, char **argv,
-        // char **envp, char **apple, const struct ProgramVars *)`; the first three are passed
-        // here, `apple` and `vars` are not (only libSystem's own initializers read them, and
-        // libSystem is never a member); an initializer declared `void (void)` ignores the
-        // arguments (AAPCS64: arguments are registers the callee may ignore).
+        // SAFETY: a C initializer of a member the program's link pulled (`__mod_init_func` on
+        // macOS, `.init_array` on Linux, moved to the image's inits region). Both dyld and glibc
+        // call these as `void (int argc, char **argv, char **envp, ...)`; an initializer declared
+        // `void (void)` ignores the arguments (AAPCS64: arguments are registers the callee may
+        // ignore).
         let init: Init = unsafe { core::mem::transmute(address as usize) };
-        init(argc, argv.cast_const().cast(), envp.cast_const().cast());
+        init(argc, argv, envp);
     }
     Ok(())
 }
 
-/// Linux: the native library is ELF (W5, not built), so an image with initializers is refused
-/// by name rather than called with arguments this driver has not checked.
-#[cfg(not(target_os = "macos"))]
+/// Runs the library's initializers in order on the calling thread: the process's first thread,
+/// after the entry is numbered and before it is called (NATIVE.md 3.4, 3.7).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn run_inits(loaded: Loaded) -> Result<(), RunModeError> {
+    run_inits_with(loaded, 0, core::ptr::null())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn run_inits_with(loaded: Loaded, _argc: core::ffi::c_int, _argv: *const *const core::ffi::c_char) -> Result<(), RunModeError> {
     match loaded.inits {
         0 => Ok(()),
-        _ => Err(RunModeError::NotBuilt { what: "a native library's initializers on Linux (NATIVE.md W5)" }),
+        _ => Err(RunModeError::NotBuilt { what: "a native library's initializers on this platform (NATIVE.md W5)" }),
     }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn run_inits(loaded: Loaded) -> Result<(), RunModeError> {
+    run_inits_with(loaded, 0, core::ptr::null())
 }

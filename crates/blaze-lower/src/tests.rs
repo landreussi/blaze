@@ -216,6 +216,7 @@ fn a_block_item_whose_cfg_is_false_is_no_row() {
 // ---------------------------------------------------------------------------------------------
 // The desugarings, against rustc's (rustc_ast_lowering, as `-Zunpretty=hir` prints them)
 
+/// The refinement: lowering desugars `for` loops (including breaking on `None`) and other Rust syntax forms identically to rustc.
 /// rustc: `match IntoIterator::into_iter(xs) { mut iter => loop { match Iterator::next(&mut
 /// iter) { None => break, Some(x) => { .. } } } }`, the `None` arm first.
 #[test]
@@ -696,7 +697,7 @@ fn for_leaves_on_none(v: &View<'_>) -> Result<(), String> {
         let Ok(Expr::Break { value: None, target: Some(t) }) = v.expr(none.body) else {
             return Err(format!("e{m}: the None arm does not leave its loop"));
         };
-        let Ok(Expr::Loop { body, source: LoopSource::ForLoop }) = v.expr(t) else {
+        let Ok(Expr::Loop { body, source: LoopSource::ForLoop, .. }) = v.expr(t) else {
             return Err(format!("e{m}: the None arm's break leaves e{}, no `for` loop", t.0));
         };
         let holds = match v.expr(body) {
@@ -763,6 +764,57 @@ fn a_where_const_condition_is_a_predicate() {
     let r = v.const_range(cond).expect("its range");
     assert_eq!(v.text_at(r).expect("its text"), "const { false }");
     assert!(dump_of(&l).contains("(const-pred const { false })"), "{}", dump_of(&l));
+}
+
+/// `where for<F in fields(T)> F: FieldCodec + Copy` lowers to `WherePred::ForFields` with exact
+/// `param`, `container`, `subject`, and `bounds`.
+#[test]
+fn a_where_for_fields_predicate_lowers_with_container_subject_and_bounds() {
+    let text = "fn to_json<T>(v: &T, out: &mut Buf) where for<F in fields(T)> F: FieldCodec + Copy {}";
+    let l = signature(text);
+    let v = l.view();
+    assert!(v.diags().next().is_none(), "unexpected diagnostics: {}", dump_of(&l));
+    let rows = v.rows(v.list(crate::columns::head::WHERE)).expect("where rows");
+    assert_eq!(rows.len(), 1, "{}", dump_of(&l));
+    let Ok(WherePred::ForFields { param, container, subject, bounds }) = WherePred::decode(rows[0]) else {
+        panic!("{}", dump_of(&l))
+    };
+    assert_eq!(v.text_at(v.name_range(param).expect("param range")).expect("param text"), "F");
+    assert_eq!(v.text_at(v.type_range(container).expect("container range")).expect("container text"), "T");
+    assert_eq!(v.text_at(v.type_range(subject).expect("subject range")).expect("subject text"), "F");
+    let bound_rows = v.rows(bounds).expect("bound rows");
+    assert_eq!(bound_rows.len(), 2, "{}", dump_of(&l));
+    let Ok(Bound::Trait { ty: b0, .. }) = Bound::decode(bound_rows[0]) else { panic!("{}", dump_of(&l)) };
+    let Ok(Bound::Trait { ty: b1, .. }) = Bound::decode(bound_rows[1]) else { panic!("{}", dump_of(&l)) };
+    assert_eq!(v.text_at(v.type_range(b0).expect("b0 range")).expect("b0 text"), "FieldCodec");
+    assert_eq!(v.text_at(v.type_range(b1).expect("b1 range")).expect("b1 text"), "Copy");
+    assert!(dump_of(&l).contains("(for-fields-pred F"), "{}", dump_of(&l));
+
+    // Also works on impl with generic trait args & compound container types,
+    // and body lowering skips the where clause cleanly.
+    let impl_l = signature("impl<T> FieldCodec for T where for<F in fields(Foo<T>)> F: FieldCodec<Buf> + Copy {}");
+    let iv = impl_l.view();
+    assert!(iv.diags().next().is_none(), "{}", dump_of(&impl_l));
+    let irows = iv.rows(iv.list(crate::columns::head::WHERE)).expect("impl where rows");
+    assert_eq!(irows.len(), 1);
+    let Ok(WherePred::ForFields { param, container, subject, bounds }) = WherePred::decode(irows[0]) else {
+        panic!("{}", dump_of(&impl_l))
+    };
+    assert_eq!(iv.text_at(iv.name_range(param).expect("param")).expect("text"), "F");
+    assert_eq!(iv.text_at(iv.type_range(container).expect("container")).expect("text"), "Foo<T>");
+    assert_eq!(iv.text_at(iv.type_range(subject).expect("subject")).expect("text"), "F");
+    assert_eq!(iv.rows(bounds).expect("bounds").len(), 2);
+
+    let body_l = body("fn to_json<T>(v: &T) -> u32 where for<F in fields(T)> F: FieldCodec + Copy { 42 }");
+    assert!(body_l.view().diags().next().is_none(), "{}", dump_of(&body_l));
+
+    // Unknown binder keyword (not `fields`) records a syntax diagnostic instead of `ForFields`.
+    let bad_l = signature("fn f<T>() where for<F in other(T)> F: Copy {}");
+    let bv = bad_l.view();
+    assert!(bv.diags().next().is_some(), "expected diagnostic for `other(T)`: {}", dump_of(&bad_l));
+    for &row in bv.rows(bv.list(crate::columns::head::WHERE)).expect("bad where rows") {
+        assert!(!matches!(WherePred::decode(row), Ok(WherePred::ForFields { .. })), "{}", dump_of(&bad_l));
+    }
 }
 
 /// A format spec's trait and the arguments its width and precision name.
@@ -979,4 +1031,201 @@ fn a_binding_that_becomes_a_constant_is_lowered_again() {
     assert!(locals(&v).iter().all(|p| matches!(v.pat(*p), Ok(Pat::Bind { .. }))), "every local is a binding");
     assert_eq!(locals(&v).len(), 1, "`n` alone: the arm's `LIMIT` is no local");
     assert_eq!(crate::value_reads_hold(&v, &mut Limit(true)), Ok(true));
+}
+
+#[test]
+fn uniq_and_record_named_args_with_defaults_lower_cleanly() {
+    let h = blaze_own::testing::heap();
+    let alloc = h.alloc();
+    let exts = parser::Extensions::UNIQ.with(parser::Extensions::RECORDS);
+
+    // 1. Signature with `&uniq` and record parameter carrying defaults (`= 0`, `= false`).
+    let sig_text = "fn obj_row(ui: &uniq UiWorld, p: { name: &str, depth: u32 = 0, open: bool = false }) -> u32;";
+    let sig = crate::lower_signature_with_extensions(sig_text, Edition::E2024, exts, &mut Unix, alloc)
+        .expect("signature lowers with UNIQ + RECORDS");
+    let sv = sig.view();
+    assert!(sv.unhandled.is_empty(), "unhandled forms:\n{}", dump_of(&sig));
+    assert!(sv.diags.is_empty(), "diagnostics:\n{}", dump_of(&sig));
+
+    // Verify `&uniq UiWorld` lowered to `TypeRef::Ref { mutbl: Mutbl::Mut, .. }`
+    let has_mut_ref = (0..sv.types.len() as u32)
+        .any(|i| matches!(sv.ty(TypeId(i)), Ok(TypeRef::Ref { mutbl: Mutbl::Mut, .. })));
+    assert!(has_mut_ref, "expected &uniq UiWorld to lower as Mutbl::Mut ref:\n{}", dump_of(&sig));
+
+    // Verify `{ name: &str, depth: u32 = 0, open: bool = false }` lowered to `TypeRef::Record` with 3 fields and 2 defaults.
+    let rec_fields = (0..sv.types.len() as u32)
+        .find_map(|i| match sv.ty(TypeId(i)) {
+            Ok(TypeRef::Record(l)) => Some(l),
+            _ => None,
+        })
+        .expect("expected TypeRef::Record");
+    assert_eq!(rec_fields.len, 3);
+    let rows = sv.rows(rec_fields).expect("record field rows");
+    let f0 = Field::decode(rows[0]).expect("field 0");
+    let f1 = Field::decode(rows[1]).expect("field 1");
+    let f2 = Field::decode(rows[2]).expect("field 2");
+    assert!(f0.default.is_none(), "`name` has no default");
+    assert!(f1.default.is_some(), "`depth` has default `0`");
+    assert!(f2.default.is_some(), "`open` has default `false`");
+
+    // 2. Body with `&uniq self`, `&uniq x`, `ref uniq`, `&uniq pat`, record literal with `..`, and record pattern.
+    let body_text = "fn demo(&uniq self, p: { name: &str, depth: u32 = 0, open: bool = false }) { let { name, depth, .. } = p; let mut x = 1; let r = &uniq x; let ref uniq y = x; let &uniq z = r; call(&uniq x, { name: name, depth: depth, .. }); }";
+    let lowered = crate::lower_body_with_extensions(body_text, Edition::E2024, exts, &mut Unix, &mut crate::NoModule, alloc)
+        .expect("body lowers with UNIQ + RECORDS");
+    let bv = lowered.view();
+    assert!(bv.unhandled.is_empty(), "unhandled forms:\n{}", dump_of(&lowered));
+    assert!(bv.diags.is_empty(), "diagnostics:\n{}", dump_of(&lowered));
+    let has_rec_expr = (0..bv.exprs.len() as u32)
+        .any(|i| matches!(bv.expr(ExprId(i)), Ok(Expr::Record { base: StructBase::Defaults, .. })));
+    assert!(has_rec_expr, "expected Expr::Record with Defaults:\n{}", dump_of(&lowered));
+    let has_rec_pat = (0..bv.pats.len() as u32)
+        .any(|i| matches!(bv.pat(PatId(i)), Ok(Pat::Record { rest: true, .. })));
+    assert!(has_rec_pat, "expected Pat::Record with rest:\n{}", dump_of(&lowered));
+
+    // Also verify all-defaults `{ .. }` literal lowers cleanly as `Expr::Record { fields: empty, base: Defaults }`.
+    let all_def_body = "fn call_defaults() { open(\"p\", { .. }); }";
+    let lowered_def = crate::lower_body_with_extensions(all_def_body, Edition::E2024, exts, &mut Unix, &mut crate::NoModule, alloc)
+        .expect("all-defaults `{ .. }` lowers");
+    let dv = lowered_def.view();
+    assert!(dv.unhandled.is_empty(), "unhandled:\n{}", dump_of(&lowered_def));
+    assert!(dv.diags.is_empty(), "diags:\n{}", dump_of(&lowered_def));
+    assert!(
+        (0..dv.exprs.len() as u32)
+            .any(|i| matches!(dv.expr(ExprId(i)), Ok(Expr::Record { fields, base: StructBase::Defaults }) if fields.len == 0)),
+        "expected empty Expr::Record with Defaults:\n{}",
+        dump_of(&lowered_def)
+    );
+}
+
+#[test]
+fn inline_for_lowers_without_into_iter_desugaring() {
+    let h = blaze_own::testing::heap();
+    let alloc = h.alloc();
+    let exts = parser::Extensions::RECORDS;
+    let src = "fn demo(r: { a: u32, b: i32 }) { inline for f in r { use_field(f); } inline for (k, v) in &r { inspect(k, v); } }";
+    let lowered = crate::lower_body_with_extensions(src, Edition::E2024, exts, &mut Unix, &mut crate::NoModule, alloc)
+        .expect("inline for lowers");
+    let v = lowered.view();
+    assert!(v.unhandled.is_empty(), "unhandled:\n{}", dump_of(&lowered));
+    assert!(v.diags.is_empty(), "diags:\n{}", dump_of(&lowered));
+    assert_eq!(v.langs().count(), 0, "inline for must not desugar to IntoIterator lang items");
+    let inline_count = (0..v.exprs.len() as u32)
+        .filter(|&i| matches!(v.expr(ExprId(i)), Ok(Expr::InlineFor { .. })))
+        .count();
+    assert_eq!(inline_count, 2, "expected 2 Expr::InlineFor nodes:\n{}", dump_of(&lowered));
+}
+
+#[test]
+fn error_unions_and_typed_binding_patterns_lower_cleanly() {
+    let h = blaze_own::testing::heap();
+    let alloc = h.alloc();
+    let exts = parser::Extensions::ERROR_UNIONS;
+
+    // 1. Signature with union type `OutError | FsError | Stopped` lowers to `TypeRef::Union` with 3 members.
+    let sig_text = "fn load() -> Result<(), OutError | FsError | Stopped>;";
+    let sig = crate::lower_signature_with_extensions(sig_text, Edition::E2024, exts, &mut Unix, alloc)
+        .expect("union signature lowers");
+    let sv = sig.view();
+    assert!(sv.unhandled.is_empty(), "unhandled:\n{}", dump_of(&sig));
+    assert!(sv.diags.is_empty(), "diags:\n{}", dump_of(&sig));
+    let union_members = (0..sv.types.len() as u32)
+        .find_map(|i| match sv.ty(TypeId(i)) {
+            Ok(TypeRef::Union(l)) => Some(l),
+            _ => None,
+        })
+        .expect("expected TypeRef::Union");
+    assert_eq!(union_members.len, 3);
+
+    // 2. Typed binding patterns `Err(e: FsError)` and `Err(_: Stopped)` parse and lower cleanly with 0 errors.
+    let body_text = "fn handle(res: Result<(), FsError | Stopped>) { let x: u32 = 1; match res { Ok(()) => {} Err(e: FsError) => { let _ = e; } Err(_: Stopped) => {} } }";
+    let lowered = crate::lower_body_with_extensions(body_text, Edition::E2024, exts, &mut Unix, &mut crate::NoModule, alloc)
+        .expect("typed binding pattern lowers");
+    let bv = lowered.view();
+    assert!(bv.unhandled.is_empty(), "unhandled:\n{}", dump_of(&lowered));
+    assert!(bv.diags.is_empty(), "diags:\n{}", dump_of(&lowered));
+
+    // 3. `Result<Row, FsError | Stopped>` and `Result<Row, _>` lower cleanly with 0 unhandled nodes.
+    let result_sig = "fn load(p: &Path) -> Result<Row, FsError | Stopped>;";
+    let rsig = crate::lower_signature_with_extensions(result_sig, Edition::E2024, exts, &mut Unix, alloc)
+        .expect("Result<T, E1 | E2> signature lowers");
+    let rsv = rsig.view();
+    assert!(rsv.unhandled.is_empty(), "unhandled:\n{}", dump_of(&rsig));
+    assert!(rsv.diags.is_empty(), "diags:\n{}", dump_of(&rsig));
+    assert!(
+        (0..rsv.types.len() as u32).any(|i| matches!(rsv.ty(TypeId(i)), Ok(TypeRef::Union(l)) if l.len == 2)),
+        "expected TypeRef::Union(2) in Result<Row, FsError | Stopped>:\n{}",
+        dump_of(&rsig)
+    );
+
+    let infer_sig = "fn helper() -> Result<Row, _>;";
+    let isig = crate::lower_signature_with_extensions(infer_sig, Edition::E2024, exts, &mut Unix, alloc)
+        .expect("Result<T, _> signature lowers");
+    let isv = isig.view();
+    assert!(isv.unhandled.is_empty(), "unhandled:\n{}", dump_of(&isig));
+    assert!(isv.diags.is_empty(), "diags:\n{}", dump_of(&isig));
+    assert!(
+        (0..isv.types.len() as u32).any(|i| matches!(isv.ty(TypeId(i)), Ok(TypeRef::Infer))),
+        "expected TypeRef::Infer in Result<Row, _>:\n{}",
+        dump_of(&isig)
+    );
+}
+
+#[test]
+fn record_type_spread_lowers_cleanly() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let exts = parser::Extensions::RECORDS;
+
+    let actor_src = "type Actor = { ..Transform, hp: u32 = 100 };";
+    let actor = crate::lower_signature_with_extensions(actor_src, Edition::E2024, exts, &mut Unix, alloc)
+        .expect("Actor spread alias lowers");
+    let av = actor.view();
+    assert!(av.unhandled.is_empty(), "unhandled:\n{}", dump_of(&actor));
+    assert!(av.diags.is_empty(), "diags:\n{}", dump_of(&actor));
+    let actor_fields = (0..av.types.len() as u32)
+        .find_map(|i| match av.ty(TypeId(i)) {
+            Ok(TypeRef::Record(l)) => Some(l),
+            _ => None,
+        })
+        .expect("expected TypeRef::Record for Actor");
+    assert_eq!(actor_fields.len, 2);
+    let arows = av.rows(actor_fields).expect("Actor field rows");
+    let af0 = Field::decode(arows[0]).expect("spread field");
+    let af1 = Field::decode(arows[1]).expect("hp field");
+    assert!(af0.name.is_none(), "spread `..Transform` must have name: None");
+    assert!(af0.default.is_none(), "spread `..Transform` must have default: None");
+    assert_eq!(av.text_at(av.type_range(af0.ty).expect("spread ty range")).expect("spread ty text").trim(), "Transform");
+    assert_eq!(av.name_text(af1.name.expect("hp name")).expect("hp name text"), "hp");
+    assert!(af1.default.is_some(), "`hp` must keep its default `100`");
+
+    let boss_src = "type Boss = { ..Actor, ..Combat, hp: u32 = 500, shield: u32 = 50 };";
+    let boss = crate::lower_signature_with_extensions(boss_src, Edition::E2024, exts, &mut Unix, alloc)
+        .expect("Boss multi-spread alias lowers");
+    let bv = boss.view();
+    assert!(bv.unhandled.is_empty(), "unhandled:\n{}", dump_of(&boss));
+    assert!(bv.diags.is_empty(), "diags:\n{}", dump_of(&boss));
+    let boss_fields = (0..bv.types.len() as u32)
+        .find_map(|i| match bv.ty(TypeId(i)) {
+            Ok(TypeRef::Record(l)) => Some(l),
+            _ => None,
+        })
+        .expect("expected TypeRef::Record for Boss");
+    assert_eq!(boss_fields.len, 4);
+    let brows = bv.rows(boss_fields).expect("Boss field rows");
+    assert!(Field::decode(brows[0]).expect("f0").name.is_none());
+    assert!(Field::decode(brows[1]).expect("f1").name.is_none());
+    assert!(Field::decode(brows[2]).expect("f2").name.is_some());
+    assert!(Field::decode(brows[3]).expect("f3").name.is_some());
+
+    // Generic argument starting with a spread: `Vec<{ ..Transform, hp: u32 }>`.
+    let generic_src = "fn list(xs: Vec<{ ..Transform, hp: u32 }>) -> u32;";
+    let generic = crate::lower_signature_with_extensions(generic_src, Edition::E2024, exts, &mut Unix, alloc)
+        .expect("generic arg spread lowers");
+    let gv = generic.view();
+    assert!(gv.unhandled.is_empty(), "unhandled:\n{}", dump_of(&generic));
+    assert!(gv.diags.is_empty(), "diags:\n{}", dump_of(&generic));
+    assert!(
+        (0..gv.types.len() as u32).any(|i| matches!(gv.ty(TypeId(i)), Ok(TypeRef::Record(l)) if l.len == 2)),
+        "expected TypeRef::Record(2) inside Vec<...>:\n{}",
+        dump_of(&generic)
+    );
 }

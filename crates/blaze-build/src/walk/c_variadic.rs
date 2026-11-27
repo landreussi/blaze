@@ -41,7 +41,7 @@ const UNSAID: &str = "a call of a C-variadic fn whose unwind category (\"C\" or 
 const UNPROMOTED: &str = "a variable argument narrower than `c_int`, a `bool` or an `f32` (C's default promotions; the checker refuses it, E0617)";
 const AGGREGATE: &str = "an aggregate, a wide pointer or a value-less type passed to `...` (not built)";
 
-impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
+impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// Whether a C-variadic callee of `abi` whose unwind category is `nounwind`
     /// ([`crate::Adts::nounwind`]) is built (as a plain call: module doc), or its refusal by name.
     /// The builder's `Abi` has no `system` or unwinding form (the front end maps "C", "C-unwind",
@@ -72,14 +72,14 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// [`Walk::emit_call`] with `declared`: `Some(n)` for a C-variadic callee whose first `n`
     /// of `passes` are its declared parameters (the rest the `...` ones), `None` for any other
     /// call. One home for building a call: `emit_call` is this with `None`.
-    pub(super) fn emit_call_from(&mut self, callee: Callee, reprs: &[Repr], passes: &[Pass], declared: Option<usize>, rrepr: Repr, rpass: Pass) -> Result<(), BuildError> {
+    pub(super) fn emit_call_from(&mut self, callee: Callee, reprs: &[Repr], passes: &[Pass], declared: Option<usize>, callee_nounwind: bool, rrepr: Repr, rpass: Pass) -> Result<(), BuildError> {
         let named = match declared {
             Some(n) if n <= passes.len() => &passes[..n],
             Some(_) => return Err(malformed("a C-variadic call with fewer arguments than declared parameters (the checker's E0061)")),
             None => passes,
         };
         let (params, rets) = self.sig_of(named, rpass);
-        let mut values = Vec::with_capacity_in(params.len(), self.alloc.clone());
+        let mut values = Vec::with_capacity_in(params.len(), self.alloc);
         // The result's slot, the callee's to write.
         let result = match rpass {
             Pass::Ref | Pass::Memory { .. } => {
@@ -91,12 +91,32 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         };
         let n = reprs.len();
         let base = self.vals.len().checked_sub(n).ok_or(malformed("a call's arguments missing from the value stack (a build bug)"))?;
+        let mut arg_temps: blaze_own::Vec<blaze_lir::func::SlotId, A> = blaze_own::Vec::new_in(self.alloc);
         for i in 0..n {
-            let v = self.vals[base + i];
-            self.pass_arg(v, reprs[i], passes[i], &mut values)?;
+            let (&v, &repr, &pass) = match (self.vals.get(base + i), reprs.get(i), passes.get(i)) {
+                (Some(v), Some(r), Some(p)) => (v, r, p),
+                _ => return Err(malformed("a call's arguments missing from the value stack (a build bug)")),
+            };
+            if let super::V::Place(p, off) = v
+                && let Some(slot) = self.whole_slot((p, off))
+            {
+                arg_temps.push(slot);
+            }
+            if let Some(slot) = self.pass_arg(v, repr, pass, &mut values)? {
+                arg_temps.push(slot);
+            }
         }
         self.truncate_vals(base);
         let r = match declared {
+            None if callee_nounwind => {
+                // A non-unwinding callee (`extern "C"`, `#[rustc_nounwind]`) cannot unwind: a plain
+                // call, no landing pad or terminate block.
+                let sig = self.b.sig(Conv::C, Variadic::No, &params, &rets);
+                match callee {
+                    Callee::Direct(reference) => self.b.call(Flags::NONE, reference, sig, &values),
+                    Callee::Pointer(p) => self.b.call_indirect(Flags::NONE, p, sig, &values),
+                }
+            }
             None => {
                 let sig = self.b.sig(Conv::C, Variadic::No, &params, &rets);
                 self.call_unwinding(callee, sig, &values)?
@@ -110,12 +130,15 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 }
             }
         };
+        for slot in arg_temps {
+            self.end_temp_slot(slot);
+        }
         let v = match (result, rets.len()) {
             (Some(at), _) => V::Place(at.0, at.1),
             (None, 0) => self.take_passed(rrepr, rpass, &mut core::iter::empty())?,
             (None, 1) => self.take_passed(rrepr, rpass, &mut core::iter::once(r))?,
             (None, k) => {
-                let mut parts = Vec::with_capacity_in(k, self.alloc.clone());
+                let mut parts = Vec::with_capacity_in(k, self.alloc);
                 for i in 0..k as u32 {
                     parts.push(self.b.project(r, i));
                 }

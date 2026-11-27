@@ -63,7 +63,7 @@ fn one_refused_fn_is_counted_and_the_survey_goes_on() {
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the survey's frame");
     let mut left_out = Vec::new_in(Global);
     let mut program = Front2Program::survey(&names, &frame, &files, &mut left_out, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("BUILDS: no survey: {e}"));
@@ -75,6 +75,6 @@ fn one_refused_fn_is_counted_and_the_survey_goes_on() {
     println!("BUILDS: {} of {} instances ({} refused: {})", counts.built, counts.tried, rows.len(), rows.join("; "));
     assert_eq!(rows.len(), 1, "one refused instance: {rows:?}");
     assert!(refused[0].0.contains("half"), "the refused fn is `half`: {rows:?}");
-    assert!(refused[0].1.contains("f16"), "the cause names `f16`: {rows:?}");
+    assert!(refused[0].1.contains("NoLiteralValue"), "the cause names the missing literal value: {rows:?}");
     assert_eq!((counts.built, counts.tried), (2, 3), "`main` and `fine` built, `half` tried and refused: {rows:?}");
 }

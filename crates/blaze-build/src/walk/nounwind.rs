@@ -51,7 +51,7 @@ use crate::{Abi, BuildError, Instance, Panic};
 /// The lang item a nounwind body's terminate block calls (core/src/panicking.rs:348).
 const CANNOT_UNWIND_FN: &str = "panic_cannot_unwind";
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Whether the body being built may not unwind: its fn's own ABI is non-unwinding, or it is
     /// `#[rustc_nounwind]` (set once by [`Self::mark_nounwind`] before the body is walked).
     pub(super) fn is_nounwind(&self) -> bool {
@@ -86,8 +86,12 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             }
         };
         self.nounwind = nounwind;
+        let mut attrs = if body { self.adts.fn_attrs(owner) } else { FnAttrs::default() };
         if nounwind {
-            self.b.set_attrs(FnAttrs(FnAttrs::NOUNWIND));
+            attrs.0 |= FnAttrs::NOUNWIND;
+        }
+        if attrs.0 != 0 {
+            self.b.set_attrs(attrs);
         }
         Ok(())
     }

@@ -197,6 +197,7 @@ impl NativeProcMacroServer {
     }
 
     /// Expands a single proc-macro call natively against `dylib_path` (zero Wasmtime!).
+    #[expect(clippy::too_many_arguments, reason = "mirrors ProcMacros::run_why parameters")]
     pub fn expand_macro<'a>(
         &mut self,
         dylib_path: &Path,
@@ -205,14 +206,26 @@ impl NativeProcMacroServer {
         edition: Edition,
         env: &[(&str, &str)],
         current_dir: Option<&str>,
+        path_remap: Option<(&str, &str)>,
         alloc: Alloc<'a>,
     ) -> Result<Produced<'a>, NativeBridgeError> {
+        const SPAN_CALL_SITE: u32 = 0;
+        const SPAN_MIXED_SITE: u32 = 1;
+        const SPAN_DEF_SITE: u32 = 2;
+        const SPAN_TOKEN_BASE: u32 = 3;
+
         let lib_esc = json_escape(&dylib_path.to_string_lossy());
         let name_esc = json_escape(macro_name);
-        let body_json = encode_flat_tree_json(call.input);
-        let attr_json = match call.attr_args {
-            Some(args) => encode_flat_tree_json(args),
-            None => "null".to_owned(),
+        let input_len = u32::try_from(call.input.tokens().len()).unwrap_or(u32::MAX - SPAN_TOKEN_BASE);
+        let attr_len = call.attr_args.map_or(0, |args| u32::try_from(args.tokens().len()).unwrap_or(0));
+        let body_json = encode_flat_tree_json(call.input, SPAN_TOKEN_BASE);
+        let attr_owned = call.attr_args.map(|args| encode_flat_tree_json(args, SPAN_TOKEN_BASE.saturating_add(input_len)));
+        let attr_json: &str = match attr_owned.as_deref() {
+            Some(s) => s,
+            None if call.kind == ProcKind::Attr => {
+                r#"{"subtree":[0,0,0,0,0],"literal":[],"punct":[],"ident":[],"token_tree":[],"text":[]}"#
+            }
+            None => "null",
         };
         let cwd_json = match current_dir {
             Some(dir) => format!("\"{}\"", json_escape(dir)),
@@ -232,10 +245,10 @@ impl NativeProcMacroServer {
         env_json.push(']');
 
         let req = format!(
-            r#"{{"ExpandMacro":{{"lib":"{lib_esc}","env":{env_json},"current_dir":{cwd_json},"macro_name":"{name_esc}","macro_body":{body_json},"attributes":{attr_json},"has_global_spans":{{"serialize":false,"def_site":0,"call_site":0,"mixed_site":0}},"span_data_table":[]}}}}"#
+            r#"{{"ExpandMacro":{{"lib":"{lib_esc}","env":{env_json},"current_dir":{cwd_json},"macro_name":"{name_esc}","macro_body":{body_json},"attributes":{attr_json},"has_global_spans":{{"serialize":false,"def_site":{SPAN_DEF_SITE},"call_site":{SPAN_CALL_SITE},"mixed_site":{SPAN_MIXED_SITE}}},"span_data_table":[]}}}}"#
         );
         let reply = self.roundtrip(&req)?;
-        parse_expand_macro_reply(&reply, edition, alloc)
+        parse_expand_macro_reply(&reply, edition, input_len, attr_len, path_remap, alloc)
     }
 }
 
@@ -267,6 +280,7 @@ impl NativeServerPool {
         edition: Edition,
         env: &[(&str, &str)],
         current_dir: Option<&str>,
+        path_remap: Option<(&str, &str)>,
         alloc: Alloc<'a>,
     ) -> Result<Produced<'a>, NativeBridgeError> {
         let mut srv = {
@@ -277,7 +291,7 @@ impl NativeServerPool {
             Some(s) => s,
             None => NativeProcMacroServer::spawn()?,
         };
-        match worker.expand_macro(dylib_path, macro_name, call, edition, env, current_dir, alloc) {
+        match worker.expand_macro(dylib_path, macro_name, call, edition, env, current_dir, path_remap, alloc) {
             Ok(produced) => {
                 let mut guard = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if guard.len() < 32 {
@@ -289,7 +303,7 @@ impl NativeServerPool {
                 // Worker may have crashed on a hostile macro; drop dead worker and retry once fresh.
                 drop(worker);
                 let mut fresh = NativeProcMacroServer::spawn()?;
-                let res = fresh.expand_macro(dylib_path, macro_name, call, edition, env, current_dir, alloc);
+                let res = fresh.expand_macro(dylib_path, macro_name, call, edition, env, current_dir, path_remap, alloc);
                 if res.is_ok() {
                     let mut guard = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     if guard.len() < 32 {
@@ -309,10 +323,13 @@ impl NativeServerPool {
     }
 }
 
-/// Encodes a `blaze_expand::TokenStream` into a rust-analyzer API v6 `FlatTree` JSON object.
-pub fn encode_flat_tree_json(stream: &TokenStream<'_>) -> String {
+/// Encodes a `blaze_expand::TokenStream` into a rust-analyzer API v6 `FlatTree` JSON object,
+/// tagging each token at index `i` with span ID `span_offset + i` so the native proc-macro
+/// server preserves token origins and macro hygiene (`$crate`, `Span::call_site`, `mixed_site`,
+/// `def_site`) losslessly across the expansion boundary.
+pub fn encode_flat_tree_json(stream: &TokenStream<'_>, span_offset: u32) -> String {
     enum Node {
-        Subtree { delim: u32, children: Vec<Node> },
+        Subtree { open_span: u32, close_span: u32, delim: u32, children: Vec<Node> },
         Leaf(u32),
     }
 
@@ -333,8 +350,9 @@ pub fn encode_flat_tree_json(stream: &TokenStream<'_>) -> String {
     let mut idents: Vec<u32> = Vec::new();
 
     // Pass 1: build nested tree from linear Open/Close token stream.
-    let mut stack: Vec<(u32, Vec<Node>)> = vec![(0, Vec::new())];
-    for tok in stream.tokens() {
+    let mut stack: Vec<(u32, u32, Vec<Node>)> = vec![(0, 0, Vec::new())];
+    for (tok_idx, tok) in stream.tokens().iter().enumerate() {
+        let span = span_offset.saturating_add(u32::try_from(tok_idx).unwrap_or(u32::MAX));
         match tok.kind {
             TokenKind::Open(delim) => {
                 let d = match delim {
@@ -343,29 +361,29 @@ pub fn encode_flat_tree_json(stream: &TokenStream<'_>) -> String {
                     Delim::Brace => 2,
                     Delim::Bracket => 3,
                 };
-                stack.push((d, Vec::new()));
+                stack.push((d, span, Vec::new()));
             }
             TokenKind::Close(_) => {
                 if stack.len() > 1 {
-                    let (delim, children) = stack.pop().unwrap();
-                    stack.last_mut().unwrap().1.push(Node::Subtree { delim, children });
+                    let (delim, open_span, children) = stack.pop().unwrap();
+                    stack.last_mut().unwrap().2.push(Node::Subtree { open_span, close_span: span, delim, children });
                 }
             }
             TokenKind::Ident { raw, .. } => {
                 let tid = intern(stream.text_of(tok));
                 let idx = (idents.len() / 3) as u32;
                 let is_raw = if raw == Raw::Yes { 1 } else { 0 };
-                idents.extend_from_slice(&[0, tid, is_raw]);
-                stack.last_mut().unwrap().1.push(Node::Leaf((idx << 2) | 3));
+                idents.extend_from_slice(&[span, tid, is_raw]);
+                stack.last_mut().unwrap().2.push(Node::Leaf((idx << 2) | 3));
             }
             TokenKind::Punct { char: ch, spacing } => {
                 let idx = (puncts.len() / 3) as u32;
                 let sp = match spacing {
-                    Spacing::Alone => 0,
-                    Spacing::Joint | Spacing::JointHidden => 1,
+                    Spacing::Alone | Spacing::JointHidden => 0,
+                    Spacing::Joint => 1,
                 };
-                puncts.extend_from_slice(&[0, ch as u32, sp]);
-                stack.last_mut().unwrap().1.push(Node::Leaf((idx << 2) | 2));
+                puncts.extend_from_slice(&[span, ch as u32, sp]);
+                stack.last_mut().unwrap().2.push(Node::Leaf((idx << 2) | 2));
             }
             TokenKind::Literal { kind, suffix_len, .. } => {
                 let full = stream.text_of(tok);
@@ -387,16 +405,16 @@ pub fn encode_flat_tree_json(stream: &TokenStream<'_>) -> String {
                     LitKind::CStrRaw(h) => 10 | ((h as u32) << 8),
                 };
                 let idx = (literals.len() / 4) as u32;
-                literals.extend_from_slice(&[0, body_id, kind_u32, suffix_id]);
-                stack.last_mut().unwrap().1.push(Node::Leaf((idx << 2) | 1));
+                literals.extend_from_slice(&[span, body_id, kind_u32, suffix_id]);
+                stack.last_mut().unwrap().2.push(Node::Leaf((idx << 2) | 1));
             }
         }
     }
     while stack.len() > 1 {
-        let (delim, children) = stack.pop().unwrap();
-        stack.last_mut().unwrap().1.push(Node::Subtree { delim, children });
+        let (delim, open_span, children) = stack.pop().unwrap();
+        stack.last_mut().unwrap().2.push(Node::Subtree { open_span, close_span: open_span, delim, children });
     }
-    let (root_delim, root_children) = stack.pop().unwrap();
+    let (root_delim, _, root_children) = stack.pop().unwrap();
 
     // Pass 2: BFS-flatten subtrees so each subtree's children are a contiguous range in `token_tree`.
     let mut subtrees: Vec<u32> = Vec::new();
@@ -410,9 +428,9 @@ pub fn encode_flat_tree_json(stream: &TokenStream<'_>) -> String {
         for child in children {
             match child {
                 Node::Leaf(encoded) => token_tree.push(encoded),
-                Node::Subtree { delim, children: grand } => {
+                Node::Subtree { open_span, close_span, delim, children: grand } => {
                     let child_idx = subtrees.len() / 5;
-                    subtrees.extend_from_slice(&[0, 0, delim, 0, 0]);
+                    subtrees.extend_from_slice(&[open_span, close_span, delim, 0, 0]);
                     token_tree.push((child_idx as u32) << 2);
                     queue.push_back((child_idx, grand));
                 }
@@ -579,12 +597,51 @@ fn parse_string_array(json: &str, key: &str) -> Result<Vec<String>, NativeBridge
     Ok(out)
 }
 
+/// Maps a `FlatTree` span ID back to a `blaze_expand::TokenOrigin`.
+fn origin_of_span(span: u32, input_len: u32, attr_len: u32) -> TokenOrigin {
+    const SPAN_CALL_SITE: u32 = 0;
+    const SPAN_MIXED_SITE: u32 = 1;
+    const SPAN_DEF_SITE: u32 = 2;
+    const SPAN_TOKEN_BASE: u32 = 3;
+    match span {
+        SPAN_CALL_SITE => TokenOrigin::Made(Transparency::Transparent),
+        SPAN_MIXED_SITE => TokenOrigin::Made(Transparency::SemiOpaque),
+        SPAN_DEF_SITE => TokenOrigin::Made(Transparency::Opaque),
+        s => {
+            let rel = s - SPAN_TOKEN_BASE;
+            if rel < input_len {
+                TokenOrigin::Input(rel)
+            } else if rel - input_len < attr_len {
+                TokenOrigin::AttrArgs(rel - input_len)
+            } else {
+                TokenOrigin::Made(Transparency::Transparent)
+            }
+        }
+    }
+}
+
 /// Decodes a rust-analyzer API v6 `FlatTree` JSON object directly into a `blaze_expand::TokenStream`.
 pub fn decode_flat_tree_json<'a>(
     json: &str,
     edition: Edition,
     alloc: Alloc<'a>,
 ) -> Result<TokenStream<'a>, NativeBridgeError> {
+    decode_flat_tree_json_with_origins(json, edition, 0, 0, None, alloc).map(|(stream, _)| stream)
+}
+
+/// Decodes a rust-analyzer API v6 `FlatTree` JSON object into a `blaze_expand::TokenStream` and
+/// its per-token [`TokenOrigin`] column (preserving `Input`, `AttrArgs`, `call_site`, `mixed_site`,
+/// and `def_site` hygiene). When `path_remap = Some((host_dir, virtual_dir))`, string literals
+/// beginning with `host_dir` (e.g. from `sol!`'s `include_bytes!(CARGO_MANIFEST_DIR/...)`) are
+/// mapped back to `virtual_dir` so expansions remain hermetic and machine-independent (D60/D96).
+fn decode_flat_tree_json_with_origins<'a>(
+    json: &str,
+    edition: Edition,
+    input_len: u32,
+    attr_len: u32,
+    path_remap: Option<(&str, &str)>,
+    alloc: Alloc<'a>,
+) -> Result<(TokenStream<'a>, OVec<TokenOrigin, Alloc<'a>>), NativeBridgeError> {
     let ctx = Ctx::root(edition);
     let subtrees = parse_u32_array(json, "subtree")?;
     let literals = parse_u32_array(json, "literal")?;
@@ -594,29 +651,48 @@ pub fn decode_flat_tree_json<'a>(
     let texts = parse_string_array(json, "text")?;
 
     let mut stream = TokenStream::new_in(alloc);
+    let mut origins = OVec::with_capacity_in(token_tree.len(), alloc);
     if subtrees.len() < 5 {
-        return Ok(stream);
+        return Ok((stream, origins));
     }
 
     enum Step {
         Tree(usize),
-        Close(Delim),
+        Close(Delim, u32),
     }
 
-    // Walk iteratively starting from root subtree 0 (its Invisible delimiters are implicit).
+    // Walk iteratively starting from root subtree 0. When a proc macro returns a single
+    // delimited group (e.g. `paste::paste! {{ ... }}` returning a block expression `{ ... }`),
+    // `rust-analyzer-proc-macro-srv` collapses that group into root subtree 0 with a non-zero
+    // delimiter (`1` Paren, `2` Brace, `3` Bracket); only `0` (Invisible) is implicit.
+    let stream_err = |what: &'static str, e: blaze_expand::StreamError| {
+        NativeBridgeError::Failed(format!("token stream {what}: {e:?}"))
+    };
     let mut stack: Vec<Step> = Vec::new();
+    let root_open_span = subtrees[0];
+    let root_close_span = subtrees[1];
+    let root_delim = match subtrees[2] {
+        1 => Some(Delim::Paren),
+        2 => Some(Delim::Brace),
+        3 => Some(Delim::Bracket),
+        _ => None,
+    };
     let root_start = subtrees[3] as usize;
     let root_end = subtrees[4] as usize;
+    if let Some(delim) = root_delim {
+        stream.open(delim, ctx).map_err(|e| stream_err("open", e))?;
+        origins.push(origin_of_span(root_open_span, input_len, attr_len));
+        stack.push(Step::Close(delim, root_close_span));
+    }
     for idx in (root_start..root_end.min(token_tree.len())).rev() {
         stack.push(Step::Tree(idx));
     }
 
     while let Some(step) = stack.pop() {
         match step {
-            Step::Close(delim) => {
-                stream
-                    .close(delim, ctx)
-                    .map_err(|e| NativeBridgeError::Failed(format!("token stream close: {e:?}")))?;
+            Step::Close(delim, close_span) => {
+                stream.close(delim, ctx).map_err(|e| stream_err("close", e))?;
+                origins.push(origin_of_span(close_span, input_len, attr_len));
             }
             Step::Tree(tt_pos) => {
                 let encoded = token_tree[tt_pos];
@@ -628,6 +704,8 @@ pub fn decode_flat_tree_json<'a>(
                         if base + 5 > subtrees.len() {
                             return Err(NativeBridgeError::Protocol("subtree index out of range".to_owned()));
                         }
+                        let open_span = subtrees.get(base).copied().unwrap_or(0);
+                        let close_span = subtrees.get(base + 1).copied().unwrap_or(0);
                         let delim = match subtrees[base + 2] {
                             1 => Delim::Paren,
                             2 => Delim::Brace,
@@ -636,10 +714,9 @@ pub fn decode_flat_tree_json<'a>(
                         };
                         let start = subtrees[base + 3] as usize;
                         let end = subtrees[base + 4] as usize;
-                        stream
-                            .open(delim, ctx)
-                            .map_err(|e| NativeBridgeError::Failed(format!("token stream open: {e:?}")))?;
-                        stack.push(Step::Close(delim));
+                        stream.open(delim, ctx).map_err(|e| stream_err("open", e))?;
+                        origins.push(origin_of_span(open_span, input_len, attr_len));
+                        stack.push(Step::Close(delim, close_span));
                         for c in (start..end.min(token_tree.len())).rev() {
                             stack.push(Step::Tree(c));
                         }
@@ -649,6 +726,7 @@ pub fn decode_flat_tree_json<'a>(
                         if base + 4 > literals.len() {
                             return Err(NativeBridgeError::Protocol("literal index out of range".to_owned()));
                         }
+                        let span = literals.get(base).copied().unwrap_or(0);
                         let text_idx = literals[base + 1] as usize;
                         let kind_raw = literals[base + 2];
                         let suffix_idx = literals[base + 3];
@@ -675,7 +753,16 @@ pub fn decode_flat_tree_json<'a>(
                             _ => LitKind::Err,
                         };
                         let mut combined = String::with_capacity(body.len() + suffix.len());
-                        combined.push_str(body);
+                        if matches!(kind, LitKind::Str | LitKind::StrRaw(_))
+                            && let Some((host_dir, virt_dir)) = path_remap
+                            && let Some(rest) = body.strip_prefix(host_dir)
+                            && (rest.is_empty() || rest.starts_with('/'))
+                        {
+                            combined.push_str(virt_dir);
+                            combined.push_str(rest);
+                        } else {
+                            combined.push_str(body);
+                        }
                         combined.push_str(suffix);
                         stream
                             .push(
@@ -688,23 +775,27 @@ pub fn decode_flat_tree_json<'a>(
                                 ctx,
                             )
                             .map_err(|e| NativeBridgeError::Failed(format!("push literal: {e:?}")))?;
+                        origins.push(origin_of_span(span, input_len, attr_len));
                     }
                     2 => {
                         let base = idx * 3;
                         if base + 3 > puncts.len() {
                             return Err(NativeBridgeError::Protocol("punct index out of range".to_owned()));
                         }
+                        let span = puncts.get(base).copied().unwrap_or(0);
                         let ch = char::from_u32(puncts[base + 1]).unwrap_or('?');
                         let spacing = if puncts[base + 2] == 1 { Spacing::Joint } else { Spacing::Alone };
                         stream
                             .push(TokenKind::Punct { char: ch, spacing }, "", ctx)
                             .map_err(|e| NativeBridgeError::Failed(format!("push punct: {e:?}")))?;
+                        origins.push(origin_of_span(span, input_len, attr_len));
                     }
                     _ => {
                         let base = idx * 3;
                         if base + 3 > idents.len() {
                             return Err(NativeBridgeError::Protocol("ident index out of range".to_owned()));
                         }
+                        let span = idents.get(base).copied().unwrap_or(0);
                         let text_idx = idents[base + 1] as usize;
                         let is_raw = idents[base + 2] != 0;
                         let name = texts
@@ -720,18 +811,22 @@ pub fn decode_flat_tree_json<'a>(
                         stream
                             .push(TokenKind::Ident { raw, spacing: Spacing::Alone }, clean, ctx)
                             .map_err(|e| NativeBridgeError::Failed(format!("push ident: {e:?}")))?;
+                        origins.push(origin_of_span(span, input_len, attr_len));
                     }
                 }
             }
         }
     }
 
-    Ok(stream)
+    Ok((stream, origins))
 }
 
 fn parse_expand_macro_reply<'a>(
     reply: &str,
     edition: Edition,
+    input_len: u32,
+    attr_len: u32,
+    path_remap: Option<(&str, &str)>,
     alloc: Alloc<'a>,
 ) -> Result<Produced<'a>, NativeBridgeError> {
     if let Some(err_pos) = reply.find(r#""Err":"#) {
@@ -761,11 +856,7 @@ fn parse_expand_macro_reply<'a>(
         .find(r#""Ok":"#)
         .ok_or_else(|| NativeBridgeError::Protocol(format!("unexpected ExpandMacro reply: {reply}")))?;
     let tree_json = &reply[ok_pos + 5..];
-    let tokens = decode_flat_tree_json(tree_json, edition, alloc)?;
-    let mut origins = OVec::with_capacity_in(tokens.len(), alloc);
-    for _ in 0..tokens.len() {
-        origins.push(TokenOrigin::Made(Transparency::Transparent));
-    }
+    let (tokens, origins) = decode_flat_tree_json_with_origins(tree_json, edition, input_len, attr_len, path_remap, alloc)?;
     Ok(Produced {
         tokens,
         origins,
@@ -1017,6 +1108,14 @@ pub fn run_native_build_script(
         }
     }
 
+    let clock_spec = match dedup_env.iter().find(|(name, _)| *name == "SOURCE_DATE_EPOCH") {
+        // A value that is no decimal leaves the spec's own check to refuse it by name.
+        Some((_, value)) => value
+            .parse::<u64>()
+            .map_or(ClockSpec::NeverAsks, |unix_secs| ClockSpec::Fixed { unix_secs }),
+        None => ClockSpec::NeverAsks,
+    };
+
     let spec = HermeticSpec::new(HermeticOpts {
         program: Program::Stored { name: bin_str, digest: bin_digest, path: bin_str },
         args: &[],
@@ -1027,7 +1126,7 @@ pub fn run_native_build_script(
         helpers: &[],
         helper_folders: &[],
         channels: &[],
-        clock: ClockSpec::Fixed { unix_secs: 0 },
+        clock: clock_spec,
         seed: 0,
         budget: Budget { cpu: deadline_dur.saturating_mul(16), memory: 16 << 30, steps: None },
         deadline,
@@ -1041,7 +1140,7 @@ pub fn run_native_build_script(
     .map_err(|e| NativeBridgeError::Failed(format!("hermetic spec refused: {:?}", e.fault)))?;
 
     let hermetic = Hermetic::new(HermeticCapOpts { spawner, clock });
-    let files = OutDir { root: output_id, folder: out_str };
+    let files = OutDir { root: output_id, folder: out_str, package_root: None };
     let ran = hermetic
         .run(&cx, &spec, &files, alloc)
         .map_err(|e| NativeBridgeError::Failed(format!("hermetic run failed: {:?}", e.fault)))?;
@@ -1199,9 +1298,11 @@ mod tests {
             r#"
 fn main() {
     let out = std::env::var("OUT_DIR").expect("OUT_DIR");
+    let epoch = std::env::var("SOURCE_DATE_EPOCH").expect("SOURCE_DATE_EPOCH");
     std::fs::write(std::path::Path::new(&out).join("generated.rs"), "pub const MAGIC: u64 = 42;\n").unwrap();
     println!("cargo::rustc-cfg=blaze_native_hermetic");
     println!("cargo::rustc-env=BLAZE_ZERO_WASM=1");
+    println!("cargo::rustc-env=SEEN_EPOCH={epoch}");
 }
 "#,
         )
@@ -1227,11 +1328,36 @@ fn main() {
 
         assert_eq!(res.exit_code, 0, "stderr: {}", res.stderr);
         assert_eq!(res.cfgs, vec!["blaze_native_hermetic".to_owned()]);
-        assert_eq!(res.rustc_envs, vec![("BLAZE_ZERO_WASM".to_owned(), "1".to_owned())]);
+        assert_eq!(
+            res.rustc_envs,
+            vec![
+                ("BLAZE_ZERO_WASM".to_owned(), "1".to_owned()),
+                ("SEEN_EPOCH".to_owned(), "0".to_owned()),
+            ]
+        );
         assert!(
             res.output_files.iter().any(|f| f == "generated.rs"),
             "expected generated.rs in output_files, got {:?}",
             res.output_files
+        );
+
+        // Overriding SOURCE_DATE_EPOCH must keep ClockSpec in sync with dedup_env.
+        let custom = run_native_build_script(
+            &bin,
+            &manifest_dir,
+            &out_dir,
+            &[],
+            &[("SOURCE_DATE_EPOCH", "1700000000")],
+            Duration::from_secs(10),
+        )
+        .expect("SOURCE_DATE_EPOCH override must be accepted consistently");
+        assert_eq!(custom.exit_code, 0, "stderr: {}", custom.stderr);
+        assert_eq!(
+            custom.rustc_envs,
+            vec![
+                ("BLAZE_ZERO_WASM".to_owned(), "1".to_owned()),
+                ("SEEN_EPOCH".to_owned(), "1700000000".to_owned()),
+            ]
         );
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1282,7 +1408,7 @@ fn main() {
             };
             let pool = NativeServerPool::new();
             let produced = pool
-                .expand_macro(serde_dylib, "Serialize", &call, Edition::E2024, &[], None, alloc)
+                .expand_macro(serde_dylib, "Serialize", &call, Edition::E2024, &[], None, None, alloc)
                 .expect("native serde_derive Serialize expansion");
             assert!(produced.diagnostics.is_empty(), "unexpected diagnostics: {:?}", produced.diagnostics);
             assert!(
@@ -1313,6 +1439,47 @@ fn main() {
                 "expected sol! macro in {:?}",
                 exports
             );
+        }
+    }
+
+    #[test]
+    fn decode_flat_tree_preserves_non_invisible_root_delimiters() {
+        let alloc = blaze_own::testing::heap().alloc();
+        // `rust-analyzer-proc-macro-srv` encodes a single top-level `{ ... }`, `(...)`, or `[...]`
+        // (such as `paste::paste! {{ let x = 1; x }}` returning a block expression) in root subtree 0's
+        // delimiter slot (`subtrees[2] != 0`). Verify all four root delimiter kinds and span origins.
+        for (delim_code, expected) in [
+            (0u32, None),
+            (1u32, Some(Delim::Paren)),
+            (2u32, Some(Delim::Brace)),
+            (3u32, Some(Delim::Bracket)),
+        ] {
+            // Single ident `"x"` inside root subtree 0 with open_span=3 (Input(0)), close_span=4 (Input(1)).
+            let json = blaze_own::format_in!(
+                alloc,
+                r#"{{"subtree":[3,4,{delim_code},0,1],"literal":[],"punct":[],"ident":[0,0,0],"token_tree":[3],"text":["x"]}}"#
+            );
+            let (stream, origins) =
+                decode_flat_tree_json_with_origins(json.as_str(), Edition::E2024, 2, 0, None, alloc)
+                    .expect("decode root subtree");
+            assert_eq!(stream.len(), origins.len(), "delim_code={delim_code}");
+            match expected {
+                None => {
+                    assert_eq!(stream.len(), 1);
+                    assert!(matches!(stream.tokens()[0].kind, TokenKind::Ident { .. }));
+                    assert_eq!(stream.text_at(0), "x");
+                    assert_eq!(origins[0], TokenOrigin::Made(Transparency::Transparent));
+                }
+                Some(delim) => {
+                    assert_eq!(stream.len(), 3, "expected Open, Ident, Close for {delim:?}");
+                    assert_eq!(stream.tokens()[0].kind, TokenKind::Open(delim));
+                    assert_eq!(stream.text_at(1), "x");
+                    assert_eq!(stream.tokens()[2].kind, TokenKind::Close(delim));
+                    assert_eq!(origins[0], TokenOrigin::Input(0));
+                    assert_eq!(origins[1], TokenOrigin::Made(Transparency::Transparent));
+                    assert_eq!(origins[2], TokenOrigin::Input(1));
+                }
+            }
         }
     }
 }

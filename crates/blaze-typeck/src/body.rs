@@ -95,6 +95,9 @@ pub enum Expr {
     Break { value: Option<ExprId>, target: ExprId },
     Continue { target: ExprId },
     Return { value: Option<ExprId> },
+    /// `become value` (RFC 3407 explicit tail call): type-checks `value` against the enclosing
+    /// function's return type and diverges (`!`).
+    Become { value: ExprId },
     /// `args` in `BodyView::expr_lists`.
     Call { callee: ExprId, args: List },
     /// `generic_args` in `BodyView::type_lists`, `args` in `expr_lists`.
@@ -120,6 +123,9 @@ pub enum Expr {
     /// `fields` in `BodyView::field_inits`; what the fields it does not write are taken from
     /// in `base` ([`StructBase`]).
     Struct { path: PathIdx, fields: List, base: StructBase },
+    /// Anonymous structural record literal `{ a: 1, b: 2 }` or `{ a: 9, ..base }`.
+    /// `fields` in `BodyView::field_inits` in written order.
+    Record { fields: List, base: StructBase },
     Index { base: ExprId, index: ExprId },
     /// `params` in `pat_lists`; `param_tys` in `BodyView::opt_types`, one per param.
     /// `is_async`: `async |..| body`, whose call returns a future of `body` (and `ret`, when
@@ -226,7 +232,7 @@ pub struct BindAnn {
 pub enum Pat {
     Missing,
     Wild,
-    Bind { ann: BindAnn, name: Name, sub: Option<PatId> },
+    Bind { ann: BindAnn, name: Name, sub: Option<PatId>, ty: Option<PTy> },
     /// `rest` is the position of `..`, if any.
     Tuple { elems: List, rest: Option<u32> },
     Ref { mutbl: Mutbl, inner: PatId },
@@ -238,6 +244,8 @@ pub enum Pat {
     TupleStruct { path: PathIdx, elems: List, rest: Option<u32> },
     /// `fields` in `BodyView::field_pats`.
     Struct { path: PathIdx, fields: List, rest: bool },
+    /// Structural record pattern `{ a, b: p, .. }`; `fields` in `BodyView::field_pats`.
+    Record { fields: List, rest: bool },
     Or { alts: List },
     /// `elems` holds the `..` (a `Wild`, or `x @ ..`) at `rest`, if any.
     Slice { elems: List, rest: Option<u32> },
@@ -419,6 +427,73 @@ pub struct BodyView<'b> {
     /// The edition of each pattern's first word, as [`Self::expr_editions`] over pattern ids:
     /// the edition 2024 binding-mode errors are by it (rules/pat.rs).
     pub pat_editions: &'b [(PatId, Edition)],
+    /// Canonical lexicographically-sorted [`crate::ids::RecordSchema`] for each anonymous
+    /// `Expr::Record` literal, ascending by [`ExprId`].
+    pub record_expr_schemas: &'b [(ExprId, crate::ids::RecordSchema)],
+    /// Explicit written non-elided lifetimes in closure parameter type annotations
+    /// (`|lock: &'static str|`, `|t: Typed<'c>|`, `|buf: &mut Vec<(A, B), Alloc<'a>>|`), sorted
+    /// ascending by `(closure, param, path, own)`.
+    pub closure_param_regions: &'b [ClosureParamRegion],
+    /// Loop cost marks (`#[blaze::cost(bounded | amortized | reset)]`) on `Expr::Loop` nodes,
+    /// sorted ascending by [`ExprId`] (rules/cost.rs). Unlisted loops are [`LoopCost::Normal`].
+    pub loop_marks: &'b [(ExprId, LoopCost)],
+}
+
+/// Cost mark on a loop expression (`#[blaze::cost(..)]`), controlling how the loop compounds
+/// enclosing time and space loop depths (rules/cost.rs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum LoopCost {
+    /// Unmarked loop: compounds both time and space depth (`time + 1`, `space + 1`).
+    Normal = 0,
+    /// `#[blaze::cost(bounded)]` (or `bounded = ".."`): constant trip count (`+0` time, `+0` space).
+    Bounded = 1,
+    /// `#[blaze::cost(amortized)]` (or `amortized = ".."`): amortized across enclosing loop (`max(1)` time and space).
+    Amortized = 2,
+    /// `#[blaze::cost(reset)]` (or `reset = ".."`): scratch/frame reset per iteration (`time + 1`, `space + 0`).
+    Reset = 3,
+    /// Malformed or duplicate `#[blaze::cost(..)]` on a loop (Rule 3: never silently ignored).
+    Invalid = 4,
+}
+
+/// What kind of explicit non-elided lifetime a closure parameter type wrote at a region slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WrittenRegion {
+    /// Explicitly `'static`.
+    Static,
+    /// An explicitly named lifetime from the enclosing item (not `'static`, not `'_`).
+    Named,
+    /// A shared elided lifetime group within one closure parameter type (for example a defaulted
+    /// type argument referencing an elided parameter lifetime: `|r: &Records<'_, '_>|` where
+    /// `S = &'n Names<'n>` repeats `'n`'s elided id across multiple slots).
+    Elided(u32),
+}
+
+/// One explicit non-elided lifetime written in a closure parameter type annotation, located by
+/// structural child-index path from the parameter's root type (4 bits per step, depth in low 4
+/// bits) and the node's own lifetime index (`0` for `&`, `0..n` for an ADT's lifetime args).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ClosureParamRegion {
+    pub closure: ExprId,
+    pub param: u32,
+    pub path: u64,
+    pub own: u32,
+    pub kind: WrittenRegion,
+}
+
+impl ClosureParamRegion {
+    /// The root structural path (depth 0).
+    pub const ROOT: u64 = 0;
+
+    /// Appends child index `child` (0..16) to structural path `path` (depth 0..15).
+    pub fn push_step(path: u64, child: u32) -> Option<u64> {
+        let depth = path & 0xf;
+        if depth >= 15 || child >= 16 {
+            return None;
+        }
+        let shift = 4 + (depth << 2);
+        Some(((path & !0xf) | (u64::from(child) << shift)) | (depth + 1))
+    }
 }
 
 /// The edition at `id` in the runs `runs` (rows `(first, edition)`, ascending), `body`
@@ -440,6 +515,16 @@ fn slice<'b, T>(column: &'static str, all: &'b [T], l: List) -> Result<&'b [T], 
 }
 
 impl<'b> BodyView<'b> {
+    /// The written non-elided lifetime at `(closure, param, path, own)`, if any.
+    pub fn closure_param_region(&self, closure: ExprId, param: u32, path: u64, own: u32) -> Option<WrittenRegion> {
+        let key = (closure.0, param, path, own);
+        let at = self
+            .closure_param_regions
+            .binary_search_by_key(&key, |r| (r.closure.0, r.param, r.path, r.own))
+            .ok()?;
+        self.closure_param_regions.get(at).map(|r| r.kind)
+    }
+
     pub(crate) fn expr(&self, e: ExprId) -> Result<Expr, CheckError> {
         self.exprs.get(e.ix()).copied().ok_or(CheckError::Malformed(Malformed::Expr(e)))
     }
@@ -556,6 +641,14 @@ impl<'b> BodyView<'b> {
         self.unsafe_blocks.binary_search(&e).is_ok()
     }
 
+    /// The cost mark of loop `e` ([`BodyView::loop_marks`]), or [`LoopCost::Normal`] when unmarked.
+    pub(crate) fn loop_cost(&self, e: ExprId) -> LoopCost {
+        match self.loop_marks.binary_search_by_key(&e, |&(x, _)| x) {
+            Ok(i) => self.loop_marks[i].1,
+            Err(_) => LoopCost::Normal,
+        }
+    }
+
     /// The edition the expression `e`'s first word was written in ([`BodyView::expr_editions`]):
     /// for a block its `{` (or the `unsafe`, `async`, `const` or label before it).
     pub fn expr_edition(&self, e: ExprId) -> Edition {
@@ -565,6 +658,12 @@ impl<'b> BodyView<'b> {
     /// The edition the pattern `p`'s first word was written in ([`BodyView::pat_editions`]).
     pub fn pat_edition(&self, p: PatId) -> Edition {
         edition_in(self.pat_editions, p, self.edition)
+    }
+
+    /// The canonical [`crate::ids::RecordSchema`] recorded for anonymous record literal `e`.
+    pub(crate) fn record_expr_schema(&self, e: ExprId) -> Option<crate::ids::RecordSchema> {
+        let i = self.record_expr_schemas.binary_search_by_key(&e, |&(x, _)| x).ok()?;
+        self.record_expr_schemas.get(i).map(|&(_, s)| s)
     }
 
     /// The expressions directly under `e`, pushed onto `out` in source order: a block's
@@ -610,6 +709,7 @@ impl<'b> BodyView<'b> {
                 }
             }
             Expr::Break { value, .. } | Expr::Return { value } => out.extend(value),
+            Expr::Become { value } => out.push(value),
             Expr::Call { callee, args } => {
                 out.push(callee);
                 out.extend_from_slice(self.expr_list(args)?);
@@ -632,7 +732,7 @@ impl<'b> BodyView<'b> {
                 }
             }
             Expr::Repeat { elem, count, .. } => out.extend([elem].into_iter().chain(count)),
-            Expr::Struct { fields, base, .. } => {
+            Expr::Struct { fields, base, .. } | Expr::Record { fields, base } => {
                 for f in self.field_init_list(fields)? {
                     out.push(f.expr);
                 }

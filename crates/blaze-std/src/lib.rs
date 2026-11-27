@@ -90,6 +90,7 @@
 //! | [`rng`] | the seeded generator | blaze-rng |
 //! | [`record`] | zero-copy records | blaze-format |
 //! | [`report`] | what a program says, as data | blaze-report |
+//! | [`cli`] | declarative `#![no_std]` CLI parser (clap replacement: nested subcommands, aliases, typo hints, ANSI `--help`) | new |
 //! | [`quic`], [`http`] | sans-IO QUIC (WebTransport over HTTP/3) and HTTP/1.1 | blaze-http |
 //! | [`test`] | `#[bstd::test]` and its runner, the simulation, the model checker, allocation counting | new, blaze-core, blaze-check, blaze-alloc-count |
 //!
@@ -112,7 +113,7 @@
 // Two builders (std.md, "Two builders"): what is plain Rust is compiled by rustc and by blaze;
 // what needs blaze's extensions is under `cfg(blaze)`, the cfg blaze sets for every crate it
 // compiles, each with a plain form under `cfg(not(blaze))` that says what the extension adds.
-#![cfg_attr(blaze, feature(blaze_comptime, blaze_const_exprs, blaze_verify))]
+#![cfg_attr(blaze, feature(blaze_comptime, blaze_const_exprs, blaze_verify, lang_items))]
 #![feature(
     allocator_ext,
     atomic_internals,
@@ -123,6 +124,7 @@
     contracts,
     core_intrinsics,
     custom_inner_attributes,
+    default_field_values,
     fn_static,
     freeze,
     generic_atomic,
@@ -160,6 +162,8 @@
 extern crate alloc;
 
 pub mod args;
+/// Zero-alloc ANSI escape sequence parsing, stripping, terminal display width, and styling.
+pub mod ansi;
 /// Sound: `AudioOut` and `AudioIn`, PCM streams pulled by the device.
 pub mod audio;
 /// Driving other applications: `Automation`, narrowed to one.
@@ -175,19 +179,44 @@ pub mod budget;
     reason = "a token cell's two views of its value and its `Sync`, each with its SAFETY"
 )]
 pub mod cell;
+/// Declarative sans-IO CLI argument parser, subcommand router, and ANSI-styled `--help` formatter.
+pub mod cli;
+/// IPv4/IPv6 CIDR subnet arithmetic, SSRF global-routability classifiers, and binary-trie LPM (`PrefixMap`).
+pub mod cidr;
 pub mod clock;
 /// Turning data into instructions: `Code`, executable memory and native modules.
 pub mod code;
+/// Strict RFC 6265 HTTP `Cookie` and `Set-Cookie` parser, validator, formatter, and matcher.
+pub mod cookie;
+/// Strict, bounded, zero-dependency RFC 4180 CSV / TSV reader and writer.
+pub mod csv;
+/// Authenticated encryption (ChaCha20-Poly1305 RFC 8439), key derivation (HKDF-SHA256 RFC 5869,
+/// PBKDF2-HMAC-SHA256 RFC 2898), and strict Ed25519 verification (`blaze-ed25519`).
+pub mod crypto;
+/// Standard 5-field cron schedule parser and next-occurrence iterator over [`time::DateTime`].
+pub mod cron;
 pub mod cx;
 /// The device capabilities: `Camera`, `Screen`, `Location`, `Bluetooth`, `Usb`, `Serial`,
 /// `Clipboard`, `Notify`.
 pub mod device;
+/// Text and slice diffing (Myers O(ND) linear-space & Patience), unified patch creation,
+/// parsing, forward/reverse application, ANSI highlighting, edit distance, and similarity.
+pub mod diff;
+/// Cryptographic digests (BLAKE3, SHA-256), HMAC-SHA256, constant-time equality, and CRC-32 / Adler-32.
+pub mod digest;
 /// The simulated disk's ledger: what file calls paid, and which names a crash may undo.
 pub mod disk;
+/// Sans-IO RFC 1035/3596/2782 DNS wire message encoder and loop-safe decoder.
+pub mod dns;
+/// Strict, bounded, sans-IO `.env` file parser, variable interpolator, and formatter.
+pub mod dotenv;
 pub mod entry;
 pub mod env;
 /// Who decides how a pure function is computed: `Eval` and its providers, memo points, keys.
 pub mod eval;
+/// Zero-cost compile-time enum reflection traits (`Enum`, `UnitEnum`, `EnumMeta`,
+/// `FromVariantStr`, `FromLowercaseStr`, `FromSnakeStr`) and `const fn` introspection.
+pub mod reflect;
 /// Flat values: `Flat`, bytes that mean the same on any thread, process or machine.
 #[expect(
     unsafe_code,
@@ -195,18 +224,29 @@ pub mod eval;
 )]
 pub mod flat;
 pub mod fs;
+/// Unix shell glob matching (`Pattern`, `GlobSet`) and capability-confined directory globbing (`glob_dir`).
+pub mod glob;
 pub mod gpu;
+/// Strict, zero-dependency RFC 4648 §8 hexadecimal encoding and decoding.
+pub mod hex;
+/// HTML/XML entity codec, zero-alloc streaming tokenizer, tag stripper, and allowlist XSS sanitizer.
+pub mod html;
 pub mod host;
 // The heavy areas, each behind its feature (Cargo.toml, "[features]"; std.md, "What a program
 // pays for at start"): a program that turns none on links none of their dependencies.
 #[cfg(feature = "image")]
 pub mod image;
+/// Fast Starship-class Git prompt and status driven over `bstd::fs` (sans-IO core in `blaze-git`).
+#[cfg(feature = "git")]
+pub mod git;
 /// The simulated host behind the capabilities blaze-core has no effect for, and how a call
 /// on one fails.
 pub mod hosted;
 /// Standard input: `In`, the byte stream a program was started with.
 pub mod input;
 pub mod io;
+/// RFC 7519 JWT and RFC 7515 JWS (`HS256` & `EdDSA`) signing and verification with explicit clock.
+pub mod jwt;
 /// The keychain: `Keys`, by named key, and the `Secret` a fetch gives.
 pub mod keys;
 /// A key-value store beneath a directory: `Kv`, by typed `Key`.
@@ -216,6 +256,10 @@ pub mod kv;
 pub mod local;
 /// The locale: time zone, language and formats, as plain data.
 pub mod locale;
+/// Bounded LZ4 Raw Block and LZ4 Frame v1.6.4 compression and decompression (`XXH32` checksums).
+pub mod lz4;
+/// Bounded, non-recursive CommonMark + GFM Markdown parser with HTML and ANSI terminal renderers.
+pub mod markdown;
 pub mod mem;
 /// Typed names: a key's, a device's, a module's, an application's.
 pub mod name;
@@ -225,9 +269,15 @@ pub mod net;
 pub mod network;
 /// Handing a URL to the user's default application: `Opener`, narrowed to a scheme.
 pub mod opener;
+/// RFC 4226 HOTP, RFC 6238 TOTP (`otpauth://`), RFC 4648 & Crockford Base32, and RFC 7468 PEM armor.
+pub mod otp;
+pub use crate::otp::{base32, pem};
 pub mod out;
 /// Data parallelism over disjoint chunks: `for_each`, `map_into`, `reduce`.
 pub mod par;
+/// Safe plain-old-data (`Pod`), `Zeroable`, `CheckedBitPattern`, and `TransparentWrapper`
+/// conversions (`blaze_own::pod`): Blaze's safe replacement for `core::mem::transmute`.
+pub use blaze_own::pod;
 /// Ownership properties derived by reflection (`Acyclic`, `NoCapability`), the walk they are
 /// instances of, and the handles built on them: `Shared`, `LocalShared`, `Shares`.
 #[expect(
@@ -262,16 +312,37 @@ pub mod comptime;
 pub mod type_set;
 /// Anonymous Union Types (`A | B | C`) with small local tags, by-value widening & narrowing.
 pub mod union_ty;
+/// Zero-cost, `#![forbid(unsafe_code)]` View Types (`bstd::views!`, `ProjectView`, `DisjointSplit`).
+pub mod view;
+/// Structural Records (`{ a: T, b: U }`) and named-argument functions with defaults (`bstd::record_fn!`, `bstd::call!`).
+pub mod record_ty;
+/// Zero-cost, `#![forbid(unsafe_code)]` finite const value-set pattern types (`ValueSet`, `FinitePat`, `InSet`, `bstd::define_value_set!`).
+pub mod pat_ty;
+/// Zero-copy shared Prefabs (`LocalShare` + `TypeSet!`) and reactive Templates with retractions.
+/// Zero-unsafe, sans-IO, Flecs 4.2-equivalent archetype Entity-Component-System (`World`,
+/// generational `Entity`, `(Rel, Target)` pairs with `ChildOf` cascade & `IsA` prefab inheritance,
+/// incrementally synced `CachedQuery`, reactive observers, and conflict-free phased `Pipeline`).
+pub use blaze_ecs as ecs;
+pub mod prefab;
 /// The native backend's reads of its host's facts.
 #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
 mod native;
 pub mod pending;
+/// RFC 6901 JSON Pointer, RFC 7396 JSON Merge Patch, and bounded JSONPath queries over `blaze_data::Value`.
+pub mod pointer;
 /// Power: the battery, and keeping the machine awake.
 pub mod power;
 /// Other processes: `Procs`, from `Host`, narrowed to one.
 pub mod procs;
 #[cfg(feature = "net")]
 pub mod quic;
+/// RFC 3986 percent-encoding, WHATWG `application/x-www-form-urlencoded` query strings, and sans-IO
+/// RFC 7578 `multipart/form-data` parsing and formatting.
+pub mod query;
+/// Linear-time Thompson NFA / PikeVM regular expression engine with bounded step budgets.
+pub mod regex;
+/// Sans-IO explicit-clock rate limiters (`Gcra`, `TokenBucket`), `CircuitBreaker`, and jittered `Backoff`.
+pub mod rate;
 /// Making requests: `Http`, one type over a `Net`, the host or a handler. Behind `requests`.
 #[cfg(feature = "requests")]
 pub mod requests;
@@ -286,18 +357,32 @@ pub mod rng;
 pub(crate) mod rt;
 /// Whom TLS trusts: `Roots`, a set of trust anchors.
 pub mod roots;
+/// Fast sans-IO HTTP URL router (`Static > :param > *wildcard`, 404 vs 405 `Allow`).
+pub mod router;
 /// `#[bstd::test]`: a test shaped like `main`, run on the simulation under many seeds with its
 /// faults on. Its items are [`test`]'s.
 mod simtest;
+/// Bounded Google Snappy raw block and Snappy Framing Format compression (`crc32c` masked checksums).
+pub mod snappy;
 /// Streams to an origin: `Streams`, from the host or a handler.
 pub mod streams;
+/// Everyday text transformations: case conversions, Unicode `slugify_in`, `natural_cmp`, `dedent_in`/`indent_in`, and ANSI/CJK `truncate_width_in`.
+pub mod strx;
+/// Sans-IO W3C Server-Sent Events (SSE) streaming parser and event formatter.
+pub mod sse;
 pub mod sync;
+/// ANSI-aware word wrapping (`wrap_ansi_in`) and box-drawn Unicode/ASCII/Markdown tables.
+pub mod table;
 pub mod task;
 // What a run used and where its time went, kept per worker and merged into one `Report` at
 // exit (D178): spans, distributions, effects by kind, the pool, the longest chain.
 pub mod telemetry;
+/// Bounded, iterative (zero-recursion) Mustache-style template engine over `blaze_data::Value`.
+pub mod template;
 /// The terminal as a device: `Term`, its size, raw mode, styled text and keys.
 pub mod term;
+/// Civil calendar dates, Unix epoch conversions, strict RFC 3339 parsing/formatting, and human durations.
+pub mod time;
 pub mod trace;
 /// The rustc debug build's check that a must-finish value was finished, not dropped.
 pub(crate) mod unfinished;
@@ -307,8 +392,21 @@ pub mod video;
 pub mod url;
 /// Who is running: `User`, its name, ids and home directory.
 pub mod user;
+/// RFC 9562 UUIDs (v4 random, v7 Unix-millisecond time-ordered, deterministic v8 via BLAKE3)
+/// with zero ambient RNG or clock access.
+pub mod uuid;
 /// The program's windows: `Window`, a surface's size and its events.
 pub mod window;
+/// Sans-IO RFC 6455 WebSocket handshake (`accept_key`) and frame encoder/decoder.
+pub mod ws;
+/// Bounded, iterative, XXE-proof XML 1.0 pull parser and canonical writer.
+pub mod xml;
+/// Strict, bounded, non-recursive YAML 1.2 Core Schema parser and emitter over `blaze_data::Value`.
+pub mod yaml;
+/// Bounded, traversal-safe Store/Deflate ZIP archive reader and writer over [`compress`] and [`digest::Crc32`].
+pub mod zip;
+/// Pure `#![no_std]` RFC 8878 Zstandard compression and decompression (`XXH64` checksums).
+pub use blaze_zstd as zstd;
 /// A worker's state as a value the pool owns, in typed columns (D171): `Workers`, `Slot<T>`,
 /// `cx.on_worker`.
 #[expect(
@@ -537,13 +635,33 @@ pub mod id {
     pub use blaze_kit::{Id, NonMax, Table, TableMap, TableSet, id};
 }
 
+/// Explicit zero-cost newtypes, affine spaces (`ByteOffset` vs `ByteLen` + `ByteSpan`,
+/// `TextOffset` vs `TextLen` + `TextSpan`), power-of-two [`newtype::Alignment`], quantities
+/// (`Count`, `Capacity`, `Stride`), opaque wrappers (`Port`, `LineNo`, `ColNo`), Kotlin-style
+/// selective `delegate { ... }` forwarding (`newtype!`), and `TypeSet!`-powered unit/invariant
+/// sets (`Tagged`, `Dim`, `slice_from`).
+pub mod newtype;
+
+/// Symbolic algebra, DAG differentiation (`diff`, `grad`, `hessian`, `taylor`), bounded e-graph
+/// equality saturation (`simplify`), symbolic equation solving (`solve_for`), `const fn`
+/// compile-time expression graphs (`comptime::ConstGraph`), and CSE Rust SSA emission
+/// (`blaze-algebra`; `docs/v2/plan/design/symbolic-algebra.md`).
+pub mod algebra {
+    pub use blaze_algebra::*;
+}
+
 /// The stable radix sort (blaze-radix), on workers named at the call ([`sort::on`], with
-/// [`sort::Serial`] for the calling thread alone). The free functions that sort on the
-/// thread's ambient workers are left out.
+/// [`sort::Serial`] for the calling thread alone) and type-selected sorting/searching/comparing
+/// (`blaze-sort`). The free functions that sort on the thread's ambient workers are left out.
 pub mod sort {
     pub use blaze_radix::{
         Csr, Key, PARALLEL, Radix, SMALL, Serial, WIDE, Workers, on, pack_32, pack_64, signed_32,
         signed_64,
+    };
+    pub use blaze_sort::{
+        LSD_FROM, RadixKey, TINY, binary_search, cmp, contains, dedup, eq, is_sorted, kernels,
+        lower_bound, lsd_from, max, min, position, sort, sort_by_key_in, sort_in,
+        sort_stable_by_in, sort_stable_in, sort_unstable, sort_unstable_by,
     };
 }
 
@@ -555,10 +673,135 @@ pub mod phf {
     };
 }
 
-/// Digests: BLAKE3 (blaze-ids' `b3`, the one copy) and SHA-256 (blaze-sha256).
-pub mod digest {
-    pub use blaze_ids::b3::{Hasher as Blake3, OUT_LEN as BLAKE3_LEN, hash as blake3};
-    pub use blaze_sha256::{Sha256, digest as sha256};
+/// Format-neutral structured data model (`Value`, `Map`, `Cursor`, `FromValue`, `ToValue`,
+/// `value!`), shared across [`json`], [`toml`], and [`cbor`] (`blaze-data`).
+pub mod data {
+    pub use blaze_data::*;
+}
+
+/// Strict RFC 8259 JSON streaming pull reader, writer, and `Value` codec (`blaze-json`).
+pub mod json {
+    pub use blaze_json::*;
+}
+
+/// Deterministic RFC 8949 §4.2.1 CBOR reader, streaming encoder/decoder, and `Value` codec (`blaze-cbor`).
+pub mod cbor {
+    pub use blaze_cbor::*;
+}
+
+/// Strict TOML 1.0 parser, writer, and lossless format-preserving editor (`blaze-toml`).
+pub mod toml {
+    pub use blaze_toml::*;
+}
+
+/// LLM-first tabular structured data format (TAB) over [`data::Value`] (`blaze-tab`).
+pub mod tab {
+    pub use blaze_tab::*;
+
+    #[cfg(test)]
+    mod tests {
+        use crate::data::{Int, Map, Value};
+        use crate::tab::{Limits, read, write_pretty};
+        use blaze_own::{String, Vec};
+
+        #[test]
+        fn sparse_table_round_trip_via_bstd_tab() {
+            let alloc = blaze_own::testing::heap().alloc();
+
+            let mut row1 = Map::new_in(alloc);
+            row1.insert(String::from_str_in("kind", alloc), Value::Text(String::from_str_in("error", alloc)));
+            row1.insert(String::from_str_in("file", alloc), Value::Text(String::from_str_in("src/main.rs", alloc)));
+            row1.insert(String::from_str_in("line", alloc), Value::Int(Int::from_u64(12)));
+
+            let mut row2 = Map::new_in(alloc);
+            row2.insert(String::from_str_in("kind", alloc), Value::Text(String::from_str_in("warning", alloc)));
+            row2.insert(String::from_str_in("file", alloc), Value::Text(String::from_str_in("Cargo.toml", alloc)));
+            row2.insert(String::from_str_in("line", alloc), Value::Int(Int::from_u64(8)));
+            row2.insert(String::from_str_in("fix", alloc), Value::Text(String::from_str_in("remove dep", alloc)));
+
+            let mut rows = Vec::new_in(alloc);
+            rows.push(Value::Map(row1));
+            rows.push(Value::Map(row2));
+            let doc = Value::List(rows);
+
+            let rendered = write_pretty(&doc, alloc).expect("bstd::tab::write_pretty failed");
+            let text = rendered.as_str();
+            assert!(text.starts_with("[["), "expected tabular header:\n{text}");
+            assert!(text.contains("src/main.rs"), "expected bare path:\n{text}");
+            assert!(text.contains('_'), "expected sparse absent sentinel `_`:\n{text}");
+
+            let parsed = read(text.as_bytes(), Limits::SHIPPED, alloc).expect("bstd::tab::read failed");
+            assert_eq!(parsed, doc);
+        }
+    }
+}
+
+/// Canonical RFC 4648 Base64 encoding and decoding (`STANDARD`, `URL_SAFE`, padded and unpadded; `blaze-base64`).
+pub mod base64 {
+    pub use blaze_base64::*;
+}
+
+/// SemVer 2.0.0 versions and Cargo version requirement matching (`blaze-semver`).
+pub mod semver {
+    pub use blaze_semver::*;
+}
+
+/// Bounded streaming DEFLATE (RFC 1951), zlib (RFC 1950), and gzip (RFC 1952) compression,
+/// plus CRC-32 and Adler-32 checksums (`blaze-deflate`).
+pub mod compress {
+    pub use blaze_deflate::*;
+}
+
+/// Deterministic ustar tar writer and traversal-safe sans-IO tar reader (`blaze-tar`).
+pub mod tar {
+    pub use blaze_tar::*;
+}
+
+/// SIMD/SWAR byte and substring search (`memchr`, `memchr2`, `memchr3`, `memrchr`, `memmem::Finder`; `blaze-memchr`).
+pub mod search {
+    pub use blaze_memchr::*;
+}
+
+/// Zero-dependency typed bitflags macro and `Flags` trait (`blaze-bitflags`).
+pub mod bitflags {
+    pub use blaze_bitflags::*;
+}
+
+/// Official UCD Unicode tables: `char_width`, `str_width`, `graphemes`, `nfd_chars`, `is_xid_start`,
+/// `is_xid_continue`, `is_emoji` (`blaze-unicode`).
+pub mod unicode {
+    pub use blaze_unicode::*;
+}
+
+/// Deterministic scalar & SIMD floating-point math (fdlibm/musl `sin`/`cos`/`exp`/`ln`/`pow`/...)
+/// and 3D geometry (`Vec2`, `Vec3`, `Mat3`, `Affine3`, `Aabb3`, `Interval`; `blaze-math`).
+pub mod math {
+    pub use blaze_math::*;
+}
+
+/// Typed quantities (lengths, angles, areas, volumes, masses, `Nanos`, `Bytes`, `Count`; `blaze-units`).
+pub mod units {
+    pub use blaze_units::*;
+}
+
+/// Named integer conversions (`widen_to`, `narrow`, `truncate_to`, `saturate`; `blaze-int`).
+pub mod int {
+    pub use blaze_int::*;
+}
+
+/// Sans-IO RFC 9113 HTTP/2 with RFC 7541 HPACK (`blaze-h2`).
+pub mod h2 {
+    pub use blaze_h2::*;
+}
+
+/// Columnar in-memory tables and typed batches (`blaze-columns`).
+pub mod columns {
+    pub use blaze_columns::*;
+}
+
+/// Zero-dependency Apache Arrow IPC stream and file reader/writer over [`columns`] (`blaze-arrow-ipc`).
+pub mod arrow {
+    pub use blaze_arrow_ipc::*;
 }
 
 /// Zero-copy records: the bytes in memory are the bytes on disk (blaze-format).
@@ -672,6 +915,7 @@ pub mod prelude {
             cx::Cx,
             entry::Error,
             mem::{Alloc, Frame, Heap, String, format_in},
+            reflect::{Enum, EnumMeta, FromLowercaseStr, FromSnakeStr, FromVariantStr, UnitEnum},
             vec::Vec,
         };
 

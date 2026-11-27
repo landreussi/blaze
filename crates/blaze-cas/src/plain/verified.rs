@@ -31,9 +31,12 @@
 use std::alloc::Allocator;
 
 use blaze_core::{FileName, Mapping};
+use blaze_own::Share;
 use blaze_keyed::store::{ENTRY, Generation, SegmentId, SegmentProof, StoreError};
 
+use super::bloom::BLOOM_ALLOC;
 use super::format::{self, Entry, Segment, record_crc};
+use super::par::{Par, Serial};
 use crate::{Corrupt, Key};
 
 /// What a read returns as its segment's proof ([`blaze_keyed::store::SegmentProof`]): the
@@ -87,6 +90,10 @@ impl Unverified {
 
     pub(crate) fn seg(&self) -> &Segment {
         &self.seg
+    }
+
+    pub(crate) fn into_file(self) -> FileName {
+        self.file
     }
 
     /// Its length on the disk (from the mapping, not a byte of it): what its row names, or the
@@ -155,13 +162,26 @@ impl Verified {
     /// every byte, and that it is the segment its row names. Consumes it: a proved segment is
     /// never checked again. `Err` names what failed, with the segment and file.
     pub(crate) fn check(it: Unverified, boot: Boot, checks: &mut Checks) -> Result<Verified, (Segment, FileName, StoreError)> {
+        Verified::check_par(it, boot, checks, &Serial, BLOOM_ALLOC)
+    }
+
+    /// Parallel twin of [`Verified::check`]: verifies large segments (`>= 128 KiB`) via
+    /// [`format::check_segment_par`] using `par`, delegating to serial [`format::check_segment`]
+    /// below the threshold or when `par.workers() <= 1`.
+    pub(crate) fn check_par<P: Par, B: Allocator + Copy>(
+        it: Unverified,
+        boot: Boot,
+        checks: &mut Checks,
+        par: &P,
+        alloc: B,
+    ) -> Result<Verified, (Segment, FileName, StoreError)> {
         let len = it.len();
         let segment = SegmentId(it.seg.digest);
         if len != it.seg.file_len() {
             return Err((it.seg, it.file, StoreError::Layout { segment, what: "its file's length is not the one its generation names", at: len }));
         }
         checks.full += 1;
-        let checked = format::check_segment(it.map.bytes()).and_then(|described| {
+        let checked = format::check_segment_par(it.map.bytes(), par, alloc).and_then(|described| {
             (described.digest == it.seg.digest && described.namespace == it.seg.namespace && described.count == it.seg.count)
                 .then_some(())
                 .ok_or(StoreError::Layout { segment, what: "it is a whole segment, but not the one its generation names", at: 0 })
@@ -247,7 +267,7 @@ impl Verified {
         let entry = match Entry::decode(&run[i * ENTRY..(i + 1) * ENTRY]) {
             Ok(entry) => entry,
             Err(what) => {
-                out.push(Corrupt { key: Key(blaze_ids::ContentId(run[i * ENTRY..i * ENTRY + 32].try_into().expect("32 bytes"))), pack: self.file.clone(), what: what.to_owned() });
+                out.push(Corrupt { key: Key(blaze_ids::ContentId(run[i * ENTRY..i * ENTRY + 32].try_into().expect("32 bytes"))), pack: self.file.share(), what: what.to_owned() });
                 return;
             }
         };
@@ -255,7 +275,7 @@ impl Verified {
         if end > self.seg.index_at || record_crc(&entry.key, entry.tag, self.payload(&entry)) != entry.crc {
             out.push(Corrupt {
                 key: Key(entry.key),
-                pack: self.file.clone(),
+                pack: self.file.share(),
                 what: format!("its {} bytes at {} fail their CRC-32C {:08x}: changed on the disk after the segment was proved", entry.len, entry.at, entry.crc),
             });
         }

@@ -10,14 +10,16 @@
 //! A crate's cfg is the target's atoms as the toolchain record states them
 //! (`ToolchainView::cfg`), the profile's, and a `feature` atom per feature on.
 
+use core::cell::RefCell;
 use core::fmt;
 
-use blaze_fetch::PackView;
+use blaze_fetch::{FileBytes, PackView};
 use blaze_id::{ContentId, CrateItemKey};
-use blaze_own::Alloc;
+use blaze_mem::{Arena, Frame, Tag};
+use blaze_own::{AVec, Alloc, Bump, Erased};
 use blaze_scope::graph::{CrateId, Sysroot};
 use blaze_scope::resolve::{CrateInput, Names, NamesError, SourceTexts, resolve_crates};
-use blaze_scope::task::Serial;
+use blaze_scope::task::{Par, Scratch, Serial};
 use blaze_surface::Edition;
 use blaze_toolchain::{Role, Shelf, ToolchainError, ToolchainId, ToolchainView, UnitKind};
 use blaze_unit_graph::implicit;
@@ -25,8 +27,13 @@ use edition::PackageEdition;
 
 pub mod library;
 
-/// The one target the ladder runs on.
+/// The host target the ladder runs on.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub const TRIPLE: &str = "aarch64-apple-darwin";
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+pub const TRIPLE: &str = "aarch64-unknown-linux-gnu";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub const TRIPLE: &str = "x86_64-unknown-linux-gnu";
 
 /// The profile's atoms, beside the target's: the ladder builds as `dev`.
 const PROFILE: &[(&str, Option<&str>)] = &[("debug_assertions", None)];
@@ -151,6 +158,8 @@ pub struct Toolchain {
     units: Vec<Unit>,
     /// The target's cfg atoms, as the record states them.
     cfg: Vec<(String, Option<String>)>,
+    /// Shared arena for decompressing compressed `BLZFPK04` toolchain pack files on read.
+    arena: Arena,
 }
 
 impl Toolchain {
@@ -160,21 +169,32 @@ impl Toolchain {
     /// pattern type (`usize is 0..=HALF`) reads `target_pointer_width` as any crate's does.
     /// `alloc` is the caller's scratch for the target's cfg, copied out before this returns.
     pub fn none(alloc: Alloc<'_>) -> Toolchain {
-        Toolchain { units: Vec::new(), cfg: target_cfg(alloc) }
+        Toolchain { units: Vec::new(), cfg: target_cfg(alloc), arena: Arena::new(Tag::Other) }
     }
 
     /// Opens the shelf's pinned manifest and reads the packs of every unit reachable from bstd,
     /// core and alloc for [`TRIPLE`] (not the host side).
     pub fn open(shelf: &mut DirShelf) -> Result<Toolchain, CratesError> {
-        let id: ToolchainId = blaze_toolchain::PINNED;
+        Self::open_target(shelf, blaze_toolchain::PINNED, TRIPLE)
+    }
+
+    /// Opens `id`'s manifest from `shelf` and reads the packs of every unit reachable from bstd,
+    /// core, alloc and std for `triple` (e.g., `"wasm64-blaze-wasip1"`).
+    pub fn open_target(shelf: &mut DirShelf, id: ToolchainId, triple: &str) -> Result<Toolchain, CratesError> {
         let manifest = blaze_toolchain::shelf::open_manifest(shelf, id).map_err(CratesError::Toolchain)?;
         let view = ToolchainView::open(manifest.as_ref(), id).expect("open_manifest checked it");
-        let sys = blaze_toolchain::sysroot(&view, TRIPLE, false).ok_or(CratesError::NoTarget)?;
-        let all: Vec<_> = view.units(TRIPLE).ok_or(CratesError::NoTarget)?.collect();
-        // The closure of bstd, core, alloc and Rust's std over dependencies, by a work list:
-        // std because the Rust-edition crates beneath bstd (blaze_mem) name it implicitly.
+        let sys = blaze_toolchain::sysroot(&view, triple, false).ok_or(CratesError::NoTarget)?;
+        let all: Vec<_> = view.units(triple).ok_or(CratesError::NoTarget)?.collect();
+        // The closure of bstd, core, alloc, Rust's std and proc_macro over dependencies, by a work
+        // list: std because Rust-edition crates name it implicitly, proc_macro for wasm64 proc-macros.
         let mut keep = vec![false; all.len()];
-        let mut todo = vec![sys.bstd.0 as usize, sys.core.0 as usize, sys.alloc.0 as usize, sys.std.0 as usize];
+        let mut todo = vec![
+            sys.bstd.0 as usize,
+            sys.core.0 as usize,
+            sys.alloc.0 as usize,
+            sys.std.0 as usize,
+            sys.proc_macro.0 as usize,
+        ];
         while let Some(u) = todo.pop() {
             if keep[u] {
                 continue;
@@ -235,8 +255,8 @@ impl Toolchain {
                 dep.1 = kept;
             }
         }
-        let cfg = view.cfg(TRIPLE).ok_or(CratesError::NoTarget)?.map(|(n, v)| (n.to_owned(), v.map(str::to_owned))).collect();
-        Ok(Toolchain { units, cfg })
+        let cfg = view.cfg(triple).ok_or(CratesError::NoTarget)?.map(|(n, v)| (n.to_owned(), v.map(str::to_owned))).collect();
+        Ok(Toolchain { units, cfg, arena: Arena::new(Tag::Other) })
     }
 }
 
@@ -245,7 +265,7 @@ impl Toolchain {
 /// one list that names every target atom (`target_pointer_width`, `target_os`, ..). Asserted
 /// equal in triple by the constant's name: [`TRIPLE`] is `aarch64-apple-darwin`.
 fn target_cfg(alloc: Alloc<'_>) -> Vec<(String, Option<String>)> {
-    let target = blaze_scope::task::Target::AARCH64_APPLE_DARWIN;
+    let target = blaze_scope::task::Target::host();
     let cfg = blaze_scope::task::Cfg::of(&target, &[], alloc);
     cfg.atoms().iter().map(|&(n, v)| (n.to_owned(), v.map(str::to_owned))).collect()
 }
@@ -260,10 +280,27 @@ fn unit_key<'f>(pack: &[u8; 32], features: impl Iterator<Item = &'f str>) -> Vec
     out
 }
 
+/// Either owned by [`Inputs::new`] or borrowed from a solved [`library::Library`].
+pub(crate) enum Shared<'t, T> {
+    Owned(Vec<T>),
+    Borrowed(&'t [T]),
+}
+
+impl<T> core::ops::Deref for Shared<'_, T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        match self {
+            Self::Owned(v) => v,
+            Self::Borrowed(s) => s,
+        }
+    }
+}
+
 /// The texts `resolve_crates` reads: the program's files, then each unit's pack.
 pub struct Texts<'t> {
     user: &'t [(String, String)],
-    packs: Vec<PackView<'t>>,
+    packs: Shared<'t, PackView<'t>>,
+    arena: &'t Arena,
 }
 
 impl<'t> SourceTexts<'t> for Texts<'t> {
@@ -273,8 +310,15 @@ impl<'t> SourceTexts<'t> for Texts<'t> {
         }
         let rest = path.strip_prefix("/toolchain/")?;
         let (_, inner) = rest.split_once('/')?;
-        let file = self.packs.get(krate - 1)?.find(inner)?;
-        core::str::from_utf8(file.bytes).ok()
+        let entry = self.packs.get(krate - 1)?.find_entry(inner)?;
+        let local = self.arena.local();
+        match entry.read_in(&local).ok()? {
+            FileBytes::Borrowed(bytes) => core::str::from_utf8(bytes).ok(),
+            FileBytes::Owned(bytes) => {
+                let text = core::str::from_utf8(bytes.as_slice()).ok()?;
+                Some(local.alloc_str(text))
+            }
+        }
     }
 }
 
@@ -311,10 +355,10 @@ impl Toolchain {
 /// The inputs of one `resolve_crates` call: the program's crate first, then the units.
 pub struct Inputs<'t> {
     pub texts: Texts<'t>,
-    features: Vec<Vec<&'t str>>,
+    features: Shared<'t, Vec<&'t str>>,
     /// Each unit's cfg: the target's atoms and a `feature` atom per feature on.
-    cfgs: Vec<Vec<(&'t str, Option<&'t str>)>>,
-    deps: Vec<Vec<(&'t str, usize)>>,
+    cfgs: Shared<'t, Vec<(&'t str, Option<&'t str>)>>,
+    deps: Shared<'t, Vec<(&'t str, usize)>>,
     user: &'t UserCrate<'t>,
     tc: &'t Toolchain,
     sysroot: Sysroot,
@@ -344,7 +388,15 @@ impl<'t> Inputs<'t> {
         // The program crate's `cfg(panic)` is its inputs' strategy; the toolchain's crates keep
         // the strategy their records were cut under (the target list's), as Rust does with std.
         crate::panic_strategy::derive_cfg(&mut cfgs[0], user.panic);
-        Ok(Inputs { texts: Texts { user: user.files, packs }, features, cfgs, deps, user, tc, sysroot })
+        Ok(Inputs {
+            texts: Texts { user: user.files, packs: Shared::Owned(packs), arena: &tc.arena },
+            features: Shared::Owned(features),
+            cfgs: Shared::Owned(cfgs),
+            deps: Shared::Owned(deps),
+            user,
+            tc,
+            sysroot,
+        })
     }
 
     /// The crate inputs, the program's at index 0.
@@ -385,21 +437,54 @@ impl<'t> Inputs<'t> {
         out
     }
 
-    /// Every crate's names, resolved together, held in `alloc` (the caller's, alive as long as
-    /// the names).
-    pub fn resolve(&'t self, crates: &[CrateInput<'t>], alloc: Alloc<'t>) -> Result<Names<'t>, NamesError<'t>> {
-        self.resolve_with(crates, &Serial, alloc)
+    /// Every crate's names, resolved together, held in `bump` (the caller's arena, alive as long as
+    /// the names), with per-call macro scratch rolled back after each expansion.
+    pub fn resolve(&'t self, crates: &[CrateInput<'t>], bump: Bump<'t>) -> Result<Names<'t>, NamesError<'t>> {
+        let par = ScratchSerial::new();
+        self.resolve_with(crates, &par, bump)
     }
 
     /// [`Inputs::resolve`] under the caller's `par` (one that asks for each crate's names
     /// groups, `Par::names_groups`).
-    pub fn resolve_with<P: blaze_scope::task::Par>(&'t self, crates: &[CrateInput<'t>], par: &P, alloc: Alloc<'t>) -> Result<Names<'t>, NamesError<'t>> {
-        resolve_crates(crates, self.sysroot, &self.texts, par, alloc)
+    pub fn resolve_with<P: blaze_scope::task::Par>(&'t self, crates: &[CrateInput<'t>], par: &P, bump: Bump<'t>) -> Result<Names<'t>, NamesError<'t>> {
+        resolve_crates(crates, self.sysroot, &self.texts, par, bump)
     }
 
     /// The names with `roots` (crate indices) solved whole and every other crate's groups on
     /// demand (E13, blaze-scope cells/lazy_deps.rs).
-    pub fn names_on_demand(&'t self, crates: &[CrateInput<'t>], roots: &[usize], alloc: Alloc<'t>) -> Result<blaze_scope::NamesOnDemand<'t>, blaze_scope::NamesOnDemandError<'t>> {
-        blaze_scope::names_on_demand(crates, self.sysroot, &self.texts, roots, alloc)
+    pub fn names_on_demand(&'t self, crates: &[CrateInput<'t>], roots: &[usize], bump: Bump<'t>) -> Result<blaze_scope::NamesOnDemand<'t>, blaze_scope::NamesOnDemandError<'t>> {
+        blaze_scope::names_on_demand(crates, self.sysroot, &self.texts, roots, bump)
+    }
+}
+
+/// Serial `Par` whose macro-expansion work runs in a reusable scratch `Frame` reset after each
+/// call (`Par::call_scratch`), preventing bump-arena exhaustion when resolving the toolchain.
+pub(crate) struct ScratchSerial {
+    frame: RefCell<Option<Frame>>,
+}
+
+impl ScratchSerial {
+    pub(crate) fn new() -> Self {
+        Self { frame: RefCell::new(Frame::new(Tag::Expand).ok()) }
+    }
+}
+
+impl Par for ScratchSerial {
+    fn map<T, F: Fn(usize) -> T>(&self, n: usize, f: F, out: &mut AVec<'_, T>) {
+        Serial.map(n, f, out);
+    }
+
+    fn call_scratch(&self, work: &mut dyn FnMut(Alloc<'_>)) -> Scratch {
+        let Ok(mut slot) = self.frame.try_borrow_mut() else {
+            return Scratch::Kept;
+        };
+        let Some(frame) = slot.as_mut() else {
+            return Scratch::Kept;
+        };
+        frame.scope(|f| {
+            let erased = Erased::new(f);
+            work(erased.handle());
+        });
+        Scratch::Reset
     }
 }

@@ -159,7 +159,7 @@ pub fn trait_rows<'s>(store: &'s Store<'_>, trait_: ItemKey, head: &TraitHead, a
     let alloc = store.tys.alloc();
     let view = store.tys.view();
     let mut rows: Vec<Synthetic, Alloc<'static>> = Vec::new_in(alloc);
-    let mut placed: Vec<(ItemKey, List), Alloc<'static>> = Vec::new_in(alloc);
+    let mut placed: Vec<(ItemKey, List), Alloc<'static>> = Vec::new_in(store.work_alloc());
     for m in head.members.iter() {
         if !may_return_opaque(m.shape) {
             continue;
@@ -206,7 +206,7 @@ pub fn trait_rows<'s>(store: &'s Store<'_>, trait_: ItemKey, head: &TraitHead, a
 /// `impl Trait` in its bounds is no place: the module doc's "Not yet").
 fn opaques_placed(store: &Store<'_>, view: PTys<'_>, fk: ItemKey, output: PTy, out: &mut Vec<(ItemKey, List), Alloc<'static>>) -> Result<(), &'static str> {
     const PAST: &str = "its return type names a type past the heads' type table";
-    let mut work: Vec<PTy, Alloc<'static>> = Vec::new_in(store.tys.alloc());
+    let mut work: Vec<PTy, Alloc<'static>> = Vec::new_in(store.work_alloc());
     work.push(output);
     let mut seen = 0usize;
     while let Some(t) = work.pop() {
@@ -248,7 +248,7 @@ fn twin(store: &Store<'_>, view: PTys<'_>, fk: ItemKey, o: ItemKey, args: List) 
     let swap = |t: PTy| swap_self(store, view, t, o, args, me).map_err(|why| Need::Refused(fk, why));
     let swap_list = |l: List| -> Result<List, Need> {
         let tys = view.list(l).map_err(|_| Need::Refused(fk, TABLE))?;
-        let mut new: Vec<PTy, Alloc<'static>> = Vec::with_capacity_in(tys.len(), store.tys.alloc());
+        let mut new: Vec<PTy, Alloc<'static>> = Vec::with_capacity_in(tys.len(), store.work_alloc());
         for &t in tys {
             new.push(swap(t)?);
         }
@@ -262,6 +262,7 @@ fn twin(store: &Store<'_>, view: PTys<'_>, fk: ItemKey, o: ItemKey, args: List) 
             PClause::Trait { trait_, args } => PClause::Trait { trait_, args: swap_list(args)? },
             PClause::Projection { trait_, args, name, term } => PClause::Projection { trait_, args: swap_list(args)?, name, term: swap(term)? },
             PClause::Const { cond, args } => PClause::Const { cond, args: swap_list(args)? },
+            PClause::ForFields { container, trait_, args } => PClause::ForFields { container: swap(container)?, trait_, args: swap_list(args)? },
             PClause::TypeOutlives { ty, region } => PClause::TypeOutlives { ty: swap(ty)?, region },
             c @ PClause::RegionOutlives { .. } => c,
         });
@@ -280,7 +281,7 @@ fn swap_self(store: &Store<'_>, view: PTys<'_>, t: PTy, o: ItemKey, args: List, 
         PNode::Opaque(k, _) if k == o => return Err("its `impl Trait`'s bounds name that opaque with other arguments"),
         _ => {}
     }
-    let mut work: Vec<PTy, Alloc<'static>> = Vec::new_in(store.tys.alloc());
+    let mut work: Vec<PTy, Alloc<'static>> = Vec::new_in(store.work_alloc());
     work.push(t);
     let mut seen = 0usize;
     while let Some(x) = work.pop() {
@@ -336,7 +337,7 @@ pub fn impl_assoc<'s>(store: &'s Store<'_>, impl_: ItemKey, head: &ImplHead, row
 /// `tr`: both walked together, a node of the trait's descended into only where the impl's has
 /// the same constructor (`same_head`) and as many children.
 fn at_place(store: &Store<'_>, view: PTys<'_>, tr: PTy, imp: PTy, o: ItemKey) -> Result<PTy, &'static str> {
-    place_in(view, tr, view, imp, o, store.tys.alloc())
+    place_in(view, tr, view, imp, o, store.work_alloc())
 }
 
 /// [`at_place`] over two tables: the trait fn's return type `tr` in `tv`, the impl fn's `imp` in
@@ -382,7 +383,8 @@ pub(crate) fn place_in(tv: PTys<'_>, tr: PTy, iv: PTys<'_>, imp: PTy, o: ItemKey
 fn same_head(a: PNode, b: PNode) -> bool {
     use PNode as N;
     match (a, b) {
-        (N::Tuple(x), N::Tuple(y)) | (N::Dynamic(x), N::Dynamic(y)) => x.len == y.len,
+        (N::Tuple(x), N::Tuple(y)) | (N::Union(x), N::Union(y)) | (N::Dynamic(x), N::Dynamic(y)) => x.len == y.len,
+        (N::Record(s1, x), N::Record(s2, y)) => s1 == s2 && x.len == y.len,
         (N::Ref(m, _), N::Ref(n, _)) | (N::Ptr(m, _), N::Ptr(n, _)) => m == n,
         (N::Array(..), N::Array(..)) | (N::Slice(_), N::Slice(_)) => true,
         (N::Adt(k, _), N::Adt(j, _)) | (N::FnDef(k, _), N::FnDef(j, _)) | (N::ExTrait(k, _), N::ExTrait(j, _)) | (N::Foreign(k), N::Foreign(j)) => k == j,

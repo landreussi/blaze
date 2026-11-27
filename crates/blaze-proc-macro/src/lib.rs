@@ -18,11 +18,20 @@
 // Without `runtime`: a module's identity and key, the module store's lookup, the expansion
 // record's key and lookup. A command that only asks whether a module or an answer is kept
 // links no Wasmtime.
+pub mod comptime_patch;
 pub mod module;
 pub mod package_env;
 pub mod parts;
 pub mod record;
 pub mod sandbox;
+
+/// O(1) refcount share of a `std::sync::Arc` handle.
+#[cfg(feature = "runtime")]
+pub(crate) trait ShareArc {
+    fn share_arc(&self) -> Self;
+}
+#[cfg(feature = "runtime")]
+impl<T: ?Sized> ShareArc for std::sync::Arc<T> { #[inline] fn share_arc(&self) -> Self { std::sync::Arc::clone(self) } }
 
 // With `runtime`: running a module (the bridge, the host, the hook, build scripts).
 #[cfg(feature = "runtime")]
@@ -48,6 +57,8 @@ pub mod native_setting;
 #[cfg(feature = "runtime")]
 pub mod native_unit;
 #[cfg(feature = "runtime")]
+pub mod probe_clang;
+#[cfg(feature = "runtime")]
 pub mod protocol;
 #[cfg(feature = "runtime")]
 pub mod script;
@@ -63,6 +74,8 @@ pub mod server;
 pub mod spawn_records;
 #[cfg(feature = "runtime")]
 pub mod spawn_route;
+#[cfg(feature = "runtime")]
+pub mod wasm64_runtime;
 #[cfg(feature = "runtime")]
 pub mod wire;
 

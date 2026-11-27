@@ -157,7 +157,7 @@ impl<'a> Origin<'a> {
             let hit = match object {
                 Object::Segment(_) => which == 0,
                 Object::Index(_) => which == 1,
-                Object::Head | Object::Prefix | Object::Manifest(_) | Object::Summary(_) => false,
+                Object::Head | Object::Prefix | Object::Manifest(_) | Object::SegmentWire(_) | Object::Summary(_) => false,
             };
             if hit {
                 out.push(*object);
@@ -201,7 +201,7 @@ fn bound(ask: &Ask, limits: &Limits) -> Option<u64> {
         Object::Prefix => Some(u64::from(limits.prefix_most)),
         Object::Segment(_) => Some(u64::from(limits.range_most.max(limits.record_most))),
         Object::Index(_) => Some(u64::from(PAGE_ENTRIES_MOST) * REMOTE_ENTRY as u64),
-        Object::Head | Object::Manifest(_) | Object::Summary(_) => None,
+        Object::Head | Object::Manifest(_) | Object::SegmentWire(_) | Object::Summary(_) => None,
     }
 }
 
@@ -471,6 +471,7 @@ fn case_in(tape: &Tape, alloc: Alloc<'_>) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The invariant: published remote reads return only verified true bytes of public settled records or typed refusals within configured index limits.
 #[test]
 fn published_records_are_true_bytes_or_typed_refusals_in_three_waves() {
     on_a_big_stack(|| blaze_sim::check(Config::cases(400), |tape| case(tape, Plant::None)));

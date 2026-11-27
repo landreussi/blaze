@@ -306,14 +306,15 @@ fn kept(dep: &'static str) -> &'static Kept {
         input("core", "/core/lib.rs", &[]),
     ];
     let sysroot = Sysroot { core: Some(CrateId(CORE_AT as u32)), alloc: None, std: None, bstd: None };
-    let names: &'static Names<'static> = Box::leak(Box::new(resolve_crates(&crates, sysroot, &Texts { dep }, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))));
     let g = a();
+    let bump = blaze_own::testing::bump();
+    let names: &'static Names<'static> = Box::leak(Box::new(resolve_crates(&crates, sysroot, &Texts { dep }, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}"))));
     let mut kept = Kept { names: Vec::new(), items: Vec::new(), files: Vec::new(), expansions: Vec::new(), keys: Vec::new(), crate_names: Vec::new(), cells: HashMap::new() };
     for c in names.crates().iter() {
-        let names_bytes = aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), g);
-        let items_bytes = aligned(&items_record::encode(c, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), g);
+        let names_bytes = aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), bump);
+        let items_bytes = aligned(&items_record::encode(c, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), bump);
         let wholes = [(Section::Names, names_bytes), (Section::Items, items_bytes)];
-        let table = crate_table(c, names_bytes, items_bytes, &wholes, g).unwrap_or_else(|e| panic!("the cell table of `{}`: {e:?}", c.name));
+        let table = crate_table(c, names_bytes, items_bytes, &wholes, bump).unwrap_or_else(|e| panic!("the cell table of `{}`: {e:?}", c.name));
         let mut prefix = [0u8; 8];
         prefix.copy_from_slice(&c.key.0.0[..8]);
         kept.cells.insert(prefix, table.to_vec());
@@ -364,7 +365,7 @@ impl<'a> Make<'a> for MapMake {
 
 fn body_frame() -> BodyFrame<'static> {
     let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the body's frame")));
-    BodyFrame { frame, alloc: a(), plant_drop: None, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All, heads: None, sources: None, goals: None, census: None }
+    BodyFrame { frame, alloc: a(), plant_drop: None, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All, heads: None, sources: None, goals: None, prepared: None, front: None }
 }
 
 /// One body task: a task error (the find's refusal) fails the test by the body's path.

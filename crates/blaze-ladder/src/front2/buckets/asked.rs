@@ -60,16 +60,27 @@ pub struct BucketRead {
     pub answer: u64,
 }
 
+/// What one answered trait question read over buckets or impl tables.
+pub(super) struct TraitReads {
+    /// Question-specific reads (all reads for `admit_asked` and non-`Home::Any` `admit_tables`;
+    /// shape-specific reads only when `uses_any_filter` is true).
+    pub(super) own: blaze_own::AVec<'static, BucketRead>,
+    /// When true, this question also read the per-body `TablesCache` (`all_unread_reads` and
+    /// `trait_any_filter[&trait_]`).
+    pub(super) uses_any_filter: bool,
+}
+
 /// What [`Buckets::admit_asked`] keeps: which buckets are filed, and what each question read.
 pub(super) struct Indexed {
+    pub(super) alloc: blaze_own::Alloc<'static>,
     /// Each (crate, bucket) filed, with its digest.
-    filed: HashMap<(usize, BucketKey), u64, Global>,
+    filed: HashMap<(usize, BucketKey), u64, blaze_own::Alloc<'static>>,
     /// Each crate whose unfiled list is filed, with the list's digest.
-    unfiled: HashMap<usize, u64, Global>,
-    /// The incoherent fact's digest, once `Buckets::incoherent` holds it.
-    incoherent: Option<u64>,
-    pub(super) trait_reads: HashMap<(ItemKey, Shape), Vec<BucketRead, Global>, Global>,
-    pub(super) inherent_reads: HashMap<Shape, Vec<BucketRead, Global>, Global>,
+    pub(super) unfiled: HashMap<usize, u64, blaze_own::Alloc<'static>>,
+    /// The incoherent fact's digest, once `BucketIndex::crate_state` holds it.
+    pub(super) incoherent: Option<u64>,
+    pub(super) trait_reads: HashMap<(ItemKey, Shape), TraitReads, blaze_own::Alloc<'static>>,
+    pub(super) inherent_reads: HashMap<Shape, blaze_own::AVec<'static, BucketRead>, blaze_own::Alloc<'static>>,
     /// How many impls were filed from a bucket: no impl row decoded, no text opened.
     pub(super) from_index: u32,
     /// How many (crate, bucket) were looked up in a crate's record ([`Buckets::bucket_lookups`]).
@@ -81,13 +92,14 @@ pub(super) struct Indexed {
 }
 
 impl Indexed {
-    pub(super) fn new() -> Indexed {
+    pub(super) fn new(alloc: blaze_own::Alloc<'static>) -> Indexed {
         Indexed {
-            filed: HashMap::new_in(Global),
-            unfiled: HashMap::new_in(Global),
+            alloc,
+            filed: HashMap::new_in(alloc),
+            unfiled: HashMap::new_in(alloc),
             incoherent: None,
-            trait_reads: HashMap::new_in(Global),
-            inherent_reads: HashMap::new_in(Global),
+            trait_reads: HashMap::new_in(alloc),
+            inherent_reads: HashMap::new_in(alloc),
             from_index: 0,
             lookups: 0,
             asks: 0,
@@ -120,8 +132,8 @@ fn first16(id: ContentId) -> u128 {
 /// fn item, a fn pointer, an opaque type, a closure, a trait object, a pattern type: an impl
 /// on one is unfiled or under "any"). Refused: a nominal type whose library key the key map
 /// and the records do not give.
-fn heads_of<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> Result<Vec<(Head, Shape), Global>, ImplQuestionError> {
-    let mut out = Vec::new_in(Global);
+fn heads_of<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape, alloc: blaze_own::Alloc<'static>) -> Result<blaze_own::Vec<(Head, Shape), blaze_own::Alloc<'static>>, ImplQuestionError> {
+    let mut out = blaze_own::Vec::new_in(alloc);
     match shape {
         Shape::Bool | Shape::Char | Shape::Str | Shape::Int(_) | Shape::Uint(_) | Shape::Float(_) | Shape::AnyInt | Shape::AnyFloat => {
             for (name, _) in PRIMS.iter() {
@@ -169,34 +181,38 @@ impl BucketIndex {
         // Every field: a new kind of home is a compile error here, not a crate left unasked.
         // `local` judges filed impls, never which crates are asked.
         let Homes { all, bare, blanket, local: _ } = home;
-        let mut reads: Vec<BucketRead, Global> = Vec::new_in(Global);
+        let alloc = self.indexed.alloc;
+        let mut reads: blaze_own::AVec<'static, BucketRead> = blaze_own::AVec::new_in(alloc);
         if [all, bare, blanket].contains(&Home::Incoherent) {
-            match names.incoherent_crates() {
-                Some((crates, digest)) => {
-                    if self.indexed.incoherent.is_none() {
-                        for krate in 0..self.incoherent.len() {
-                            self.incoherent[krate] = crates.contains(&krate);
+            if let Some(digest) = self.indexed.incoherent {
+                reads.push(BucketRead { krate: 0, bucket: INCOHERENT_FACT, answer: digest });
+            } else {
+                match names.incoherent_crates() {
+                    Some((crates, digest)) => {
+                        for krate in 0..self.crate_state.len() {
+                            self.crate_state[krate].incoherent = crates.contains(&krate);
                         }
-                        self.indexed.incoherent = Some(first8(digest));
+                        let answer = first8(digest);
+                        self.indexed.incoherent = Some(answer);
+                        reads.push(BucketRead { krate: 0, bucket: INCOHERENT_FACT, answer });
                     }
-                    reads.push(BucketRead { krate: 0, bucket: INCOHERENT_FACT, answer: first8(digest) });
+                    // Not told: every crate stays admitted (the wide side), and the gap voids
+                    // the verdict by name.
+                    None => names.gap("which crates may write an incoherent inherent impl (the records were named no lang crates: `Records::name_lang_crates`)", None),
                 }
-                // Not told: every crate stays admitted (the wide side), and the gap voids
-                // the verdict by name.
-                None => names.gap("which crates may write an incoherent inherent impl (the records were named no lang crates: `Records::name_lang_crates`)", None),
             }
         }
         // The buckets asked of each crate, how an impl found in each is filed, and whether the
         // bucket is the "any" head's (where a self path the writer read to no constructor is:
         // `PathSelf`).
-        let mut wanted: Vec<(BucketKey, Under, bool), Global> = Vec::new_in(Global);
+        let mut wanted: blaze_own::Vec<(BucketKey, Under, bool), blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         // The asked trait's crate (`PathSelf::Trait`).
         let mut trait_krate = None;
         let (trait_, shape) = match ask {
             Ask::Trait(t, shape) => (Some(t), shape),
             Ask::Inherent(shape) => (None, shape),
         };
-        let heads = heads_of(names, keys, shape)?;
+        let heads = heads_of(names, keys, shape, alloc)?;
         // A builtin the checker has no shape for is filed with no constructor (`file_row`).
         let shapeless = blaze_scope::BUILTIN_TYPES.iter().filter(|name| prim_shape(name).is_none()).filter_map(|name| blaze_scope::builtin_type(name)).map(|def| (Head::Named(def.key), None));
         let all_heads = heads.iter().map(|(head, of)| (*head, Some(*of))).chain(core::iter::once((Head::Any, None))).chain(shapeless);
@@ -217,7 +233,7 @@ impl BucketIndex {
             }
             // A proc-macro unit the program reaches answers none of its questions; the
             // program's own crate (0) does, a proc macro's too (linked.rs `links_unit`).
-            if !crate::front2::linked::links_unit(krate == 0, names.proc_macro(krate) == Some(true)) {
+            if !self.crate_linked(names, krate) {
                 continue;
             }
             // Never skipped without a word: an admitted crate not asked leaves its impls out.
@@ -227,7 +243,7 @@ impl BucketIndex {
             let unfiled = match self.indexed.unfiled.get(&krate).copied() {
                 Some(digest) => digest,
                 None => {
-                    let mut rows: Vec<(ImplRow<'n>, NotFiled), Global> = Vec::new_in(Global);
+                    let mut rows: blaze_own::Vec<(ImplRow<'n>, NotFiled), blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(alloc);
                     // No record, or one that did not read: the source filed why.
                     let Some(digest) = names.unfiled(krate, &mut |row, why| rows.push((row, why))) else { continue };
                     filed += rows.len();
@@ -241,7 +257,7 @@ impl BucketIndex {
                 let digest = match self.indexed.filed.get(&(krate, *key)).copied() {
                     Some(digest) => digest,
                     None => {
-                        let mut got: Vec<BucketImpl, Global> = Vec::new_in(Global);
+                        let mut got: blaze_own::Vec<BucketImpl, blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(alloc);
                         self.indexed.lookups += 1;
                         let Some(digest) = names.bucket(krate, key, &mut |it| got.push(it)) else { continue };
                         for it in got.iter() {
@@ -277,9 +293,13 @@ impl BucketIndex {
         reads.sort_unstable();
         reads.dedup();
         match ask {
-            Ask::Trait(t, shape) => self.indexed.trait_reads.insert((t, shape), reads),
-            Ask::Inherent(shape) => self.indexed.inherent_reads.insert(shape, reads),
-        };
+            Ask::Trait(t, shape) => {
+                self.indexed.trait_reads.insert((t, shape), TraitReads { own: reads, uses_any_filter: false });
+            }
+            Ask::Inherent(shape) => {
+                self.indexed.inherent_reads.insert(shape, reads);
+            }
+        }
         Ok(filed)
     }
 
@@ -287,19 +307,47 @@ impl BucketIndex {
     /// [`Buckets::admit`] files a crate's rows: by the row (`file_row`: the reader's names
     /// resolve what the writer's did not), else by the header's text.
     fn file_unfiled<'n, S: NamesSource<'n>>(&mut self, names: S, krate: usize, rows: &[(ImplRow<'n>, NotFiled)]) {
-        let mut plain: Vec<ImplRow<'n>, Global> = Vec::with_capacity_in(rows.len(), Global);
+        let mut plain: blaze_own::Vec<ImplRow<'n>, blaze_own::Alloc<'static>> = blaze_own::Vec::with_capacity_in(rows.len(), self.indexed.alloc);
         for (row, why) in rows.iter() {
             self.indexed.not_filed[*why as usize] += 1;
             plain.push(*row);
         }
-        let counts = file_rows(names, krate, &plain, &mut |f| self.take(names, krate, f));
+        let mut aliases = self.alias_shapes.take();
+        let counts = super::file_rows_with_aliases(names, krate, &plain, aliases.as_mut(), &mut |f| self.take(names, krate, f));
+        self.alias_shapes = aliases;
         self.count(counts);
+    }
+
+    /// Visits the parts of an answered trait question's reads without allocating: its own reads
+    /// and, when answered via the per-body `Home::Any` filter cache, the shared `UnreadTrait`
+    /// and per-trait `NoImplsOf` read slices.
+    pub(super) fn with_trait_reads<R>(&self, trait_: ItemKey, shape: Shape, f: impl FnOnce(&[BucketRead], Option<(&[BucketRead], &[BucketRead])>) -> R) -> R {
+        let Some(entry) = self.indexed.trait_reads.get(&(trait_, shape)) else {
+            return f(&[], None);
+        };
+        if !entry.uses_any_filter {
+            return f(&entry.own, None);
+        }
+        let shared = self.tables_cache.as_ref().map(|cache| (cache.all_unread_reads(), cache.trait_reads_for(trait_)));
+        f(&entry.own, shared)
     }
 
     /// What the answered trait question read, sorted: each (crate, bucket) with its digest
     /// (module docs). Empty before the question is asked, and where no bucket index is read.
-    pub fn trait_reads(&self, trait_: ItemKey, shape: Shape) -> &[BucketRead] {
-        self.indexed.trait_reads.get(&(trait_, shape)).map_or(&[], |v| v.as_slice())
+    pub fn trait_reads(&self, trait_: ItemKey, shape: Shape) -> blaze_own::Vec<BucketRead, Global> {
+        let mut out: blaze_own::Vec<BucketRead, Global> = blaze_own::Vec::new_in(Global);
+        self.with_trait_reads(trait_, shape, |own, shared| {
+            let extra = shared.map_or(0, |(u, t)| u.len() + t.len());
+            out.reserve(own.len() + extra);
+            out.extend_from_slice(own);
+            if let Some((unread, trait_filter)) = shared {
+                out.extend_from_slice(unread);
+                out.extend_from_slice(trait_filter);
+                out.sort_unstable();
+                out.dedup();
+            }
+        });
+        out
     }
 
     /// What the answered inherent question at `shape` read, sorted.

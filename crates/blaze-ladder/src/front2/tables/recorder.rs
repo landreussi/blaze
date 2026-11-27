@@ -15,7 +15,7 @@ use core::cell::{Cell, RefCell};
 
 use blaze_id::ItemKey;
 use blaze_own::{AVec, Alloc};
-use blaze_scope::cell_key::BindingKeys;
+use blaze_scope::cell_key::{BindingKeys, CellKey};
 use blaze_scope::names_cells::{CellSink, NameCell, Section};
 use blaze_surface::Namespace;
 
@@ -247,6 +247,40 @@ pub enum Repeats {
 /// The direct-mapped filter's slots ([`Recorder::keep`]): a power of two.
 const FILTER_SLOTS: usize = 64;
 
+/// Stretch-scoped binding cell-key cache shared across consecutive bodies in one stretch
+/// (single-threaded per worker, zero locks).
+///
+/// `blaze_scope::cell_key::cell_key(ns, name)` is a pure function of `(ns, name)` (independent of
+/// `module`), so keying the inner [`BindingKeys`] with a fixed dummy module derives each distinct
+/// `(ns, name)` BLAKE3 cell key once per stretch across all modules and bodies while each
+/// [`Recorder`] still emits `NameCell::Binding { module, name: key }` with the real `module` and
+/// deduplicates per-body via its own `recent_raw`/`mapped`/`recent`/`seen` tables.
+pub struct SharedBindingKeys {
+    inner: RefCell<BindingKeys<'static>>,
+}
+
+const SHARED_BINDING_MODULE: ItemKey = ItemKey(blaze_id::ContentId([0; 32]));
+
+impl SharedBindingKeys {
+    pub fn new(alloc: Alloc<'static>) -> SharedBindingKeys {
+        SharedBindingKeys { inner: RefCell::new(BindingKeys::new_in(alloc)) }
+    }
+
+    /// How many distinct `(ns, name)` cell keys this stretch cache has derived via BLAKE3.
+    pub fn derived(&self) -> u64 {
+        self.inner.borrow().derived()
+    }
+
+    fn key(&self, ns: Namespace, name: &str) -> CellKey {
+        self.inner.borrow_mut().key(SHARED_BINDING_MODULE, ns, name).key
+    }
+}
+
+enum BindingCache<'a> {
+    Owned(RefCell<BindingKeys<'a>>),
+    Shared(&'a SharedBindingKeys),
+}
+
 /// One task's reads (module docs).
 ///
 /// A read is kept once, when first offered: the common case is the SAME cell read again and
@@ -271,6 +305,10 @@ pub struct Recorder<'a> {
     /// ([`slot_of`], a byte of the key, no hash). A repeat of a recent cell is one load and one
     /// compare; a miss probes `seen` as before.
     recent: [Cell<Option<ReadKey>>; FILTER_SLOTS],
+    /// Direct-mapped filter in front of `mapped` for raw questions placed via [`Recorder::read_mapped`]:
+    /// kept in the recorder's scratch allocator (not on the stack) and only populated after
+    /// placement succeeds (or on a `mapped` hit), so a placement error is never hidden.
+    recent_raw: blaze_own::ABox<'a, [Cell<Option<TableRead>>; FILTER_SLOTS]>,
     /// Reads offered since the last item transferred its new cells, including repeats; a
     /// repeated question's muted offers are not ([`Recorder::memo`]).
     offered: Cell<u64>,
@@ -293,12 +331,23 @@ pub struct Recorder<'a> {
     /// A test's planted bug: reads of this cell are dropped ([`Recorder::plant_drop`]).
     dropped: Cell<Option<NameCell>>,
     /// The binding reads' cell keys, each derived once ([`ReadSink::binding`]): a names lookup
-    /// hashes nothing here on a repeat.
-    binding_keys: RefCell<BindingKeys<'a>>,
+    /// hashes nothing here on a repeat (per-recorder or stretch-shared via [`SharedBindingKeys`]).
+    binding_keys: BindingCache<'a>,
 }
 
 impl<'a> Recorder<'a> {
     pub fn new(opts: RecorderOpts<'a>) -> Recorder<'a> {
+        let alloc = opts.alloc;
+        Self::new_with_cache(opts, BindingCache::Owned(RefCell::new(BindingKeys::new_in(alloc))))
+    }
+
+    /// Creates a recorder sharing `shared`'s stretch-scoped `(ns, name) -> CellKey` BLAKE3 memo
+    /// while keeping all read deduplication strictly per-recorder (rule 21).
+    pub fn with_shared_bindings(opts: RecorderOpts<'a>, shared: &'a SharedBindingKeys) -> Recorder<'a> {
+        Self::new_with_cache(opts, BindingCache::Shared(shared))
+    }
+
+    fn new_with_cache(opts: RecorderOpts<'a>, binding_keys: BindingCache<'a>) -> Recorder<'a> {
         Recorder {
             reads: RefCell::new(AVec::new_in(opts.alloc)),
             seen: RefCell::new(blaze_hash::HashSet::new_in(opts.alloc)),
@@ -306,6 +355,7 @@ impl<'a> Recorder<'a> {
             allocating: Cell::new(None),
             checking: Cell::new(None),
             recent: [const { Cell::new(None) }; FILTER_SLOTS],
+            recent_raw: blaze_own::Box::new_in([const { Cell::new(None) }; FILTER_SLOTS], opts.alloc),
             offered: Cell::new(0),
             repeats: Cell::new(Repeats::Quiet),
             asking: Cell::new(None),
@@ -316,14 +366,17 @@ impl<'a> Recorder<'a> {
             wholes: RefCell::new(AVec::new_in(opts.alloc)),
             full: Cell::new(false),
             dropped: Cell::new(None),
-            binding_keys: RefCell::new(BindingKeys::new_in(opts.alloc)),
+            binding_keys,
         }
     }
 
-    /// How many binding cell keys this recorder derived: one per distinct binding read,
-    /// whatever the number of lookups (the floor's counter).
+    /// How many binding cell keys this recorder (or its shared stretch cache) derived: one per
+    /// distinct binding read, whatever the number of lookups (the floor's counter).
     pub fn binding_keys_derived(&self) -> u64 {
-        self.binding_keys.borrow().derived()
+        match &self.binding_keys {
+            BindingCache::Owned(keys) => keys.borrow().derived(),
+            BindingCache::Shared(shared) => shared.derived(),
+        }
     }
 
     /// Offers and newly kept cells since the last transfer (all of them for a single task).
@@ -354,7 +407,7 @@ impl<'a> Recorder<'a> {
         let raw = core::mem::size_of::<TableRead>() as u64;
         let list = self.reads.borrow().capacity() as u64 * raw;
         let seen = self.seen.borrow().capacity() as u64 * (slot + 1);
-        let filter = core::mem::size_of_val(&self.recent) as u64;
+        let filter = (core::mem::size_of_val(&self.recent) + core::mem::size_of_val(&*self.recent_raw)) as u64;
         list + seen + filter + self.mapped.borrow().capacity() as u64 * (raw + 1)
     }
 
@@ -519,25 +572,109 @@ impl Recorder<'_> {
             return None;
         }
         self.allocating.set(Some("the binding-name key table"));
-        let binding = self.binding_keys.borrow_mut().key(module, ns, name);
+        let out = match &self.binding_keys {
+            BindingCache::Owned(keys) => {
+                let binding = keys.borrow_mut().key(module, ns, name);
+                (binding.fresh || self.dropped.get().is_some()).then_some(TableRead::Names(NameCell::Binding { module, name: binding.key }))
+            }
+            BindingCache::Shared(shared) => {
+                // Shared cache covers the whole stretch: every body must still deduplicate via its
+                // own recorder (`keep` / `read_mapped_offered`) so no read is ever dropped.
+                let key = shared.key(ns, name);
+                Some(TableRead::Names(NameCell::Binding { module, name: key }))
+            }
+        };
         self.allocating.set(None);
-        (binding.fresh || self.dropped.get().is_some()).then_some(TableRead::Names(NameCell::Binding { module, name: binding.key }))
+        out
+    }
+
+    /// Records a binding read with placement (`ObservedReads::binding`): hashes `(ns, name)` once
+    /// per stretch when backed by [`SharedBindingKeys`], and deduplicates per-recorder before
+    /// invoking `place`.
+    pub(super) fn binding_mapped<E>(
+        &self,
+        module: ItemKey,
+        ns: Namespace,
+        name: &str,
+        place: impl FnOnce(TableRead) -> Result<Option<PlacedCell>, E>,
+    ) -> Result<(), E> {
+        if !self.offer() {
+            return Ok(());
+        }
+        match &self.binding_keys {
+            BindingCache::Owned(keys) => {
+                self.allocating.set(Some("the binding-name key table"));
+                let binding = keys.borrow_mut().key(module, ns, name);
+                self.allocating.set(None);
+                if binding.fresh || self.dropped.get().is_some() {
+                    let read = TableRead::Names(NameCell::Binding { module, name: binding.key });
+                    match place(read) {
+                        Ok(cell) => self.keep(read, cell),
+                        Err(error) => {
+                            self.keep(read, None);
+                            return Err(error);
+                        }
+                    }
+                }
+                Ok(())
+            }
+            BindingCache::Shared(shared) => {
+                self.allocating.set(Some("the binding-name key table"));
+                let key = shared.key(ns, name);
+                self.allocating.set(None);
+                let read = TableRead::Names(NameCell::Binding { module, name: key });
+                self.read_mapped_offered(read, || place(read))
+            }
+        }
     }
 
     /// Place each raw question on its first offer. A hit skips deriving the cell digest,
     /// searching the crate list and probing the canonical set. A placement error ends the
     /// check; keep its key out of the memo so a later check cannot hide the error.
     pub(super) fn read_mapped<E>(&self, read: TableRead, place: impl FnOnce() -> Result<Option<PlacedCell>, E>) -> Result<(), E> {
-        const MEMO_LIMIT: usize = 1 << 16;
         if !self.offer() {
             return Ok(());
+        }
+        self.read_mapped_offered(read, place)
+    }
+
+    fn read_mapped_offered<E>(&self, read: TableRead, place: impl FnOnce() -> Result<Option<PlacedCell>, E>) -> Result<(), E> {
+        const MEMO_LIMIT: usize = 1 << 16;
+        let recent = self.recent_raw.get(slot_of(ReadKey::Raw(read)));
+        if recent.is_some_and(|slot| slot.get() == Some(read)) {
+            self.filtered.set(self.filtered.get().saturating_add(1));
+            return Ok(());
+        }
+        // Impl table reads are already deduplicated per body by `BucketReadUnion` and placed in
+        // O(1) via `ReadIds::impl_names`; skip `self.mapped` (which would otherwise hold tens of
+        // thousands of one-shot impl keys alongside `self.seen`).
+        if matches!(read, TableRead::Impls { .. }) {
+            return match place() {
+                Ok(cell) => {
+                    if let Some(slot) = recent {
+                        slot.set(Some(read));
+                    }
+                    self.keep(read, cell);
+                    Ok(())
+                }
+                Err(error) => {
+                    self.keep(read, None);
+                    Err(error)
+                }
+            };
         }
         let mut mapped = self.mapped.borrow_mut();
         if mapped.len() == MEMO_LIMIT {
             if mapped.contains(&read) {
+                if let Some(slot) = recent {
+                    slot.set(Some(read));
+                }
                 return Ok(());
             }
             mapped.clear();
+            for cell in self.recent_raw.iter() {
+                cell.set(None);
+            }
         }
         let may_grow = mapped.len() == mapped.capacity();
         if may_grow {
@@ -548,10 +685,18 @@ impl Recorder<'_> {
             self.allocating.set(None);
         }
         if !first {
+            if let Some(slot) = recent {
+                slot.set(Some(read));
+            }
             return Ok(());
         }
         match place() {
-            Ok(cell) => self.keep(read, cell),
+            Ok(cell) => {
+                if let Some(slot) = recent {
+                    slot.set(Some(read));
+                }
+                self.keep(read, cell);
+            }
             Err(error) => {
                 mapped.remove(&read);
                 // Early setup or seed refusal can stop the check before its stored
@@ -644,6 +789,12 @@ fn slot_of(key: ReadKey) -> usize {
             NameCell::Root { krate } => krate[7] ^ 0x33,
             NameCell::Lang { krate } => krate[7] ^ 0x44,
             NameCell::Incoherent { krate } => krate[7] ^ 0x55,
+            NameCell::InternalSymbols { krate } => krate[7] ^ 0x45,
+            NameCell::Links { krate } => krate[7] ^ 0x46,
+            NameCell::ImplRows { krate } => krate[7] ^ 0x47,
+            NameCell::Files { krate } => krate[7] ^ 0x48,
+            NameCell::Extensions { krate } => krate[7] ^ 0x49,
+            NameCell::CfgAtoms { krate } => krate[7] ^ 0x4a,
             NameCell::Whole { krate, section } => krate[7] ^ (section as u8) ^ 0x66,
             NameCell::Variants { owner } => item(owner) ^ 0x77,
             NameCell::Members { owner } => item(owner) ^ 0x88,
@@ -656,7 +807,7 @@ fn slot_of(key: ReadKey) -> usize {
         ReadKey::Raw(TableRead::Signature { key }) => item(key) ^ 0x0e,
         ReadKey::Raw(TableRead::Text { key }) => item(key) ^ 0x1e,
         ReadKey::Raw(TableRead::Head { item: k, part }) => k[15] ^ part.rotate_left(4),
-        ReadKey::Raw(TableRead::Impls { bucket, .. }) => bucket[0] ^ 0x2e,
+        ReadKey::Raw(TableRead::Impls { krate, bucket }) => krate[15] ^ bucket[0] ^ 0x2e,
     };
     usize::from(b) & (FILTER_SLOTS - 1)
 }
@@ -807,6 +958,28 @@ mod tests {
         assert_eq!((tally.offered, tally.filtered), (20, 18), "two modules in two slots: every repeat met by the filter");
     }
 
+    /// `read_mapped` hits the direct-mapped raw filter on repeats without hiding placement errors.
+    #[test]
+    fn read_mapped_filters_recent_raw_repeats_and_keeps_errors_visible() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let r = Recorder::new(RecorderOpts { alloc });
+        let ok_read = TableRead::Names(NameCell::Root { krate: [1; 8] });
+        let err_read = TableRead::Names(NameCell::Root { krate: [2; 8] });
+        let mut placements = 0u32;
+        for _ in 0..8 {
+            r.read_mapped(ok_read, || {
+                placements += 1;
+                Ok::<_, ()>(Some(super::PlacedCell { kind: 1, subject: [1; 32], cell: [1; 16] }))
+            }).expect("ok placement");
+        }
+        assert_eq!(placements, 1);
+        assert_eq!(r.read_mapped(err_read, || Err(())), Err(()));
+        assert_eq!(r.read_mapped(err_read, || Err(())), Err(()), "placement error must not be cached in recent_raw");
+        let (list, tally) = r.finish_tallied().expect("within the cap");
+        assert_eq!(list.len(), 2);
+        assert_eq!(tally.filtered, 8, "7 repeats of ok_read in recent_raw + 1 repeat of err_read in keep");
+    }
+
     /// Control: the planted drop removes exactly that cell.
     #[test]
     fn a_planted_drop_removes_its_cell() {
@@ -817,5 +990,66 @@ mod tests {
         r.item(key(4));
         let list = r.finish().expect("within the cap");
         assert_eq!(&list[..], &[TableRead::Names(NameCell::Item { key: key(4) })]);
+    }
+
+    /// Impl-table reads bypass the secondary `mapped` hash set while still deduplicating
+    /// cleanly in `recent_raw` + `seen` and surfacing placement errors.
+    #[test]
+    fn read_mapped_skips_mapped_set_for_impls_and_deduplicates() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let r = Recorder::new(RecorderOpts { alloc });
+        let r1 = TableRead::Impls { krate: [1; 16], bucket: [0xaa; 16] };
+        let r2 = TableRead::Impls { krate: [2; 16], bucket: [0xaa; 16] };
+        let place = |k: u8| super::PlacedCell { kind: 7, subject: [k; 32], cell: [0xaa; 16] };
+        assert!(r.read_mapped(r1, || Ok::<_, ()>(Some(place(1)))).is_ok());
+        assert!(r.read_mapped(r2, || Ok::<_, ()>(Some(place(2)))).is_ok());
+        // Repeat of r1 and r2: `seen` keeps each once and `mapped` stayed empty.
+        assert!(r.read_mapped(r1, || Ok::<_, ()>(Some(place(1)))).is_ok());
+        assert!(r.read_mapped(r2, || Ok::<_, ()>(Some(place(2)))).is_ok());
+        assert_eq!(r.mapped.borrow().len(), 0);
+        let list = match r.finish() {
+            Ok(list) => list,
+            Err(_) => {
+                assert!(false, "within the cap");
+                return;
+            }
+        };
+        assert_eq!(list.len(), 2);
+    }
+
+    /// Stretch-shared binding keys derive each `(ns, name)` once across multiple modules and
+    /// recorders while producing byte-identical read lists and placement counts per recorder.
+    #[test]
+    fn shared_binding_keys_hash_once_and_keep_per_recorder_reads_equal() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let shared = super::SharedBindingKeys::new(alloc);
+        let mods = [key(1), key(2), key(3)];
+        let names = ["Vec", "Option", "Result", "Copy"];
+        let mut placements = 0u32;
+        for &m in &mods {
+            let owned = Recorder::new(RecorderOpts { alloc });
+            let pooled = Recorder::with_shared_bindings(RecorderOpts { alloc }, &shared);
+            for _ in 0..3 {
+                for &n in &names {
+                    owned.binding(m, blaze_surface::Namespace::Types, n);
+                    pooled
+                        .binding_mapped(m, blaze_surface::Namespace::Types, n, |read| {
+                            placements += 1;
+                            let cell = match read {
+                                TableRead::Names(NameCell::Binding { name, .. }) => name.0,
+                                _ => [0; 16],
+                            };
+                            Ok::<_, ()>(Some(super::PlacedCell { kind: 1, subject: m.0.0, cell }))
+                        })
+                        .expect("placement ok");
+                }
+            }
+            let owned_reads = owned.finish().expect("within cap");
+            let pooled_reads = pooled.finish().expect("within cap");
+            assert_eq!(&owned_reads[..], &pooled_reads[..], "identical read list for module {m:?}");
+            assert_eq!(pooled_reads.len(), names.len());
+        }
+        assert_eq!(shared.derived(), names.len() as u64, "each (ns, name) hashed once across all 3 modules");
+        assert_eq!(placements, (mods.len() * names.len()) as u32, "each distinct (module, ns, name) placed once per recorder");
     }
 }

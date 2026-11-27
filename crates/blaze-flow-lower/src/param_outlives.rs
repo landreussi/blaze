@@ -34,7 +34,7 @@
 use blaze_flow::Origin;
 use blaze_own::Vec;
 use blaze_typeck::regions::Region;
-use blaze_typeck::{ExprId, List, PNode, PTy};
+use blaze_typeck::{ExprId, PNode, PTy};
 use core::alloc::Allocator;
 
 use crate::{CallBounds, Facts, Form, Lower, MOST_POSITIONS, OutlivesType, Plant, Refusal, TyD};
@@ -49,7 +49,7 @@ pub struct ParamOrigin {
     pub certain: bool,
 }
 
-impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
+impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
     /// The body's type parameters `t` holds (pushed to `params`; unsorted, may repeat), and
     /// whether it holds another type whose lifetimes the lowering does not count as positions:
     /// an alias, an opaque type, a closure, a coroutine, a trait object, an inference variable,
@@ -62,8 +62,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
     /// A projection of that same value can depend on other types (e.g. its output).
     /// Only open the captures for the former, and only with an exact capture witness.
     pub(crate) fn outlives_components(&self, t: PTy, e: ExprId, params: &mut Vec<u32, A>, captures: bool) -> Result<bool, Refusal> {
-        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
-        stack.push(t);
+        let mut stack = crate::TyStack::new(t, self.alloc);
         let mut steps = 0u32;
         while let Some(t) = stack.pop() {
             steps += 1;
@@ -120,7 +119,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
                     }
                 }
                 PNode::Ref(_, i) | PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
-                PNode::Tuple(l) | PNode::Adt(_, l) => stack.extend_from_slice(self.list(l, e)?),
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) | PNode::Adt(_, l) => stack.extend_from_slice(self.list(l, e)?),
                 _ => {}
             }
         }
@@ -135,7 +134,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
     pub(crate) fn sig_param_bounds(&mut self, t: TyD, start: u32, e: ExprId) -> Result<(), Refusal> {
         // (type, its first position, the position of the nearest enclosing reference or
         // `u32::MAX`, under an ADT with lifetimes)
-        let mut stack: Vec<(PTy, u32, u32, bool), A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<(PTy, u32, u32, bool), A> = Vec::new_in(self.alloc);
         if t.wrap.is_some() {
             stack.push((t.ty, 1, 0, false));
         } else {
@@ -158,7 +157,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
                 }
                 PNode::Ref(_, i) => stack.push((i, at + 1, at, in_adt)),
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push((i, at, under, in_adt)),
-                PNode::Tuple(l) => {
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => {
                     let mut off = at;
                     for &x in self.list(l, e)? {
                         stack.push((x, off, under, in_adt));
@@ -222,34 +221,5 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
         }
         self.param_origs.push(ParamOrigin { origin: o, param: u, certain });
         o
-    }
-
-    /// Whether the call of a callee with declared `bounds`, instantiated with `g`, owes a
-    /// type-outlives bound over an argument that holds none of the call's origin positions
-    /// but does hold a type parameter of the body or a type the lowering does not place: the
-    /// first such callee parameter. Such a call is taken by `call_by_generic_signature` (which
-    /// relates or refuses it), never by `call_by_signature` (which reads no bounds).
-    pub(crate) fn owes_type_outlives(&self, bounds: CallBounds<'_>, g: List, e: ExprId) -> Result<Option<u32>, Refusal> {
-        let args: &'c [PTy] = self.list(g, e)?;
-        // A bound on the output is independent of the future's own captures. It must
-        // reach the generic signature even for an entirely capture-free block.
-        for &(subject, _) in bounds.outlives {
-            if !matches!(subject, OutlivesType::Param(_)) {
-                return Ok(Some(subject.param()));
-            }
-        }
-        let mut params: Vec<u32, A> = Vec::new_in(self.alloc.clone());
-        for (i, &t) in args.iter().enumerate() {
-            let i = i as u32;
-            let bound = i < bounds.unread_below || bounds.outlives.iter().any(|&(s, _)| s == OutlivesType::Param(i));
-            if !bound {
-                continue;
-            }
-            params.clear();
-            if self.npos(t, e)? != 0 || self.unplaced(t, e, &mut params)? || !params.is_empty() {
-                return Ok(Some(i));
-            }
-        }
-        Ok(None)
     }
 }

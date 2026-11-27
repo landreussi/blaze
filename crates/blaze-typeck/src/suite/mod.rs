@@ -40,6 +40,10 @@ mod assoc_item_bounds;
 mod async_closures;
 mod async_fmt;
 mod await_impl;
+mod borrow_unsized_tail;
+mod box_deref_capture;
+mod capability;
+mod cast_branch_expect;
 mod checked_record;
 mod closure_identity;
 mod closures;
@@ -49,6 +53,7 @@ mod const_path_args;
 mod const_terms;
 mod coroutine;
 mod coroutine_id;
+mod cost;
 mod deferred_place;
 mod discriminant;
 mod dyn_objects;
@@ -85,6 +90,7 @@ mod opaque_post_analysis_recursive;
 /// E0425 names the segment that failed (rules/lit_path.rs `path_miss`).
 mod path_miss;
 mod pat_editions;
+mod or_pat_bindings;
 /// An impl parameter named only by a where-clause projection (reth's `DebugNodeLauncher`).
 mod impl_param_by_projection;
 /// The body's own signature's projections as rows at its root (design B).
@@ -113,6 +119,7 @@ mod where_const;
 mod where_projection;
 mod env_shadow_projection;
 mod promote;
+mod reborrow_capture;
 mod impl_for_object;
 mod blanket_beside_own_impl;
 mod coerce_target_obligations;

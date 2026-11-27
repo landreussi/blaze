@@ -69,7 +69,7 @@ pub(crate) enum CannotRun {
     BodiesNotBuilt,
     /// No zygote runs tests on this host yet (test.md piece 9).
     NoRunner,
-    /// No test sandbox is built for this host (Linux), and no test runs unsandboxed (rule 9):
+    /// No test sandbox is built for this host, and no test runs unsandboxed (rule 9):
     /// test_run.rs `Runner` answers every run so without starting anything.
     NoSandbox,
     /// blaze refused the test's entry (blaze-ladder run/special/test_roots.rs): its words are
@@ -82,7 +82,7 @@ impl CannotRun {
         match self {
             CannotRun::BodiesNotBuilt => "the code builder cannot build test bodies yet (test.md, piece 8)",
             CannotRun::NoRunner => "no zygote runs tests on this host yet (test.md, piece 9)",
-            CannotRun::NoSandbox => "no test sandbox is built for Linux yet, and blaze runs no test unsandboxed (rule 9; test.md, piece 9)",
+            CannotRun::NoSandbox => "no test sandbox is built for this host yet, and blaze runs no test unsandboxed (rule 9; test.md, piece 9)",
             CannotRun::EntryRefused => "blaze refuses its entry: the line before this one says why",
         }
     }
@@ -191,8 +191,12 @@ pub(crate) enum Effect<'a> {
 /// The command's verdict.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Status {
+    /// Tests that passed (ran or cached).
+    pub passed: u32,
     /// Tests that ran and failed.
     pub failed: u32,
+    /// Tests ignored or benches skipped.
+    pub ignored: u32,
     /// Tests the plan wanted run that could not be.
     pub not_run: u32,
     /// The check's error findings.
@@ -295,6 +299,7 @@ pub(crate) enum Plant {
 /// A head row moved in this request.
 #[derive(Clone, Copy, Debug)]
 struct Change {
+    suite: SuiteId,
     test: TestId,
     /// None removes a row whose code did not build. Its former pass and asks cannot
     /// validate another run, even if an older pass still occupies the same address.
@@ -310,6 +315,8 @@ struct Current<'a, 'r> {
     /// A live request shares one pool across all suites. Its flat dispatch rows
     /// retain their actual suite for filing results and writing suite heads.
     owners: Option<&'r [SuiteId]>,
+    /// Per-suite previous heads when running a shared inventory pool across suites.
+    suite_heads: Option<&'r [Head<'r>]>,
     /// The tests record's rows, in row (path) order.
     asked: AVec<'a, Asked<'r>>,
     /// (test id, row), sorted by id.
@@ -339,6 +346,17 @@ impl<'r> Current<'_, 'r> {
             Some(owners) => Ok(owners[self.row_of(test)? as usize]),
             None => Ok(self.suite),
         }
+    }
+
+    fn head_of(&self, suite: SuiteId) -> Head<'r> {
+        self.suite_heads
+            .and_then(|heads| usize::try_from(suite.0).ok().and_then(|i| heads.get(i)).copied())
+            .unwrap_or(self.head)
+    }
+
+    fn head_row(&self, test: TestId) -> Result<Option<head::RowRef>, LoopError> {
+        let suite = self.owner(test)?;
+        Ok(self.head_of(suite).row(test))
     }
 
     /// The run's asks and reads, kept for the new head.
@@ -464,12 +482,16 @@ impl<'a, 'r> TestLoop<'a, 'r> {
         self.open(SuiteId(0), out)
     }
 
-    /// The live inventory has no saved heads. Select each raw test path before
-    /// qualifying its display name, then schedule all selected rows at one width.
+    /// Select each raw test path before qualifying its display name, then schedule all selected
+    /// rows at one width using any previously persisted suite heads, postings, and moved asks.
+    #[expect(clippy::too_many_arguments, reason = "inventory rows, suite heads, postings, and moved asks")]
     pub(crate) fn begin_inventory(
         &mut self,
         asked: AVec<'a, Asked<'r>>,
         owners: &'r [SuiteId],
+        suite_heads: &'r [Head<'r>],
+        postings: Postings<'r>,
+        moved: &[Ask],
         filtered: u32,
         now: Nanos,
         out: &mut AVec<'_, Effect<'a>>,
@@ -497,11 +519,11 @@ impl<'a, 'r> TestLoop<'a, 'r> {
         }
         self.filtered = filtered;
         self.current = Some(Current {
-            suite: pool, owners: Some(owners), asked, by_id,
-            plan: Plan::new(config, self.alloc)?, head: Head::EMPTY, postings: Postings::EMPTY,
+            suite: pool, owners: Some(owners), suite_heads: Some(suite_heads), asked, by_id,
+            plan: Plan::new(config, self.alloc)?, head: Head::EMPTY, postings,
             changes: Vec::new_in(self.alloc), pool: Vec::new_in(self.alloc), reads: Vec::new_in(self.alloc),
         });
-        self.decide(&[], now, out)
+        self.decide(moved, now, out)
     }
 
     pub(crate) fn row_detail(&mut self, row: u32, text: AVec<'a, u8>) {
@@ -627,6 +649,7 @@ impl<'a, 'r> TestLoop<'a, 'r> {
         self.current = Some(Current {
             suite,
             owners: None,
+            suite_heads: None,
             asked,
             by_id,
             head,
@@ -676,8 +699,15 @@ impl<'a, 'r> TestLoop<'a, 'r> {
         let plant = self.plant;
         let alloc = self.alloc;
         let current = current_of(&mut self.current, self.phase)?;
-        let mut kept: AVec<'_, Kept> = Vec::with_capacity_in(current.head.len(), alloc);
-        current.head.kept_into(&mut kept);
+        let mut kept: AVec<'_, Kept> = Vec::new_in(alloc);
+        if let Some(heads) = current.suite_heads {
+            for head in heads {
+                head.kept_into(&mut kept);
+            }
+            kept.sort_unstable_by_key(|row| row.test);
+        } else {
+            current.head.kept_into(&mut kept);
+        }
         if plant == Plant::KeepFailures {
             for row in kept.iter_mut() {
                 if row.last == Last::Failed {
@@ -687,6 +717,54 @@ impl<'a, 'r> TestLoop<'a, 'r> {
         }
         let suite = current.suite;
         current.plan.decide(&current.asked, &kept, moved, &current.postings, now, &mut self.scratch)?;
+        // Any previously passed test excluded from `current.asked` (e.g. filtered out by a raw-path
+        // filter / `--skip` / `--ignored` before `begin_inventory`, or absent from today's tests
+        // record) whose asks moved MUST be marked `Last::Unsettled` before `SuiteState` advances
+        // `old_key` to `now_key`; otherwise a later unfiltered run would falsely report
+        // `Cached(Unchanged)` (rule 21).
+        if !moved.is_empty() {
+            let mut named: AVec<'_, TestId> = Vec::new_in(alloc);
+            let mut unasked: AVec<'_, TestId> = Vec::new_in(alloc);
+            for ask in moved {
+                named.clear();
+                current.postings.tests_of(*ask, &mut named);
+                for &test in named.iter() {
+                    if current.by_id.binary_search_by(|(id, _)| id.cmp(&test)).is_err() {
+                        unasked.push(test);
+                    }
+                }
+            }
+            unasked.sort_unstable();
+            unasked.dedup();
+            for &test in unasked.iter() {
+                if let Some(heads) = current.suite_heads {
+                    for (idx, head) in heads.iter().enumerate() {
+                        if let Some(row) = head.row(test)
+                            && matches!(row.kept.last, Last::Passed { .. })
+                            && let Ok(owner) = u32::try_from(idx)
+                        {
+                            current.changes.push(Change {
+                                suite: SuiteId(owner),
+                                test,
+                                last: Some(head::unsettle(row.kept.last)),
+                                micros: row.kept.micros,
+                                asks: None,
+                            });
+                        }
+                    }
+                } else if let Some(row) = current.head.row(test)
+                    && matches!(row.kept.last, Last::Passed { .. })
+                {
+                    current.changes.push(Change {
+                        suite: current.suite,
+                        test,
+                        last: Some(head::unsettle(row.kept.last)),
+                        micros: row.kept.micros,
+                        asks: None,
+                    });
+                }
+            }
+        }
         self.phase = Phase::Running(suite);
         self.apply(None, out)?;
         self.after_run_step(out)
@@ -699,13 +777,14 @@ impl<'a, 'r> TestLoop<'a, 'r> {
         let current = current_of(&mut self.current, self.phase)?;
         let path = current.path_of(test)?;
         current.plan.not_run(test, now, &mut self.scratch)?;
-        if let Some(row) = current.head.row(test) {
+        if let Some(row) = current.head_row(test)? {
             let last = match why {
                 RefusalReason::BeforeStart(_) => Some(head::unsettle(row.kept.last)),
                 RefusalReason::FirstCall(_) => None,
             };
             if last != Some(row.kept.last) {
-                current.changes.push(Change { test, last, micros: row.kept.micros, asks: None });
+                let owner = current.owner(test)?;
+                current.changes.push(Change { suite: owner, test, last, micros: row.kept.micros, asks: None });
             }
         }
         match plant {
@@ -746,7 +825,8 @@ impl<'a, 'r> TestLoop<'a, 'r> {
         match effect {
             plan::Effect::Look { test } => {
                 let row = current.row_of(test)?;
-                out.push(Effect::Look { suite, test, row });
+                let owner = current.owner(test)?;
+                out.push(Effect::Look { suite: owner, test, row });
             }
             plan::Effect::Start { test, deadline } => {
                 let row = current.row_of(test)?;
@@ -754,8 +834,9 @@ impl<'a, 'r> TestLoop<'a, 'r> {
             }
             plan::Effect::Kill { test } => out.push(Effect::Kill { suite, test }),
             plan::Effect::Unsettle { test } => {
-                if let Some(row) = current.head.row(test) {
-                    current.changes.push(Change { test, last: Some(head::unsettle(row.kept.last)), micros: row.kept.micros, asks: None });
+                if let Some(row) = current.head_row(test)? {
+                    let owner = current.owner(test)?;
+                    current.changes.push(Change { suite: owner, test, last: Some(head::unsettle(row.kept.last)), micros: row.kept.micros, asks: None });
                 }
             }
             plan::Effect::File { test } => {
@@ -764,8 +845,9 @@ impl<'a, 'r> TestLoop<'a, 'r> {
                 let Some(address) = ended.address else { return Err(LoopError::NoAddress { test }) };
                 let pass = Verdict::Pass(Passed { run, micros: ended.ran.micros, kept: Ok(()) });
                 let asks = current.keep_asks(ended);
-                current.changes.push(Change { test, last: Some(Last::Passed { address }), micros: ended.ran.micros, asks: Some(asks) });
-                file(current.owner(test)?, test, address, &ended.held, &pass, alloc, out, &mut self.flaky)?;
+                let owner = current.owner(test)?;
+                current.changes.push(Change { suite: owner, test, last: Some(Last::Passed { address }), micros: ended.ran.micros, asks: Some(asks) });
+                file(owner, test, address, &ended.held, &pass, alloc, out, &mut self.flaky)?;
             }
             plan::Effect::Report { test, outcome } => {
                 let path = current.path_of(test)?;
@@ -780,18 +862,20 @@ impl<'a, 'r> TestLoop<'a, 'r> {
                             out.push(Effect::Print { text });
                         }
                         let asks = current.keep_asks(ended);
-                        current.changes.push(Change { test, last: Some(Last::Failed), micros: ended.ran.micros, asks: Some(asks) });
+                        let owner = current.owner(test)?;
+                        current.changes.push(Change { suite: owner, test, last: Some(Last::Failed), micros: ended.ran.micros, asks: Some(asks) });
                         // Filed BESIDE any pass at its address; a kill before the marks were read
                         // has no address and is reported only.
                         if let Some(address) = ended.address {
-                            file(current.owner(test)?, test, address, &ended.held, &Verdict::Fail(failed), alloc, out, &mut self.flaky)?;
+                            file(owner, test, address, &ended.held, &Verdict::Fail(failed), alloc, out, &mut self.flaky)?;
                         }
                         self.failed += 1;
                     }
                     (Outcome::Failed { .. }, None) => return Err(LoopError::Verdict { test }),
                     (Outcome::Passed { kept: Err(why), .. }, Some(ended)) => {
                         let asks = current.keep_asks(ended);
-                        current.changes.push(Change { test, last: Some(Last::NotKept(why)), micros: ended.ran.micros, asks: Some(asks) });
+                        let owner = current.owner(test)?;
+                        current.changes.push(Change { suite: owner, test, last: Some(Last::NotKept(why)), micros: ended.ran.micros, asks: Some(asks) });
                     }
                     (Outcome::Passed { .. }, _) | (Outcome::Cached(_) | Outcome::Ignored | Outcome::Bench, _) => {}
                 }
@@ -813,11 +897,13 @@ impl<'a, 'r> TestLoop<'a, 'r> {
         if current.owners.is_some() {
             let mut changes = Vec::with_capacity_in(current.changes.len(), self.alloc);
             for change in &current.changes {
-                changes.push((current.owner(change.test)?, *change));
+                changes.push((change.suite, *change));
             }
             changes.sort_unstable_by_key(|(suite, change)| (*suite, change.test));
             for group in changes.chunk_by(|a, b| a.0 == b.0) {
-                current.suite = group[0].0;
+                let Some(&(owner, _)) = group.first() else { continue };
+                current.suite = owner;
+                current.head = current.head_of(owner);
                 current.changes.clear();
                 current.changes.extend(group.iter().map(|(_, change)| *change));
                 write_records(&mut current, self.alloc, out)?;
@@ -940,8 +1026,23 @@ impl<'a, 'r> TestLoop<'a, 'r> {
             self.ordered_summary(&mut text)?;
         }
         out.push(Effect::Print { text });
+        let mut passed = 0u32;
+        let mut ignored = 0u32;
+        for entry in self.entries.iter() {
+            match entry.outcome {
+                Outcome::Cached(_) | Outcome::Passed { .. } => passed = passed.saturating_add(1),
+                Outcome::Ignored | Outcome::Bench => ignored = ignored.saturating_add(1),
+                Outcome::Failed { .. } => {}
+            }
+        }
         let not_run = self.not_run.len() + self.not_built.len();
-        let status = Status { failed: self.failed, not_run: u32::try_from(not_run).map_err(|_| ReportError::TooMany { count: not_run })?, check_errors };
+        let status = Status {
+            passed,
+            failed: self.failed,
+            ignored,
+            not_run: u32::try_from(not_run).map_err(|_| ReportError::TooMany { count: not_run })?,
+            check_errors,
+        };
         self.phase = Phase::Finished;
         out.push(Effect::Done { status });
         Ok(())
@@ -1095,3 +1196,325 @@ fn write_records<'a>(current: &mut Current<'_, '_>, alloc: Alloc<'a>, out: &mut 
 #[cfg(test)]
 #[path = "tests/test_loop_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod filtered_cache_tests {
+    use super::*;
+    use blaze_run::plan::{Filter, Ignored, ShouldPanic};
+    use blaze_run::postings::FnName;
+
+    fn mk_config() -> LoopConfig<'static> {
+        LoopConfig {
+            plan: Config {
+                width: 2,
+                deadline: Nanos(50_000_000),
+                run_all: false,
+                ignored: Ignored::Skip,
+                benches: false,
+                filter: Filter::All,
+                skip: &[],
+            },
+            style: Style::text(80, false),
+            list: false,
+            run: CheckoutKey([1; 32]),
+            suites: 1,
+        }
+    }
+
+    fn mk_asked(id: u8, path: &'static str) -> Asked<'static> {
+        Asked {
+            test: TestId([id; 32]),
+            path,
+            ignore: None,
+            should_panic: ShouldPanic::No,
+            bench: false,
+        }
+    }
+
+    /// Regression for the P0 filtered-test cache corruption bug (rule 21):
+    /// 1. Unfiltered run passes `test_a` (calls `helper`) and `test_b` (calls `helper`).
+    /// 2. Edit `helper()` (`v1 -> v2`), then run filtered `test_a` (so `test_b` is excluded
+    ///    before `begin_inventory`). `WriteHead` MUST mark `test_b` as `Last::Unsettled` before
+    ///    `SuiteState` advances `helper` from `v1` to `v2`.
+    /// 3. Subsequent unfiltered run with `moved = []` MUST NOT falsely cache `test_b` as
+    ///    `Cached(Unchanged)`: it must `Look` and rerun `test_b` while keeping `test_a` cached.
+    #[test]
+    fn filtered_run_unsettles_excluded_tests_whose_asks_moved() {
+        let res = (|| -> Result<(), &'static str> {
+            let alloc = blaze_own::testing::heap().alloc();
+            let test_a = mk_asked(0x11, "m::test_a");
+            let test_b = mk_asked(0x22, "m::test_b");
+            let fn_a = FnName([0xa1; 32]);
+            let fn_b = FnName([0xb2; 32]);
+            let helper = FnName([0xcc; 32]);
+            let addr_a1 = Address([0x10; 32]);
+            let addr_b1 = Address([0x20; 32]);
+            let addr_a2 = Address([0x12; 32]);
+            let addr_b2 = Address([0x22; 32]);
+
+            // Run 1: unfiltered, both tests run and pass cleanly.
+            let mut head_1_bytes: Option<AVec<'static, u8>> = None;
+            let mut postings_1_bytes: Option<AVec<'static, u8>> = None;
+            {
+                let mut machine = TestLoop::new(mk_config(), alloc).map_err(|_| "TestLoop::new failed (run 1)")?;
+                let mut asked = Vec::new_in(alloc);
+                asked.push(test_a);
+                asked.push(test_b);
+                let owners = [SuiteId(0), SuiteId(0)];
+                let heads = [Head::EMPTY];
+                let mut out: AVec<'static, Effect<'static>> = Vec::new_in(alloc);
+                machine
+                    .begin_inventory(asked, &owners, &heads, Postings::EMPTY, &[], 0, Nanos(0), &mut out)
+                    .map_err(|_| "begin_inventory failed (run 1)")?;
+                machine.step(Event::Checked { errors: 0 }, Nanos(0), &mut out).map_err(|_| "Checked failed (run 1)")?;
+
+                let mut ran_a = false;
+                let mut ran_b = false;
+                let mut done = false;
+                while !out.is_empty() {
+                    let mut effects = core::mem::replace(&mut out, Vec::new_in(alloc));
+                    for effect in effects.drain(..) {
+                        match effect {
+                            Effect::Run { test, .. } if test == test_a.test => {
+                                ran_a = true;
+                                let asks = [Ask::Fn(fn_a), Ask::Fn(helper)];
+                                let ended = TestEnded {
+                                    test,
+                                    ran: Ran { exit: Exit::Returned, keep: Ok(()), micros: 10 },
+                                    detail: Detail::NONE,
+                                    asks: &asks,
+                                    reads: &[],
+                                    address: Some(addr_a1),
+                                    held: AtAddress::EMPTY,
+                                    output: Captured::NONE,
+                                };
+                                machine.step(Event::Ended(ended), Nanos(10), &mut out).map_err(|_| "Ended test_a failed (run 1)")?;
+                            }
+                            Effect::Run { test, .. } if test == test_b.test => {
+                                ran_b = true;
+                                let asks = [Ask::Fn(fn_b), Ask::Fn(helper)];
+                                let ended = TestEnded {
+                                    test,
+                                    ran: Ran { exit: Exit::Returned, keep: Ok(()), micros: 20 },
+                                    detail: Detail::NONE,
+                                    asks: &asks,
+                                    reads: &[],
+                                    address: Some(addr_b1),
+                                    held: AtAddress::EMPTY,
+                                    output: Captured::NONE,
+                                };
+                                machine.step(Event::Ended(ended), Nanos(20), &mut out).map_err(|_| "Ended test_b failed (run 1)")?;
+                            }
+                            Effect::WriteHead { bytes, .. } => head_1_bytes = Some(bytes),
+                            Effect::WritePostings { bytes, .. } => postings_1_bytes = Some(bytes),
+                            Effect::Done { status } => {
+                                assert_eq!(status.passed, 2);
+                                assert_eq!(status.failed, 0);
+                                done = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                assert!(ran_a && ran_b && done, "Run 1 must run both tests and finish");
+            }
+            let h1_buf = head_1_bytes.ok_or("Run 1 missing WriteHead")?;
+            let p1_buf = postings_1_bytes.ok_or("Run 1 missing WritePostings")?;
+            let head_1 = Head::open(h1_buf.as_slice()).map_err(|_| "Head::open failed (run 1)")?;
+            let postings_1 = Postings::open(p1_buf.as_slice()).map_err(|_| "Postings::open failed (run 1)")?;
+            assert_eq!(head_1.row(test_a.test).map(|r| r.kept.last), Some(Last::Passed { address: addr_a1 }));
+            assert_eq!(head_1.row(test_b.test).map(|r| r.kept.last), Some(Last::Passed { address: addr_b1 }));
+
+            // Run 2: edit `helper()` -> `moved = [Ask::Fn(helper)]`, run FILTERED `test_a` only
+            // (`test_b` excluded before `begin_inventory`, matching `test_drive.rs`).
+            let mut head_2_bytes: Option<AVec<'static, u8>> = None;
+            let mut postings_2_bytes: Option<AVec<'static, u8>> = None;
+            {
+                let mut machine = TestLoop::new(mk_config(), alloc).map_err(|_| "TestLoop::new failed (run 2)")?;
+                let mut asked = Vec::new_in(alloc);
+                asked.push(test_a);
+                let owners = [SuiteId(0)];
+                let heads = [head_1];
+                let moved = [Ask::Fn(helper)];
+                let mut out: AVec<'static, Effect<'static>> = Vec::new_in(alloc);
+                machine
+                    .begin_inventory(asked, &owners, &heads, postings_1, &moved, 1, Nanos(100), &mut out)
+                    .map_err(|_| "begin_inventory failed (run 2)")?;
+                machine.step(Event::Checked { errors: 0 }, Nanos(100), &mut out).map_err(|_| "Checked failed (run 2)")?;
+
+                let mut ran_a = false;
+                let mut done = false;
+                while !out.is_empty() {
+                    let mut effects = core::mem::replace(&mut out, Vec::new_in(alloc));
+                    for effect in effects.drain(..) {
+                        match effect {
+                            Effect::Look { test, .. } => {
+                                assert_eq!(test, test_a.test);
+                                machine.step(Event::Looked { test, found: false }, Nanos(105), &mut out).map_err(|_| "Looked failed (run 2)")?;
+                            }
+                            Effect::Run { test, .. } => {
+                                assert_eq!(test, test_a.test);
+                                ran_a = true;
+                                let asks = [Ask::Fn(fn_a), Ask::Fn(helper)];
+                                let ended = TestEnded {
+                                    test,
+                                    ran: Ran { exit: Exit::Returned, keep: Ok(()), micros: 11 },
+                                    detail: Detail::NONE,
+                                    asks: &asks,
+                                    reads: &[],
+                                    address: Some(addr_a2),
+                                    held: AtAddress::EMPTY,
+                                    output: Captured::NONE,
+                                };
+                                machine.step(Event::Ended(ended), Nanos(111), &mut out).map_err(|_| "Ended failed (run 2)")?;
+                            }
+                            Effect::WriteHead { bytes, .. } => head_2_bytes = Some(bytes),
+                            Effect::WritePostings { bytes, .. } => postings_2_bytes = Some(bytes),
+                            Effect::Done { status } => {
+                                assert_eq!(status.passed, 1);
+                                assert_eq!(status.failed, 0);
+                                done = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                assert!(ran_a && done, "Run 2 must run test_a and finish");
+            }
+            let h2_buf = head_2_bytes.ok_or("Run 2 missing WriteHead")?;
+            let p2_buf = postings_2_bytes.ok_or("Run 2 missing WritePostings")?;
+            let head_2 = Head::open(h2_buf.as_slice()).map_err(|_| "Head::open failed (run 2)")?;
+            let postings_2 = Postings::open(p2_buf.as_slice()).map_err(|_| "Postings::open failed (run 2)")?;
+            assert_eq!(head_2.row(test_a.test).map(|r| r.kept.last), Some(Last::Passed { address: addr_a2 }));
+            assert_eq!(
+                head_2.row(test_b.test).map(|r| r.kept.last),
+                Some(Last::Unsettled { address: addr_b1 }),
+                "filtered-out test_b MUST be marked Last::Unsettled when helper() moved"
+            );
+
+            // Run 3: unfiltered run AFTER SuiteState advanced `helper` to v2 (`moved = []`).
+            // `test_a` stays Cached(Unchanged); `test_b` MUST be Looked and then Run!
+            {
+                let mut machine = TestLoop::new(mk_config(), alloc).map_err(|_| "TestLoop::new failed (run 3)")?;
+                let mut asked = Vec::new_in(alloc);
+                asked.push(test_a);
+                asked.push(test_b);
+                let owners = [SuiteId(0), SuiteId(0)];
+                let heads = [head_2];
+                let mut out: AVec<'static, Effect<'static>> = Vec::new_in(alloc);
+                machine
+                    .begin_inventory(asked, &owners, &heads, postings_2, &[], 0, Nanos(200), &mut out)
+                    .map_err(|_| "begin_inventory failed (run 3)")?;
+                machine.step(Event::Checked { errors: 0 }, Nanos(200), &mut out).map_err(|_| "Checked failed (run 3)")?;
+
+                let mut looked_b = false;
+                let mut ran_a = false;
+                let mut ran_b = false;
+                let mut done = false;
+                while !out.is_empty() {
+                    let mut effects = core::mem::replace(&mut out, Vec::new_in(alloc));
+                    for effect in effects.drain(..) {
+                        match effect {
+                            Effect::Look { test, .. } => {
+                                assert_eq!(test, test_b.test);
+                                looked_b = true;
+                                machine.step(Event::Looked { test, found: false }, Nanos(205), &mut out).map_err(|_| "Looked failed (run 3)")?;
+                            }
+                            Effect::Run { test, .. } => {
+                                if test == test_a.test {
+                                    ran_a = true;
+                                } else if test == test_b.test {
+                                    ran_b = true;
+                                }
+                                let asks = [Ask::Fn(fn_b), Ask::Fn(helper)];
+                                let ended = TestEnded {
+                                    test,
+                                    ran: Ran { exit: Exit::Returned, keep: Ok(()), micros: 15 },
+                                    detail: Detail::NONE,
+                                    asks: &asks,
+                                    reads: &[],
+                                    address: Some(addr_b2),
+                                    held: AtAddress::EMPTY,
+                                    output: Captured::NONE,
+                                };
+                                machine.step(Event::Ended(ended), Nanos(220), &mut out).map_err(|_| "Ended failed (run 3)")?;
+                            }
+                            Effect::Done { status } => {
+                                assert_eq!(status.passed, 2);
+                                assert_eq!(status.failed, 0);
+                                done = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                assert!(!ran_a, "unchanged test_a must stay Cached(Unchanged)");
+                assert!(looked_b && ran_b && done, "filtered-out test_b MUST look and rerun after helper() changed");
+            }
+            Ok(())
+        })();
+        assert_eq!(res, Ok(()));
+    }
+
+    /// Variant: even when the filtered-in test (`test_a`) does NOT depend on `helper()` and hits
+    /// `Cached(Unchanged)` immediately (0 tests run in Run 2), `test_b` (filtered out, depends on
+    /// `helper()`) must STILL trigger `WriteHead` with `Last::Unsettled`.
+    #[test]
+    fn filtered_cached_run_still_writes_unsettled_head_for_excluded_test() {
+        let res = (|| -> Result<(), &'static str> {
+            let alloc = blaze_own::testing::heap().alloc();
+            let test_a = mk_asked(0x31, "m::test_a");
+            let test_b = mk_asked(0x32, "m::test_b");
+            let fn_a = FnName([0xd1; 32]);
+            let helper = FnName([0xd2; 32]);
+            let addr_a1 = Address([0x31; 32]);
+            let addr_b1 = Address([0x32; 32]);
+
+            let asks_a = [Ask::Fn(fn_a)];
+            let asks_b = [Ask::Fn(helper)];
+            let head_rows = [
+                HeadRow { test: test_a.test, last: Last::Passed { address: addr_a1 }, micros: 5, asks: &asks_a },
+                HeadRow { test: test_b.test, last: Last::Passed { address: addr_b1 }, micros: 7, asks: &asks_b },
+            ];
+            let h1_buf = head::encode(&head_rows, &[], alloc).map_err(|_| "encode head")?;
+            let pairs = [(Ask::Fn(fn_a), test_a.test), (Ask::Fn(helper), test_b.test)];
+            let p1_buf = postings::encode(&pairs, alloc).map_err(|_| "encode postings")?;
+            let head_1 = Head::open(h1_buf.as_slice()).map_err(|_| "open head")?;
+            let postings_1 = Postings::open(p1_buf.as_slice()).map_err(|_| "open postings")?;
+
+            let mut machine = TestLoop::new(mk_config(), alloc).map_err(|_| "TestLoop::new failed")?;
+            let mut asked = Vec::new_in(alloc);
+            asked.push(test_a);
+            let owners = [SuiteId(0)];
+            let heads = [head_1];
+            let moved = [Ask::Fn(helper)];
+            let mut out: AVec<'static, Effect<'static>> = Vec::new_in(alloc);
+            machine
+                .begin_inventory(asked, &owners, &heads, postings_1, &moved, 1, Nanos(0), &mut out)
+                .map_err(|_| "begin_inventory failed")?;
+            machine.step(Event::Checked { errors: 0 }, Nanos(0), &mut out).map_err(|_| "Checked failed")?;
+
+            let mut head_2_bytes: Option<AVec<'static, u8>> = None;
+            let mut ran_any = false;
+            let mut done = false;
+            for effect in out.drain(..) {
+                match effect {
+                    Effect::Run { .. } => ran_any = true,
+                    Effect::WriteHead { bytes, .. } => head_2_bytes = Some(bytes),
+                    Effect::Done { status } => {
+                        assert_eq!(status.passed, 1);
+                        done = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(!ran_any && done, "test_a should hit Cached(Unchanged) with zero runs");
+            let h2_buf = head_2_bytes.ok_or("WriteHead must still be emitted to unsettle filtered-out test_b")?;
+            let head_2 = Head::open(h2_buf.as_slice()).map_err(|_| "open updated head")?;
+            assert_eq!(head_2.row(test_a.test).map(|r| r.kept.last), Some(Last::Passed { address: addr_a1 }));
+            assert_eq!(head_2.row(test_b.test).map(|r| r.kept.last), Some(Last::Unsettled { address: addr_b1 }));
+            Ok(())
+        })();
+        assert_eq!(res, Ok(()));
+    }
+}

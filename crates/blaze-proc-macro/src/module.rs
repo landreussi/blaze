@@ -108,11 +108,28 @@ impl<'l, 'a> LockedPackages<'l, 'a> {
     /// sources): the first in the file's order is the root, as it was before (`Lock::named`
     /// keeps the file's order within a name).
     pub fn closure(&self, name: &str, version: &str) -> Result<String, ClosureError> {
+        match self.closure_with(name, version, |_| Ok::<Option<String>, core::convert::Infallible>(None)) {
+            Ok(result) => result,
+            Err(never) => match never {},
+        }
+    }
+
+    /// Like [`Self::closure`], but allows pinning workspace/path dependencies in the transitive
+    /// closure via `path_pin(dep_lock_id)` (returning `Some(files_sha256)`). Any path dependency
+    /// for which `path_pin` returns `None` is still refused as [`ClosureError::Unpinned`].
+    pub fn closure_with<D: AsRef<str>, E>(
+        &self,
+        name: &str,
+        version: &str,
+        mut path_pin: impl FnMut(blaze_manifest::lock::LockId) -> Result<Option<D>, E>,
+    ) -> Result<Result<String, ClosureError>, E> {
         let lock = self.lock;
-        let root = lock
+        let Some(root) = lock
             .named(name)
             .find(|id| lock.package(*id).version.to_string() == version)
-            .ok_or_else(|| ClosureError::NotLocked { name: name.to_owned(), version: version.to_owned() })?;
+        else {
+            return Ok(Err(ClosureError::NotLocked { name: name.to_owned(), version: version.to_owned() }));
+        };
         let mut seen = vec![false; lock.packages.len()];
         seen[root.index()] = true;
         let mut stack = vec![root];
@@ -132,18 +149,25 @@ impl<'l, 'a> LockedPackages<'l, 'a> {
             // The version as the lock writes it: a parsed semver prints as its text (no
             // leading zero, nothing dropped), so the line is the text the old reader cut out.
             let version = package.version.to_string();
-            let pin = match (&package.checksum, &package.source) {
+            let owned_path_pin: String;
+            let pin: &str = match (&package.checksum, &package.source) {
                 (Checksum::Sha256(sum), _) => sum.as_str(),
-                (Checksum::Absent, LockSource::Path) => {
-                    return Err(ClosureError::Unpinned { name: package.name.as_str().to_owned(), version });
-                }
+                (Checksum::Absent, LockSource::Path) => match path_pin(blaze_manifest::lock::LockId(at as u32))? {
+                    Some(files_sha256) => {
+                        owned_path_pin = format!("files:{}", files_sha256.as_ref());
+                        owned_path_pin.as_str()
+                    }
+                    None => {
+                        return Ok(Err(ClosureError::Unpinned { name: package.name.as_str().to_owned(), version }));
+                    }
+                },
                 (Checksum::Absent, LockSource::Registry { .. } | LockSource::Git { .. }) => package.source_text.as_str(),
             };
             let pin = self.corrections.pin(package.name.as_str(), &version, pin);
             lines.push(format!("{} {version} {pin}", package.name));
         }
         lines.sort();
-        Ok(sha256_hex(lines.join("\n").as_bytes()))
+        Ok(Ok(sha256_hex(lines.join("\n").as_bytes())))
     }
 }
 
@@ -373,12 +397,18 @@ pub fn find_module(store: &Path, id: &CrateId<'_>) -> Result<(String, String), M
 
 /// The record of `id` in `store` (prefers native `.dylib`/`.so` over `module.wasm` when present).
 pub fn read_module(store: &Path, id: &CrateId<'_>) -> Result<ModuleRecord, ModuleError> {
-    let key = module_key(id);
+    read_module_by_key(store, module_key(id), id.name, id.version)
+}
+
+/// The record for `key` (`name` `version`) in `store` (prefers native `.dylib`/`.so` over
+/// `module.wasm` when present). Used both on initial registration ([`read_module`]) and when
+/// a `MacroModule` task self-compiles and publishes the module later in the same command.
+pub fn read_module_by_key(store: &Path, key: String, name: &str, version: &str) -> Result<ModuleRecord, ModuleError> {
     let dir = store.join("proc-macro/modules").join(&key);
     let native_path = dir.join(native_dylib_filename());
     let is_native = dir.join("dylib-sha256").is_file() && native_path.is_file();
     if !is_native && !dir.join("wasm-sha256").exists() {
-        return Err(ModuleError::Missing { name: id.name.to_owned(), version: id.version.to_owned(), key });
+        return Err(ModuleError::Missing { name: name.to_owned(), version: version.to_owned(), key });
     }
     let read = |file: &str| -> Result<Vec<u8>, ModuleError> {
         let path = dir.join(file);
@@ -397,9 +427,9 @@ pub fn read_module(store: &Path, id: &CrateId<'_>) -> Result<ModuleRecord, Modul
             Some("bang") => ProcKind::FnLike,
             _ => return Err(bad()),
         };
-        let name = parts.next().filter(|it| !it.is_empty()).ok_or_else(bad)?.to_owned();
+        let macro_name = parts.next().filter(|it| !it.is_empty()).ok_or_else(bad)?.to_owned();
         let helpers = parts.next().unwrap_or("").split(',').filter(|it| !it.is_empty()).map(str::to_owned).collect();
-        macros.push(Exported { index, kind, name, helpers });
+        macros.push(Exported { index, kind, name: macro_name, helpers });
     }
     let decls = if is_native {
         dir.join("decls")
@@ -414,8 +444,8 @@ pub fn read_module(store: &Path, id: &CrateId<'_>) -> Result<ModuleRecord, Modul
     };
     Ok(ModuleRecord {
         key,
-        name: id.name.to_owned(),
-        version: id.version.to_owned(),
+        name: name.to_owned(),
+        version: version.to_owned(),
         wasm_sha256: held,
         macros,
         decls,

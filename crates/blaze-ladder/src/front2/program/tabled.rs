@@ -32,6 +32,7 @@ struct Row<'n> {
     abi: Abi,
     nounwind: bool,
     track_caller: bool,
+    fn_attrs: blaze_lir::func::FnAttrs,
     symbol: Box<str>,
     export: Option<Box<str>>,
     lits: Literals,
@@ -59,6 +60,7 @@ pub(super) fn table_one<'n>(
             abi: r.abi,
             nounwind: r.nounwind,
             track_caller: r.track_caller,
+            fn_attrs: r.fn_attrs,
             symbol: r.symbol,
             export: r.export,
             lits: r.lits,
@@ -84,6 +86,12 @@ fn row<'n>(
         return Err(Front2Refusal::NoHead { function: function() });
     };
     let symbols = symbols_of(names, head.lib, crate::front2::links::values_key(names, store, head.lib), head.text, path)?;
+    if symbols.extern_weak {
+        return Err(Front2Refusal::Attrs {
+            function: function(),
+            why: "`#[linkage = \"extern_weak\"]` is only supported on foreign statics".into(),
+        });
+    }
     let (at, foreign) = super::head_abi::placed_fn(names, store, key, head.lib).map_err(|_| Front2Refusal::Unplaced { function: function() })?;
     // A fn an `extern` block in a BODY declares is foreign as a module-level one is: the
     // names library places no local item, so its block's ABI and its declared name are the
@@ -99,6 +107,7 @@ fn row<'n>(
             abi: llvm.build.abi,
             nounwind: llvm.build.nounwind,
             track_caller: llvm.track_caller,
+            fn_attrs: symbols.fn_attrs,
             symbol: llvm.symbol.into(),
             export: symbols.export,
             lits: Literals::default(),
@@ -164,9 +173,14 @@ fn row<'n>(
         }
         _ => None,
     };
+    let intrinsic = intrinsic.or_else(|| {
+        (kind == FnKind::Foreign)
+            .then(|| lazy::seam_rules::libm_float_intrinsic(own.abi, &symbol, head, store.tys.view()))
+            .flatten()
+    });
     // `#[rustc_nounwind]` makes any fn nounwind (core/src/panicking.rs:88-92).
     let nounwind = own.nounwind || symbols.nounwind;
-    Ok(Row { body, checked, kind, at, abi: own.abi, nounwind, track_caller: symbols.track_caller, symbol, export: symbols.export, lits, intrinsic })
+    Ok(Row { body, checked, kind, at, abi: own.abi, nounwind, track_caller: symbols.track_caller, fn_attrs: symbols.fn_attrs, symbol, export: symbols.export, lits, intrinsic })
 }
 
 /// The cause a survey files a left-out fn under: the refusal without the fn's own name or
@@ -288,14 +302,15 @@ mod tests {
         let files = [(String::from("/hello-world/src/main.rs"), String::from(HELLO))];
         let edition = edition::PackageEdition::of_manifest("blaze-2026.11").expect("a known edition");
         let user = crate::crates::UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
+        let erased = blaze_own::Erased::new(&frame);
         let inputs = crate::crates::Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
         let crates = inputs.crates();
         // The store's tables are `'static` (heads.rs `Store::new`): until the test grant hands
         // one down, the global allocator is the only `Alloc<'static>` a test can name.
         let alloc = blaze_own::Alloc::global();
-        let names = inputs.resolve(&crates, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let names = inputs.resolve(&crates, erased.bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
         let sources = [SourceFile { path: "src/main.rs", text: HELLO }];
-        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
         let front = crate::front2::Front2::new(&names, &frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
         let store = Store::new(front.index.lang("sized"), front.frame, alloc);
         let ghost = ItemKey(0x2980e808e42ac8c9057e8231da5614fc);

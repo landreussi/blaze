@@ -40,15 +40,17 @@
 
 use std::alloc::Allocator;
 
-use blaze_core::{Effect, Extent};
+use blaze_core::Effect;
+use blaze_own::Share;
 use blaze_keyed::{
     kind::{Namespace, ReservedTag, Tag},
     store::StoreError,
 };
 
 use super::super::format::{Entry, LostKind};
+use super::super::par::{Par, Serial};
 use super::super::verified::{Unverified, Verified};
-use super::{GRACE_NS, Got, MAP, Phase, Placed, Plain, Plant, Then};
+use super::{GRACE_NS, Got, Phase, Placed, Plain, Plant, Then};
 use crate::Key;
 
 /// Why a map asked late is refused ([`StoreError::Lost`]'s words).
@@ -159,6 +161,7 @@ impl<A: Allocator + Clone> Plain<A> {
         self.view.clear();
         self.view.extend((0..segs.len()).filter(|&row| segs[row].local && !dropped.contains(&segs[row].id)));
         self.view.sort_unstable_by(|&a, &b| segs[b].count.cmp(&segs[a].count).then(b.cmp(&a)));
+        self.last_hit = None;
     }
 
     /// The mapped segment of `row`, when it is mapped, proved and not lost.
@@ -181,8 +184,9 @@ impl<A: Allocator + Clone> Plain<A> {
     }
 
     /// The record under `key` in `spaces` (asked in their order: in each, what this process
-    /// holds uncommitted, then its rows in probe order), mapping at most ONE segment a call:
-    /// see the module's docs. The store must be ready (not mid-commit).
+    /// holds uncommitted, then already-mapped rows, then an optional creation-generation hint,
+    /// then remaining unmapped rows in probe order with verified Bloom filtering), mapping at
+    /// most ONE segment a call: see the module's docs. The store must be ready (not mid-commit).
     pub fn find(&mut self, spaces: &[Namespace], key: &Key, now_ns: u64, effects: &mut Vec<Effect>) -> Result<Probe, StoreError> {
         if let Some(why) = &self.broken {
             return Err(why.clone());
@@ -190,20 +194,94 @@ impl<A: Allocator + Clone> Plain<A> {
         if !self.ready() {
             return Err(StoreError::Busy { phase: self.what() });
         }
+        let hint_gen = self.hint_gen;
         let every = self.plant() == Plant::IgnoresNamespace;
         for space in spaces {
             if let Some((_, entry)) = self.held_in(*space, key) {
                 return Ok(Probe::Hit(Found { key: *key, tag: entry.tag, namespace: *space, at: At::Held }));
             }
-            let mut next = 0;
-            while next < self.view.len() {
-                let row = self.view[next];
-                next += 1;
+            // Pass 1: probe already-mapped segments first (zero syscalls / zero mmaps), starting
+            // with the most recently hit segment for intra-commit locality (root -> pointer -> lines).
+            let mut tried_last: Option<usize> = None;
+            if let Some(last_row) = self.last_hit
+                && let Some(seg) = self.manifest.segments.get(last_row).copied()
+                && seg.local
+                && (every || seg.namespace == *space)
+                && !self.dropped.contains(&seg.id)
+                && let Some(&map) = self.by_id.get(&seg.id)
+            {
+                tried_last = Some(last_row);
+                if self.may_contain_row(last_row, key) {
+                    self.probes.probes += 1;
+                    if let Some((map, entry)) = self.probe(map, key) {
+                        return Ok(Probe::Hit(Found { key: *key, tag: entry.tag, namespace: seg.namespace, at: At::Mapped { map, entry } }));
+                    }
+                }
+            }
+            for i in 0..self.view.len() {
+                let Some(&row) = self.view.get(i) else {
+                    break;
+                };
+                if tried_last == Some(row) {
+                    continue;
+                }
+                let Some(&seg) = self.manifest.segments.get(row) else {
+                    continue;
+                };
+                if (!every && seg.namespace != *space) || self.dropped.contains(&seg.id) {
+                    continue;
+                }
+                let Some(&map) = self.by_id.get(&seg.id) else {
+                    continue;
+                };
+                if !self.may_contain_row(row, key) {
+                    continue;
+                }
+                self.probes.probes += 1;
+                if let Some((map, entry)) = self.probe(map, key) {
+                    self.last_hit = Some(row);
+                    return Ok(Probe::Hit(Found { key: *key, tag: entry.tag, namespace: seg.namespace, at: At::Mapped { map, entry } }));
+                }
+            }
+            // Pass 2: if a creation generation hint was supplied (e.g. from a manifest root),
+            // probe unmapped segments of that generation before walking older/larger segments.
+            if let Some(target_gen) = hint_gen {
+                for i in 0..self.view.len() {
+                    let Some(&row) = self.view.get(i) else {
+                        break;
+                    };
+                    let Some(&seg) = self.manifest.segments.get(row) else {
+                        continue;
+                    };
+                    if seg.generation != target_gen || (!every && seg.namespace != *space) || self.dropped.contains(&seg.id) {
+                        continue;
+                    }
+                    if self.by_id.contains_key(&seg.id) || !self.may_contain_row(row, key) {
+                        continue;
+                    }
+                    if let Some(probe) = self.probe_row(row, key, now_ns, effects)? {
+                        if matches!(probe, Probe::Hit(_)) {
+                            self.last_hit = Some(row);
+                        }
+                        return Ok(probe);
+                    }
+                }
+            }
+            // Pass 3: remaining unmapped / parked segments in probe order, skipping segments whose
+            // verified Bloom filter proves `key` is absent.
+            for i in 0..self.view.len() {
+                let row = self.view[i];
                 let seg = self.manifest.segments[row];
                 if (!every && seg.namespace != *space) || self.dropped.contains(&seg.id) {
                     continue;
                 }
+                if self.by_id.contains_key(&seg.id) || !self.may_contain_row(row, key) {
+                    continue;
+                }
                 if let Some(probe) = self.probe_row(row, key, now_ns, effects)? {
+                    if matches!(probe, Probe::Hit(_)) {
+                        self.last_hit = Some(row);
+                    }
                     return Ok(probe);
                 }
             }
@@ -249,7 +327,7 @@ impl<A: Allocator + Clone> Plain<A> {
     /// already moves that row to the end, and a merge replaces a contiguous run of a
     /// namespace's rows in place: `build` and `plan`). Not [`Plain::order_view`]'s order
     /// (largest first), which serves content-keyed records, equal in every row.
-    fn newest_rows(&self, space: Namespace) -> impl Iterator<Item = usize> + '_ {
+    pub(super) fn newest_rows(&self, space: Namespace) -> impl Iterator<Item = usize> + '_ {
         let rows = self.manifest.segments.len();
         let oldest = self.plant() == Plant::PointerOldest;
         (0..rows).map(move |i| if oldest { i } else { rows - 1 - i }).filter(move |&row| {
@@ -277,6 +355,9 @@ impl<A: Allocator + Clone> Plain<A> {
         let mut rows: Vec<usize, A> = Vec::new_in(self.alloc.clone());
         rows.extend(self.newest_rows(space));
         for row in rows {
+            if !self.may_contain_row(row, key) {
+                continue;
+            }
             if let Some(probe) = self.probe_row(row, key, now_ns, effects)? {
                 return Ok(probe);
             }
@@ -287,7 +368,10 @@ impl<A: Allocator + Clone> Plain<A> {
     /// [`Plain::find_newest`] over the mapped rows alone, committed records only: the map index
     /// and the entry. The commit's layout and compaction ask it, over a whole store.
     pub(crate) fn newest_mapped(&self, space: Namespace, key: &Key) -> Option<(usize, Entry)> {
-        self.newest_rows(space).filter_map(|row| self.mapped_row(row)).find_map(|at| self.probe(at, key))
+        self.newest_rows(space)
+            .filter(|&row| self.may_contain_row(row, key))
+            .filter_map(|row| self.mapped_row(row))
+            .find_map(|at| self.probe(at, key))
     }
 
     /// The bytes of what [`Plain::find`] found, in place: no check (a mapped segment is
@@ -318,7 +402,7 @@ impl<A: Allocator + Clone> Plain<A> {
     pub fn placed(&self, found: Found) -> Option<Placed> {
         let At::Mapped { map, entry } = found.at else { return None };
         let mapped = &self.maps[map];
-        Some(Placed { key: found.key, tag: entry.tag, namespace: mapped.seg().namespace, segment: mapped.seg().digest, file: mapped.file().clone(), at: entry.at, len: entry.len })
+        Some(Placed { key: found.key, tag: entry.tag, namespace: mapped.seg().namespace, segment: mapped.seg().digest, file: mapped.file().share(), at: entry.at, len: entry.len })
     }
 
     /// One row's map asked, within the grace of the open (see the module's docs).
@@ -327,7 +411,7 @@ impl<A: Allocator + Clone> Plain<A> {
         if now_ns.saturating_sub(self.opened_ns) > GRACE_NS {
             return Err(StoreError::Lost { segment: seg.id, generation: self.manifest.generation, what: LATE_MAP });
         }
-        effects.push(Effect::Map { file: self.segment_file(seg.id), extent: Extent::Whole, tag: self.tag(MAP, row as u32) });
+        self.queue_map(row, seg.id, effects);
         self.phase = Phase::Mapping { left: 1, then: Then::Probe };
         Ok(())
     }
@@ -360,13 +444,19 @@ impl<A: Allocator + Clone> Plain<A> {
     /// The parked segment `id`'s one full check (its first hit, or [`Plain::map_all`]): proved
     /// into the maps and recorded for the boot by the next flip, or lost by name.
     pub(super) fn check_parked(&mut self, id: u64) {
+        self.check_parked_par(id, &Serial);
+    }
+
+    /// Parallel twin of [`Plain::check_parked`]: verifies large parked segments (`>= 128 KiB`)
+    /// through [`Verified::check_par`] using `par`.
+    pub(super) fn check_parked_par<P: Par>(&mut self, id: u64, par: &P) {
         let Some(unverified) = self.unchecked.remove(&id) else { return };
         let proved = if self.plant() == Plant::TrustsUnchecked {
             // The planted bug: a hit in an unproved run served with no check.
             Ok(self.trust_for_a_plant(unverified))
         } else {
             let mut checks = self.checks.get();
-            let proved = Verified::check(unverified, self.boot, &mut checks);
+            let proved = Verified::check_par(unverified, self.boot, &mut checks, par, &self.alloc);
             self.checks.set(checks);
             self.checked_ids.push(id);
             proved
@@ -392,6 +482,11 @@ impl<A: Allocator + Clone> Plain<A> {
     /// map), and before a commit, a compaction or a scrub. `false`: whole already, nothing
     /// asked. Within the grace of the open (see the module's docs).
     pub fn map_all(&mut self, now_ns: u64, effects: &mut Vec<Effect>) -> Result<bool, StoreError> {
+        self.map_all_par(now_ns, &Serial, effects)
+    }
+
+    /// Parallel twin of [`Plain::map_all`]: checks parked earlier-boot segments through `par`.
+    pub fn map_all_par<P: Par>(&mut self, now_ns: u64, par: &P, effects: &mut super::EffectList) -> Result<bool, StoreError> {
         if let Some(why) = &self.broken {
             return Err(why.clone());
         }
@@ -401,19 +496,38 @@ impl<A: Allocator + Clone> Plain<A> {
         if self.eager {
             return Ok(false);
         }
-        let mut left = 0u32;
-        for (row, seg) in self.manifest.segments.iter().enumerate() {
+        let late = now_ns.saturating_sub(self.opened_ns) > GRACE_NS;
+        let mut to_map = 0usize;
+        let mut sealed_to_map = 0usize;
+        for seg in &self.manifest.segments {
             if !seg.local || self.by_id.contains_key(&seg.id) || self.dropped.contains(&seg.id) || self.unchecked.contains_key(&seg.id) {
                 continue;
             }
-            if now_ns.saturating_sub(self.opened_ns) > GRACE_NS {
+            if late {
                 return Err(StoreError::Lost { segment: seg.id, generation: self.manifest.generation, what: LATE_MAP });
             }
-            effects.push(Effect::Map { file: self.segment_file(seg.id), extent: Extent::Whole, tag: self.tag(MAP, row as u32) });
-            left += 1;
+            to_map = to_map.saturating_add(1);
+            if seg.boot != self.cfg.boot && seg.sealed {
+                sealed_to_map = sealed_to_map.saturating_add(1);
+            }
+        }
+        if to_map == 0 {
+            self.mapped_par(Then::All, par, effects);
+            return Ok(true);
+        }
+        self.reserve_maps(to_map, sealed_to_map, effects);
+        let mut left = 0u32;
+        let len = self.manifest.segments.len();
+        for row in 0..len {
+            let Some(seg) = self.manifest.segments.get(row).copied() else { continue };
+            if !seg.local || self.by_id.contains_key(&seg.id) || self.dropped.contains(&seg.id) || self.unchecked.contains_key(&seg.id) {
+                continue;
+            }
+            self.queue_map(row, seg.id, effects);
+            left = left.saturating_add(1);
         }
         if left == 0 {
-            self.mapped(Then::All, effects);
+            self.mapped_par(Then::All, par, effects);
         } else {
             self.phase = Phase::Mapping { left, then: Then::All };
         }
@@ -422,10 +536,15 @@ impl<A: Allocator + Clone> Plain<A> {
 
     /// [`Then::All`]'s end: every parked row checked, whole from now on.
     pub(super) fn all_mapped(&mut self) {
+        self.all_mapped_par(&Serial);
+    }
+
+    /// Parallel twin of [`Plain::all_mapped`]: checks every parked row through `par`.
+    pub(super) fn all_mapped_par<P: Par>(&mut self, par: &P) {
         let mut parked: Vec<u64, A> = Vec::new_in(self.alloc.clone());
         parked.extend(self.unchecked.keys().copied());
         for id in parked {
-            self.check_parked(id);
+            self.check_parked_par(id, par);
         }
         self.eager = true;
     }

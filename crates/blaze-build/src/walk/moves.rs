@@ -47,6 +47,37 @@ use blaze_typeck::{AdjustKind, Expr, ExprId, PNode, PTy, Pat, PatId, UnOp};
 
 use super::{Held, NO_EXPR, Owner, Repr, Shape, V, Walk, malformed, unsupported};
 use crate::BuildError;
+use crate::coroutine_state::{REST_BITS, REST_BYTES, REST_WORDS};
+
+/// Multi-word partial-move field-flags bitset (`REST_WORDS` × 64 = `REST_BITS` bits).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct FieldBits([u64; REST_WORDS]);
+
+impl FieldBits {
+    pub(super) const EMPTY: Self = FieldBits([0; REST_WORDS]);
+
+    pub(super) fn single(bit: u32) -> Self {
+        let mut out = Self::EMPTY;
+        out.set(bit);
+        out
+    }
+
+    pub(super) fn is_empty(self) -> bool {
+        self.0.iter().all(|&w| w == 0)
+    }
+
+    pub(super) fn set(&mut self, bit: u32) {
+        let w = (bit / 64) as usize;
+        if let Some(word) = self.0.get_mut(w) {
+            *word |= 1u64 << (bit % 64);
+        }
+    }
+
+    pub(super) fn contains(self, bit: u32) -> bool {
+        let w = (bit / 64) as usize;
+        self.0.get(w).is_some_and(|&word| word & (1u64 << (bit % 64)) != 0)
+    }
+}
 
 mod boxes;
 pub(super) mod env_places;
@@ -99,8 +130,8 @@ pub(super) enum Pending {
     Own(PatId),
     /// Every binding of pattern `p` owns its part (`own_pat`, the switch's).
     OwnPat(PatId),
-    /// Bits `bits` of word `mask` cleared: their parts moved out.
-    Clear { mask: SlotId, bits: u64 },
+    /// Bits `bits` of bitset `mask` cleared: their parts moved out.
+    Clear { mask: SlotId, bits: FieldBits },
     /// Local `x` moved whole by `expr` (`moved`).
     Moved { expr: ExprId, x: PatId },
 }
@@ -130,6 +161,10 @@ pub(super) struct Moves<A: Allocator> {
     parts: Vec<Part, A>,
     roots: Vec<Root, A>,
     assigned: Vec<Assigned, A>,
+    /// For each local field-flags `mask` allocated inside a loop, the innermost `Expr::Loop`
+    /// containing its declaration. Any loop at or outside that loop re-declares the local fresh
+    /// on each turn, so its back-edge cannot carry a moved-out bit back to an earlier assignment.
+    mask_decl_loop: Vec<(SlotId, ExprId), A>,
     cx: Option<Cx>,
     /// The effects guarded arms hold until their guards pass, innermost last.
     pending: Vec<Pending, A>,
@@ -138,23 +173,41 @@ pub(super) struct Moves<A: Allocator> {
     /// `bind_with`).
     alt_owned: Vec<PatId, A>,
     /// The last `Box` whose first adjustment `box_deref_builtin` built: its expression and the
-    /// pointer to it. A move out of a temporary box's contents (walk/moves/boxes.rs
-    /// `move_temp_box_contents`) finds the box's held entry by this pointer: the contents'
-    /// place it is given is the data pointer, which says nothing of where the box is.
+    /// pointer to it. A move out of a temporary unsized box's contents (walk/moves/boxes.rs
+    /// `move_temp_unsized_box_contents`) finds the box's held entry by this pointer.
     box_self: Option<(ExprId, Value)>,
+    /// Temporary expressions spilled by `Task::Spill` whose types need drop: `(expr, at)`,
+    /// used by `move_temp_part` to locate the temporary's `Held` entry across `Box` derefs.
+    temp_spills: Vec<(ExprId, (Value, i32)), A>,
 }
 
-impl<A: Allocator + Clone> Moves<A> {
+impl<A: Allocator + Copy> Moves<A> {
     pub(super) fn new_in(alloc: A) -> Self {
         Moves {
-            steps: Vec::new_in(alloc.clone()),
-            parts: Vec::new_in(alloc.clone()),
-            roots: Vec::new_in(alloc.clone()),
-            assigned: Vec::new_in(alloc.clone()),
+            steps: Vec::new_in(alloc),
+            parts: Vec::new_in(alloc),
+            roots: Vec::new_in(alloc),
+            assigned: Vec::new_in(alloc),
+            mask_decl_loop: Vec::new_in(alloc),
             cx: None,
-            pending: Vec::new_in(alloc.clone()),
+            pending: Vec::new_in(alloc),
             alt_owned: Vec::new_in(alloc),
             box_self: None,
+            temp_spills: Vec::new_in(alloc),
+        }
+    }
+
+    /// Reports every slot still referenced by open move roots or a pending temporary box deref.
+    pub(super) fn for_each_live_slot(&self, mut f: impl FnMut(SlotId), value_slot: impl Fn(Value) -> Option<SlotId>) {
+        for r in self.roots.iter() {
+            if let Some(s) = r.mask {
+                f(s);
+            }
+        }
+        if let Some((_, v)) = self.box_self
+            && let Some(s) = value_slot(v)
+        {
+            f(s);
         }
     }
 }
@@ -179,6 +232,10 @@ enum Do {
     Visit(Node),
     Begin(Block),
     Jump(Block),
+    /// The `dyn` contents of a `Box` of type `g` at `place` (wide pointer at `off`), dropped via
+    /// `dyn_glue` only if `bit` of `mask` is still set (otherwise moved out, e.g. `Box<dyn
+    /// FnOnce>::call_once`), with `BoxFree` owed on unwind when `free` is true.
+    BoxDyn { g: PTy, place: (Value, i32), off: i32, bit: u32, free: bool },
     /// The `Box` of type `g` at `place`, its contents visited: its allocation freed alone.
     BoxFree { g: PTy, place: (Value, i32) },
 }
@@ -190,7 +247,7 @@ type Seen = (PatId, PTy, u32, Option<Step>, bool);
 
 const MOVE_OUT: &str = "a binding by value of a part that needs drop, in a match by tests (a move out)";
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Before match `m` by tests (`e`, on `scrutinee`, its value `s` held as `srepr`) tests its
     /// arms: a scrutinee that needs drop is owned. A local (walk/matches.rs `tested_place`
     /// takes its place) moves by its field flags; a temporary joins its statement's
@@ -205,6 +262,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         }
         if self.adjust_rows(scrutinee).is_empty()
             && let Some(x) = self.local_of(scrutinee)?
+            && self.local_is_owned(x)
         {
             self.moves.roots.push(Root { m, expr: e, owner: Owner::Local(x), mask: None, g, field: None });
             return Ok(None);
@@ -227,10 +285,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             return Err(unsupported(scrutinee, "a temporary scrutinee that needs drop held as other than an aggregate (a `Box`), in a match by tests"));
         };
         self.hold_temp(scrutinee, (p, off), srepr)?;
-        let slot = self.b.slot(8, 3, SlotKind::Named);
-        let fa = self.b.slot_addr(slot);
-        let all = self.b.iconst(Ty::I64, u128::from(u64::MAX));
-        self.b.store(Flags::NONE, all, fa, 0, MemAttrs::aligned(3));
+        let slot = self.new_temp_mask((p, off), scrutinee);
         // `hold_temp`'s entry for it (a whole `Held::Rest` at its place) takes the word.
         let held = self.scope_pats.iter().rposition(|h| matches!(*h, Held::Rest { at, variant: None, .. } if at == (p, off)));
         let held = held.ok_or(malformed("a held temporary scrutinee missing from its scope"))?;
@@ -246,14 +301,64 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// parameters'), pushed before the parameter's bindings so it drops after them. No expression
     /// moves it: its root names the body's root, which no assignment is under before the
     /// parameters are bound (`part_bit`'s loop check never applies).
+    /// Allocates a `REST_BYTES`-byte partial-move field-flags bitset slot (align 8).
+    pub(super) fn alloc_mask_slot(&mut self) -> SlotId {
+        self.b.slot(REST_BYTES, 3, SlotKind::Named)
+    }
+
+    /// Writes `fill` to every 64-bit word of field-flags bitset `slot`.
+    pub(super) fn store_mask_words(&mut self, slot: SlotId, fill: u64) {
+        let fa = self.b.slot_addr(slot);
+        let val = self.b.iconst(Ty::I64, u128::from(fill));
+        for w in 0..REST_WORDS {
+            self.b.store(Flags::NONE, val, fa, (w * 8) as i32, MemAttrs::aligned(3));
+        }
+    }
+
+    /// Number of direct field bits reserved for enum layout `l` (the maximum field count of any
+    /// variant, since an enum holds at most one active variant at runtime).
+    pub(super) fn enum_field_base(&self, l: u32) -> u32 {
+        match self.layouts[l as usize].shape {
+            Shape::Enum { first, len, .. } => (0..len).map(|v| self.layout_variants[(first + v) as usize].1).max().unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    /// Records a temporary aggregate spilled by `Task::Spill` whose type needs drop, so
+    /// `move_temp_part` can locate its `Held` entry across `Box` dereferences.
+    pub(super) fn note_temp_spill(&mut self, e: ExprId, at: (Value, i32)) {
+        self.moves.temp_spills.push((e, at));
+    }
+
     pub(super) fn own_param(&mut self, m: u32, at: (Value, i32), g: PTy) {
         self.moves.roots.retain(|r| r.m != m);
-        let slot = self.b.slot(8, 3, SlotKind::Named);
-        let fa = self.b.slot_addr(slot);
-        let all = self.b.iconst(Ty::I64, u128::from(u64::MAX));
-        self.b.store(Flags::NONE, all, fa, 0, MemAttrs::aligned(3));
+        let slot = self.alloc_mask_slot();
+        self.store_mask_words(slot, u64::MAX);
         self.scope_pats.push(Held::Moved { at, g, mask: slot });
         self.moves.roots.push(Root { m, expr: self.body.root, owner: Owner::Temp, mask: Some(slot), g, field: None });
+    }
+
+    /// Allocates and initializes a partial-move field-flags bitset (`Held::Moved::mask`)
+    /// for a temporary at `at` (from expression `expr`), naming it as that temporary's `rest`
+    /// sub-slot in a laid coroutine state when the flow saves it.
+    pub(super) fn new_temp_mask(&mut self, at: (Value, i32), expr: ExprId) -> SlotId {
+        let slot = self.alloc_mask_slot();
+        if let Some(id) = self.whole_slot(at).and_then(|s| self.slot_identity(s)) {
+            self.name_rest(slot, id);
+        } else {
+            let mut cur = expr;
+            while let Ok(Expr::Paren(inner)) = self.expr(cur) {
+                cur = inner;
+            }
+            let role = if matches!(self.expr(cur), Ok(Expr::Await(_))) {
+                blaze_flow_lower::identity::Role::Result
+            } else {
+                blaze_flow_lower::identity::Role::Value
+            };
+            self.name_rest(slot, blaze_flow_lower::identity::Identity::Temp(cur, role));
+        }
+        self.store_mask_words(slot, u64::MAX);
+        slot
     }
 
     /// Arm `pat` of match `m` is about to bind (`guarded`: it has a guard): its moves are of
@@ -328,22 +433,41 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 }
                 return self.arm_effect(Pending::Moved { expr: cx.root.expr, x }, cx.guarded);
             }
-            (Owner::Local(x), None) => self.owned[x.ix()]
-                .and_then(|o| o.rest)
+            (Owner::Local(x), None) => self
+                .field_mask(x)
                 .ok_or(malformed("a match by tests moving out of a local without field flags (`scan_flags`)"))?,
             (Owner::Temp, None) => cx.root.mask.ok_or(malformed("a temporary scrutinee without its word"))?,
             (Owner::None, None) => return Err(malformed("a part moved out of a scrutinee no one owns")),
         };
+        // A direct variant field `(v, j)` of a local enum already has its bit in `0..base`
+        // (`field_bit`), which both `drop_owned` (on earlier whole-local assignments in a loop)
+        // and `drop_tree` (`root_switch`) already test. Clearing that bit directly avoids
+        // allocating a new `part_bit` past `base` and lets loops like `output = Some(v); if let
+        // Some(v) = output { break v; }` build cleanly without double-drop.
+        if matches!(cx.root.owner, Owner::Local(_))
+            && prefix.is_none()
+            && len == 1
+            && let Some(Step::Variant { v, row }) = self.moves.steps.get(start as usize).copied()
+            && let Ok(l) = self.layout(cx.root.g)
+            && let Shape::Enum { first, .. } = self.layouts[l as usize].shape
+            && let (ff, fl) = self.layout_variants[(first + v) as usize]
+            && row >= ff
+            && row < ff + fl
+            && let Some(bit) = self.field_bit(l, v, row - ff)?
+        {
+            self.moves.steps.truncate(start as usize);
+            return self.arm_effect(Pending::Clear { mask, bits: FieldBits::single(bit) }, cx.guarded);
+        }
         // A local enum's switch owns its first `field_bit`s (a whole local's only: a local with
         // a field scrutinee is a struct or tuple, `field_path`'s `Shape::Fields`).
-        let base = match (cx.root.owner, prefix, self.layout(cx.root.g).map(|l| self.layouts[l as usize].shape)) {
-            (Owner::Local(_), None, Ok(Shape::Enum { first, len, .. })) => (0..len).map(|v| self.layout_variants[(first + v) as usize].1).sum(),
+        let base = match (cx.root.owner, prefix, self.layout(cx.root.g)) {
+            (Owner::Local(_), None, Ok(l)) => self.enum_field_base(l),
             _ => 0u32,
         };
         let Some(bit) = self.part_bit(mask, start, len, base, Some(cx.root.expr))? else {
-            return Err(BuildError::UnsupportedPat { pat: p, what: "a match moving out more than 64 parts of one value (its word)" });
+            return Err(BuildError::UnsupportedPat { pat: p, what: "a match moving out more than 256 parts of one value (its bitset)" });
         };
-        self.arm_effect(Pending::Clear { mask, bits: 1u64 << bit }, cx.guarded)
+        self.arm_effect(Pending::Clear { mask, bits: FieldBits::single(bit) }, cx.guarded)
     }
 
     /// Whether the arm being bound holds its moves until its guard passed (`Pending`).
@@ -402,12 +526,13 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             return Ok(Some(q.bit));
         }
         let Some(by) = moved_by else { return self.new_part(mask, start, len, base) };
+        let decl_loop = self.moves.mask_decl_loop.iter().find(|&&(m, _)| m == mask).map(|&(_, l)| l);
         for i in 0..self.moves.assigned.len() {
             let a = self.moves.assigned[i];
             let under = a.mask == mask
                 && a.len <= len
                 && self.moves.steps[a.start as usize..(a.start + a.len) as usize] == self.moves.steps[start as usize..(start + a.len) as usize];
-            if under && self.in_one_loop(a.by, by)? {
+            if under && self.in_one_loop(a.by, by, decl_loop)? {
                 self.moves.steps.truncate(start as usize);
                 return Err(unsupported(
                     by,
@@ -418,11 +543,11 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         self.new_part(mask, start, len, base)
     }
 
-    /// A new part at path `steps[start..start + len]` of word `mask`: its bit, `None` past 64.
+    /// A new part at path `steps[start..start + len]` of bitset `mask`: its bit, `None` past `REST_BITS`.
     fn new_part(&mut self, mask: SlotId, start: u32, len: u32, base: u32) -> Result<Option<u32>, BuildError> {
         let used = self.moves.parts.iter().filter(|q| q.mask == mask).count() as u32;
         let bit = base + used;
-        if bit >= 64 {
+        if bit >= REST_BITS {
             self.moves.steps.truncate(start as usize);
             return Ok(None);
         }
@@ -430,27 +555,206 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         Ok(Some(bit))
     }
 
-    /// Clears bit `bit` of word `mask`: its part moved out.
+    /// Clears bit `bit` of bitset `mask`: its part moved out.
     fn clear_bit(&mut self, mask: SlotId, bit: u32) {
-        self.clear_bits(mask, 1u64 << bit);
+        self.clear_bits(mask, FieldBits::single(bit));
     }
 
-    /// Clears the bits `bits` of word `mask`: their parts moved out.
-    pub(super) fn clear_bits(&mut self, mask: SlotId, bits: u64) {
+    /// Clears the bits `bits` of bitset `mask`: their parts moved out.
+    pub(super) fn clear_bits(&mut self, mask: SlotId, bits: FieldBits) {
         let fa = self.b.slot_addr(mask);
-        let word = self.b.load(Ty::I64, Flags::NONE, fa, 0, MemAttrs::aligned(3));
-        let keep = self.b.iconst(Ty::I64, u128::from(!bits));
-        let left = self.b.binary(Op::And, Flags::NONE, word, keep);
-        self.b.store(Flags::NONE, left, fa, 0, MemAttrs::aligned(3));
+        for (w, &mask_word) in bits.0.iter().enumerate() {
+            if mask_word == 0 {
+                continue;
+            }
+            let off = (w * 8) as i32;
+            let word = self.b.load(Ty::I64, Flags::NONE, fa, off, MemAttrs::aligned(3));
+            let keep = self.b.iconst(Ty::I64, u128::from(!mask_word));
+            let left = self.b.binary(Op::And, Flags::NONE, word, keep);
+            self.b.store(Flags::NONE, left, fa, off, MemAttrs::aligned(3));
+        }
     }
 
-    /// Whether expressions `a` and `b` are inside one `loop` (by `scan_flags`'s parents).
-    fn in_one_loop(&self, a: ExprId, b: ExprId) -> Result<bool, BuildError> {
+    /// Sets the bits `bits` of bitset `mask`: their parts are initialized again.
+    pub(super) fn set_bits(&mut self, mask: SlotId, bits: FieldBits) {
+        let fa = self.b.slot_addr(mask);
+        for (w, &mask_word) in bits.0.iter().enumerate() {
+            if mask_word == 0 {
+                continue;
+            }
+            let off = (w * 8) as i32;
+            let word = self.b.load(Ty::I64, Flags::NONE, fa, off, MemAttrs::aligned(3));
+            let set = self.b.iconst(Ty::I64, u128::from(mask_word));
+            let held = self.b.binary(Op::Or, Flags::NONE, word, set);
+            self.b.store(Flags::NONE, held, fa, off, MemAttrs::aligned(3));
+        }
+    }
+
+    /// Tests whether bit `bit` of bitset `mask` is still set (its part is still held).
+    pub(super) fn test_bit(&mut self, mask: SlotId, bit: u32) -> Value {
+        let off = ((bit / 64) * 8) as i32;
+        let fa = self.b.slot_addr(mask);
+        let word = self.b.load(Ty::I64, Flags::NONE, fa, off, MemAttrs::aligned(3));
+        let one = self.b.iconst(Ty::I64, 1u128 << (bit % 64));
+        let held = self.b.binary(Op::And, Flags::NONE, word, one);
+        let zero = self.b.iconst(Ty::I64, 0);
+        self.b.icmp(IntCond::Ne, held, zero)
+    }
+
+    /// Records the innermost enclosing `loop` (if any) in which a local's field-flags `mask` was
+    /// declared, so `in_one_loop` ignores loops that re-declare and reset the local each turn.
+    pub(super) fn record_mask_decl_loop(&mut self, mask: SlotId) {
+        if let Some(loop_expr) = self.targets.iter().rev().find(|t| t.header.is_some()).map(|t| t.expr) {
+            self.moves.mask_decl_loop.push((mask, loop_expr));
+        }
+    }
+
+    /// Pre-registers moved part bits for every `match` scrutinee, field/tuple-field move, and
+    /// `Box` deref move rooted at local `p` (of type `g`, with field-flags slot `mask`) so earlier
+    /// whole-local or parent assignments in the same loop (e.g. `ignore::walk::Worker::get_work`
+    /// and `regex_automata::nfa::thompson::literal_trie::LiteralTrie::compile`) already test those
+    /// parts' bits when dropping the overwritten value.
+    pub(super) fn preregister_local_parts(&mut self, p: PatId, g: PTy, mask: SlotId) {
+        let layout_id = self.layout(g).ok();
+        let base = layout_id.map_or(0, |l| self.enum_field_base(l));
+        let mut pat_stack: Vec<PatId, A> = Vec::new_in(self.alloc);
+        let expr_count = self.body.exprs.len();
+        for i in 0..expr_count {
+            let eid = ExprId(i as u32);
+            let Ok(expr) = self.expr(eid) else { continue };
+            match expr {
+                Expr::Field { .. } | Expr::TupleField { .. } => {
+                    let adj_kinds = self.checked.adjusts.column::<1>();
+                    let borrowed = self
+                        .adjust_rows(eid)
+                        .any(|r| matches!(adj_kinds[r], blaze_typeck::AdjustKind::Borrow { .. }))
+                        || self
+                            .expr_parent
+                            .get(i)
+                            .and_then(|&(up, _)| (up != NO_EXPR).then_some(ExprId(up)))
+                            .is_some_and(|up| match self.expr(up) {
+                                Ok(Expr::Ref { .. }) => true,
+                                Ok(Expr::Assign { lhs, .. } | Expr::AssignOp { lhs, .. }) => lhs == eid,
+                                _ => false,
+                            });
+                    if borrowed {
+                        continue;
+                    }
+                    let Ok(et) = self.expr_ty(eid) else { continue };
+                    let Ok(eg) = self.ground_ty(et) else { continue };
+                    if !matches!(self.needs_drop(eg), Ok(true)) {
+                        continue;
+                    }
+                    let Ok(el) = self.layout(eg) else { continue };
+                    if self.layouts[el as usize].size == 0 {
+                        continue;
+                    }
+                    let mark = self.moves.steps.len();
+                    if let Ok(Some((q, _, start, len, false))) = self.field_path(eid)
+                        && q == p
+                        && len > 0
+                    {
+                        if self.part_bit(mask, start, len, base, None).ok().flatten().is_none() {
+                            self.moves.steps.truncate(mark);
+                        }
+                    } else {
+                        self.moves.steps.truncate(mark);
+                    }
+                    continue;
+                }
+                Expr::Match { scrutinee, arms } => {
+                    let mut s = scrutinee;
+                    let mut ok = true;
+                    for _ in 0..16 {
+                        if !self.adjust_rows(s).is_empty() {
+                            ok = false;
+                            break;
+                        }
+                        match self.expr(s) {
+                            Ok(Expr::Paren(inner)) => s = inner,
+                            Ok(Expr::Local(q)) if q == p => break,
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    let Some(arm_list) = self.body.arms.get(arms.range()) else { continue };
+                    for arm_idx in 0..arm_list.len() {
+                        let arm_pat = self.body.arms[arms.start as usize + arm_idx].pat;
+                        pat_stack.clear();
+                        pat_stack.push(arm_pat);
+                        let mut steps = 0usize;
+                        while let Some(q) = pat_stack.pop() {
+                            steps += 1;
+                            if steps > self.body.pats.len() + 1 {
+                                break;
+                            }
+                            let Ok(pat) = self.pat(q) else { continue };
+                            match pat {
+                                Pat::Bind { ann, sub, .. } => {
+                                    if ann.by_ref.is_none()
+                                        && let Some(&bt) = self.checked.local_ty.get(q.ix())
+                                        && let Ok(bg) = self.ground_in(self.checked.types.view(), bt)
+                                        && matches!(self.needs_drop(bg), Ok(true))
+                                        && let Ok(bl) = self.layout(bg)
+                                        && self.layouts[bl as usize].size > 0
+                                    {
+                                        let mark = self.moves.steps.len();
+                                        if let Ok((start, len)) = self.move_path(arm_pat, g, q) {
+                                            let direct_enum_field = len == 1
+                                                && matches!(self.moves.steps.get(start as usize), Some(Step::Variant { .. }))
+                                                && layout_id.is_some_and(|l| matches!(self.layouts[l as usize].shape, Shape::Enum { .. }));
+                                            if len == 0 || direct_enum_field {
+                                                self.moves.steps.truncate(mark);
+                                            } else if self.part_bit(mask, start, len, base, None).ok().flatten().is_none() {
+                                                self.moves.steps.truncate(mark);
+                                            }
+                                        } else {
+                                            self.moves.steps.truncate(mark);
+                                        }
+                                    }
+                                    if let Some(sub_p) = sub {
+                                        pat_stack.push(sub_p);
+                                    }
+                                }
+                                Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } | Pat::Or { alts: elems } => {
+                                    if let Some(subs) = self.body.pat_lists.get(elems.range()) {
+                                        pat_stack.extend_from_slice(subs);
+                                    }
+                                }
+                                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
+                                    if let Some(fps) = self.body.field_pats.get(fields.range()) {
+                                        for fp in fps {
+                                            pat_stack.push(fp.pat);
+                                        }
+                                    }
+                                }
+                                // Behind a reference pattern nothing moves out of `p`.
+                                Pat::Ref { .. } | Pat::Missing | Pat::Wild | Pat::Lit(_) | Pat::NegLit(_) | Pat::Path(_) | Pat::Range { .. } => {}
+                            }
+                        }
+                    }
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    /// Whether expressions `a` and `b` share an enclosing `loop` strictly inside `stop` (the
+    /// innermost loop in which the local was declared, if any, by `scan_flags`'s parents).
+    fn in_one_loop(&self, a: ExprId, b: ExprId, stop: Option<ExprId>) -> Result<bool, BuildError> {
         let mut x = a.0;
         while let Some(&(up, _)) = self.expr_parent.get(x as usize)
             && up != NO_EXPR
         {
             x = up;
+            if stop == Some(ExprId(x)) {
+                break;
+            }
             if !matches!(self.expr(ExprId(x))?, Expr::Loop { .. }) {
                 continue;
             }
@@ -477,8 +781,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// not followed (no move goes through one), so a binding under one is refused by name, and
     /// so is one under a type that implements `Drop`. An or-pattern's alternatives are.
     fn move_path(&mut self, root: PatId, g: PTy, target: PatId) -> Result<(u32, u32), BuildError> {
-        let mut seen: Vec<Seen, A> = Vec::new_in(self.alloc.clone());
-        let mut todo: Vec<(PatId, PTy, u32, Option<Step>), A> = Vec::new_in(self.alloc.clone());
+        let mut seen: Vec<Seen, A> = Vec::new_in(self.alloc);
+        let mut todo: Vec<(PatId, PTy, u32, Option<Step>), A> = Vec::new_in(self.alloc);
         todo.push((root, g, u32::MAX, None));
         let mut found = None;
         while let Some((q, g, parent, step)) = todo.pop() {
@@ -504,7 +808,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 }
                 continue;
             }
-            if !matches!(pat, Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Slice { .. }) {
+            if !matches!(pat, Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Record { .. } | Pat::Slice { .. }) {
                 continue;
             }
             match self.ground_node(g).map_err(|error| Self::pat_ty_err(q, error))? {
@@ -556,7 +860,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                         todo.push((sub, self.layout_field_tys[row as usize], me, Some(step_of(row))));
                     }
                 }
-                Pat::Struct { fields, .. } => {
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                     let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
                     for fp in fps {
                         let row = (first..first + len)
@@ -612,7 +916,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// enum switch's `field_bit`s. In the Reference's order: fields in declaration order, an
     /// enum's live variant's fields, an array's elements first to last.
     pub(super) fn drop_moved(&mut self, g: PTy, at: (Value, i32), mask: SlotId, switch_bits: bool) -> Result<(), BuildError> {
-        let mut ps: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let mut ps: Vec<u32, A> = Vec::new_in(self.alloc);
         for (i, q) in self.moves.parts.iter().enumerate() {
             if q.mask == mask {
                 ps.push(i as u32);
@@ -626,13 +930,30 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 
     /// Drops node `root` of a value at `at` (word `mask`, parts `ps`), part by part.
     fn drop_tree(&mut self, root: Node, at: (Value, i32), mask: SlotId, switch_bits: bool, ps: &[u32]) -> Result<(), BuildError> {
-        let mut todo: Vec<Do, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<Do, A> = Vec::new_in(self.alloc);
         todo.push(Do::Visit(root));
         while let Some(d) = todo.pop() {
             match d {
                 Do::Begin(b) => self.begin(b),
                 Do::Jump(b) => self.jump(b, &[]),
                 Do::Visit(n) => self.drop_node(n, at, mask, switch_bits && n.depth == 0, ps, &mut todo)?,
+                Do::BoxDyn { g, place, off, bit, free } => {
+                    let set = self.test_bit(mask, bit);
+                    let yes = self.create();
+                    let skip = self.create();
+                    self.br(set, (yes, &[]), (skip, &[]));
+                    self.begin(yes);
+                    let data = self.b.load(Ty::PTR, Flags::NONE, place.0, place.1 + off, MemAttrs::aligned(3));
+                    let vt = self.b.load(Ty::PTR, Flags::NONE, place.0, place.1 + off + 8, MemAttrs::aligned(3));
+                    if free {
+                        let p = self.address(place);
+                        self.drop_owing(super::unwind_ladder::DropStep::DynGlue { data, vt }, super::unwind_ladder::DropStep::BoxFree { g, p })?;
+                    } else {
+                        self.dyn_glue(data, vt)?;
+                    }
+                    self.jump(skip, &[]);
+                    self.begin(skip);
+                }
                 Do::BoxFree { g, place } => {
                     let p = self.address(place);
                     self.drop_box_free(g, p)?;
@@ -679,7 +1000,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             return Err(unsupported(e, "a move out of a field of a type that implements `Drop` (E0509)"));
         }
         let Some(bit) = self.part_bit(mask, start, len, 0, Some(e))? else {
-            return Err(unsupported(e, "a move out of more than 64 parts of one local (its word)"));
+            return Err(unsupported(e, "a move out of more than 256 parts of one local (its bitset)"));
         };
         self.clear_bit(mask, bit);
         let tmp = self.temp(repr);
@@ -687,40 +1008,55 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         Ok(V::Place(tmp.0, tmp.1))
     }
 
-    /// `let a = make().f;`: a move by place expression `e` (its value at `at`, held as `repr`,
-    /// which needs drop) out of a field of a TEMPORARY. The Reference, [expr.move.movable-place]:
-    /// "Only the following place expressions may be moved out of: ... Temporary values. Fields
-    /// of a place expression which can be moved out of and don't implement `Drop`."; "Destructors",
-    /// "Temporary scopes": the temporary lives to the end of its temporary scope (its statement),
-    /// and "If a variable has been partially initialized, only its initialized fields are
-    /// dropped" (a temporary alike). Built as a match by tests' temporary scrutinee is
-    /// (`own_scrutinee`): the temporary's `hold_temp` entry (a whole `Held::Rest`) becomes a
-    /// `Held::Moved` with a word of its own, all held, and the moved part's bit is cleared, so
-    /// the statement's end drops the rest and the moved field is dropped by its new owner only.
-    /// Refused by name: a field reached through a pointer or a smart pointer (Rust's E0507,
-    /// unless the type is `Copy`, which never needs drop; a `Box`'s contents moved out by a
-    /// field path is not built), a container that implements `Drop` (E0509), more than 64
-    /// parts of one temporary, and a temporary not held to its statement's end.
+    /// `let a = make().f;`, `let a = (*make_box()).f;`, `let a = make_box().f;`: a move by place
+    /// expression `e` (its value at `at`, held as `repr`, which needs drop) out of a field of a
+    /// TEMPORARY (including fields reached through `Box` dereferences).
     fn move_temp_field(&mut self, e: ExprId, at: (Value, i32), repr: Repr) -> Result<V, BuildError> {
-        let Some((base, start, len, drops, off)) = self.temp_field_path(e)? else {
+        let Some((base, start, len, drops, off, has_box)) = self.temp_path_steps(e, 0)? else {
             return Err(unsupported(
                 e,
-                "a move out of a field of other than a temporary or a local with field flags (behind a pointer or a smart pointer: E0507 unless a `Box`'s, whose contents moved out by a field are not built to LIR yet)",
+                "a move out of a field of other than a temporary or a local with field flags (behind a pointer or a smart pointer: E0507)",
             ));
         };
         if drops {
             self.moves.steps.truncate(start as usize);
             return Err(unsupported(e, "a move out of a field of a type that implements `Drop` (E0509)"));
         }
-        let held_at = (at.0, at.1 - off);
-        let found = self
-            .scope_pats
-            .iter()
-            .rposition(|h| matches!(*h, Held::Rest { at: a, variant: None, .. } | Held::Moved { at: a, .. } if a == held_at));
-        let Some(i) = found else {
+        let held_at = if has_box {
+            self.moves.temp_spills.iter().rev().find(|&&(b, _)| b == base).map(|&(_, spilled)| spilled)
+        } else {
+            Some((at.0, at.1 - off))
+        };
+        self.move_temp_part(e, base, start, len, held_at, at, repr)
+    }
+
+    /// Moves part `steps[start..start + len]` out of temporary `base` (whose held `scope_pats`
+    /// place is `held_at`, and whose moved part's value lives at `at`, held as `repr`). Shared
+    /// by `move_temp_field` and `move_temp_box_contents`.
+    pub(super) fn move_temp_part(
+        &mut self,
+        e: ExprId,
+        base: ExprId,
+        start: u32,
+        len: u32,
+        held_at: Option<(Value, i32)>,
+        at: (Value, i32),
+        repr: Repr,
+    ) -> Result<V, BuildError> {
+        let found = held_at.and_then(|held_at| {
+            self.scope_pats
+                .iter()
+                .rposition(|h| matches!(*h, Held::Rest { at: a, variant: None, .. } | Held::Moved { at: a, .. } if a == held_at))
+                .map(|i| (i, held_at))
+        });
+        let Some((i, held_at)) = found else {
             self.moves.steps.truncate(start as usize);
-            if !self.live {
-                // Unreachable code: nothing runs, nothing is held (`Task::Spill` held nothing).
+            let t = self.expr_ty(base)?;
+            let g = self.ground_ty(t).map_err(|error| Self::ty_err(base, error))?;
+            if !self.live || !self.needs_drop(g).map_err(|error| Self::ty_err(base, error))? {
+                // Unreachable code, or a temporary whose own type needs no drop (e.g.
+                // `ManuallyDrop::new(x).value`): `Task::Spill` held nothing because nothing in
+                // the temporary drops at statement end.
                 let tmp = self.temp(repr);
                 self.store(V::Place(at.0, at.1), repr, tmp)?;
                 return Ok(V::Place(tmp.0, tmp.1));
@@ -728,21 +1064,18 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             return Err(unsupported(e, "a move out of a field of a temporary not held to its statement's end (an extended temporary)"));
         };
         let mask = match self.scope_pats[i] {
-            // A second part of the same temporary: its word is made.
+            // A second part of the same temporary: its bitset is made.
             Held::Moved { mask, .. } => mask,
             _ => {
                 let t = self.expr_ty(base)?;
                 let g = self.ground_ty(t).map_err(|error| Self::ty_err(base, error))?;
-                let slot = self.b.slot(8, 3, SlotKind::Named);
-                let fa = self.b.slot_addr(slot);
-                let all = self.b.iconst(Ty::I64, u128::from(u64::MAX));
-                self.b.store(Flags::NONE, all, fa, 0, MemAttrs::aligned(3));
+                let slot = self.new_temp_mask(held_at, base);
                 self.scope_pats[i] = Held::Moved { at: held_at, g, mask: slot };
                 slot
             }
         };
         let Some(bit) = self.part_bit(mask, start, len, 0, Some(e))? else {
-            return Err(unsupported(e, "a move out of more than 64 parts of one temporary (its word)"));
+            return Err(unsupported(e, "a move out of more than 256 parts of one temporary (its bitset)"));
         };
         self.clear_bit(mask, bit);
         // Copied out first, as `move_field` does.
@@ -751,25 +1084,51 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         Ok(V::Place(tmp.0, tmp.1))
     }
 
-    /// The path of fields from a temporary to place expression `e` (a chain of struct or tuple
-    /// fields with no adjustment on the way, over a value expression that is not a place and
-    /// has no adjustment: `make().a.b`), appended to `steps` root first: the temporary's
-    /// expression, the path's start and length, whether some container on it implements `Drop`,
-    /// and the field's offset in the temporary. `None` (`steps` as it was) for anything else:
-    /// a local's field, a union's, or a field behind a dereference.
-    fn temp_field_path(&mut self, e: ExprId) -> Result<Option<(ExprId, u32, u32, bool, i32)>, BuildError> {
+    /// The path of struct/tuple fields and `Box` dereferences from a temporary to place
+    /// expression `e` after `derefs` box dereferences of its value, appended to `steps` root
+    /// first: `(base, start, len, drops, off, has_box)`. When `!has_box`, `off` is the field's
+    /// byte offset inside the temporary; when `has_box`, the caller locates the temporary's
+    /// spilled place via `temp_spills`. `None` (`steps` as it was) for anything else: a local's
+    /// place, a union's field, or a field behind a non-`Box` dereference.
+    pub(super) fn temp_path_steps(&mut self, e: ExprId, derefs: u32) -> Result<Option<(ExprId, u32, u32, bool, i32, bool)>, BuildError> {
         let start = self.moves.steps.len() as u32;
         let mut drops = false;
         let mut off = 0i32;
+        let mut has_box = derefs > 0;
+        for _ in 0..derefs {
+            self.moves.steps.push(Step::Deref);
+        }
         let mut cur = e;
+        let mut is_base = false;
         let base = loop {
+            if is_base {
+                let Some(k) = self.box_derefs(cur)? else { break None };
+                if k > 0 {
+                    has_box = true;
+                    for _ in 0..k {
+                        self.moves.steps.push(Step::Deref);
+                    }
+                }
+            }
+            is_base = true;
             match self.expr(cur)? {
-                Expr::Paren(inner) if self.adjust_rows(inner).is_empty() => cur = inner,
-                Expr::Field { base, .. } | Expr::TupleField { base, .. } if self.adjust_rows(base).is_empty() => {
+                Expr::Paren(inner) => cur = inner,
+                Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
                     let col = self.checked.fields.column::<0>();
                     let row = col.binary_search(&cur).map_err(|_| malformed("a field access without its record row"))?;
                     let k = self.checked.fields.column::<2>()[row];
-                    let Repr::Agg(l) = self.adjusted_repr(base)? else { break None };
+                    if self.box_derefs(base)?.is_none() {
+                        break None;
+                    }
+                    // A temporary cannot be unsized; stop before `repr` refuses a nested DST
+                    // field base (`self.inner.header.owned`) with `UNSIZED_BY_VALUE`.
+                    let base_ty = self.adjusted_ty(base)?;
+                    let base_g = self.ground_ty(base_ty).map_err(|error| Self::ty_err(base, error))?;
+                    let base_ls = self.ls_of(base_g).map_err(|error| Self::ty_err(base, error))?;
+                    if self.ls.get(base_ls).tail != crate::layout::Tail::Sized {
+                        break None;
+                    }
+                    let Repr::Agg(l) = self.repr(base_g).map_err(|error| Self::ty_err(base, error))? else { break None };
                     if self.layouts[l as usize].is_union {
                         break None;
                     }
@@ -778,12 +1137,15 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                         return Err(malformed("a field index past its aggregate's fields"));
                     }
                     drops |= self.layouts[l as usize].drop_fn.is_some();
-                    off += self.layout_fields[(first + k) as usize].1 as i32;
+                    if !has_box {
+                        off += self.layout_fields[(first + k) as usize].1 as i32;
+                    }
                     self.moves.steps.push(Step::Field(first + k));
                     cur = base;
                 }
+                Expr::Unary { op: UnOp::Deref, operand } if self.deref_on_operand(operand) => cur = operand,
                 // The chain's root: a temporary (a call, a literal, a block) when it is no place.
-                _ if cur != e && !self.is_place_expr(cur)? => break Some(cur),
+                _ if (cur != e || derefs > 0) && !self.is_place_expr(cur)? => break Some(cur),
                 _ => break None,
             }
         };
@@ -793,7 +1155,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         };
         self.moves.steps[start as usize..].reverse();
         let len = self.moves.steps.len() as u32 - start;
-        Ok(Some((base, start, len, drops, off)))
+        Ok(Some((base, start, len, drops, off, has_box)))
     }
 
     /// Whether `match`/`if let`/`let`-`else` scrutinee `scrutinee` is matched IN PLACE as a
@@ -831,6 +1193,14 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 Expr::Unary { op: UnOp::Deref, .. } | Expr::Index { .. } => break true,
                 // A static's place.
                 Expr::Path(_) => break self.is_place_expr(cur)?,
+                // A binding this body does not currently own (a guarded match arm's binding
+                // while its guard runs, or a binding captured by a non-`FnOnce` closure):
+                // matched in place, owned by no one here (`Err(e) if matches!(e.kind, ..)`).
+                Expr::Local(x) if !self.local_is_owned(x) => {
+                    let t = self.adjusted_ty(scrutinee)?;
+                    let g = self.ground_ty(t).map_err(|error| Self::ty_err(scrutinee, error))?;
+                    break self.needs_drop(g).map_err(|error| Self::ty_err(scrutinee, error))?;
+                }
                 _ => break false,
             }
         };
@@ -858,26 +1228,22 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             return self.store(v, repr, at);
         };
         let Some(bit) = self.part_bit(mask, start, len, 0, None)? else {
-            return Err(unsupported(lhs, "an assignment naming more than 64 parts of one local (its word)"));
+            return Err(unsupported(lhs, "an assignment naming more than 256 parts of one local (its bitset)"));
         };
         // The part `part_bit` found or made (an equal one found gives the steps back).
-        let me = *self.moves.parts.iter().find(|q| q.mask == mask && q.bit == bit).ok_or(malformed("an assigned part missing from its word"))?;
+        let me = *self.moves.parts.iter().find(|q| q.mask == mask && q.bit == bit).ok_or(malformed("an assigned part missing from its bitset"))?;
         self.moves.assigned.push(Assigned { mask, start: me.start, len: me.len, by: lhs });
-        let mut ps: Vec<u32, A> = Vec::new_in(self.alloc.clone());
-        let mut bits = 0u64;
+        let mut ps: Vec<u32, A> = Vec::new_in(self.alloc);
+        let mut bits = FieldBits::EMPTY;
         for (i, q) in self.moves.parts.iter().enumerate() {
             if q.mask == mask && self.part_under(*q, me.start, me.len) {
                 ps.push(i as u32);
-                bits |= 1u64 << q.bit;
+                bits.set(q.bit);
             }
         }
         self.drop_tree(Node { g, off: 0, base: None, depth: me.len, rep: ps.first().copied(), field_bit: None }, at, mask, false, &ps)?;
         self.store(v, repr, at)?;
-        let fa = self.b.slot_addr(mask);
-        let word = self.b.load(Ty::I64, Flags::NONE, fa, 0, MemAttrs::aligned(3));
-        let set = self.b.iconst(Ty::I64, u128::from(bits));
-        let held = self.b.binary(Op::Or, Flags::NONE, word, set);
-        self.b.store(Flags::NONE, held, fa, 0, MemAttrs::aligned(3));
+        self.set_bits(mask, bits);
         Ok(())
     }
 
@@ -885,10 +1251,36 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// it holds by `drop_owned` and sets every bit by `hold_all`): kept so a part moved later
     /// in the same loop is refused (`part_bit`), as this drop, walked first, does not test it.
     pub(super) fn note_whole_assign(&mut self, e: ExprId, p: PatId) {
-        if let Some(mask) = self.owned[p.ix()].and_then(|o| o.rest) {
+        if let Some(mask) = self.field_mask(p) {
             // The empty path: every part is under it.
             self.moves.assigned.push(Assigned { mask, start: 0, len: 0, by: e });
         }
+    }
+
+    /// `lhs = v` over a placed field whose own type needs no drop (e.g. `w.m = ManuallyDrop::new(x)`),
+    /// after the store: sets every bit moved under `lhs` back to held, and records the assignment
+    /// for `part_bit`'s loop check.
+    pub(super) fn reinit_field_bits(&mut self, lhs: ExprId) -> Result<(), BuildError> {
+        let path = self.field_path(lhs)?;
+        let Some((_, mask, start, len, false)) = path else {
+            if let Some((.., start, _, true)) = path
+                && let Ok(n) = usize::try_from(start)
+            {
+                self.moves.steps.truncate(n);
+            }
+            return Ok(());
+        };
+        let mut bits = FieldBits::EMPTY;
+        for q in self.moves.parts.iter() {
+            if q.mask == mask && self.part_under(*q, start, len) {
+                bits.set(q.bit);
+            }
+        }
+        if !bits.is_empty() {
+            self.set_bits(mask, bits);
+        }
+        self.moves.assigned.push(Assigned { mask, start, len, by: lhs });
+        Ok(())
     }
 
     /// Whether part `q`'s path is at least `depth + 1` long and starts with part `rep`'s first
@@ -923,12 +1315,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let skip = if n.field_bit.is_some() || exact_bit.is_some() { Some(self.create()) } else { None };
         if let Some(skip) = skip {
             for bit in [n.field_bit, exact_bit].into_iter().flatten() {
-                let fa = self.b.slot_addr(mask);
-                let word = self.b.load(Ty::I64, Flags::NONE, fa, 0, MemAttrs::aligned(3));
-                let one = self.b.iconst(Ty::I64, 1u128 << bit);
-                let held = self.b.binary(Op::And, Flags::NONE, word, one);
-                let zero = self.b.iconst(Ty::I64, 0);
-                let set = self.b.icmp(IntCond::Ne, held, zero);
+                let set = self.test_bit(mask, bit);
                 let yes = self.create();
                 self.br(set, (yes, &[]), (skip, &[]));
                 self.begin(yes);
@@ -969,8 +1356,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 let PNode::Array(elem, _) = self.ground_node(n.g).map_err(|_| malformed("an array layout of other than an array"))? else {
                     return Err(malformed("an array layout of other than an array"));
                 };
-                if len > 64 {
-                    return Err(malformed("a move out of an array of more than 64 elements"));
+                if len > REST_BITS {
+                    return Err(malformed("a move out of an array of more than 256 elements"));
                 }
                 for k in (0..len).rev() {
                     let node = child(&*self,Step::Elem(k), elem, (k * stride) as i32, None);
@@ -982,8 +1369,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 // the rest drop whole by the glue, which reads the discriminant again.
                 let join = self.create();
                 let default = self.create();
-                let mut cases = Vec::with_capacity_in(len as usize, self.alloc.clone());
-                let mut bodies = Vec::with_capacity_in(len as usize, self.alloc.clone());
+                let mut cases = Vec::with_capacity_in(len as usize, self.alloc);
+                let mut bodies = Vec::with_capacity_in(len as usize, self.alloc);
                 for v in 0..len {
                     let (ff, fl) = self.layout_variants[(first + v) as usize];
                     if !self.fields_need_drop(ff, fl) {
@@ -1025,7 +1412,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// `match` on a local with such an arm may move a part out, so the local gets field
     /// flags).
     pub(super) fn moves_deep(&self, p: PatId) -> Result<bool, BuildError> {
-        let mut todo: Vec<(PatId, bool), A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<(PatId, bool), A> = Vec::new_in(self.alloc);
         todo.push((p, true));
         while let Some((q, root)) = todo.pop() {
             let pat = self.pat(q)?;
@@ -1042,7 +1429,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                     let subs = self.body.pat_lists.get(elems.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?;
                     todo.extend(subs.iter().map(|&s| (s, false)));
                 }
-                Pat::Struct { fields, .. } => {
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                     let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
                     todo.extend(fps.iter().map(|fp| (fp.pat, false)));
                 }

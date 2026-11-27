@@ -157,6 +157,7 @@ use blaze_units::Length;
 
 use crate::MeshLimits;
 use crate::check::{CheckOpts, Defect, Proof, Verified, check};
+use crate::feature::FeatureZone;
 use crate::geom::{D3, M3, P3, add, dot, length_up, narrow, scale, sub, unit};
 use crate::ids::{MaterialRole, PartId};
 use crate::mesh::Mesh;
@@ -177,7 +178,7 @@ const SQRT_3: f64 = 1.732_050_807_568_877_3;
 
 #[blaze::args]
 #[derive(Clone, Copy, Debug)]
-pub struct MeshOpts<'a, 's> {
+pub struct MeshOpts<'a, 's, 'z> {
     /// Where the mesh and its key list live.
     pub alloc: Alloc<'a>,
     /// Where the walk's lists, the region tapes and the soup live.
@@ -191,6 +192,9 @@ pub struct MeshOpts<'a, 's> {
     /// between the leaf and the piece): a closed feature smaller than half of it on every axis can
     /// fall between a stopped cell's samples (module documentation). 2^23 nm is about 8.4 mm.
     pub feature: Length = Length::nm(1 << 23),
+    /// Optional spatial feature zones that tighten local octree refinement (`feature` and settle
+    /// tolerance) only in pieces intersecting those regions, keeping the rest of the part coarse.
+    pub zones: &'z [FeatureZone] = &[],
     /// The most cells the walk may look at.
     pub most_cells: u64 = 1 << 28,
     /// The weld's and the verifier's caps.
@@ -434,21 +438,75 @@ impl<'c> PieceCache<'c> {
     }
 }
 
+/// Scale-aware dyadic octree grid parameters returned by [`auto_grid`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GridSizing {
+    /// Side of a cached octree piece (a power of two of nanometres, at least two leaves).
+    pub piece: Length,
+    /// Largest cell side a surface may stop in (a power of two of nanometres, between leaf and
+    /// piece). Features wider than this on any axis are always hit by the 3×3×3 cell lattice.
+    pub feature: Length,
+}
+
+/// Choose deterministic, dyadic-grid-aligned [`MeshOpts::piece`] and [`MeshOpts::feature`] sizes
+/// from a solid's bounding box `bounds`, target `tolerance`, and optional smallest feature size
+/// `min_feature` (such as a window frame, trim, or hole diameter that must never fall between
+/// stopped-cell lattice samples).
+///
+/// Why this matters: [`MeshOpts`]'s legacy fixed defaults (`piece = 16.8 mm`, `feature = 8.4 mm`)
+/// subdivide a 6 m flat cabin wall into hundreds of thousands of cells before decimation even runs.
+/// Scaling `feature` to the part's extent (while clamping to `min_feature` when specified) keeps
+/// flat faces coarse on meter-scale game assets while still refining curved rounds and thin walls
+/// down to `leaf <= tolerance / 2` via the QEF residual test.
+pub fn auto_grid(bounds: &Aabb3, tolerance: Length, min_feature: Option<Length>) -> GridSizing {
+    let tol_nm = tolerance.as_nm().max(16);
+    let leaf = floor_log2(tol_nm / 2);
+    let leaf_nm = 1i64 << leaf;
+
+    let extent_m = if bounds.is_empty() {
+        0.1
+    } else {
+        let d = bounds.hi - bounds.lo;
+        let max_d = d.x.max(d.y).max(d.z);
+        if max_d.is_finite() && max_d > 0.0 { max_d } else { 0.1 }
+    };
+    let extent_nm = (extent_m * 1e9).clamp(f64::from(16u32), 1e15) as i64;
+
+    // Default feature ceiling: ~1/16 of the part's extent, at least 16× tolerance (so flat faces
+    // stay coarse on meter-scale assets) and at most 1/4 of the extent or ~1.07 m (2^30 nm).
+    let max_feature_cap = (extent_nm / 4).clamp(leaf_nm, 1i64 << 30);
+    let auto_feature_nm = (extent_nm / 16).max(tol_nm.saturating_mul(16)).clamp(leaf_nm, max_feature_cap);
+
+    // When `min_feature` is stated, cap `feature` so the cell's 3×3×3 half-step lattice (`feature / 2`)
+    // samples at least twice across any feature of width `min_feature`.
+    let feature_target = match min_feature {
+        Some(mf) if mf.as_nm() > 0 => auto_feature_nm.min(mf.as_nm().max(leaf_nm)),
+        _ => auto_feature_nm,
+    };
+    let feature_shift = floor_log2(feature_target.max(leaf_nm)).max(leaf);
+    // Piece is one octave above `feature` (or at least 4 leaves so a piece holds a compact subtree
+    // of cells rather than exploding into tens of thousands of tiny pieces on meter-scale assets).
+    let piece_shift = (feature_shift + 1).max(leaf + 2).min(31);
+    let feature_shift = feature_shift.min(piece_shift);
+
+    GridSizing { piece: Length::nm(1i64 << piece_shift), feature: Length::nm(1i64 << feature_shift) }
+}
+
 /// The mesh of `t`'s solid, every piece made here.
-pub fn mesh<'a>(t: &Tape<'_>, o: MeshOpts<'a, '_>) -> Result<Meshed<'a>, MeshError> {
+pub fn mesh<'a>(t: &Tape<'_>, o: MeshOpts<'a, '_, '_>) -> Result<Meshed<'a>, MeshError> {
     contour(t, o, None, NoPlant)
 }
 
 /// The mesh of `t`'s solid, each piece's tree and triangles read from `cache` when their keys are
 /// there, and each made here kept in it. The bytes equal [`mesh`]'s.
-pub fn mesh_cached<'a>(t: &Tape<'_>, o: MeshOpts<'a, '_>, cache: &mut PieceCache<'_>) -> Result<Meshed<'a>, MeshError> {
+pub fn mesh_cached<'a>(t: &Tape<'_>, o: MeshOpts<'a, '_, '_>, cache: &mut PieceCache<'_>) -> Result<Meshed<'a>, MeshError> {
     contour(t, o, Some(cache), NoPlant)
 }
 
 /// [`mesh_cached`] with a planted bug, for the tests' controls.
 pub fn mesh_planted<'a>(
     t: &Tape<'_>,
-    o: MeshOpts<'a, '_>,
+    o: MeshOpts<'a, '_, '_>,
     cache: Option<&mut PieceCache<'_>>,
     plant: impl Planted<ContourPlant>,
 ) -> Result<Meshed<'a>, MeshError> {
@@ -519,7 +577,7 @@ impl Grid {
 
 fn contour<'a>(
     t: &Tape<'_>,
-    o: MeshOpts<'a, '_>,
+    o: MeshOpts<'a, '_, '_>,
     mut cache: Option<&mut PieceCache<'_>>,
     plant: impl Planted<ContourPlant>,
 ) -> Result<Meshed<'a>, MeshError> {
@@ -534,10 +592,25 @@ fn contour<'a>(
     if o.feature.as_nm() < 1 {
         return Err(MeshError::BadFeature { feature: o.feature });
     }
-    let leaf = floor_log2(tol / 2);
-    let piece = floor_log2(o.piece.as_nm()).max(leaf + 1);
-    let feature = floor_log2(o.feature.as_nm()).max(leaf).min(piece);
+    let base_leaf = floor_log2(tol / 2);
+    // Allow spatial feature zones to refine up to 3 octaves (8×) finer than the part's baseline
+    // leaf without letting an ultra-tight tolerance target on a meter-scale part explode sharp
+    // rabbet/miter edges into millions of micron-scale leaves.
+    let min_zone_leaf = base_leaf.saturating_sub(3).max(3);
+    let mut leaf = base_leaf;
+    for z in o.zones {
+        if let Some(me) = z.max_error {
+            let znm = me.as_nm();
+            if znm < 16 {
+                return Err(MeshError::BadTolerance { tolerance: me });
+            }
+            leaf = leaf.min(floor_log2(znm / 2).max(min_zone_leaf));
+        }
+    }
+    let piece = floor_log2(o.piece.as_nm()).max(base_leaf + 1).max(leaf + 1);
+    let feature = floor_log2(o.feature.as_nm()).max(base_leaf).min(piece);
     let leaf_nm = 1i64 << leaf;
+    let base_leaf_nm = 1i64 << base_leaf;
     let b = t.aabb();
     if b.is_empty() {
         return Err(MeshError::Empty);
@@ -671,15 +744,69 @@ fn contour<'a>(
         push(&mut region_digests, rt.digest())?;
     }
     let grid = Grid { leaf, piece, feature };
-    let key_leaf = if plant.has(ContourPlant::KeyWithoutTolerance) { 0 } else { leaf_nm };
+    // Precompute per-zone dyadic `(feature_shift, leaf_shift)` and per-piece cache digests so
+    // untouched pieces keep bit-identical `RegionKey`s while pieces overlapping a `FeatureZone`
+    // refine ONLY the cells that actually intersect the zone (never the whole piece!).
+    let mut zone_shifts: V<'_, (u32, u32)> = Vec::try_with_capacity_in(o.zones.len(), s)?;
+    for z in o.zones {
+        let zl = match z.max_error {
+            Some(me) => floor_log2(me.as_nm() / 2).max(leaf).min(base_leaf),
+            None => base_leaf,
+        };
+        let zf = match z.min_feature {
+            Some(fnm) if fnm.as_nm() > 0 => floor_log2(fnm.as_nm().max(leaf_nm)).max(zl).min(feature),
+            _ => feature.max(zl),
+        };
+        push(&mut zone_shifts, (zf, zl))?;
+    }
+    let mut piece_digests: V<'_, Digest> = Vec::try_with_capacity_in(cells.len(), s)?;
+    let mut piece_has_zone: V<'_, bool> = Vec::try_with_capacity_in(cells.len(), s)?;
+    let mut piece_min_grid: V<'_, (u32, u32)> = Vec::try_with_capacity_in(cells.len(), s)?;
+    for (n, &p) in cells.iter().enumerate() {
+        let mut pf = feature;
+        let mut pl = base_leaf;
+        let mut touched = false;
+        if !o.zones.is_empty() {
+            let pbox = cell_box(p, piece, leaf_nm);
+            let mut zh = Hasher::new();
+            zh.update(&region_digests[n]);
+            if leaf != base_leaf {
+                zh.update(&base_leaf.to_le_bytes());
+            }
+            for (zi, z) in o.zones.iter().enumerate() {
+                if !z.region.intersects_aabb(&pbox) {
+                    continue;
+                }
+                touched = true;
+                let (zf, zl) = zone_shifts[zi];
+                pf = pf.min(zf);
+                pl = pl.min(zl);
+                hash_zone_into(&mut zh, z, zf, zl);
+            }
+            if touched || leaf != base_leaf {
+                push(&mut piece_digests, zh.finalize())?;
+            } else {
+                push(&mut piece_digests, region_digests[n])?;
+            }
+        } else {
+            push(&mut piece_digests, region_digests[n])?;
+        }
+        push(&mut piece_has_zone, touched)?;
+        push(&mut piece_min_grid, (pf, pl))?;
+    }
+    let key_without_tol = plant.has(ContourPlant::KeyWithoutTolerance);
     let uniform = plant.has(ContourPlant::NoResidualTest);
     let own = |n: usize| {
         let p = cells[n];
+        let (pf, _) = piece_min_grid[n];
         RegionKey {
-            tape: region_digests[n],
+            tape: piece_digests[n],
             cell: [p[0] << piece, p[1] << piece, p[2] << piece, (p[0] + 1) << piece, (p[1] + 1) << piece, (p[2] + 1) << piece],
-            leaf_nm: key_leaf,
-            feature_nm: 1i64 << feature,
+            // Every piece in this contour run bisects shared boundary crossings at `leaf_nm`, so
+            // `RegionKey.leaf_nm` must record `leaf_nm` (never a coarser local settle leaf) so
+            // cached pieces from a coarser bisection leaf can never mix with finer neighbours.
+            leaf_nm: if key_without_tol { 0 } else { leaf_nm },
+            feature_nm: 1i64 << pf,
             around: [0u8; 32],
             schema: CONTOUR_SCHEMA,
         }
@@ -689,6 +816,7 @@ fn contour<'a>(
     let mut tree: V<'_, TreeCell> = Vec::new_in(s);
     let mut tree_stack: V<'_, Cell> = Vec::new_in(s);
     let mut spans: V<'_, (usize, usize)> = Vec::try_with_capacity_in(cells.len(), s)?;
+    let base_grid = Grid { leaf: base_leaf, piece, feature };
     for (n, &p) in cells.iter().enumerate() {
         let key = own(n);
         let start = tree.len();
@@ -700,7 +828,21 @@ fn contour<'a>(
         } else {
             let tidx = region_tidx[n];
             let rt = if tidx == 0 { t } else { &tapes[tidx - 1] };
-            piece_tree(rt, p, &grid, uniform, &mut tree, &mut tree_stack, &mut sc, &mut stats, o.most_cells)?;
+            let zones_slice: &[FeatureZone] = if piece_has_zone[n] { o.zones } else { &[] };
+            let shifts_slice: &[(u32, u32)] = if piece_has_zone[n] { &zone_shifts } else { &[] };
+            piece_tree(
+                rt,
+                p,
+                &base_grid,
+                zones_slice,
+                shifts_slice,
+                uniform,
+                &mut tree,
+                &mut tree_stack,
+                &mut sc,
+                &mut stats,
+                o.most_cells,
+            )?;
             if let Some(c) = cache.as_deref_mut()
                 && !c.put_tree(key, &tree[start..])?
             {
@@ -717,7 +859,7 @@ fn contour<'a>(
     let mut ps = PieceScratch::new(s);
     let mut far = 0.0f64;
     for (n, &p) in cells.iter().enumerate() {
-        let (around_digest, nb_indices, nb_count) = around_and_neighbours(&cells, &region_digests, p);
+        let (around_digest, nb_indices, nb_count) = around_and_neighbours(&cells, &piece_digests, p);
         let key = RegionKey { around: around_digest, ..own(n) };
         stats.pieces += 1;
         if let Some(c) = cache.as_deref()
@@ -775,12 +917,41 @@ fn contour<'a>(
     let proof = check(mesh.view(), CheckOpts { limits: o.limits, scratch: s }).map_err(MeshError::Verify)?.proof();
     stats.triangles = mesh.view().triangle_count();
     let quantum = length_up(most_abs / 16_777_216.0);
-    let vertex_bound = length_up((m(leaf_nm) * SQRT_3).max(far)) + quantum + quantum;
+    let vertex_bound = length_up((m(base_leaf_nm) * SQRT_3).max(far)) + quantum + quantum;
     Ok(Meshed { mesh, proof, quantum, vertex_bound, keys, stats })
 }
 
-/// The `around` of piece `p` (BLAKE3 of its 26 neighbours' tape digests, zeros where the walk kept
-/// no piece, in `z`, `y`, `x` order) together with the indices of the kept neighbours.
+/// Deterministically hash a [`FeatureZone`]'s spatial bounds and resolved dyadic shifts into a
+/// piece digest so `PieceCache` keys cover every local refinement input (rule 21).
+fn hash_zone_into(h: &mut Hasher, z: &FeatureZone, zf: u32, zl: u32) {
+    match z.region {
+        crate::feature::FeatureRegion::Box(b) => {
+            h.update(&[1u8]);
+            for x in [b.lo.x, b.lo.y, b.lo.z, b.hi.x, b.hi.y, b.hi.z] {
+                h.update(&x.to_bits().to_le_bytes());
+            }
+        }
+        crate::feature::FeatureRegion::Ball { center, radius } => {
+            h.update(&[2u8]);
+            for x in [center.x, center.y, center.z] {
+                h.update(&x.to_bits().to_le_bytes());
+            }
+            h.update(&radius.as_nm().to_le_bytes());
+        }
+        crate::feature::FeatureRegion::Capsule { a, b, radius } => {
+            h.update(&[3u8]);
+            for x in [a.x, a.y, a.z, b.x, b.y, b.z] {
+                h.update(&x.to_bits().to_le_bytes());
+            }
+            h.update(&radius.as_nm().to_le_bytes());
+        }
+    }
+    h.update(&zf.to_le_bytes());
+    h.update(&zl.to_le_bytes());
+}
+
+/// The `around` of piece `p` (BLAKE3 of its 26 neighbours' piece digests, zeros where the walk
+/// kept no piece, in `z`, `y`, `x` order) together with the indices of the kept neighbours.
 fn around_and_neighbours(cells: &[[i64; 3]], digests: &[Digest], p: [i64; 3]) -> (Digest, [usize; 26], usize) {
     let mut h = Hasher::new_derive_key("blaze-cad-mesh 2026-11-21 contour piece neighbours");
     let mut nbs = [0usize; 26];
@@ -820,12 +991,15 @@ fn locate(splits: &[Cell], g: &Grid, q: [i64; 3]) -> Cell {
 }
 
 /// Piece `p`'s tree, from its cell down (module documentation, "Where the walk stops"), appended
-/// to `out` depth first: each cell `eval_box` keeps, split or stopped.
+/// to `out` depth first: each cell `eval_box` keeps, split or stopped. When `zones` is non-empty,
+/// only cells that intersect a zone refine to that zone's tighter `(feature, leaf)`.
 #[allow(clippy::too_many_arguments)]
 fn piece_tree(
     r: &Tape<'_>,
     p: [i64; 3],
     g: &Grid,
+    zones: &[FeatureZone],
+    zone_shifts: &[(u32, u32)],
     uniform: bool,
     out: &mut V<'_, TreeCell>,
     stack: &mut V<'_, Cell>,
@@ -842,11 +1016,24 @@ fn piece_tree(
             return Err(MeshError::TooManyCells { most: most_cells });
         }
         stats.work += instrs;
-        let (iv, _) = eval_box(r, &cell_box(c.i, c.shift, 0), sc);
+        let cbox = cell_box(c.i, c.shift, 0);
+        let (iv, _) = eval_box(r, &cbox, sc);
         if !spans_zero(iv) {
             continue;
         }
-        let split = c.shift > g.leaf && (uniform || c.shift > g.feature || !settles(r, c, g, sc, stats)?);
+        let mut cell_grid = Grid { leaf: g.leaf, piece: g.piece, feature: g.feature };
+        if !zones.is_empty() {
+            for (zi, z) in zones.iter().enumerate() {
+                if z.region.intersects_aabb(&cbox) {
+                    let (zf, zl) = zone_shifts[zi];
+                    cell_grid.feature = cell_grid.feature.min(zf);
+                    cell_grid.leaf = cell_grid.leaf.min(zl);
+                }
+            }
+            cell_grid.feature = cell_grid.feature.max(cell_grid.leaf);
+        }
+        let split = c.shift > cell_grid.leaf
+            && (uniform || c.shift > cell_grid.feature || !settles(r, c, &cell_grid, sc, stats)?);
         push(out, TreeCell { cell: c, split })?;
         if split {
             for d in (0..8).rev() {

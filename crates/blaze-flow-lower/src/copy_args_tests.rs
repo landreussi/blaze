@@ -90,7 +90,7 @@ impl Facts for World {
         Some(AdtFacts { copy, drop_impl: false, needs_drop: !copy, lifetimes: 0, union: false, is_enum: false, is_box: false })
     }
     fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
-        Some(CalleeFacts { writes_lifetimes: false, self_ref: false })
+        Some(CalleeFacts { writes_lifetimes: false, self_ref: false, c_variadic: false })
     }
     fn field(&self, _: ItemKey, _: u32, _: Name) -> Option<u32> {
         None
@@ -159,4 +159,209 @@ fn an_unbounded_copy_impl_copies_whatever_its_argument() {
     let wrong = twice(Some(&[false, false]));
     std::println!("copy_args misaligned: {wrong:?}");
     assert!(matches!(wrong, Err(ref r) if matches!(r.form, Form::CopyArgsUnaligned { .. })), "{wrong:?}");
+}
+
+/// Structural `needs_drop` with [`Facts::drop_args`]: `W<D<'a>>` (like `ManuallyDrop<D<'a>>` or
+/// `NonNull<D<'a>>`) is not `Copy`, has `needs_drop: false`, and `drop_args: Some(&[false])` — so
+/// `w` has no drop glue at scope exit and borrowing `x` into `W<D<'a>>` does not conflict with a
+/// subsequent mutation of `x`. NEGATIVE: with `drop_args: Some(&[true])` (or `None`, the
+/// conservative default), `W<D<'a>>` drops `D<'a>` at scope exit, keeping the borrow of `x` alive
+/// across the assignment to `x`.
+#[test]
+fn drop_args_controls_whether_type_arguments_trigger_drop_glue() {
+    struct DropWorld {
+        w: ItemKey,
+        d: ItemKey,
+        drop_args: Option<&'static [bool]>,
+    }
+
+    impl Facts for DropWorld {
+        fn regions(&self) -> &dyn crate::RegionFacts { &crate::NoRegions }
+        fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> { None }
+        fn adt_variances(&self, k: ItemKey) -> Option<&[crate::Variance]> {
+            if k == self.d || k == self.w { Some(&[crate::Variance::Co]) } else { None }
+        }
+        fn implied_bounds(&self) -> Option<(&[(u32, crate::Region)], &[(crate::Region, crate::Region)])> { None }
+        fn constant_initializer(&self) -> bool { false }
+        fn fn_binders(&self) -> bool { true }
+        fn closure_bodies_checked(&self) -> bool { false }
+        fn closure_requirements(&self, _: blaze_typeck::ExprId) -> &[crate::Requirement] { &[] }
+        fn async_bodies_checked(&self) -> bool { false }
+        fn is_future(&self, _: blaze_typeck::PTy) -> Option<bool> { None }
+        fn shape(&self, _: ItemKey) -> Option<crate::Shape<'_>> { None }
+        fn object_trait_lifetimes(&self, _: ItemKey) -> Option<bool> { None }
+        fn call_bounds(&self, _: ItemKey) -> Option<crate::CallBounds<'_>> { None }
+        fn trait_lifetimes(&self, _: ItemKey) -> Option<u32> { None }
+        fn alias_lifetimes(&self, _: ItemKey, _: Name) -> Option<u32> { None }
+        fn ties(&self, _: ItemKey) -> Option<crate::Ties<'_>> { None }
+        fn field_param(&self, _: ItemKey, _: u32, _: u32) -> Option<u32> { None }
+        fn field_lead(&self, _: ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> { None }
+        fn field_regions(&self, _: ItemKey, _: u32, _: u32) -> Option<&[crate::FieldRegion]> { None }
+        fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
+            if k == self.d {
+                Some(AdtFacts { copy: false, drop_impl: true, needs_drop: true, lifetimes: 1, union: false, is_enum: false, is_box: false })
+            } else if k == self.w {
+                Some(AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: false, is_box: false })
+            } else {
+                None
+            }
+        }
+        fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
+            Some(CalleeFacts { writes_lifetimes: false, self_ref: false, c_variadic: false })
+        }
+        fn field(&self, _: ItemKey, _: u32, _: Name) -> Option<u32> { None }
+        fn field_count(&self, _: ItemKey, _: u32) -> Option<u32> { None }
+        fn copy_args(&self, _: ItemKey) -> Option<&[bool]> { None }
+        fn drop_args(&self, adt: ItemKey) -> Option<&[bool]> {
+            if adt == self.w { self.drop_args } else { None }
+        }
+        fn param_copy(&self, _: u32) -> bool { false }
+    }
+
+    let run_case = |drop_args: Option<&'static [bool]>| {
+        let mut fx = Fx::new();
+        let u32_t = fx.u32();
+        let ref_u32 = fx.r(blaze_typeck::Mutbl::Not, u32_t);
+        let mut_u32 = fx.r(blaze_typeck::Mutbl::Mut, u32_t);
+        let d = fx.strukt("D", 0, &[("r", ref_u32)]);
+        let dt = fx.adt(d, &[]);
+        let t0 = fx.param(0);
+        let w = fx.strukt("W", 1, &[("inner", t0)]);
+        let wd = fx.adt(w, &[dt]);
+        let unit = fx.unit();
+        let make = fx.func("make", 0, &[ref_u32], wd, Default::default());
+        let mutate = fx.func("mutate", 0, &[mut_u32], unit, Default::default());
+        let f = fx.func("f", 0, &[u32_t], unit, Default::default());
+        fx.finish();
+
+        let mut decls = Decls::new();
+        decls.adt(d, 1);
+        decls.adt(w, 0);
+        // `fn make<'a>(_: &'a u32) -> W<D<'a>>`: input slot 0 and output slot 0 share lifetime 0.
+        let r0 = crate::Region::Param(0);
+        decls.func(make, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[ref_u32], output: wd, slots: &[r0, r0] });
+        decls.func(mutate, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[mut_u32], output: unit, slots: &[r0] });
+        decls.func(f, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[u32_t], output: unit, slots: &[] });
+
+        // `fn f(mut x: u32) { let _w = make(&x); mutate(&mut x); }`
+        let mut b = Bb::new();
+        let px = b.param("x");
+        let pw = b.bind("_w");
+        let lx1 = b.local(px);
+        let r_x = b.borrow(blaze_typeck::Mutbl::Not, lx1);
+        let p_make = b.path(&["make"]);
+        let call = b.call(p_make, &[r_x]);
+        let s_let = b.let_(pw, None, call);
+        let lx2 = b.local(px);
+        let m_x = b.borrow(blaze_typeck::Mutbl::Mut, lx2);
+        let p_mut = b.path(&["mutate"]);
+        let call_mut = b.call(p_mut, &[m_x]);
+        let s_mut = b.semi(call_mut);
+        let root = b.block(&[s_let, s_mut], None);
+
+        findings(&fx, &b, f, root, &DropWorld { w, d, drop_args }, &decls, Plant::None)
+    };
+
+    assert_eq!(run_case(Some(&[false])), Ok(Default::default()), "drop_args=[false] has no drop glue");
+    let drops_arg = run_case(Some(&[true])).expect("drop_args=[true] should check");
+    assert!(!drops_arg.is_empty(), "drop_args=[true] must keep borrow alive for drop glue");
+    let default_drops = run_case(None).expect("drop_args=None should check");
+    assert!(!default_drops.is_empty(), "drop_args=None must conservatively drop type args");
+}
+
+/// Instantiated `needs_drop` via [`Facts::inst_needs_drop`]: when an ADT has structural
+/// `needs_drop: true` and `drop_impl: false` (e.g. `Flatten<I>` / `Split<'a, P>` with a generic
+/// `PNode::Alias` field), `inst_needs_drop(ty) == Some(false)` discharges drop glue so a borrow
+/// held only by the dead value can be mutated; `None` / `Some(true)` keeps the drop; and when
+/// `drop_impl: true`, `inst_needs_drop` is never consulted (a real `Drop` impl always runs).
+#[test]
+fn inst_needs_drop_overrides_structural_drop_only() {
+    struct InstWorld {
+        split: ItemKey,
+        drop_impl: bool,
+        inst: Option<bool>,
+    }
+
+    impl Facts for InstWorld {
+        fn regions(&self) -> &dyn crate::RegionFacts { &crate::NoRegions }
+        fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> { None }
+        fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
+            if k == self.split {
+                Some(AdtFacts { copy: false, drop_impl: self.drop_impl, needs_drop: true, lifetimes: 1, union: false, is_enum: false, is_box: false })
+            } else {
+                None
+            }
+        }
+        fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
+            Some(CalleeFacts { writes_lifetimes: false, self_ref: false, c_variadic: false })
+        }
+        fn adt_variances(&self, k: ItemKey) -> Option<&[crate::Variance]> {
+            if k == self.split { Some(&[crate::Variance::Co]) } else { None }
+        }
+        fn implied_bounds(&self) -> Option<(&[(u32, crate::Region)], &[(crate::Region, crate::Region)])> { None }
+        fn constant_initializer(&self) -> bool { false }
+        fn fn_binders(&self) -> bool { true }
+        fn closure_bodies_checked(&self) -> bool { false }
+        fn closure_requirements(&self, _: blaze_typeck::ExprId) -> &[crate::Requirement] { &[] }
+        fn async_bodies_checked(&self) -> bool { false }
+        fn is_future(&self, _: blaze_typeck::PTy) -> Option<bool> { None }
+        fn shape(&self, _: ItemKey) -> Option<crate::Shape<'_>> { None }
+        fn object_trait_lifetimes(&self, _: ItemKey) -> Option<bool> { None }
+        fn call_bounds(&self, _: ItemKey) -> Option<crate::CallBounds<'_>> { None }
+        fn trait_lifetimes(&self, _: ItemKey) -> Option<u32> { None }
+        fn alias_lifetimes(&self, _: ItemKey, _: blaze_typeck::Name) -> Option<u32> { None }
+        fn ties(&self, _: ItemKey) -> Option<crate::Ties<'_>> { None }
+        fn field(&self, _: ItemKey, _: u32, _: blaze_typeck::Name) -> Option<u32> { None }
+        fn field_param(&self, _: ItemKey, _: u32, _: u32) -> Option<u32> { None }
+        fn field_lead(&self, _: ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> { None }
+        fn field_regions(&self, _: ItemKey, _: u32, _: u32) -> Option<&[crate::FieldRegion]> { None }
+        fn field_count(&self, _: ItemKey, _: u32) -> Option<u32> { None }
+        fn copy_args(&self, _: ItemKey) -> Option<&[bool]> { None }
+        fn inst_needs_drop(&self, _: blaze_typeck::PTy) -> Option<bool> { self.inst }
+        fn param_copy(&self, _: u32) -> bool { false }
+    }
+
+    let run_case = |drop_impl: bool, inst: Option<bool>| {
+        let mut fx = Fx::new();
+        let u32_t = fx.u32();
+        let ref_u32 = fx.r(blaze_typeck::Mutbl::Not, u32_t);
+        let mut_u32 = fx.r(blaze_typeck::Mutbl::Mut, u32_t);
+        let split = fx.strukt("Split", 0, &[("r", ref_u32)]);
+        let split_ty = fx.adt(split, &[]);
+        let unit = fx.unit();
+        let make = fx.func("make", 0, &[ref_u32], split_ty, Default::default());
+        let mutate = fx.func("mutate", 0, &[mut_u32], unit, Default::default());
+        let f = fx.func("f", 0, &[u32_t], unit, Default::default());
+        fx.finish();
+
+        let mut decls = Decls::new();
+        decls.adt(split, 1);
+        let r0 = crate::Region::Param(0);
+        decls.func(make, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[ref_u32], output: split_ty, slots: &[r0, r0] });
+        decls.func(mutate, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[mut_u32], output: unit, slots: &[r0] });
+        decls.func(f, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[u32_t], output: unit, slots: &[] });
+
+        // `fn f(mut x: u32) { let _s = make(&x); mutate(&mut x); }`
+        let mut b = Bb::new();
+        let px = b.param("x");
+        let ps = b.bind("_s");
+        let lx1 = b.local(px);
+        let r_x = b.borrow(blaze_typeck::Mutbl::Not, lx1);
+        let p_make = b.path(&["make"]);
+        let call = b.call(p_make, &[r_x]);
+        let s_let = b.let_(ps, None, call);
+        let lx2 = b.local(px);
+        let m_x = b.borrow(blaze_typeck::Mutbl::Mut, lx2);
+        let p_mut = b.path(&["mutate"]);
+        let call_mut = b.call(p_mut, &[m_x]);
+        let s_mut = b.semi(call_mut);
+        let root = b.block(&[s_let, s_mut], None);
+
+        findings(&fx, &b, f, root, &InstWorld { split, drop_impl, inst }, &decls, Plant::None)
+    };
+
+    assert_eq!(run_case(false, Some(false)), Ok(Default::default()), "structural drop with inst_needs_drop=Some(false) drops nothing");
+    assert!(!run_case(false, Some(true)).expect("checks").is_empty(), "inst_needs_drop=Some(true) keeps borrow alive for drop");
+    assert!(!run_case(false, None).expect("checks").is_empty(), "inst_needs_drop=None conservatively keeps borrow alive");
+    assert!(!run_case(true, Some(false)).expect("checks").is_empty(), "real Drop impl must never be overridden by inst_needs_drop=Some(false)");
 }

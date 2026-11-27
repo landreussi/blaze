@@ -17,6 +17,7 @@
 //! d = tuple|array|adt|closure|coroutine (..) d = (..')
 //! d = size T | align T | tls cN              d = const
 //! d = discr P; switch copy|move d [..]       switch P' -> ..        (one flow row for both)
+//! d = discr P  (lone, e.g. enum as int)      d = (copy P')
 //! live _N, dead _N                           live _N, dead _N
 //! activate LN                                activate LN'
 //! fakeread P                                 P' = copy P'           (blaze-flow-lower's guard use)
@@ -41,7 +42,8 @@
 //! every cleanup block, entered only by an unwind edge (`verify`), is unreachable and is left
 //! out whole with its rows, its loans and its subsets. Places: `.N:T` is `Field(N)`, `[_N]` is
 //! `Index` (the flow's index names no local, so the read of the index local is not an access),
-//! `#N` is `Downcast(N)`; a constant index or a subslice is [`ProjectError::SlicePlace`].
+//! `#N` is `Downcast(N)`, constant index `[k]` is `ConstantIndex`, and subslice `[a..b]` is
+//! `Subslice`.
 //! Origins, placeholders, `mentions` and `known` carry over id for id; a body local `_N` is the
 //! flow's `_N`, and the one flow local past them is the scratch local `k`.
 #![blaze::sans_io]
@@ -108,7 +110,7 @@ impl fmt::Display for ProjectError {
 }
 
 /// A body's flow and the map both ways between their ids.
-pub struct Projected<A: Allocator + Clone> {
+pub struct Projected<A: Allocator + Copy> {
     pub flow: Flow<A>,
     /// Per body statement: its flow statement (the one a finding there names), or [`NONE`].
     flow_stmt: Vec<u32, A>,
@@ -136,7 +138,7 @@ fn at(v: &[u32], i: usize) -> Option<u32> {
     }
 }
 
-impl<A: Allocator + Clone> Projected<A> {
+impl<A: Allocator + Copy> Projected<A> {
     /// The flow statement body row `s` became (a finding at it names this one); `None` for a
     /// row of a left-out cleanup block.
     pub fn flow_stmt(&self, s: bd::Stmt) -> Option<fl::Stmt> {
@@ -196,7 +198,7 @@ impl<A: Allocator + Clone> Projected<A> {
     /// What drop elaboration does at each projected body `Drop`, in row order, from the move
     /// check's two dataflows (`blaze_flow::moves::drop_kind`).
     pub fn drop_kinds(&self, alloc: A) -> Result<Vec<(bd::Stmt, DropKind), A>, Bound> {
-        let st = fl::moves::inits(&self.flow, fl::record::Plant::None, alloc.clone())?;
+        let st = fl::moves::inits(&self.flow, fl::record::Plant::None, alloc)?;
         let mut out = Vec::with_capacity_in(self.drops.len(), alloc);
         for &(row, s, p) in self.drops.iter() {
             out.push((row, fl::moves::drop_kind(&self.flow, &st, s, p)));
@@ -225,7 +227,7 @@ fn span(s: bd::Span) -> fl::Span {
 }
 
 /// Projects `body` to its flow (the module doc gives each row's form).
-pub fn project<A: Allocator + Clone>(body: Verified<'_>, alloc: A) -> Result<Projected<A>, ProjectError> {
+pub fn project<A: Allocator + Copy>(body: Verified<'_>, alloc: A) -> Result<Projected<A>, ProjectError> {
     let locals = body.locals();
     let args = body.args();
     for i in 1..=args {
@@ -234,7 +236,7 @@ pub fn project<A: Allocator + Clone>(body: Verified<'_>, alloc: A) -> Result<Pro
             _ => return Err(ProjectError::ArgOrder { local: bd::Local(i) }),
         }
     }
-    let mut b = FlowBuilder::new_in(locals, args, alloc.clone());
+    let mut b = FlowBuilder::new_in(locals, args, alloc);
     for o in 0..body.origins() {
         b.origin(body.placeholder(bd::Origin(o)));
     }
@@ -246,40 +248,45 @@ pub fn project<A: Allocator + Clone>(body: Verified<'_>, alloc: A) -> Result<Pro
     }
 
     // Places in row order: a parent is an earlier row (verify), so it is mapped first.
-    let mut flow_place = filled(body.places() as usize, alloc.clone());
+    let mut flow_place = filled(body.places() as usize, alloc);
     for i in 0..body.places() {
         let row = body.place(bd::Place(i));
         let p = match (row.parent, row.proj) {
             (Some(up), Some(proj)) => {
-                let parent = fl::Place(flow_place[up.index()]);
+                let parent = fl::Place(flow_place.get(up.index()).copied().unwrap_or(NONE));
                 let proj = match proj {
                     Proj::Field { index, .. } => fl::Proj::Field(index),
                     Proj::Deref => fl::Proj::Deref,
                     Proj::DerefBox => fl::Proj::DerefBox,
                     Proj::Index(_) => fl::Proj::Index,
-                    Proj::Downcast(v) => fl::Proj::Downcast(v),
-                    Proj::ConstIndex { .. } | Proj::Subslice { .. } => {
-                        return Err(ProjectError::SlicePlace { place: bd::Place(i) });
+                    Proj::ConstIndex { offset, min_length, from_end } => {
+                        fl::Proj::ConstantIndex { offset, min_length, from_end }
                     }
+                    Proj::Subslice { from, to, from_end } => fl::Proj::Subslice { from, to, from_end },
+                    Proj::Downcast(v) => fl::Proj::Downcast(v),
                 };
                 b.project_marked(parent, proj, row.of_drop_type)
             }
             _ => b.local(row.local.0),
         };
-        flow_place[i as usize] = p.0;
+        if let Some(slot) = flow_place.get_mut(i as usize) {
+            *slot = p.0;
+        }
     }
 
     // Blocks: every normal block in id order, so the body's entry is the flow's.
-    let mut flow_block = filled(body.blocks() as usize, alloc.clone());
-    let mut body_block = Vec::new_in(alloc.clone());
-    let mut left_out = Vec::new_in(alloc.clone());
-    let mut cleanup = Vec::with_capacity_in(body.blocks() as usize, alloc.clone());
+    let mut flow_block = filled(body.blocks() as usize, alloc);
+    let mut body_block = Vec::new_in(alloc);
+    let mut left_out = Vec::new_in(alloc);
+    let mut cleanup = Vec::with_capacity_in(body.blocks() as usize, alloc);
     for x in 0..body.blocks() {
         let kind = body.block(bd::Block(x)).kind;
         cleanup.push(kind == BlockKind::Cleanup);
         match kind {
             BlockKind::Normal => {
-                flow_block[x as usize] = b.block().0;
+                if let Some(slot) = flow_block.get_mut(x as usize) {
+                    *slot = b.block().0;
+                }
                 body_block.push(x);
             }
             BlockKind::Cleanup => left_out.push(bd::Block(x)),
@@ -287,10 +294,10 @@ pub fn project<A: Allocator + Clone>(body: Verified<'_>, alloc: A) -> Result<Pro
     }
 
     // Loans: the flow numbers them as the borrows are pushed, which is row order.
-    let mut flow_loan = filled(body.loans() as usize, alloc.clone());
-    let mut body_loan = Vec::new_in(alloc.clone());
+    let mut flow_loan = filled(body.loans() as usize, alloc);
+    let mut body_loan = Vec::new_in(alloc);
     for s in 0..body.stmts() {
-        if cleanup[body.block_of(bd::Stmt(s)).index()] {
+        if cleanup.get(body.block_of(bd::Stmt(s)).index()).copied().unwrap_or(false) {
             continue;
         }
         if let StmtKind::Assign { value: Value::Borrow { loan, .. }, .. } = body.stmt(bd::Stmt(s)).kind {
@@ -304,7 +311,7 @@ pub fn project<A: Allocator + Clone>(body: Verified<'_>, alloc: A) -> Result<Pro
         }
     }
 
-    let mut subs = Vec::new_in(alloc.clone());
+    let mut subs = Vec::new_in(alloc);
     subs.extend(body.subsets());
     let mut e = Emit {
         body,
@@ -313,14 +320,14 @@ pub fn project<A: Allocator + Clone>(body: Verified<'_>, alloc: A) -> Result<Pro
         flow_place,
         flow_block,
         flow_loan,
-        flow_stmt: filled(body.stmts() as usize, alloc.clone()),
-        body_stmt: Vec::new_in(alloc.clone()),
-        ops: Vec::new_in(alloc.clone()),
-        targets: Vec::new_in(alloc.clone()),
+        flow_stmt: filled(body.stmts() as usize, alloc),
+        body_stmt: Vec::new_in(alloc),
+        ops: Vec::new_in(alloc),
+        targets: Vec::new_in(alloc),
         subs,
         sub_at: 0,
         scratch: None,
-        drops: Vec::new_in(alloc.clone()),
+        drops: Vec::new_in(alloc),
     };
     let n = body.stmts();
     let mut s = 0;
@@ -328,12 +335,14 @@ pub fn project<A: Allocator + Clone>(body: Verified<'_>, alloc: A) -> Result<Pro
         let row = bd::Stmt(s);
         e.skip_subsets(row)?;
         let blk = body.block_of(row);
-        if e.cleanup[blk.index()] {
+        if e.cleanup.get(blk.index()).copied().unwrap_or(false) {
             s += 1;
             continue;
         }
-        if body.block(blk).stmts.start == s {
-            e.b.start(fl::Block(e.flow_block[blk.index()]));
+        if body.block(blk).stmts.start == s
+            && let Some(&fb) = e.flow_block.get(blk.index())
+        {
+            e.b.start(fl::Block(fb));
         }
         s += e.row(row)?;
     }
@@ -366,7 +375,7 @@ pub fn project<A: Allocator + Clone>(body: Verified<'_>, alloc: A) -> Result<Pro
 }
 
 /// The projection's state: the builder and the maps as they fill.
-struct Emit<'v, A: Allocator + Clone> {
+struct Emit<'v, A: Allocator + Copy> {
     body: Verified<'v>,
     b: FlowBuilder<A>,
     /// Per body block: whether it is a cleanup block (left out).
@@ -385,9 +394,9 @@ struct Emit<'v, A: Allocator + Clone> {
     drops: Vec<(bd::Stmt, fl::Stmt, fl::Place), A>,
 }
 
-impl<A: Allocator + Clone> Emit<'_, A> {
+impl<A: Allocator + Copy> Emit<'_, A> {
     fn place(&self, p: bd::Place) -> fl::Place {
-        fl::Place(self.flow_place[p.index()])
+        fl::Place(self.flow_place.get(p.index()).copied().unwrap_or(NONE))
     }
 
     fn op(&self, o: Operand) -> fl::Operand {
@@ -421,7 +430,9 @@ impl<A: Allocator + Clone> Emit<'_, A> {
     /// Records that the next flow statement is row `row`'s own: the one its findings name.
     fn primary(&mut self, row: bd::Stmt) -> fl::Stmt {
         let s = self.body_stmt.len() as u32;
-        self.flow_stmt[row.index()] = s;
+        if let Some(slot) = self.flow_stmt.get_mut(row.index()) {
+            *slot = s;
+        }
         self.body_stmt.push(row.0);
         fl::Stmt(s)
     }
@@ -438,7 +449,7 @@ impl<A: Allocator + Clone> Emit<'_, A> {
             if sub.at >= row {
                 break;
             }
-            if !self.cleanup[self.body.block_of(sub.at).index()] {
+            if !self.cleanup.get(self.body.block_of(sub.at).index()).copied().unwrap_or(false) {
                 return Err(ProjectError::SubsetOrder { at: sub.at });
             }
             self.sub_at += 1;
@@ -578,6 +589,33 @@ impl<A: Allocator + Clone> Emit<'_, A> {
                 self.primary(row);
                 self.b.ret(sp);
             }
+            StmtKind::Cancelled => {
+                // Cancel paths return no output value; write a dummy constant to `_0` so
+                // `blaze-flow`'s move check does not report `_0` uninitialized at `return`
+                // (matching `blaze-flow-lower`'s `coroutine.rs`).
+                self.primary(row);
+                self.b.assign(fl::Place(0), fl::Operand::Const, sp);
+                self.extra(row);
+                self.b.ret(sp);
+            }
+            StmtKind::TailCall { callee, args } => {
+                self.ops.clear();
+                if let Callee::Value(o) = body.callee(callee) {
+                    let o = self.op(o);
+                    self.ops.push(o);
+                }
+                for o in body.ops(args) {
+                    let o = self.op(o);
+                    self.ops.push(o);
+                }
+                let d = self.place(body.local_place(bd::Local(0)));
+                self.primary(row);
+                self.b.call(&self.ops, d, sp);
+                self.subsets_at(row);
+                self.extra(row);
+                self.b.ret(sp);
+                return Ok(1);
+            }
             // No successor and nothing read: the process aborts, or (verify keeps `resume` in
             // cleanup blocks, left out) unwinding goes on.
             StmtKind::Unreachable | StmtKind::Terminate | StmtKind::Resume => {
@@ -673,23 +711,28 @@ impl<A: Allocator + Clone> Emit<'_, A> {
             Value::Discriminant(p) => {
                 // `d = discr p; switch d`: blaze-flow-lower's switch on the matched place, whose
                 // read is the shallow one of a switch. Both rows are the one flow statement.
-                // An assignment is never a block's last row (verify), so the next row exists
-                // and is in this block.
+                // A lone `d = discr p` (e.g. an enum-to-integer cast) reads `p` as a shared copy
+                // and writes `d`, as `Value::Len(p)` does.
                 let next = bd::Stmt(row.0 + 1);
-                let StmtKind::Switch { on: Operand::Copy(x) | Operand::Move(x), cases, otherwise } =
+                if let StmtKind::Switch { on: Operand::Copy(x) | Operand::Move(x), cases, otherwise } =
                     body.stmt(next).kind
-                else {
-                    return Err(ProjectError::LoneDiscriminant { stmt: row });
-                };
-                if x != dest {
-                    return Err(ProjectError::LoneDiscriminant { stmt: row });
+                    && x == dest
+                {
+                    let on = self.place(p);
+                    self.switch(row, on, cases, otherwise, sp)?;
+                    self.subsets_at(row);
+                    if let Some(&mapped) = self.flow_stmt.get(row.index())
+                        && let Some(slot) = self.flow_stmt.get_mut(next.index())
+                    {
+                        *slot = mapped;
+                    }
+                    self.subsets_at(next);
+                    return Ok(2);
                 }
                 let on = self.place(p);
-                self.switch(row, on, cases, otherwise, sp)?;
-                self.subsets_at(row);
-                self.flow_stmt[next.index()] = self.flow_stmt[row.index()];
-                self.subsets_at(next);
-                return Ok(2);
+                self.ops.push(fl::Operand::Copy(on));
+                self.primary(row);
+                self.b.aggregate(d, &self.ops, sp);
             }
         }
         self.subsets_at(row);

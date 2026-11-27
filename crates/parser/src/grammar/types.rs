@@ -42,11 +42,9 @@ pub(super) fn type_no_bounds<S: Sink>(p: &mut Parser<'_, S>) {
     type_or_union(p, false);
 }
 
-/// A type, or under `#![blaze::error_unions]` an error union `A | B | C` of types: the union
-/// binds loosest, so `&A | B` is a union of `&A` and `B`, and a member is never a union itself
-/// (write one in parentheses). Without the extension, or where Rust lets a `|` follow a type
-/// (a closure's parameters, after `as`: [`Parser::with_unions`]), this is the type alone and
-/// the parse is Rust's.
+/// A type, or under `#![blaze::error_unions]` an error union `A | B | C`.
+/// Without the extension, or where Rust lets a `|` follow a type (a closure's parameters, after
+/// `as`: [`Parser::with_unions`]), this is the type alone and the parse is Rust's.
 fn type_or_union<S: Sink>(p: &mut Parser<'_, S>, allow_bounds: bool) {
     if !p.unions() {
         type_with_bounds_cond(p, allow_bounds);
@@ -54,12 +52,12 @@ fn type_or_union<S: Sink>(p: &mut Parser<'_, S>, allow_bounds: bool) {
     }
     let m = p.start();
     p.with_unions(false, |p| type_with_bounds_cond(p, allow_bounds));
-    if !at_union_bar(p) {
-        m.abandon(p);
+    if at_union_bar(p) {
+        union_members(p, allow_bounds);
+        m.complete(p, UNION_TYPE);
         return;
     }
-    union_members(p, allow_bounds);
-    m.complete(p, UNION_TYPE);
+    m.abandon(p);
 }
 
 /// The `| B | C` of an error union, each member a type that is no union itself.
@@ -73,18 +71,20 @@ fn union_members<S: Sink>(p: &mut Parser<'_, S>, allow_bounds: bool) {
 
 /// The rest of an error union whose first member, `first`, a caller parsed itself (a generic
 /// argument that starts with a name is parsed there, to tell `Item = T` and `Item: Bound` from
-/// a type): `first | B | C` as one `UNION_TYPE`, or `first` where no union may be or none
-/// follows.
+/// a type): `first | B | C` as one `UNION_TYPE`, or `first` where no union may be or none follows.
 pub(super) fn union_after<S: Sink>(p: &mut Parser<'_, S>, first: CompletedMarker) -> CompletedMarker {
-    if !p.unions() || !at_union_bar(p) {
+    if !p.unions() {
         return first;
     }
-    let m = first.precede(p);
-    while at_union_bar(p) {
-        p.bump(T![|]);
-        p.with_unions(false, |p| type_with_bounds_cond(p, true));
+    if at_union_bar(p) {
+        let m = first.precede(p);
+        while at_union_bar(p) {
+            p.bump(T![|]);
+            p.with_unions(false, |p| type_with_bounds_cond(p, true));
+        }
+        return m.complete(p, UNION_TYPE);
     }
-    m.complete(p, UNION_TYPE)
+    first
 }
 
 /// Whether the parser is at the `|` between two members of an error union: a lone `|`, not
@@ -128,12 +128,13 @@ fn type_with_bounds_cond_here<S: Sink>(p: &mut Parser<'_, S>, allow_bounds: bool
 }
 
 /// blaze, under `#![blaze::records]`: `fn open(opts: { create: bool = false, mode: u32 }) {}`
+/// and structural spread `type Actor = { ..Transform, hp: u32 = 100 };`.
 ///
 /// A record type: a field list where a type is expected, which is nowhere a type of Rust's
 /// (the arm after this one is its error). The list and its fields are a struct's nodes, but a
-/// record's field is a name, a `:`, a type and then a default (`= expr`, as
-/// `default_field_values` writes it) and nothing else: a visibility, an attribute or `unsafe`
-/// is an error here. hir-ty refuses a default outside a function parameter.
+/// record's field is either a spread (`..Type`, a `RECORD_FIELD` with no `NAME`) or a name, a
+/// `:`, a type and then an optional default (`= expr`, as `default_field_values` writes it) and
+/// nothing else: a visibility, an attribute or `unsafe` is an error here.
 fn record_type<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T!['{']));
     let m = p.start();
@@ -144,20 +145,26 @@ fn record_type<S: Sink>(p: &mut Parser<'_, S>) {
             error_block(p, "expected a record field: a name, `:` and a type");
             continue;
         }
-        if !p.at(IDENT) {
+        if p.at(T![..]) && !p.at(T![..=]) {
+            let field = p.start();
+            p.bump(T![..]);
+            type_(p);
+            field.complete(p, RECORD_FIELD);
+        } else if p.at(IDENT) {
+            let field = p.start();
+            name(p);
+            p.expect(T![:]);
+            type_(p);
+            if p.eat(T![=]) {
+                let default = p.start();
+                expressions::expr(p);
+                default.complete(p, CONST_ARG);
+            }
+            field.complete(p, RECORD_FIELD);
+        } else {
             p.err_and_bump("expected a record field: a name, `:` and a type");
             continue;
         }
-        let field = p.start();
-        name(p);
-        p.expect(T![:]);
-        type_(p);
-        if p.eat(T![=]) {
-            let default = p.start();
-            expressions::expr(p);
-            default.complete(p, CONST_ARG);
-        }
-        field.complete(p, RECORD_FIELD);
         if !p.at(T!['}']) {
             p.expect(T![,]);
         }
@@ -174,16 +181,16 @@ pub(super) fn at_record_type<S: Sink>(p: &Parser<'_, S>) -> bool {
 }
 
 /// Whether the parser is at a record type that is a generic argument (`Vec<{ a: u8 }>`,
-/// `#![blaze::records]`): a `{`, an identifier, a `:` and a token that is not a second `:`.
-/// Any other `{` in a generic argument list is Rust's const block (`Foo<{ N + 1 }>`, `Foo<{}>`),
-/// which never starts so; the empty record there is written `({})`. Four tokens, jointness
-/// unread, the bound of [`super::expressions::at_record_value`].
+/// `Vec<{ ..Base, a: u8 }>`, `#![blaze::records]`): a `{`, then either an identifier, a `:` and
+/// a token that is not a second `:`, or a `..` spread (not `..=`). Any other `{` in a generic
+/// argument list is Rust's const block (`Foo<{ N + 1 }>`, `Foo<{}>`), which never starts so;
+/// the empty record there is written `({})`. Four tokens, jointness unread, the bound of
+/// [`super::expressions::at_record_value`].
 pub(super) fn at_record_type_arg<S: Sink>(p: &Parser<'_, S>) -> bool {
     p.at(T!['{'])
         && p.records_gate()
-        && p.nth(1) == IDENT
-        && p.nth(2) == T![:]
-        && p.nth(3) != T![:]
+        && ((p.nth(1) == IDENT && p.nth(2) == T![:] && p.nth(3) != T![:])
+            || (p.nth_at(1, T![..]) && !p.nth_at(1, T![..=])))
 }
 
 pub(crate) fn is_dyn_weak<S: Sink>(p: &Parser<'_, S>) -> bool {
@@ -380,7 +387,28 @@ pub(super) fn for_binder<S: Sink>(p: &mut Parser<'_, S>) {
     let m = p.start();
     p.bump(T![for]);
     if p.at(T![<]) {
-        generic_params::generic_param_list(p);
+        if p.nth_at(1, IDENT) && p.nth_at(2, T![in]) {
+            p.bump(T![<]);
+            name(p);
+            p.bump(T![in]);
+            if p.eat(IDENT) {
+                if p.eat(T!['(']) {
+                    type_(p);
+                    if !p.eat(T![')']) {
+                        p.error("expected `)`");
+                    }
+                } else {
+                    p.error("expected `(`");
+                }
+            } else {
+                p.error("expected `fields`");
+            }
+            if !p.eat(T![>]) {
+                p.error("expected `>`");
+            }
+        } else {
+            generic_params::generic_param_list(p);
+        }
     } else {
         p.error("expected `<`");
     }
@@ -504,12 +532,17 @@ fn path_or_macro_type<S: Sink>(p: &mut Parser<'_, S>, allow_bounds: bool) {
 
     // test bare_pattern_type
     // type A = E is E::A(..) | E::B;
+    // type B = SemVer is in VERSIONS;
     if kind == PATH_TYPE && p.bare_pattern_types() && p.at_contextual_kw(T![is]) {
-        // `#![blaze::pattern_types]`'s `T is PAT`: the feature gate refuses it in a crate
-        // without the gate, and before the gate `T is` was never a valid type.
+        // `#![blaze::pattern_types]`'s `T is PAT` and `T is in CONST_EXPR`: the feature gate
+        // refuses it in a crate without the gate, and before the gate `T is` was never a valid type.
         let m = path.precede(p);
         p.bump_remap(T![is]);
-        pat_top(p);
+        if p.eat(T![in]) {
+            const_set_arg(p);
+        } else {
+            pat_top(p);
+        }
         m.complete(p, PATTERN_TYPE);
         return;
     }
@@ -594,10 +627,79 @@ fn pattern_type<S: Sink>(p: &mut Parser<'_, S>) {
         if !p.eat_contextual_kw(T![is]) {
             p.error("expected `is`")
         }
-        pat_top(p);
+        if p.eat(T![in]) {
+            const_set_arg(p);
+        } else {
+            pat_top(p);
+        }
         p.expect(T![')']);
         m.complete(p, PATTERN_TYPE);
     } else {
         m.abandon(p);
+    }
+}
+
+/// Parses the const slice/array expression in `T is in CONST_EXPR` wrapped in `CONST_ARG`.
+///
+/// Parses primary/unary const-set forms (`VERSIONS`, `[V1, V2, V3]`, `&[V1, V2]`, `const { .. }`,
+/// `{ .. }`, `(expr)`) without consuming enclosing type delimiters such as `=` (in `let x: T is in
+/// VERSIONS = y;`), `{` (in `fn f() -> T is in VERSIONS { .. }`), `>`, or `|`.
+fn const_set_arg<S: Sink>(p: &mut Parser<'_, S>) {
+    let c = p.start();
+    const_set_expr(p);
+    c.complete(p, CONST_ARG);
+}
+
+fn const_set_expr<S: Sink>(p: &mut Parser<'_, S>) {
+    if p.at(T![&]) {
+        let m = p.start();
+        p.bump(T![&]);
+        const_set_expr(p);
+        m.complete(p, REF_EXPR);
+        return;
+    }
+    match p.current() {
+        T!['['] => {
+            let m = p.start();
+            let mut n_exprs = 0u32;
+            let mut has_semi = false;
+            p.bump(T!['[']);
+            while !p.at(EOF) && !p.at(T![']']) {
+                n_exprs += 1;
+                if expressions::expr(p).is_none() {
+                    break;
+                }
+                if n_exprs == 1 && p.eat(T![;]) {
+                    has_semi = true;
+                    continue;
+                }
+                if has_semi || (!p.at(T![']']) && !p.expect(T![,])) {
+                    break;
+                }
+            }
+            p.expect(T![']']);
+            m.complete(p, ARRAY_EXPR);
+        }
+        T![const] if p.nth_at(1, T!['{']) => {
+            expressions::const_block(p);
+        }
+        T!['{'] => {
+            expressions::block_expr(p);
+        }
+        T!['('] => {
+            let m = p.start();
+            p.bump(T!['(']);
+            expressions::expr(p);
+            p.expect(T![')']);
+            m.complete(p, PAREN_EXPR);
+        }
+        _ if paths::is_path_start(p) => {
+            let m = p.start();
+            paths::expr_path(p);
+            m.complete(p, PATH_EXPR);
+        }
+        _ => {
+            expressions::expr_no_struct(p);
+        }
     }
 }

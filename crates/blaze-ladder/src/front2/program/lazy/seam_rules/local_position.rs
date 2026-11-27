@@ -134,24 +134,87 @@ pub(super) fn first_token(text: &str, byte: u32) -> Option<u32> {
     None
 }
 
+/// Collects every written local declaration inside `top`'s `text` into `out`, marking a key
+/// `None` on collision so [`in_source`] preserves exact ambiguity refusal.
+fn collect_all<'n>(
+    krate: CrateItemKey,
+    top: LibKey,
+    text: &str,
+    edition: Edition,
+    out: &mut blaze_hash::HashMap<ItemKey, Option<(LibKey, u32)>, Alloc<'n>>,
+    alloc: Alloc<'_>,
+) -> Result<(), PositionGap> {
+    let mut bodies = AVec::new_in(alloc);
+    bodies.push((top, 0u32, text));
+    while let Some((parent, base, body)) = bodies.pop() {
+        let nested = blaze_file_items::nested::scan(body, alloc);
+        if nested.end != NestedEnd::Whole {
+            return Err(PositionGap::NoItem);
+        }
+        let mut ranks = blaze_hash::HashMap::new_in(alloc);
+        for entry in nested.items.iter() {
+            let tag = match entry.kind {
+                NestedKind::Fn => "written local fn",
+                NestedKind::Const => "written local const",
+                NestedKind::Static => "written local static",
+                _ => continue,
+            };
+            let at = base.checked_add(entry.range.start).ok_or(PositionGap::PastText)?;
+            let start = usize::try_from(entry.range.start).map_err(|_| PositionGap::PastText)?;
+            let end = usize::try_from(entry.range.end).map_err(|_| PositionGap::PastText)?;
+            let part = body.get(start..end).ok_or(PositionGap::PastText)?;
+            let declaration = blaze_file_items::outline_item(part, edition, alloc);
+            let item = declaration.items().first().ok_or(PositionGap::NoItem)?;
+            let name = item.name.map(|r| item.text(part, r)).unwrap_or("_");
+            let ordinal = ranks.entry((tag, name)).or_insert(0u32);
+            let mut key = blaze_scope::task::key_of(krate, parent, tag, name, *ordinal);
+            key.0.0[8] |= LibKey::INNER;
+            *ordinal = ordinal.checked_add(1).ok_or(PositionGap::NoItem)?;
+            let id = checker_of(key);
+            out.entry(id).and_modify(|slot| *slot = None).or_insert(Some((top, at)));
+            if part.len() >= body.len() {
+                return Err(PositionGap::PastText);
+            }
+            bodies.push((key, at, part));
+        }
+    }
+    Ok(())
+}
+
 /// A written local's key can arrive before its enclosing body is checked.
 pub(super) fn in_source<'n, S: PositionSource<'n>>(
     names: S, krate: usize, wanted: ItemKey, site: u32, alloc: Alloc<'_>,
 ) -> Result<(u32, u32), PositionGap> {
     let key = names.crate_key(krate).ok_or(PositionGap::NoItem)?;
     let edition = names.edition_of(krate).ok_or(PositionGap::NoItem)?;
-    let mut found = None;
-    names.enclosing_keys(krate, |lib| {
-        let anchor = Anchor::from_lib(names, lib).ok_or(PositionGap::NoItem)?;
-        let text = anchor.text(names).ok_or(PositionGap::NoItem)?;
-        if let Some((_, start)) = find(key, lib, text, edition, Find::Key(wanted), alloc)? {
-            if found.replace((anchor, start)).is_some() {
-                return Err(PositionGap::NoItem);
-            }
+    let (top, old_start) = match names.cached_local_start(krate, wanted, |map_alloc| {
+        let mut out = blaze_hash::HashMap::new_in(map_alloc);
+        names.enclosing_keys(krate, |lib| {
+            let anchor = Anchor::from_lib(names, lib).ok_or(PositionGap::NoItem)?;
+            let text = anchor.text(names).ok_or(PositionGap::NoItem)?;
+            collect_all(key, lib, text, edition, &mut out, alloc)
+        })?;
+        Ok(out)
+    }) {
+        Some(hit) => {
+            let (lib, start) = hit?;
+            (Anchor::from_lib(names, lib).ok_or(PositionGap::NoItem)?, start)
         }
-        Ok(())
-    })?;
-    let (top, old_start) = found.ok_or(PositionGap::NoItem)?;
+        None => {
+            let mut found = None;
+            names.enclosing_keys(krate, |lib| {
+                let anchor = Anchor::from_lib(names, lib).ok_or(PositionGap::NoItem)?;
+                let text = anchor.text(names).ok_or(PositionGap::NoItem)?;
+                if let Some((_, start)) = find(key, lib, text, edition, Find::Key(wanted), alloc)? {
+                    if found.replace((anchor, start)).is_some() {
+                        return Err(PositionGap::NoItem);
+                    }
+                }
+                Ok(())
+            })?;
+            found.ok_or(PositionGap::NoItem)?
+        }
+    };
     let place = top.placement(names, alloc)?;
     let start = match place.2 {
         Start::Copied(_, body) => find(key, top.lib(), body, edition, Find::Key(wanted), alloc)?.ok_or(PositionGap::NoItem)?.1,
@@ -275,10 +338,28 @@ pub(super) fn written_range(body: &str, chain: ContentId, edition: Edition, allo
         }
     }
     let range = current.ok_or(PositionGap::NoItem)?;
-    for copy in copies {
+    for (idx, copy) in copies.iter().copied().enumerate() {
         let end = copy.to.checked_add(copy.len).ok_or(PositionGap::PastText)?;
         if !(copy.to <= range.start && range.start < end) {
             continue;
+        }
+        // An expression call whose statement carries outer attributes (e.g. reth's
+        // `#[expect(clippy::needless_continue)] let events = stream_select!(..);`) is rendered
+        // by `expanded_blocks::render` (`Event::Call`) as two copies separated by a synthetic
+        // `\n`: the statement's attributes, then the call itself (plus optional synthetic `;`).
+        // Rust places a function-like call at the call's own path (past outer attributes), so
+        // return the call copy's written range in `body`.
+        if let Some(next) = copies.get(idx + 1).copied()
+            && rendered.get(end as usize..next.to as usize) == Some("\n")
+        {
+            let next_end = next.to.checked_add(next.len).ok_or(PositionGap::PastText)?;
+            let tail_ok = range.end <= next_end || rendered.get(next_end as usize..range.end as usize) == Some(";");
+            if range.end > next.to && tail_ok {
+                let last = next_end.min(range.end);
+                let start = next.from;
+                let end = start.checked_add(last - next.to).ok_or(PositionGap::PastText)?;
+                return Ok(Range::new(start, end));
+            }
         }
         // A `(..)` or `[..]` call is copied and then given the `;` an item-position call ends
         // with (blaze-scope expanded_blocks.rs `render`, `Event::Call`): rand's tail call
@@ -300,7 +381,33 @@ pub(super) fn written_range(body: &str, chain: ContentId, edition: Edition, allo
 
 #[cfg(test)]
 mod tests {
-    use super::first_token;
+    use super::{first_token, written_range};
+    use blaze_surface::{Edition, ItemKind};
+
+    /// An expression-position macro call whose enclosing `let` carries an outer attribute
+    /// (`reth_node_builder`'s `#[expect(clippy::needless_continue)] let events = stream_select!(..);`):
+    /// `expanded_blocks::render` copies the attribute and the call as two disjoint slices joined by
+    /// a synthetic `\n`, plus a synthetic `;`. `written_range` must locate the call's exact written
+    /// span in the body (past the attribute and `let events = `), matching both paren and brace calls.
+    #[test]
+    fn attributed_expr_macro_call_in_body_resolves_to_call_span() {
+        let alloc = blaze_own::Alloc::global();
+        for call in ["stream_select!(a, b)", "stream_select! { a, b }"] {
+            let body = format!("fn f() {{\n    #[expect(clippy::needless_continue)]\n    let events = {call};\n}}\n");
+            let nested = blaze_file_items::nested::scan(&body, alloc);
+            let rendered = blaze_scope::blocks::module_text(&body, &nested, &mut |_| {}, alloc);
+            let outline = blaze_file_items::outline(&rendered, Edition::E2024, alloc);
+            let macro_item = outline
+                .items()
+                .iter()
+                .find(|it| it.kind() == ItemKind::MacroCall)
+                .expect("macro call in rendered block module");
+            let chain = blaze_file_items::item_chain(&outline, macro_item, &rendered);
+            let range = written_range(&body, chain, Edition::E2024, alloc)
+                .unwrap_or_else(|e| panic!("attributed `{call}` must resolve: {e:?}"));
+            assert_eq!(&body[range.start as usize..range.end as usize], call);
+        }
+    }
 
     /// curve25519-dalek's shape (two `///` lines, then `#[inline(always)]`): the declaration
     /// starts at the `#`, where the text scan starts it; a nested block comment and a plain

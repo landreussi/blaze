@@ -80,63 +80,139 @@ fn int_text(s: &str) -> Option<u64> {
 
 impl Types for Names<'_> {
     fn ty(&mut self, v: &View<'_>, t: TypeId, tys: &mut PortableTys<'_>) -> Result<PTy, Refused> {
-        let node = match v.ty(t)? {
-            TypeRef::Path(p) => {
-                let path = v.path(p)?;
-                let segs = v.segments(path)?;
-                let last = Segment::decode(*segs.last().ok_or(refuse("an empty type path"))?)?;
-                if last.kind != SegKind::Ident {
-                    return Err(refuse("a type path segment that is not a name"));
+        enum Step {
+            Visit(TypeId),
+            FinishRef(Mutbl),
+            FinishPtr(Mutbl),
+            FinishTuple(usize),
+            FinishArray(u64),
+            FinishSlice,
+            FinishFnPtr { count: usize, has_ret: bool },
+        }
+        let mut work = StdVec::new();
+        let mut vals: StdVec<PTy> = StdVec::new();
+        work.push(Step::Visit(t));
+        while let Some(step) = work.pop() {
+            match step {
+                Step::Visit(cur) => {
+                    let leaf = match v.ty(cur)? {
+                        TypeRef::Path(p) => {
+                            let path = v.path(p)?;
+                            let segs = v.segments(path)?;
+                            let last = Segment::decode(*segs.last().ok_or(refuse("an empty type path"))?)?;
+                            if last.kind != SegKind::Ident {
+                                return Err(refuse("a type path segment that is not a name"));
+                            }
+                            let name = v.name_text(last.name.ok_or(refuse("a nameless segment"))?)?;
+                            match prim(name) {
+                                Some(n) => n,
+                                None => match self.adts.iter().find(|(n, _)| n == name) {
+                                    Some(&(_, k)) => PNode::Adt(k, List::EMPTY),
+                                    None => return Err(refuse("a type name the fixture does not know")),
+                                },
+                            }
+                        }
+                        TypeRef::Ref { mutbl, inner, .. } => {
+                            work.push(Step::FinishRef(mutbl));
+                            work.push(Step::Visit(inner));
+                            continue;
+                        }
+                        TypeRef::Ptr { mutbl, inner } => {
+                            work.push(Step::FinishPtr(mutbl));
+                            work.push(Step::Visit(inner));
+                            continue;
+                        }
+                        TypeRef::Tuple(l) => {
+                            let ids = v.ids(l)?;
+                            work.push(Step::FinishTuple(ids.len()));
+                            for &i in ids.iter().rev() {
+                                work.push(Step::Visit(TypeId(i)));
+                            }
+                            continue;
+                        }
+                        TypeRef::Array { elem, len } => {
+                            let r = v.const_range(len)?;
+                            let n = int_text(v.text_at(r)?).ok_or(refuse("an array length that is not a literal"))?;
+                            work.push(Step::FinishArray(n));
+                            work.push(Step::Visit(elem));
+                            continue;
+                        }
+                        TypeRef::Slice(e) => {
+                            work.push(Step::FinishSlice);
+                            work.push(Step::Visit(e));
+                            continue;
+                        }
+                        TypeRef::Never => PNode::Never,
+                        // A safe Rust-ABI fn pointer: the inputs, then the output last (unit when none is
+                        // written), as blaze-ladder's front reads one.
+                        TypeRef::FnPtr { params, ret, abi: None, unsafety: false, extern_: false, variadic: false } => {
+                            let rows = v.rows(params)?;
+                            for &n in rows {
+                                let p = Param::decode(n)?;
+                                if p.ty.is_none() {
+                                    return Err(refuse("a fn pointer parameter with no type"));
+                                }
+                            }
+                            let count = rows.len() + usize::from(ret.is_some());
+                            work.push(Step::FinishFnPtr { count, has_ret: ret.is_some() });
+                            if let Some(r) = ret {
+                                work.push(Step::Visit(r));
+                            }
+                            for &n in rows.iter().rev() {
+                                let p = Param::decode(n)?;
+                                let pt = p.ty.ok_or(refuse("a fn pointer parameter with no type"))?;
+                                work.push(Step::Visit(pt));
+                            }
+                            continue;
+                        }
+                        _ => return Err(refuse("a written type the fixture does not resolve")),
+                    };
+                    vals.push(tys.intern(leaf)?);
                 }
-                let name = v.name_text(last.name.ok_or(refuse("a nameless segment"))?)?;
-                match prim(name) {
-                    Some(n) => n,
-                    None => match self.adts.iter().find(|(n, _)| n == name) {
-                        Some(&(_, k)) => PNode::Adt(k, List::EMPTY),
-                        None => return Err(refuse("a type name the fixture does not know")),
-                    },
+                Step::FinishRef(mutbl) => {
+                    let inner = vals.pop().ok_or(refuse("type stack underflow"))?;
+                    vals.push(tys.intern(PNode::Ref(mutbl, inner))?);
+                }
+                Step::FinishPtr(mutbl) => {
+                    let inner = vals.pop().ok_or(refuse("type stack underflow"))?;
+                    vals.push(tys.intern(PNode::Ptr(mutbl, inner))?);
+                }
+                Step::FinishTuple(len) => {
+                    let start = vals.len().checked_sub(len).ok_or(refuse("type stack underflow"))?;
+                    let slice = vals.get(start..).ok_or(refuse("type stack underflow"))?;
+                    let list = tys.intern_list(slice)?;
+                    vals.truncate(start);
+                    vals.push(tys.intern(PNode::Tuple(list))?);
+                }
+                Step::FinishArray(n) => {
+                    let elem = vals.pop().ok_or(refuse("type stack underflow"))?;
+                    let len = tys.usize_value(n)?;
+                    vals.push(tys.intern(PNode::Array(elem, len))?);
+                }
+                Step::FinishSlice => {
+                    let elem = vals.pop().ok_or(refuse("type stack underflow"))?;
+                    vals.push(tys.intern(PNode::Slice(elem))?);
+                }
+                Step::FinishFnPtr { count, has_ret } => {
+                    if !has_ret {
+                        let unit = tys.intern(PNode::Tuple(List::EMPTY))?;
+                        vals.push(unit);
+                    }
+                    let total = count + usize::from(!has_ret);
+                    let start = vals.len().checked_sub(total).ok_or(refuse("type stack underflow"))?;
+                    let slice = vals.get(start..).ok_or(refuse("type stack underflow"))?;
+                    let list = tys.intern_list(slice)?;
+                    vals.truncate(start);
+                    let header = blaze_typeck::FnPtrHeader {
+                        abi: blaze_typeck::Abi::Rust,
+                        safety: blaze_typeck::Safety::Safe,
+                        c_variadic: false,
+                    };
+                    vals.push(tys.intern(PNode::FnPtr(list, header))?);
                 }
             }
-            TypeRef::Ref { mutbl, inner, .. } => PNode::Ref(mutbl, self.ty(v, inner, tys)?),
-            TypeRef::Ptr { mutbl, inner } => PNode::Ptr(mutbl, self.ty(v, inner, tys)?),
-            TypeRef::Tuple(l) => {
-                let mut ts = StdVec::new();
-                for &i in v.ids(l)? {
-                    ts.push(self.ty(v, TypeId(i), tys)?);
-                }
-                PNode::Tuple(tys.intern_list(&ts)?)
-            }
-            TypeRef::Array { elem, len } => {
-                let r = v.const_range(len)?;
-                let n = int_text(v.text_at(r)?).ok_or(refuse("an array length that is not a literal"))?;
-                let elem = self.ty(v, elem, tys)?;
-                PNode::Array(elem, tys.usize_value(n)?)
-            }
-            TypeRef::Slice(e) => PNode::Slice(self.ty(v, e, tys)?),
-            TypeRef::Never => PNode::Never,
-            // A safe Rust-ABI fn pointer: the inputs, then the output last (unit when none is
-            // written), as blaze-ladder's front reads one.
-            TypeRef::FnPtr { params, ret, abi: None, unsafety: false, extern_: false, variadic: false } => {
-                let mut ts = StdVec::new();
-                for &n in v.rows(params)? {
-                    let p = Param::decode(n)?;
-                    let t = p.ty.ok_or(refuse("a fn pointer parameter with no type"))?;
-                    ts.push(self.ty(v, t, tys)?);
-                }
-                ts.push(match ret {
-                    Some(r) => self.ty(v, r, tys)?,
-                    None => tys.intern(PNode::Tuple(List::EMPTY))?,
-                });
-                let header = blaze_typeck::FnPtrHeader {
-                    abi: blaze_typeck::Abi::Rust,
-                    safety: blaze_typeck::Safety::Safe,
-                    c_variadic: false,
-                };
-                PNode::FnPtr(tys.intern_list(&ts)?, header)
-            }
-            _ => return Err(refuse("a written type the fixture does not resolve")),
-        };
-        Ok(tys.intern(node)?)
+        }
+        vals.pop().ok_or(refuse("type stack underflow"))
     }
 
     fn repeat_len(&mut self, v: &View<'_>, len: LExprId) -> Result<u64, Refused> {
@@ -232,6 +308,11 @@ pub struct World {
     manually_drop: Option<ItemKey>,
     /// The fixture's answer for `FnOnce::call_once`.
     pub(crate) fn_once: FnTraitMethod,
+    /// The fixture's answer for `Deref::deref` and `DerefMut::deref_mut`.
+    pub(crate) deref: FnTraitMethod,
+    pub(crate) deref_mut: FnTraitMethod,
+    /// Trait-method resolution rows for [`ConstWorld::resolve`]: `(trait_fn, self_adt, impl_fn)`.
+    resolves: StdVec<(ItemKey, ItemKey, ItemKey)>,
     /// The unit's ground table and layouts, kept between evaluations.
     unit: Option<(PortableTys<'static>, Layouts<Alloc<'static>>, Codes<Alloc<'static>>)>,
     /// The statics declared ([`ConstWorld::is_static`]).
@@ -299,6 +380,9 @@ impl World {
             drop_impls: StdVec::new(),
             manually_drop: None,
             fn_once: FnTraitMethod::Absent,
+            deref: FnTraitMethod::Absent,
+            deref_mut: FnTraitMethod::Absent,
+            resolves: StdVec::new(),
             unit: None,
             statics: StdVec::new(),
             cells: StdVec::new(),
@@ -325,6 +409,19 @@ impl World {
     /// Item `item` is `FnOnce::call_once` in this world ([`ConstWorld::fn_trait_method`]).
     pub fn fn_once_is(&mut self, item: ItemKey) {
         self.fn_once = FnTraitMethod::Found(item);
+    }
+
+    /// Item `item` is `Deref::deref` (`Not`) or `DerefMut::deref_mut` (`Mut`) in this world.
+    pub fn deref_is(&mut self, mutbl: Mutbl, item: ItemKey) {
+        match mutbl {
+            Mutbl::Not => self.deref = FnTraitMethod::Found(item),
+            Mutbl::Mut => self.deref_mut = FnTraitMethod::Found(item),
+        }
+    }
+
+    /// Records that `trait_fn` resolved at `Self = self_adt` runs `impl_fn`.
+    pub fn resolve_to(&mut self, trait_fn: ItemKey, self_adt: ItemKey, impl_fn: ItemKey) {
+        self.resolves.push((trait_fn, self_adt, impl_fn));
     }
 
     /// The item declared as `name`.
@@ -355,27 +452,83 @@ impl World {
 
     /// `t` of table `from` interned into the world's table.
     fn import(&mut self, from: blaze_typeck::PTys<'_>, t: PTy) -> PTy {
-        let n = from.node(t).expect("node");
-        let n = match n {
-            PNode::Ref(m, i) => PNode::Ref(m, self.import(from, i)),
-            PNode::Ptr(m, i) => PNode::Ptr(m, self.import(from, i)),
-            PNode::Array(i, k) => PNode::Array(self.import(from, i), self.import(from, k)),
-            PNode::ConstValue { ty, bits } => PNode::ConstValue { ty: self.import(from, ty), bits },
-            PNode::Slice(i) => PNode::Slice(self.import(from, i)),
-            PNode::Tuple(l) => {
-                let ts: StdVec<PTy> = from.list(l).expect("list").to_vec();
-                let ts: StdVec<PTy> = ts.into_iter().map(|x| self.import(from, x)).collect();
-                PNode::Tuple(self.fx.list(&ts))
+        enum Step {
+            Visit(PTy),
+            Finish { node: PNode, list_len: usize },
+        }
+        let mut work = StdVec::new();
+        let mut vals = StdVec::new();
+        work.push(Step::Visit(t));
+        while let Some(step) = work.pop() {
+            match step {
+                Step::Visit(cur) => {
+                    let n = from.node(cur).expect("node");
+                    match n {
+                        PNode::Ref(_, i) | PNode::Ptr(_, i) | PNode::Slice(i) | PNode::ConstValue { ty: i, .. } => {
+                            work.push(Step::Finish { node: n, list_len: 0 });
+                            work.push(Step::Visit(i));
+                        }
+                        PNode::Array(i, k) => {
+                            work.push(Step::Finish { node: n, list_len: 0 });
+                            work.push(Step::Visit(k));
+                            work.push(Step::Visit(i));
+                        }
+                        // The inputs and output, each imported: the list indexes `from`, not the world.
+                        PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) | PNode::FnPtr(l, _) => {
+                            let ts = from.list(l).expect("list");
+                            work.push(Step::Finish { node: n, list_len: ts.len() });
+                            for &x in ts.iter().rev() {
+                                work.push(Step::Visit(x));
+                            }
+                        }
+                        other => {
+                            let interned = self.fx.ty(other);
+                            vals.push(interned);
+                        }
+                    }
+                }
+                Step::Finish { node, list_len } => {
+                    let built = match node {
+                        PNode::Ref(m, _) => {
+                            let Some(i) = vals.pop() else { return t };
+                            PNode::Ref(m, i)
+                        }
+                        PNode::Ptr(m, _) => {
+                            let Some(i) = vals.pop() else { return t };
+                            PNode::Ptr(m, i)
+                        }
+                        PNode::Slice(_) => {
+                            let Some(i) = vals.pop() else { return t };
+                            PNode::Slice(i)
+                        }
+                        PNode::ConstValue { bits, .. } => {
+                            let Some(ty) = vals.pop() else { return t };
+                            PNode::ConstValue { ty, bits }
+                        }
+                        PNode::Array(_, _) => {
+                            let (Some(k), Some(i)) = (vals.pop(), vals.pop()) else { return t };
+                            PNode::Array(i, k)
+                        }
+                        PNode::Tuple(_) | PNode::Record(_, _) | PNode::Union(_) | PNode::FnPtr(_, _) => {
+                            let Some(start) = vals.len().checked_sub(list_len) else { return t };
+                            let Some(slice) = vals.get(start..) else { return t };
+                            let list = self.fx.list(slice);
+                            vals.truncate(start);
+                            match node {
+                                PNode::Record(s, _) => PNode::Record(s, list),
+                                PNode::Union(_) => PNode::Union(list),
+                                PNode::FnPtr(_, header) => PNode::FnPtr(list, header),
+                                _ => PNode::Tuple(list),
+                            }
+                        }
+                        other => other,
+                    };
+                    let interned = self.fx.ty(built);
+                    vals.push(interned);
+                }
             }
-            // The inputs and output, each imported: the list indexes `from`, not the world.
-            PNode::FnPtr(l, header) => {
-                let ts: StdVec<PTy> = from.list(l).expect("list").to_vec();
-                let ts: StdVec<PTy> = ts.into_iter().map(|x| self.import(from, x)).collect();
-                PNode::FnPtr(self.fx.list(&ts), header)
-            }
-            other => other,
-        };
-        self.fx.ty(n)
+        }
+        vals.pop().unwrap_or(t)
     }
 
     fn declare(&mut self, name: &str, k: ItemKey) {
@@ -941,5 +1094,23 @@ impl ConstWorld for World {
             blaze_build::FnTrait::FnOnce => self.fn_once,
             blaze_build::FnTrait::Fn | blaze_build::FnTrait::FnMut => FnTraitMethod::Absent,
         }
+    }
+
+    fn deref_method(&self, mutbl: Mutbl) -> FnTraitMethod {
+        match mutbl {
+            Mutbl::Not => self.deref,
+            Mutbl::Mut => self.deref_mut,
+        }
+    }
+
+    fn resolve(&self, item: ItemKey, args: List, ground: &mut PortableTys<'_>, _scratch: Alloc<'_>) -> Option<(ItemKey, List)> {
+        if let Ok(list) = ground.view().list(args)
+            && let Some(&first) = list.first()
+            && let Ok(PNode::Adt(adt, _)) = ground.view().node(first)
+            && let Some(&(_, _, impl_fn)) = self.resolves.iter().find(|&&(tr_fn, a, _)| tr_fn == item && a == adt)
+        {
+            return Some((impl_fn, List::EMPTY));
+        }
+        Some((item, args))
     }
 }

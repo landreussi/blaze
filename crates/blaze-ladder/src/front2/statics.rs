@@ -105,6 +105,23 @@ pub fn static_values<'c, 'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, bod
             refused.push((k, format!("more than {MOST_STATICS} statics reached (the work list's bound)").into_boxed_str()));
             break;
         }
+        if let Err(err) = ensure_static_head(r, k) {
+            let mut msg = blaze_own::String::new_in(r.store.work_alloc());
+            match err {
+                StaticHeadError::Want(e) => {
+                    let _ = core::fmt::write(&mut msg, format_args!("{e}"));
+                }
+                StaticHeadError::Ensure(want, super::program::WantError::Const { key: c, error: e }) => {
+                    let _ = core::fmt::write(&mut msg, format_args!("static head asked {want:?}: the constant {c:x} its head names: {e:?}"));
+                }
+                StaticHeadError::Ensure(want, super::program::WantError::Head(e)) => {
+                    let shown = super::item_shown::head_error_shown(r.names, &e);
+                    let _ = core::fmt::write(&mut msg, format_args!("static head asked {want:?}: {shown}"));
+                }
+            }
+            refused.push((k, msg.as_str().into()));
+            continue;
+        }
         match super::program::foreign_static_symbol(r.names, &*r.keys, &*r.store, k) {
             Ok(Some(symbol)) => {
                 match foreign_kind(r, k) {
@@ -145,6 +162,22 @@ pub fn static_values<'c, 'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, bod
     (Statics { values, kinds, foreign }, refused)
 }
 
+enum StaticHeadError {
+    Want(super::fill::FillError),
+    Ensure(super::heads::Want, super::program::WantError),
+}
+
+/// Ensures static `k`'s head is filed in `r.store.fns` and `r.store.statics` (including for
+/// cold cached-`Typed` runs and transitive `DataTarget::Static` relocations pointing to foreign
+/// statics whose heads were never loaded by `check_body`), via the shared [`super::program::ensure_want`].
+fn ensure_static_head<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, k: ItemKey) -> Result<(), StaticHeadError> {
+    if r.store.fns.contains_key(&k) && r.store.statics.contains_key(&k) {
+        return Ok(());
+    }
+    let want = super::fill::want_of_key(r.names, &*r.keys, k).map_err(StaticHeadError::Want)?;
+    super::program::ensure_want(r, want).map_err(|e| StaticHeadError::Ensure(want, e))
+}
+
 /// Static `k`'s record (copied out of the evaluator's arena) and its kind. The run's static
 /// rows (lazy/fill.rs `static_value`) ask one static by this, the work list above many.
 pub(crate) fn one_static<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, k: ItemKey) -> Result<(DataRecord<Global>, StaticItem), Box<str>> {
@@ -173,39 +206,65 @@ pub(crate) fn one_static<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, k: 
     let Some(&m) = r.store.statics.get(&k) else {
         return Err(Box::from("no static head in the store (heads.rs `Store::statics`)"));
     };
-    let thread_local = thread_local_of(r, k)?;
-    Ok((record, StaticItem { thread_local, mutable: matches!(m, tc::Mutbl::Mut) }))
+    let (thread_local, extern_weak, single_threaded_wasm) = static_attrs_of(r, k)?;
+    if extern_weak {
+        return Err("`#[linkage = \"extern_weak\"]` is only supported on foreign statics".into());
+    }
+    Ok((record, StaticItem { thread_local: thread_local && !single_threaded_wasm, mutable: matches!(m, tc::Mutbl::Mut), extern_weak: false }))
 }
 
 /// Static `k`'s kind when an `extern` block declares it: its head's mutability, nothing
 /// evaluated (it has no initializer: the Reference, "External blocks", "Statics"). A foreign
-/// `#[thread_local]` is refused by name: no foreign thread-local is built.
+/// `#[thread_local]` is refused on multi-threaded targets (no foreign TLS is built), while on
+/// single-threaded WebAssembly targets (`target_family = "wasm"` without `target_feature = "atomics"`)
+/// thread-locals are plain statics (e.g. `wasi_rt`'s `errno`).
 pub(crate) fn foreign_kind<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -> Result<StaticItem, Box<str>> {
     let Some(&m) = r.store.statics.get(&k) else {
         return Err(Box::from("no static head in the store (heads.rs `Store::statics`)"));
     };
-    if thread_local_of(r, k)? {
+    let (thread_local, extern_weak, single_threaded_wasm) = static_attrs_of(r, k)?;
+    if thread_local && !single_threaded_wasm {
         return Err(Box::from("a `#[thread_local]` static an `extern` block declares: no foreign thread-local is built (statics.rs `foreign_kind`)"));
     }
-    Ok(StaticItem { thread_local: false, mutable: matches!(m, tc::Mutbl::Mut) })
+    Ok(StaticItem { thread_local: false, mutable: matches!(m, tc::Mutbl::Mut), extern_weak })
 }
 
-/// Whether static `k`'s signature carries `#[thread_local]` (its attribute rows, read as
-/// program.rs `symbols_of` reads a fn's).
-fn thread_local_of<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -> Result<bool, Box<str>> {
+/// Whether static `k`'s signature carries `#[thread_local]` and/or `#[linkage = "extern_weak"]`
+/// (its attribute rows, read as program.rs `symbols_of` reads a fn's), plus whether its crate
+/// targets single-threaded WebAssembly (`target_family = "wasm"` without `target_feature = "atomics"`).
+fn static_attrs_of<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -> Result<(bool, bool, bool), Box<str>> {
     let refuse = |why: String| Box::<str>::from(format!("its attributes: {why}"));
     let f = r.store.fns.get(&k).ok_or_else(|| refuse(String::from("no head in the store")))?;
     let krate = r.names.crate_of(f.lib).ok_or_else(|| refuse(format!("no crate holds {:x}", f.lib)))?;
     let atoms = r.names.cfg_atoms(krate).ok_or_else(|| refuse(format!("crate {krate}'s cfg was not answered by the names source")))?;
-    let edition = r.names.edition_of(krate).ok_or_else(|| refuse(format!("crate {krate}'s edition was not answered by the names source")))?;
-    let sig = blaze_lower::lower_signature(f.text, edition, &mut CrateCfg(atoms), r.store.tys.alloc())
-        .map_err(|_| refuse(String::from("its signature needs a `cfg` the crate does not answer")))?;
-    let v = sig.view();
-    for &n in v.rows(v.list(head::ATTRS)).map_err(|e| refuse(format!("{e:?}")))? {
-        let a = v.attr(n).map_err(|e| refuse(format!("{e:?}")))?;
-        if v.text_at(a.path).map_err(|e| refuse(format!("{e:?}")))?.trim() == "thread_local" {
-            return Ok(true);
+    let mut is_wasm = false;
+    let mut has_atomics = false;
+    for &(name, value) in atoms {
+        if name == "target_family" && value == Some("wasm") {
+            is_wasm = true;
+        } else if name == "target_feature" && value == Some("atomics") {
+            has_atomics = true;
         }
     }
-    Ok(false)
+    let single_threaded_wasm = is_wasm && !has_atomics;
+    let edition = r.names.edition_of(krate).ok_or_else(|| refuse(format!("crate {krate}'s edition was not answered by the names source")))?;
+    let sig = blaze_lower::lower_signature(f.text, edition, &mut CrateCfg(atoms), r.store.work_alloc())
+        .map_err(|_| refuse(String::from("its signature needs a `cfg` the crate does not answer")))?;
+    let v = sig.view();
+    let mut thread_local = false;
+    let mut extern_weak = false;
+    let text = |r| v.text_at(r).map_err(|e| refuse(format!("{e:?}")));
+    for &n in v.rows(v.list(head::ATTRS)).map_err(|e| refuse(format!("{e:?}")))? {
+        let a = v.attr(n).map_err(|e| refuse(format!("{e:?}")))?;
+        let path = text(a.path)?.trim();
+        if path == "thread_local" {
+            thread_local = true;
+        } else if path == "linkage" {
+            let val = text(a.args)?.trim().trim_start_matches('=').trim().trim_matches('"');
+            if val == "extern_weak" {
+                extern_weak = true;
+            }
+        }
+    }
+    Ok((thread_local, extern_weak, single_threaded_wasm))
 }

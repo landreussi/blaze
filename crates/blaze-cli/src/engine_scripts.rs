@@ -116,10 +116,18 @@ enum ScriptWork<'f> {
 /// The worker gets only immutable bytes. Neither the coordinator's store nor its
 /// single-threaded frame crosses the pool boundary.
 enum ModuleJob<'a> {
-    Build { wanted: crate::script_modules::Wanted<'a>, home: Option<&'a str> },
+    Build {
+        wanted: crate::script_modules::Wanted<'a>,
+        home: Option<&'a str>,
+        compile: Option<crate::wasm64_compile::CompileInputs<'a>>,
+    },
     Proc {
-        crates: Option<crate::macros::MacroCrates>, home: Option<&'a str>, checkout: &'a str,
-        graph: Option<Input>, initial: Option<MacroInputs<'a>>,
+        crates: Option<crate::macros::MacroCrates>,
+        home: Option<&'a str>,
+        checkout: &'a str,
+        graph: Option<Input>,
+        initial: Option<MacroInputs<'a>>,
+        compile: Option<crate::wasm64_compile::CompileInputs<'a>>,
     },
     #[cfg(test)]
     Fixture,
@@ -129,7 +137,7 @@ enum ModuleJob<'a> {
 struct MacroInputs<'a> {
     graph: &'a [u8],
     lock: &'a [u8],
-    members: &'a [(blaze_manifest::lock::LockId, &'a str, ContentId)],
+    members: &'a [(blaze_manifest::lock::LockId, &'a str, blaze_world::PathKind, ContentId)],
 }
 
 enum ModuleAnswer {
@@ -186,10 +194,13 @@ impl ModuleJob<'_> {
         let name = task.planned.name;
         let drive = |inputs| drive_task(name, task.key, task.planned.source, inputs, Vec::new_in(alloc), alloc);
         let (did, crates) = match self {
-            Self::Build { wanted, home } => (crate::script_modules::run(cx, home, wanted, &drive(Vec::new_in(alloc)), frame)?, None),
+            Self::Build { wanted, home, compile } => (
+                crate::script_modules::run(cx, home, wanted, compile, &drive(Vec::new_in(alloc)), frame)?,
+                None,
+            ),
             #[cfg(test)]
             Self::Fixture => return Ok(WorkerOutput::Module(ModuleAnswer::Found(name.subject), None)),
-            Self::Proc { mut crates, home, checkout, graph, initial } => {
+            Self::Proc { mut crates, home, checkout, graph, initial, compile } => {
                 let mut handed = LookupStore { name, graph: initial.zip(graph).map(|(input, graph)| (graph.at, input.graph)) };
                 let mut inputs = Vec::new_in(alloc);
                 inputs.extend(graph);
@@ -197,8 +208,8 @@ impl ModuleJob<'_> {
                 let mut members = Vec::new_in(frame);
                 let lock = match initial {
                     Some(input) => {
-                        for &(id, dir, digest) in input.members {
-                            members.push((id, blaze_unit_graph::Text::from_str_in(dir, heap.alloc())));
+                        for &(id, dir, kind, digest) in input.members {
+                            members.push(crate::graph::CheckoutDir { id, dir: blaze_unit_graph::Text::from_str_in(dir, heap.alloc()), kind });
                             rows.push(crate::sweep::LeafKind::MacroFiles, 0, dir, None, digest);
                         }
                         match crate::fetch::Lockfile::read(input.lock, heap, frame) {
@@ -213,7 +224,7 @@ impl ModuleJob<'_> {
                     None => None,
                 };
                 let place = crate::macros::Place { home, checkout, members: Some(&members), rows: &rows };
-                let did = crate::macros::run(cx, &mut handed, lock.as_ref(), &mut crates, place, &drive(inputs), frame, frame)?;
+                let did = crate::macros::run(cx, &mut handed, lock.as_ref(), &mut crates, place, compile, &drive(inputs), frame, frame)?;
                 (did, crates)
             }
         };
@@ -324,7 +335,11 @@ pub(crate) struct ScriptQueue<'s> {
     width: usize,
     native_running: usize,
     proc_running: bool,
+    /// Proc-macro `MacroModule` tasks admitted to `Stage::Scripts` that have not yet been filed
+    /// in `ScriptsStage::finish` (so `names.mark` has not yet recorded their `out`).
+    proc_unfiled: usize,
     macro_inputs: Option<MacroInputs<'s>>,
+    compile_inputs: Option<crate::wasm64_compile::CompileInputs<'s>>,
     order: BTreeMap<(bool, Name), EngineTask, &'s Frame>,
     waiting: BTreeMap<(ScriptLane, bool, Name), EngineTask, &'s Frame>,
     running: BTreeMap<Name, Running<'s>, &'s Frame>,
@@ -345,7 +360,7 @@ impl<'s> ScriptQueue<'s> {
             scope, jobs, waiter: jobs.alloc(blaze_core::wait::Parker::new()),
             slots: jobs.alloc(PoolSlots { width, used: core::cell::Cell::new(0) }),
             width, native_running: 0,
-            proc_running: false, macro_inputs: None,
+            proc_running: false, proc_unfiled: 0, macro_inputs: None, compile_inputs: None,
             order: BTreeMap::new_in(jobs), waiting: BTreeMap::new_in(jobs), running: BTreeMap::new_in(jobs),
             answered: BTreeMap::new_in(jobs),
             joined_later: Vec::new_in(jobs), clock: &handles.env.clock,
@@ -354,8 +369,75 @@ impl<'s> ScriptQueue<'s> {
         }
     }
 
+    /// Lazily prepares immutable inputs for on-demand `wasm64` self-compilation of missing
+    /// build-script or proc-macro modules (only when running against an on-disk checkout).
+    fn ensure_compile_inputs<'f>(
+        &mut self,
+        cx: &Cx,
+        store: &mut dyn crate::store::Store<'_>,
+        graph_key: Option<Key>,
+        handles: &Handles<'s, 'f>,
+    ) -> Result<Option<crate::wasm64_compile::CompileInputs<'s>>, CliError>
+    where
+        'f: 's,
+    {
+        if self.compile_inputs.is_some() {
+            return Ok(self.compile_inputs);
+        }
+        let (Some(graph_key), Some(side), crate::engine_script_reads::Served::Root(root)) =
+            (graph_key, handles.side, handles.env.served)
+        else {
+            return Ok(None);
+        };
+        let mut bytes = bstd::mem::Bytes::new_in(self.jobs, "unit graph for wasm64 self-compile");
+        if !store.get_into(cx, graph_key, &mut bytes)? {
+            return Ok(None);
+        }
+        let held = self.jobs.alloc(bytes).as_slice();
+        let Ok(blaze_drive::record::Stored::Whole(view)) = blaze_drive::record::open(held) else {
+            return Ok(None);
+        };
+        let Ok(sections) = crate::graph_payload::sections(view.payload) else {
+            return Ok(None);
+        };
+        let mut members = Vec::new_in(self.jobs);
+        if let Some(list) = handles.members {
+            for entry in list {
+                members.push((entry.id, work::held_str(entry.dir.as_str(), self.jobs), entry.kind));
+            }
+        }
+        let built = crate::wasm64_compile::CompileInputs {
+            graph: sections.graph,
+            lock: side.lock.text,
+            checkout: Some(root),
+            members: members.into_bump_slice(),
+            heap: handles.env.heap,
+        };
+        self.compile_inputs = Some(built);
+        Ok(self.compile_inputs)
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.order.is_empty()
+    }
+
+    /// True when any proc-macro `MacroModule` lookup/self-compile is still waiting, running, or
+    /// awaiting filing in `ScriptsStage::finish`. `Stage::Names` must wait for these so no
+    /// `CrateScope` task invokes `ProcRunner` before a self-compiled proc-macro module is
+    /// published to disk and marked on `NamesStage`.
+    pub(crate) fn has_pending_proc_macro_module(&self) -> bool {
+        self.proc_unfiled > 0
+            || self.proc_running
+            || self.waiting.keys().any(|(lane, _, _)| *lane == ScriptLane::ProcLookup)
+    }
+
+    /// True when every queued script task is an instantaneously-answered `Given` cell (zero
+    /// `Script` or `MacroModule` tasks queued, waiting, or running). Finishing `Given` cells
+    /// before admitting `Stage::Names` is worker-count invariant, keeps `Scripts` at 0 crate
+    /// records read when no script runs, and lets `Names` run at full width once it is known
+    /// whether any `Script` woke up.
+    fn only_given(&self) -> bool {
+        !self.order.is_empty() && self.order.values().all(|task| task.planned.name.kind == Kind::Given)
     }
 
     pub(crate) fn is_finished(&self, name: Name) -> bool { self.answered.contains_key(&name) }
@@ -388,8 +470,30 @@ impl<'s> ScriptQueue<'s> {
         self.order.first_key_value().map(|(_, task)| *task)
     }
 
+    pub(crate) fn first_ready(&self) -> Option<EngineTask> {
+        self.order
+            .iter()
+            .find(|((_, name), _)| self.answered.contains_key(name))
+            .map(|(_, task)| *task)
+    }
+
+    pub(crate) fn next_ready_in_phase(&self, phase: blaze_engine::Phase) -> Option<EngineTask> {
+        self.order
+            .iter()
+            .find(|((_, name), task)| task.planned.phase == phase && self.answered.contains_key(name))
+            .map(|(_, task)| *task)
+    }
+
+    pub(crate) fn active_scripts(&self) -> usize {
+        self.waiting.len() + self.running.len()
+    }
+
     pub(crate) fn urgent(&self) -> bool {
         self.order.first_key_value().is_some_and(|((leaf, _), _)| !leaf)
+    }
+
+    pub(crate) fn urgent_ready(&self) -> bool {
+        self.order.iter().any(|((leaf, name), _)| !*leaf && self.answered.contains_key(name))
     }
 
     #[cfg(test)]
@@ -446,6 +550,10 @@ pub(crate) struct ScriptsStage<'f> {
     /// Each planned `Given` cell of a build script's read, by name, sorted, with today's answer
     /// from the sweep's row (engine_script_reads.rs `plan`).
     given: Vec<(Name, ContentId, crate::engine_script_reads::ReadKind), &'f Frame>,
+    /// Each newly observed `Given` cell made inline by a script in this request, by name, sorted,
+    /// with the answer first merged: a later script observing a different answer for the same cell
+    /// is reported as `CliError::Changed` instead of colliding in `engine.rs` `merge` (rule 21).
+    made_given: Vec<(Name, ContentId), &'f Frame>,
     /// Each read of the checkout a run of this request made, with the script that read it: the
     /// leaf rows the answer keeps, and the `Given` records of reads no plan holds.
     fresh: Vec<(Name, crate::engine_script_reads::CheckoutRead), &'f Frame>,
@@ -565,6 +673,7 @@ impl<'f> ScriptsStage<'f> {
             made: Vec::new_in(frame),
             results: Vec::new_in(frame),
             given: Vec::new_in(frame),
+            made_given: Vec::new_in(frame),
             fresh: Vec::new_in(frame),
             tools: None,
             plant: crate::engine_script_reads::ReadsPlant::None,
@@ -681,15 +790,19 @@ impl<'f> ScriptsStage<'f> {
     /// `BodiesStage::data_files`), one leaf a cell; `reads(name)` says whether a row of the
     /// final answer reads the cell `name` (engine_check.rs hook H2, before the answer's rows are
     /// saved).
+    #[expect(clippy::too_many_arguments, reason = "the tail's script-row merger takes its inputs by name")]
     pub(crate) fn script_rows<'r>(
         &'r self,
         followed: Option<&crate::sweep::Rows<'_>>,
         more: impl Iterator<Item = (crate::engine_script_reads::ReadKind, &'r str, ContentId)>,
-        reads: impl Fn(Name) -> bool,
+        followed_all_kept: bool,
+        reads: impl Fn(Name, bool) -> bool,
+        is_direct: impl Fn(crate::engine_script_reads::ReadKind, &str) -> bool,
+        stamp_of: impl Fn(crate::engine_script_reads::ReadKind, &str, ContentId) -> Option<crate::sweep::Stamp>,
         out: &mut crate::sweep::Rows<'_>,
     ) {
         let fresh = self.fresh.iter().map(|(_, read)| (read.kind, read.path.as_str(), read.answer));
-        crate::engine_script_reads::keep_rows(followed, fresh.chain(more), reads, out);
+        crate::engine_script_reads::keep_rows_with(followed, fresh, more, followed_all_kept, reads, is_direct, stamp_of, out);
     }
 
     /// The result of `name`, if this stage entered it.
@@ -727,7 +840,18 @@ impl<'f> ScriptsStage<'f> {
 
     /// The stage's tasks: the lookups in wave 0, each run after its `links` producers. Nothing
     /// when the graph was not made (no lock, or its task failed): no crate then has names.
-    pub(crate) fn plan<'h>(&mut self, names: &NamesStage<'_>, discovered: &Discovered<'_>, tools: Tools, env: &FetchEnv<'_>, alloc: SharedAlloc<'h>, frame: &'f Frame) -> Result<SVec<'h, Planned>, CliError> {
+    /// When `scoped` is `Some`, only the build scripts (and their transitive `links` producers),
+    /// build-script modules, and proc-macro modules needed by crates in `scoped` are planned.
+    pub(crate) fn plan<'h>(
+        &mut self,
+        names: &NamesStage<'_>,
+        discovered: &Discovered<'_>,
+        tools: Tools,
+        env: &FetchEnv<'_>,
+        scoped: Option<&crate::engine_check::ScopedUnits>,
+        alloc: SharedAlloc<'h>,
+        frame: &'f Frame,
+    ) -> Result<SVec<'h, Planned>, CliError> {
         let mut planned = SVec::new_in(alloc);
         self.tools = Some(tools);
         let (Some(names), Some(graph)) = (names.names.as_ref(), discovered.get(Name::unit_graph())) else { return Ok(planned) };
@@ -739,10 +863,53 @@ impl<'f> ScriptsStage<'f> {
             reads.extend_from_slice(names);
             reads
         };
+        let scoped_sets = scoped.map(|scoped| {
+            use blaze_world::crate_list::CrateGraph as _;
+            let list = names.list();
+            let mut allowed_scripts: blaze_engine::SSet<'h, Name> = blaze_engine::SSet::new_in(alloc);
+            let mut stack: Vec<Name, &'f Frame> = Vec::new_in(frame);
+            let mut allowed_script_modules: blaze_engine::SSet<'h, ContentId> = blaze_engine::SSet::new_in(alloc);
+            let mut allowed_macro_modules: blaze_engine::SSet<'h, ContentId> = blaze_engine::SSet::new_in(alloc);
+            for at in 0..list.len() {
+                if !scoped.allows(at) {
+                    continue;
+                }
+                if list.proc_macro(at) {
+                    allowed_macro_modules.insert(crate::macros::subject_of(list.package(at), list.version(at)));
+                }
+                if let Some(script) = names.script_of(at)
+                    && allowed_scripts.insert(script)
+                {
+                    stack.push(script);
+                }
+                if let Some(module) = names.script_module_of(at) {
+                    allowed_script_modules.insert(module.subject);
+                }
+            }
+            while let Some(script) = stack.pop() {
+                if let Some(module) = names.script_readers(script).next().and_then(|at| names.script_module_of(at)) {
+                    allowed_script_modules.insert(module.subject);
+                }
+                if let Some(run) = names.script_run(script.subject) {
+                    for producer in run.producers() {
+                        let producer = Name::new(Kind::Script, ContentId(producer));
+                        if allowed_scripts.insert(producer) {
+                            stack.push(producer);
+                        }
+                    }
+                }
+            }
+            (allowed_scripts, allowed_script_modules, allowed_macro_modules)
+        });
         // Wave 0: the proc-macro crates' lookups (they read the graph) and the build scripts'
         // (they read nothing: their source holds the module store's listing).
         for part in record.parts.iter() {
             if let (Kind::MacroModule, Locate::Source(source)) = (part.name.kind, part.locate) {
+                if let Some((_, _, allowed_macros)) = &scoped_sets
+                    && !allowed_macros.contains(&part.name.subject)
+                {
+                    continue;
+                }
                 planned.push(Planned { name: part.name, phase: Phase::new(Stage::Scripts, 0), source, file: part.name });
                 self.reads.push((part.name, reads_only(&[unit_graph])));
             }
@@ -753,6 +920,11 @@ impl<'f> ScriptsStage<'f> {
                 continue;
             }
             last = Some(subject);
+            if let Some((_, allowed_modules, _)) = &scoped_sets
+                && !allowed_modules.contains(&subject)
+            {
+                continue;
+            }
             let name = crate::script_modules::name(subject);
             planned.push(Planned { name, phase: Phase::new(Stage::Scripts, 0), source: crate::script_modules::part_source(graph.source, subject), file: name });
             self.reads.push((name, reads_only(&[])));
@@ -762,6 +934,11 @@ impl<'f> ScriptsStage<'f> {
         // `ListFacts` wrote it from the graph): the runs the world's crates read, never every
         // unit of the graph on both sides, and no graph decoded to plan them.
         for (name, source) in crate::scripts::parts(names.script_keys(), crate::scripts::sdk_identity(env)) {
+            if let Some((allowed_scripts, _, _)) = &scoped_sets
+                && !allowed_scripts.contains(&name)
+            {
+                continue;
+            }
             let mut reads = reads_only(&[unit_graph]);
             if let Some(run) = names.script_run(name.subject) {
                 // Its module's lookup: the one its reading crate names (scripts.rs `job`).
@@ -837,7 +1014,7 @@ impl<'f> ScriptsStage<'f> {
     pub(crate) fn restore(&mut self, name: Name, made: Option<(Key, ContentId)>, row: &blaze_engine::Row<'_>, _owed: bool, frame: &'f Frame) {
         self.mark(name, made);
         if name.kind == Kind::Script {
-            self.previous.insert(name, Previous { reads: Vec::from_slice_in(&row.reads, frame).leak(), out: row.out });
+            self.previous.insert(name, Previous { reads: frame.alloc_slice_copy(&row.reads), out: row.out });
         }
     }
 
@@ -879,7 +1056,7 @@ impl<'f> ScriptsStage<'f> {
                 let payload: &'j [u8] = jobs.alloc(work::payload(cx, store, input, jobs)?).payload();
                 given.push((*input, payload));
             }
-            return Ok(Dispatch::Run(ScriptWork::Double(runner, name, self.reads_planned.then_some((self.plant, self.status_view)), given.leak()), drive));
+            return Ok(Dispatch::Run(ScriptWork::Double(runner, name, self.reads_planned.then_some((self.plant, self.status_view)), given.into_bump_slice()), drive));
         }
         // The `Script` kind's tool keys the library-features records the shared setup reads
         // (scripts.rs `CommandFeatures`); the plan handed the tools with the unit graph.
@@ -932,6 +1109,7 @@ impl<'f> ScriptsStage<'f> {
             let lane = if run.is_some_and(|run| run.native) {
                 ScriptLane::Native
             } else if name.kind == Kind::MacroModule && names.names.as_ref().is_some_and(|world| world.script_module(name.subject).is_none()) {
+                queue.proc_unfiled += 1;
                 ScriptLane::ProcLookup
             } else {
                 ScriptLane::Other
@@ -939,6 +1117,43 @@ impl<'f> ScriptsStage<'f> {
             queue.waiting.insert((lane, leaf, name), *task);
         }
         self.dispatch(cx, store, handles, names, queue, frame)
+    }
+
+    /// Human-readable task label and [`blaze_screen::WorkKind`] for the live inline status UI.
+    fn status_info(&self, name: Name, job: Option<&ScriptWork<'_>>) -> (blaze_screen::WorkKind, crate::engine_status::Label) {
+        use core::fmt::Write as _;
+        match name.kind {
+            Kind::Given => (blaze_screen::WorkKind::BuildScript, crate::engine_status::Label::of("script inputs")),
+            Kind::Script => {
+                let run = self.runs.binary_search_by_key(&name, |run| run.task.planned.name).ok().and_then(|at| self.runs.get(at));
+                let mut label = crate::engine_status::Label::EMPTY;
+                match run.and_then(|run| run.script.map(|(_, package, _, _)| (package, run.native))) {
+                    Some((package, true)) => {
+                        let _ = write!(label, "{package} · cc/c++");
+                    }
+                    Some((package, false)) => {
+                        let _ = label.write_str(package);
+                    }
+                    None => {
+                        let _ = label.write_str("build.rs");
+                    }
+                }
+                (blaze_screen::WorkKind::BuildScript, label)
+            }
+            Kind::MacroModule => match job {
+                Some(ScriptWork::Module(ModuleJob::Build { wanted, .. })) => {
+                    (blaze_screen::WorkKind::BuildScript, crate::engine_status::Label::of(wanted.package))
+                }
+                _ => {
+                    let label = self.macros.as_ref().and_then(|crates| {
+                        let at = crates.binary_search_by_key(&name.subject, |(subject, _)| *subject).ok()?;
+                        crates.get(at)?.1.as_ref().ok().map(|id| crate::engine_status::Label::of(id.package.as_str()))
+                    }).unwrap_or_else(|| crate::engine_status::Label::of("proc-macro"));
+                    (blaze_screen::WorkKind::ProcMacro, label)
+                }
+            },
+            _ => (blaze_screen::WorkKind::BuildScript, crate::engine_status::Label::debug(&name)),
+        }
     }
 
     pub(crate) fn dispatch<'s>(
@@ -949,7 +1164,9 @@ impl<'f> ScriptsStage<'f> {
     {
         // Limit native roots admitted to the pool independently of the command's jobserver.
         // A worker waiting for its native child occupies a pool slot and takes no FIFO token.
-        let max_native_roots = queue.width.div_ceil(8);
+        // Allow up to half the command's width (at least 4, capped by width) so independent
+        // workspace build scripts run concurrently in one wave instead of serializing past 3.
+        let max_native_roots = queue.width.div_ceil(2).max(4).min(queue.width);
         while queue.slots.free() {
             let next = queue.waiting.keys().find(|(lane, _, _)| match lane {
                 ScriptLane::Native => queue.native_running < max_native_roots,
@@ -963,7 +1180,8 @@ impl<'f> ScriptsStage<'f> {
                 Kind::Given => {
                     let board = handles.board;
                     let clock = &handles.env.clock;
-                    board.show(Stage::Scripts, crate::engine_status::Label::debug(&name), 0, board.now(clock)).end(board.now(clock));
+                    let (kind, label) = self.status_info(name, None);
+                    board.show_kind(Stage::Scripts, kind, label, 0, board.now(clock)).end(board.now(clock));
                     queue.answered.insert(name, (task, began, began));
                     continue;
                 }
@@ -974,11 +1192,13 @@ impl<'f> ScriptsStage<'f> {
                 Dispatch::Answered(done) => {
                     let board = handles.board;
                     let clock = &handles.env.clock;
-                    board.show(Stage::Scripts, crate::engine_status::Label::debug(&name), 0, board.now(clock)).end(board.now(clock));
+                    let (kind, label) = self.status_info(name, None);
+                    board.show_kind(Stage::Scripts, kind, label, 0, board.now(clock)).end(board.now(clock));
                     self.completed.insert(name, done);
                     queue.answered.insert(name, (task, began, crate::engine_times::ns(handles.env.clock.now().since_start())));
                 }
                 Dispatch::Run(job, drive) => {
+                    let (work_kind, label) = self.status_info(name, Some(&job));
                     queue.slots.take();
                     let finished: &'s bstd::sync::Flag = queue.jobs.alloc(bstd::sync::Flag::new());
                     let notice = Notice { finished, waiter: queue.waiter };
@@ -999,7 +1219,7 @@ impl<'f> ScriptsStage<'f> {
                     let handle = scope.may_overlap("build script", crate::scripts::SCRIPT_FRAME, move |cx| {
                         let _notice = notice;
                         let began = crate::engine_times::ns(clock.now().since_start());
-                        let shown = board.show(Stage::Scripts, crate::engine_status::Label::debug(&name), 0, board.now(clock));
+                        let shown = board.show_kind(Stage::Scripts, work_kind, label, 0, board.now(clock));
                         let result = match job {
                             ScriptWork::Module(job) => match work::unwinding(|| job.run(cx, task, heap)) {
                                 Ok(result) => result?,
@@ -1105,6 +1325,9 @@ impl<'f> ScriptsStage<'f> {
         if queue.order.remove(&(false, name)).is_none() && queue.order.remove(&(true, name)).is_none() {
             return Err(EngineCheckError::MissingEntry { task: name, table: Table::ScriptsOrder, key: name }.into());
         }
+        if name.kind == Kind::MacroModule && names.names.as_ref().is_some_and(|world| world.script_module(name.subject).is_none()) {
+            queue.proc_unfiled = queue.proc_unfiled.saturating_sub(1);
+        }
         if name.kind == Kind::Given {
             let at = self.given.binary_search_by_key(&name, |(name, _, _)| *name)
                 .map_err(|_| EngineCheckError::MissingEntry { task: name, table: Table::ScriptsGiven, key: name })?;
@@ -1141,6 +1364,9 @@ impl<'f> ScriptsStage<'f> {
                     let mut defines = SVec::new_in(alloc);
                     defines.push((WHOLE, record.out));
                     self.mark(name, Some((task.key, record.out)));
+                    if name.kind == Kind::MacroModule {
+                        names.mark(name, Some((task.key, record.out)));
+                    }
                     if name.kind == Kind::Script {
                         names.mark(name, Some((task.key, record.out)));
                         // Entered again with a stored row: counted, and when it made its stored
@@ -1156,11 +1382,23 @@ impl<'f> ScriptsStage<'f> {
                         // its reader, at wave 0, keyed as next request's planned task.
                         let tools = self.tools.ok_or(EngineCheckError::Unseen { task: name, read: Name::unit_graph() })?;
                         for (_, read) in self.fresh.iter().filter(|(by, _)| *by == name) {
-                            match self.given.binary_search_by_key(&read.name(), |(cell, _, _)| *cell) {
-                                Ok(at) if self.given[at].1 != read.answer => {
+                            let cell = read.name();
+                            let diverged = match self.given.binary_search_by_key(&cell, |(cell, _, _)| *cell) {
+                                Ok(at) => self.given.get(at).is_some_and(|g| g.1 != read.answer),
+                                Err(_) => match self.made_given.binary_search_by_key(&cell, |(c, _)| *c) {
+                                    Ok(at) => self.made_given.get(at).is_some_and(|g| g.1 != read.answer),
+                                    Err(at) => {
+                                        self.made_given.insert_shift(at, (cell, read.answer));
+                                        buffer.made.push(crate::engine_script_reads::made(read, name, &tools, alloc));
+                                        false
+                                    }
+                                },
+                            };
+                            match diverged {
+                                true => {
                                     // Named by its package (rule 19); the task name follows for
                                     // the profile's rows.
-                                    let script = self.runs.binary_search_by_key(&name, |run| run.task.planned.name).ok().and_then(|at| self.runs[at].script);
+                                    let script = self.runs.binary_search_by_key(&name, |run| run.task.planned.name).ok().and_then(|at| self.runs.get(at)?.script);
                                     let subject = match script {
                                         Some((_, package, version, side)) => bstd::mem::format_in!(
                                             frame,
@@ -1172,8 +1410,7 @@ impl<'f> ScriptsStage<'f> {
                                     };
                                     return Err(CliError::Changed { paths: subject.as_str().to_owned() });
                                 }
-                                Ok(_) => {}
-                                Err(_) => buffer.made.push(crate::engine_script_reads::made(read, name, &tools, alloc)),
+                                false => {}
                             }
                         }
                     }
@@ -1190,7 +1427,7 @@ impl<'f> ScriptsStage<'f> {
                 }
                 Err(_) => {
                     self.mark(name, None);
-                    if name.kind == Kind::Script {
+                    if name.kind == Kind::Script || name.kind == Kind::MacroModule {
                         names.mark(name, None);
                     }
                     if owed {
@@ -1230,6 +1467,7 @@ impl<'f> ScriptsStage<'f> {
         let drive = self.drive(&task, handles.env.heap.alloc())?;
         let name = drive.name;
         let world = names.names.as_ref().ok_or(CliError::Text { what: "the names world, made by the planner, is gone (engine_scripts.rs `prepare_lookup`)" })?;
+        let graph_key = self.output(Name::unit_graph()).flatten().map(|(key, _)| key);
         if world.script_module(name.subject).is_some() {
             #[cfg(test)]
             if self.runner.is_some() { return Ok(Dispatch::Run(ScriptWork::Module(ModuleJob::Fixture), drive)); }
@@ -1243,8 +1481,15 @@ impl<'f> ScriptsStage<'f> {
             let wanted = crate::script_modules::Wanted {
                 ran_as: module.ran_as, package: module.package, version: module.version,
                 features: queue.jobs.alloc_slice_copy(&module.features),
+                files: module.files.as_deref().map(|s| &*queue.jobs.alloc_str(s)),
+                deps: module.deps.as_deref().map(|s| &*queue.jobs.alloc_str(s)),
             };
-            return Ok(Dispatch::Run(ScriptWork::Module(ModuleJob::Build { wanted, home: handles.env.home }), drive));
+            let compile = if wanted.ran_as == crate::scripts::RanAs::Wasm {
+                queue.ensure_compile_inputs(cx, store, graph_key, handles)?
+            } else {
+                None
+            };
+            return Ok(Dispatch::Run(ScriptWork::Module(ModuleJob::Build { wanted, home: handles.env.home, compile }), drive));
         }
         let Some(side) = handles.side else {
             let failure = TaskFailure { name, why: Why::Refused { what: "a proc-macro module's lookup with no lock read this command", rule: RULE } };
@@ -1261,17 +1506,18 @@ impl<'f> ScriptsStage<'f> {
                 let mut members = Vec::new_in(queue.jobs);
                 for leaf in side.place.rows.of(crate::sweep::LeafKind::MacroFiles).filter(|leaf| !leaf.absent()) {
                     let path = side.place.rows.path(leaf);
-                    if let Some((id, _)) = side.place.members.and_then(|all| all.iter().find(|(_, dir)| dir.as_str() == path)) {
-                        members.push((*id, work::held_str(path, queue.jobs), leaf.id));
+                    if let Some(entry) = side.place.members.and_then(|all| all.iter().find(|entry| entry.dir.as_str() == path)) {
+                        members.push((entry.id, work::held_str(path, queue.jobs), entry.kind, leaf.id));
                     }
                 }
-                queue.macro_inputs = Some(MacroInputs { graph: queue.jobs.alloc(bytes).as_slice(), lock: side.lock.text, members: members.leak() });
+                queue.macro_inputs = Some(MacroInputs { graph: queue.jobs.alloc(bytes).as_slice(), lock: side.lock.text, members: members.into_bump_slice() });
             }
             queue.macro_inputs
         } else {
             None
         };
-        let lookup = ModuleJob::Proc { crates: self.macros.take(), home: side.place.home, checkout: side.place.checkout, graph, initial };
+        let compile = queue.ensure_compile_inputs(cx, store, graph_key, handles)?;
+        let lookup = ModuleJob::Proc { crates: self.macros.take(), home: side.place.home, checkout: side.place.checkout, graph, initial, compile };
         Ok(Dispatch::Run(ScriptWork::Module(lookup), drive))
     }
 
@@ -1303,6 +1549,274 @@ fn refusal(name: Name, what: &'static str) -> Failure<'static> {
     Failure { failure: TaskFailure { name, why: Why::Refused { what, rule: RULE } }, words: None }
 }
 
+/// O(out_degree) incremental readiness tracker for `Stage::Names` backed by
+/// [`crate::engine_names::NamesDag`]: tracks each crate's remaining unsettled producer count
+/// (`deps_left`) and cascades finished crates/scripts through reverse CSR `dependents` so
+/// `Pipeline::admit` avoids `O(N^2 * W)` transitive `producers_ready`/`unsettled` scans.
+struct NamesReadiness<'s> {
+    initialized: bool,
+    deps_left: Vec<u32, &'s Frame>,
+    self_unsettled: Vec<bool, &'s Frame>,
+    in_flight: Vec<bool, &'s Frame>,
+    unsettled: Vec<bool, &'s Frame>,
+    script_blocked: Vec<usize, &'s Frame>,
+    just_finished: Vec<usize, &'s Frame>,
+    need_check: Vec<usize, &'s Frame>,
+    ready_pending: usize,
+    scripts_moved: bool,
+    cascade: Vec<usize, &'s Frame>,
+    asked_ready: Vec<usize, &'s Frame>,
+}
+
+impl<'s> NamesReadiness<'s> {
+    fn new(frame: &'s Frame) -> Self {
+        Self {
+            initialized: false,
+            deps_left: Vec::new_in(frame),
+            self_unsettled: Vec::new_in(frame),
+            in_flight: Vec::new_in(frame),
+            unsettled: Vec::new_in(frame),
+            script_blocked: Vec::new_in(frame),
+            just_finished: Vec::new_in(frame),
+            need_check: Vec::new_in(frame),
+            ready_pending: 0,
+            scripts_moved: false,
+            cascade: Vec::new_in(frame),
+            asked_ready: Vec::new_in(frame),
+        }
+    }
+
+    fn note_crate_finished(&mut self, at: usize) {
+        self.just_finished.push(at);
+    }
+
+    fn note_script_finished(&mut self) {
+        self.scripts_moved = true;
+    }
+
+    fn is_ready(&self, at: usize) -> bool {
+        self.deps_left.get(at).copied().unwrap_or(0) == 0
+    }
+
+    fn needs_engine_scan(&self) -> bool {
+        !self.initialized
+            || self.ready_pending > 0
+            || !self.need_check.is_empty()
+            || (self.scripts_moved && !self.script_blocked.is_empty())
+    }
+
+    /// Decrements `deps_left` of direct dependents of every crate finished since the last admit,
+    /// in O(out_degree). Returns immediately with zero engine scans when no dependent reaches 0.
+    fn pre_cascade(&mut self, dag: &crate::engine_names::NamesDag<'_>) {
+        if !self.initialized || self.just_finished.is_empty() {
+            return;
+        }
+        self.cascade.clear();
+        for u in self.just_finished.drain(..) {
+            if let Some(slot) = self.in_flight.get_mut(u) {
+                *slot = false;
+            }
+            if let Some(slot) = self.self_unsettled.get_mut(u) {
+                *slot = false;
+            }
+            if self.unsettled.get(u).copied().unwrap_or(false) && self.deps_left.get(u).copied().unwrap_or(0) == 0 {
+                if let Some(slot) = self.unsettled.get_mut(u) {
+                    *slot = false;
+                }
+                self.cascade.push(u);
+            }
+        }
+        while let Some(u) = self.cascade.pop() {
+            for &v_u32 in dag.dependents_of(u) {
+                let Ok(v) = usize::try_from(v_u32) else { continue };
+                if let Some(left) = self.deps_left.get_mut(v)
+                    && *left > 0
+                {
+                    *left -= 1;
+                    if *left == 0 && self.unsettled.get(v).copied().unwrap_or(false) {
+                        if self.self_unsettled.get(v).copied().unwrap_or(false) {
+                            if !self.in_flight.get(v).copied().unwrap_or(false) {
+                                self.ready_pending = self.ready_pending.saturating_add(1);
+                            }
+                        } else {
+                            self.need_check.push(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Initializes once in O(V + E) or resolves script/early-cutoff checks using `unsettled_fn`.
+    fn sync_with_engine(
+        &mut self,
+        names: &NamesStage<'_>,
+        scripts: &ScriptsStage<'_>,
+        dag: &crate::engine_names::NamesDag<'_>,
+        unsettled_fn: &dyn Fn(Name) -> bool,
+        script_reads: &mut ScriptReady<'_>,
+    ) {
+        #[cfg(test)]
+        let drop_scripts = runner_clock().is_some_and(|clock| clock.drop_names_producer());
+        #[cfg(not(test))]
+        let drop_scripts = false;
+
+        if !self.initialized {
+            let count = dag.len();
+            self.deps_left.resize(count, 0);
+            self.self_unsettled.resize(count, false);
+            self.in_flight.resize(count, false);
+            self.unsettled.resize(count, false);
+            self.script_blocked.clear();
+            self.ready_pending = 0;
+            for u in 0..count {
+                if let Some(name) = names.crate_name(u)
+                    && let Some(slot) = self.self_unsettled.get_mut(u)
+                {
+                    *slot = unsettled_fn(name);
+                }
+                if !drop_scripts
+                    && let Some(script) = names.names.as_ref().and_then(|world| world.script_of(u))
+                    && (unsettled_fn(script) || !scripts.producers_ready(script, unsettled_fn, script_reads))
+                {
+                    if let Some(left) = self.deps_left.get_mut(u) {
+                        *left = 1;
+                    }
+                    self.script_blocked.push(u);
+                }
+            }
+            for &u_u32 in dag.topo() {
+                let Ok(u) = usize::try_from(u_u32) else { continue };
+                let mut left = self.deps_left.get(u).copied().unwrap_or(0);
+                for &g_u32 in dag.deps_of(u) {
+                    if let Ok(g) = usize::try_from(g_u32)
+                        && self.unsettled.get(g).copied().unwrap_or(false)
+                    {
+                        left = left.saturating_add(1);
+                    }
+                }
+                if let Some(slot) = self.deps_left.get_mut(u) {
+                    *slot = left;
+                }
+                let self_u = self.self_unsettled.get(u).copied().unwrap_or(false);
+                if let Some(slot) = self.unsettled.get_mut(u) {
+                    *slot = self_u || left > 0;
+                }
+                if self_u && left == 0 {
+                    self.ready_pending = self.ready_pending.saturating_add(1);
+                }
+            }
+            self.initialized = true;
+            self.scripts_moved = false;
+            self.just_finished.clear();
+            self.need_check.clear();
+            return;
+        }
+
+        if self.scripts_moved && !self.script_blocked.is_empty() {
+            self.scripts_moved = false;
+            let mut kept = 0usize;
+            for i in 0..self.script_blocked.len() {
+                let Some(&u) = self.script_blocked.get(i) else { continue };
+                let still_blocked = if drop_scripts {
+                    false
+                } else if let Some(script) = names.names.as_ref().and_then(|world| world.script_of(u)) {
+                    unsettled_fn(script) || !scripts.producers_ready(script, unsettled_fn, script_reads)
+                } else {
+                    false
+                };
+                if still_blocked {
+                    if let Some(dst) = self.script_blocked.get_mut(kept) {
+                        *dst = u;
+                    }
+                    kept = kept.saturating_add(1);
+                } else if let Some(left) = self.deps_left.get_mut(u)
+                    && *left > 0
+                {
+                    *left -= 1;
+                    if *left == 0 && self.unsettled.get(u).copied().unwrap_or(false) {
+                        if self.self_unsettled.get(u).copied().unwrap_or(false) {
+                            if !self.in_flight.get(u).copied().unwrap_or(false) {
+                                self.ready_pending = self.ready_pending.saturating_add(1);
+                            }
+                        } else {
+                            self.need_check.push(u);
+                        }
+                    }
+                }
+            }
+            self.script_blocked.truncate(kept);
+        }
+
+        while let Some(v) = self.need_check.pop() {
+            if !self.unsettled.get(v).copied().unwrap_or(false) {
+                continue;
+            }
+            if self.deps_left.get(v).copied().unwrap_or(0) != 0 {
+                continue;
+            }
+            let is_pending = names.crate_name(v).is_some_and(unsettled_fn);
+            if is_pending {
+                if let Some(slot) = self.self_unsettled.get_mut(v) {
+                    *slot = true;
+                }
+                if !self.in_flight.get(v).copied().unwrap_or(false) {
+                    self.ready_pending = self.ready_pending.saturating_add(1);
+                }
+            } else {
+                // Early cutoff: `v` stood unrun and all its producers settled; cascade to its dependents.
+                if let Some(slot) = self.unsettled.get_mut(v) {
+                    *slot = false;
+                }
+                for &w_u32 in dag.dependents_of(v) {
+                    let Ok(w) = usize::try_from(w_u32) else { continue };
+                    if let Some(left) = self.deps_left.get_mut(w)
+                        && *left > 0
+                    {
+                        *left -= 1;
+                        if *left == 0 && self.unsettled.get(w).copied().unwrap_or(false) {
+                            if self.self_unsettled.get(w).copied().unwrap_or(false) {
+                                if !self.in_flight.get(w).copied().unwrap_or(false) {
+                                    self.ready_pending = self.ready_pending.saturating_add(1);
+                                }
+                            } else {
+                                self.need_check.push(w);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Marks admitted tasks as `in_flight` and queues any `asked_ready` tasks that `engine.enter`
+    /// decided stood without running into `just_finished` so their dependents unblock immediately.
+    fn settle_admitted(&mut self, entered: &[EngineTask], names: &NamesStage<'_>) -> bool {
+        if !self.initialized {
+            self.asked_ready.clear();
+            return false;
+        }
+        for task in entered {
+            if let Some(at) = names.names.as_ref().and_then(|world| world.crate_at(task.planned.name.subject))
+                && let Some(slot) = self.in_flight.get_mut(at)
+                && !*slot
+            {
+                *slot = true;
+                self.ready_pending = self.ready_pending.saturating_sub(1);
+            }
+        }
+        let mut stood_any = false;
+        for at in self.asked_ready.drain(..) {
+            if !self.in_flight.get(at).copied().unwrap_or(false) {
+                self.ready_pending = self.ready_pending.saturating_sub(1);
+                self.just_finished.push(at);
+                stood_any = true;
+            }
+        }
+        stood_any
+    }
+}
+
 /// The coordinator owns the mutable engine and store. Both kinds of jobs borrow
 /// frozen inputs and return their answers through the same foreground pool.
 pub(crate) struct Pipeline<'s, 'a> {
@@ -1310,6 +1824,7 @@ pub(crate) struct Pipeline<'s, 'a> {
     names: crate::engine_names::NamesQueue<'s, 'a>,
     script_reads: ScriptReady<'s>,
     name_reads: crate::engine_names::ProducerWalk<'s>,
+    names_readiness: NamesReadiness<'s>,
 }
 
 impl<'s, 'a: 's> Pipeline<'s, 'a> {
@@ -1321,6 +1836,7 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
             names,
             script_reads: ScriptReady::new(jobs),
             name_reads: crate::engine_names::ProducerWalk::new(jobs),
+            names_readiness: NamesReadiness::new(jobs),
         }
     }
 
@@ -1339,29 +1855,73 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
             handles.board.phase_ended(mark, 0, handles.board.now(&handles.env.clock));
             self.script_reads.clear();
         }
+        // When only `Given` cells are queued in `Stage::Scripts` (no `Script` or `MacroModule`
+        // task queued), finish and merge that instant batch before admitting `Stage::Names`
+        // (which opens dependency crate records via `EngineRecords`). That is worker-count
+        // invariant, keeps `Scripts` at 0 crate records read when no script runs, and lets
+        // `Names` run at full unthrottled width once it is known whether any `Script` woke up.
+        if self.scripts.only_given() || self.scripts.has_pending_proc_macro_module() {
+            return Ok(());
+        }
         #[cfg(test)]
         if runner_clock().is_some_and(|clock| clock.global_names_barrier()) && (!self.scripts.is_empty() || engine.has_pending_stage(Stage::Scripts)) {
             return Ok(());
         }
-        loop {
+        let runnable_scripts = self.scripts.active_scripts()
+            + usize::from(engine.has_pending_stage(Stage::Scripts) && self.scripts.active_scripts() == 0);
+        self.names.set_width(self.scripts.scope, handles, runnable_scripts);
+        while engine.has_pending_stage(Stage::Names) {
+            if let Some(dag) = names.dag() {
+                self.names_readiness.pre_cascade(dag);
+                if !self.names_readiness.needs_engine_scan() {
+                    break;
+                }
+            }
             self.name_reads.clear();
             self.script_reads.clear();
+            self.names_readiness.asked_ready.clear();
+            let mut synced = false;
             let phase = engine.next_phase_in(Stage::Names, &mut |name, pending| {
-                names.producers_ready(name, &mut |producer| {
-                    #[cfg(test)]
-                    if producer.kind == Kind::Script && runner_clock().is_some_and(|clock| clock.drop_names_producer()) {
-                        return false;
+                if let Some(dag) = names.dag() {
+                    if !synced {
+                        self.names_readiness.sync_with_engine(names, scripts, dag, pending, &mut self.script_reads);
+                        synced = true;
                     }
-                    pending(producer) || (producer.kind == Kind::Script && !scripts.producers_ready(producer, pending, &mut self.script_reads))
-                }, &mut self.name_reads)
+                    let Some(at) = names.names.as_ref().and_then(|world| world.crate_at(name.subject)) else {
+                        return true;
+                    };
+                    let ready = self.names_readiness.is_ready(at);
+                    if ready {
+                        self.names_readiness.asked_ready.push(at);
+                    }
+                    ready
+                } else {
+                    names.producers_ready(name, &mut |producer| {
+                        #[cfg(test)]
+                        if producer.kind == Kind::Script && runner_clock().is_some_and(|clock| clock.drop_names_producer()) {
+                            return false;
+                        }
+                        pending(producer) || (producer.kind == Kind::Script && !scripts.producers_ready(producer, pending, &mut self.script_reads))
+                    }, &mut self.name_reads)
+                }
             })?;
-            if phase.is_none() { break; }
+            if phase.is_none() {
+                if !self.names_readiness.settle_admitted(&[], names) {
+                    break;
+                }
+                continue;
+            }
             let mark = handles.board.phase_began(Stage::Names, engine.tasks().len() as u64, handles.board.now(&handles.env.clock));
+            let view = engine.view();
+            self.names_readiness.settle_admitted(engine.tasks(), names);
             for &task in engine.tasks() {
-                self.names.submit(self.scripts.scope, cx, names, store, read, handles, task, alloc, frame, self.scripts.waiter())?;
+                self.names.submit(self.scripts.scope, cx, names, store, read, view, handles, task, alloc, frame, self.scripts.waiter(), runnable_scripts)?;
             }
             handles.board.phase_ended(mark, 0, handles.board.now(&handles.env.clock));
         }
+        // Dispatch all newly enqueued `Names` tasks together in critical-path priority order so
+        // high-fanout hubs claim worker slots ahead of arbitrary hash-first leaf crates.
+        self.names.dispatch();
         Ok(())
     }
 
@@ -1378,61 +1938,195 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
         }
     }
 
+    /// Highest-priority ALREADY-FINISHED task across Scripts and Names.
+    fn first_ready(&self, names: &NamesStage<'_>) -> Option<EngineTask> {
+        let script = self.scripts.first_ready();
+        let scope = self.names.first_ready();
+        if self.scripts.urgent_ready() || !scope.is_some_and(|task| names.feeds_names(task.planned.name)) {
+            script.or(scope)
+        } else {
+            scope
+        }
+    }
+
+    /// Waits for ANY ready completion (never head-of-line blocking on a hash-first or wave-wide
+    /// straggler), drains all currently finished workers so freed slots dispatch immediately,
+    /// files the highest-priority ready task along with any other ALREADY-FINISHED siblings in its
+    /// `Phase`, and returns that `Phase` so downstream dependents admit immediately.
     pub(crate) fn collect<'f: 's>(
         &mut self, cx: &Cx, scripts: &mut ScriptsStage<'f>, names: &mut NamesStage<'f>,
-        store: &mut dyn crate::store::Store<'_>, handles: &Handles<'s, 'f>, first: EngineTask,
+        store: &mut dyn crate::store::Store<'_>, handles: &Handles<'s, 'f>,
         entered: &mut SVec<'_, EngineTask>, buffer: &mut Buffer<'a>, times: &mut crate::engine_times::Times,
         alloc: SharedAlloc<'a>, frame: &'f Frame,
-    ) -> Result<(), CliError> {
-        let mut task = first;
-        loop {
+    ) -> Result<blaze_engine::Phase, CliError> {
+        scripts.dispatch(cx, store, handles, names, &mut self.scripts, frame)?;
+        self.names.dispatch();
+        while self.first_ready(names).is_none() {
+            let observed_name = || self.names.has_completion();
+            #[cfg(test)]
+            let virtual_order = match (self.names.next_tick(), self.scripts.next_tick()) {
+                (Some(n), Some(s)) => Some(n < s),
+                (Some(_), None) => Some(true),
+                (None, Some(_)) if !self.names.has_completion() => Some(false),
+                _ => None,
+            };
+            #[cfg(not(test))]
+            let virtual_order: Option<bool> = None;
+            let take_name = if let Some(take_name) = virtual_order {
+                take_name
+            } else {
+                wait_finished(
+                    cx,
+                    &handles.env.clock,
+                    self.scripts.waiter(),
+                    || observed_name() || self.scripts.has_completion(),
+                    "a Names or Scripts worker to finish",
+                    self.scripts.running.len() + usize::from(!self.names.is_empty()),
+                )?;
+                observed_name()
+            };
+            if take_name {
+                self.names.observe_next(cx)?;
+            } else {
+                scripts.observe_next(cx, store, handles, names, &mut self.scripts, frame)?;
+            }
             scripts.dispatch(cx, store, handles, names, &mut self.scripts, frame)?;
             self.names.dispatch();
-            let name = task.planned.name;
-            let script = task.planned.phase.stage == Stage::Scripts;
-            while !(if script { self.scripts.is_finished(name) } else { self.names.is_finished(name) }) {
-                let observed_name = || self.names.has_completion();
-                #[cfg(test)]
-                let virtual_order = match (self.names.next_tick(), self.scripts.next_tick()) {
-                    (Some(n), Some(s)) => Some(n < s),
-                    (Some(_), None) => Some(true),
-                    (None, Some(_)) if !self.names.has_completion() => Some(false),
-                    _ => None,
-                };
-                #[cfg(not(test))]
-                let virtual_order: Option<bool> = None;
-                let take_name = if let Some(take_name) = virtual_order { take_name } else {
-                    wait_finished(cx, &handles.env.clock, self.scripts.waiter(), || observed_name() || self.scripts.has_completion(),
-                        "a Names or Scripts worker to finish", self.scripts.running.len() + usize::from(!self.names.is_empty()))?;
-                    observed_name()
-                };
-                if take_name {
-                    self.names.observe_next(cx)?;
-                } else {
-                    scripts.observe_next(cx, store, handles, names, &mut self.scripts, frame)?;
-                }
-                scripts.dispatch(cx, store, handles, names, &mut self.scripts, frame)?;
-                self.names.dispatch();
+        }
+        // Drain any other already-finished workers (real clock only; simulated tests advance
+        // one virtual tick at a time via `virtual_order`) so freed pool slots dispatch immediately.
+        #[cfg(test)]
+        let simulated = runner_clock().is_some();
+        #[cfg(not(test))]
+        let simulated = false;
+        if !simulated {
+            while self.names.has_completion() {
+                self.names.observe_next(cx)?;
             }
-            if script {
+            while self.scripts.has_completion() {
+                scripts.observe_next(cx, store, handles, names, &mut self.scripts, frame)?;
+            }
+            scripts.dispatch(cx, store, handles, names, &mut self.scripts, frame)?;
+            self.names.dispatch();
+        }
+        let chosen = self.first_ready(names).ok_or(CliError::Text {
+            what: "the pipeline observed a completion yet no task is ready to file (engine_scripts.rs)",
+        })?;
+        let phase = chosen.planned.phase;
+        let is_script_phase = phase.stage == Stage::Scripts;
+        let mut task = chosen;
+        loop {
+            let name = task.planned.name;
+            let feeds = !is_script_phase && names.feeds_names(name);
+            if is_script_phase {
                 scripts.finish(cx, store, handles, names, &mut self.scripts, name, buffer, times, alloc, frame)?;
+                self.names_readiness.note_script_finished();
             } else {
                 self.names.finish(cx, name, names, buffer, times, frame)?;
+                if let Some(at) = names.names.as_ref().and_then(|world| world.crate_at(name.subject)) {
+                    self.names_readiness.note_crate_finished(at);
+                }
             }
             entered.push(task);
-            // A script may immediately release a reader, including one in this
-            // same Names wave. Module lookups and ready crate peers file in bulk.
-            if name.kind == Kind::Script { break; }
-            let Some(next) = self.first(names) else { break };
-            if next.planned.phase != first.planned.phase { break; }
+            // A script may immediately release a reader, including one in the same Names wave.
+            if name.kind == Kind::Script {
+                break;
+            }
+            let next = if is_script_phase {
+                self.scripts.next_ready_in_phase(phase)
+            } else {
+                self.names.next_ready_in_phase(phase, feeds)
+            };
+            let Some(next) = next else { break };
             task = next;
         }
-        Ok(())
+        Ok(phase)
     }
 
     pub(crate) fn drain(&mut self, cx: &Cx) -> Result<(), CliError> {
         let stopped = self.names.wait_running(cx).and(self.scripts.wait_running(cx));
         let joined = self.names.drain(cx).and(self.scripts.drain(cx));
         joined.and(stopped)
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    #[test]
+    fn names_readiness_countdown_skips_scans_for_leaves_and_unblocks_dependents_in_o_out_degree() {
+        // Diamond DAG + unrelated leaf:
+        //   0 (root_a) -> 2 (mid) -> 3 (top)
+        //   1 (root_b) -> 2 (mid)
+        //   4 (leaf_free): no deps, no dependents
+        let edges: [&[usize]; 5] = [&[], &[], &[0, 1], &[2], &[]];
+        let frame = Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("readiness test frame");
+        let dag = crate::engine_names::build_names_dag(edges.len(), |_| true, |at| edges[at].iter().copied(), &frame).expect("acyclic");
+
+        // Cold build: all 5 crates initially pending.
+        let mut r = NamesReadiness::new(&frame);
+        r.deps_left.resize(5, 0);
+        r.self_unsettled.resize(5, true);
+        r.in_flight.resize(5, false);
+        r.unsettled.resize(5, false);
+        for &u_u32 in dag.topo() {
+            let u = usize::try_from(u_u32).expect("small");
+            let mut left = 0u32;
+            for &g_u32 in dag.deps_of(u) {
+                let g = usize::try_from(g_u32).expect("small");
+                if r.unsettled[g] {
+                    left += 1;
+                }
+            }
+            r.deps_left[u] = left;
+            r.unsettled[u] = r.self_unsettled[u] || left > 0;
+            if r.self_unsettled[u] && left == 0 {
+                r.ready_pending += 1;
+            }
+        }
+        r.initialized = true;
+
+        assert_eq!(r.deps_left.as_slice(), &[0, 0, 2, 1, 0]);
+        assert_eq!(r.ready_pending, 3);
+        assert!(r.is_ready(0) && r.is_ready(1) && r.is_ready(4));
+        assert!(!r.is_ready(2) && !r.is_ready(3));
+
+        // Admit roots 0, 1, 4.
+        for at in [0usize, 1, 4] {
+            r.in_flight[at] = true;
+            r.ready_pending -= 1;
+        }
+        assert!(!r.needs_engine_scan());
+
+        // Finishing pure leaf 4 triggers ZERO engine scans.
+        r.note_crate_finished(4);
+        r.pre_cascade(&dag);
+        assert!(!r.needs_engine_scan(), "pure leaf completion must not trigger an engine scan");
+        assert_eq!(r.deps_left.as_slice(), &[0, 0, 2, 1, 0]);
+
+        // Finishing root 0 decrements mid(2) from 2 -> 1 (still blocked): ZERO engine scans.
+        r.note_crate_finished(0);
+        r.pre_cascade(&dag);
+        assert!(!r.needs_engine_scan(), "partial dep completion (deps_left 2 -> 1) must not trigger a scan");
+        assert_eq!(r.deps_left[2], 1);
+        assert!(!r.is_ready(2));
+
+        // Finishing root 1 decrements mid(2) from 1 -> 0: immediately unblocks mid(2)!
+        r.note_crate_finished(1);
+        r.pre_cascade(&dag);
+        assert!(r.needs_engine_scan());
+        assert_eq!(r.ready_pending, 1);
+        assert!(r.is_ready(2));
+        assert!(!r.is_ready(3));
+
+        // Admit mid(2), then finish it -> unblocks top(3).
+        r.in_flight[2] = true;
+        r.ready_pending -= 1;
+        r.note_crate_finished(2);
+        r.pre_cascade(&dag);
+        assert!(r.needs_engine_scan());
+        assert_eq!(r.ready_pending, 1);
+        assert!(r.is_ready(3));
     }
 }

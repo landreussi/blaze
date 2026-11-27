@@ -210,6 +210,16 @@ impl Env {
     fn new(module: u32) -> Env {
         Env { module, params: Vec::new_in(Global), self_: SelfTy::None, self_assoc: Vec::new_in(Global) }
     }
+
+    fn copy_in(&self) -> Env {
+        let alloc = *self.params.allocator();
+        Env {
+            module: self.module,
+            params: self.params.to_vec_in(alloc),
+            self_: self.self_,
+            self_assoc: self.self_assoc.to_vec_in(alloc),
+        }
+    }
 }
 
 struct AdtHead {
@@ -573,6 +583,8 @@ impl Names {
             lf::TypeRef::Impl(_) => return Err(Why::Unsupported("an `impl Trait` type", r)),
             lf::TypeRef::Macro(_) => return Err(Why::Unsupported("a macro call in a type", r)),
             lf::TypeRef::Pat { .. } => return Err(Why::Unsupported("a pattern type", r)),
+            lf::TypeRef::Record(_) => return Err(Why::Unsupported("a record type", r)),
+            lf::TypeRef::Union(_) => return Err(Why::Unsupported("a union type", r)),
             lf::TypeRef::For { .. } => return Err(Why::Unsupported("a higher-ranked type (`for<'a>`)", r)),
             lf::TypeRef::Error => return Err(Why::Unsupported("this type", r)),
         }
@@ -916,9 +928,9 @@ pub(crate) fn repr_parts(args: &str, out: &mut ReprAttrs) -> Result<(), &'static
             "u64" => out.int = uint(tc::UintTy::U64),
             "u128" => out.int = uint(tc::UintTy::U128),
             "usize" => out.int = uint(tc::UintTy::Usize),
-            p => match p.split_once('(') {
-                Some(("packed", n)) => out.packed = Some(pow2(n.trim_end_matches(')'))?),
-                Some(("align", n)) => out.align = Some(pow2(n.trim_end_matches(')'))?),
+            p => match p.split_once('(').map(|(k, v)| (k.trim(), v.trim().strip_suffix(')'))) {
+                Some(("packed", Some(n))) => out.packed = Some(pow2(n)?),
+                Some(("align", Some(n))) => out.align = Some(pow2(n)?),
                 _ => return Err("this `repr`"),
             },
         }
@@ -1042,6 +1054,7 @@ fn read_attrs<'t>(v: &View<'t>, list: lf::List, at: At, blaze: &mut BlazeAttrs) 
             "link_name" => out.link_name = Some(value()),
             "rustc_intrinsic" => out.intrinsic = true,
             "thread_local" => out.thread_local = true,
+            "linkage" => return Err(Why::Unsupported("`#[linkage]`", r)),
             "" | "doc" | "allow" | "warn" | "deny" | "expect" | "forbid" | "inline" | "cold" | "must_use" | "track_caller" => {}
             "repr" => read_repr(args, r, &mut out.repr)?,
             "derive" => return Err(Why::Unsupported("`#[derive(..)]`", r)),
@@ -1102,6 +1115,9 @@ fn trait_lang(name: &str) -> Option<LangItem> {
         "pointee_trait" => LangItem::Pointee,
         "discriminant_kind" => LangItem::DiscriminantKind,
         "future_trait" => LangItem::Future,
+        "from" => LangItem::From,
+        "blaze_enum" => LangItem::Enum,
+        "blaze_unit_enum" => LangItem::UnitEnum,
         _ => return None,
     })
 }
@@ -1369,6 +1385,8 @@ fn shape_of(t: PTys<'_>, p: PTy) -> Option<Shape> {
         PNode::Str => Shape::Str,
         PNode::Never => Shape::Never,
         PNode::Tuple(l) => Shape::Tuple(l.len),
+        PNode::Record(s, l) => Shape::Record(s.0, l.len),
+        PNode::Union(l) => Shape::Union(l.len),
         PNode::Ref(m, _) => Shape::Ref(m),
         PNode::Ptr(m, _) => Shape::Ptr(m),
         PNode::Array(..) => Shape::Array,
@@ -1636,7 +1654,7 @@ impl<'f> Front<'f> {
                                     let ckey = member_key(key, 1, cname);
                                     let csig = lower_sig(ctext, cat, cwhole, alloc)?;
                                     let path = self.item_path(m, &format!("{name}::{cname}"));
-                                    let row = self.fn_row(ckey, cname, path, cat, ctext, FnKind::Trait(ti), Some(key), env.clone(), own + 1, csig)?;
+                                    let row = self.fn_row(ckey, cname, path, cat, ctext, FnKind::Trait(ti), Some(key), env.copy_in(), own + 1, csig)?;
                                     head_.fns.push((Name::of(cname), ckey));
                                     let i = self.fns.len() as u32;
                                     self.fns.push(row);
@@ -1686,7 +1704,7 @@ impl<'f> Front<'f> {
                                 ItemDetail::Fn { .. } => {
                                     let ckey = member_key(key, 1, cname);
                                     let csig = lower_sig(ctext, cat, cwhole, alloc)?;
-                                    let row = self.fn_row(ckey, cname, cname.into(), cat, ctext, FnKind::Impl(ii), Some(key), env.clone(), generics, csig)?;
+                                    let row = self.fn_row(ckey, cname, cname.into(), cat, ctext, FnKind::Impl(ii), Some(key), env.copy_in(), generics, csig)?;
                                     let i = self.fns.len() as u32;
                                     fns.push(i);
                                     self.fns.push(row);
@@ -1786,7 +1804,7 @@ impl<'f> Front<'f> {
             (None, false) => None,
         };
         if kind == FnKind::Static {
-            self.statics.push((key, StaticItem { thread_local: attrs.thread_local, mutable: flags & sig::MUT != 0 }));
+            self.statics.push((key, StaticItem { thread_local: attrs.thread_local, mutable: flags & sig::MUT != 0, extern_weak: false }));
         } else if attrs.thread_local {
             return Err(Why::Unsupported("`#[thread_local]` on other than a `static`", whole).at(at));
         }
@@ -2188,13 +2206,13 @@ impl<'f> Front<'f> {
                     text: p.text,
                     kind: FnKind::Ctor,
                     container: None,
-                    env: env.clone(),
+                    env: env.copy_in(),
                     parent: 0,
                     own: generics,
                     self_param: false,
                     inputs: tys_,
                     output: self_ty,
-                    clauses: sized.clone(),
+                    clauses: sized.to_vec_in(*sized.allocator()),
                     abi: Abi::Rust,
                     header: tc::FnPtrHeader::RUST,
                     symbol: "".into(),
@@ -2261,13 +2279,13 @@ impl<'f> Front<'f> {
                 text,
                 kind: FnKind::Const,
                 container: None,
-                env: env.clone(),
+                env: env.copy_in(),
                 parent: count,
                 own: 0,
                 self_param: false,
                 inputs: Vec::new_in(Global),
                 output: bool_,
-                clauses: clauses.clone(),
+                clauses: clauses.to_vec_in(*clauses.allocator()),
                 abi: Abi::Rust,
                 header: tc::FnPtrHeader::RUST,
                 symbol: "".into(),
@@ -2287,7 +2305,7 @@ impl<'f> Front<'f> {
         let p = &imp.item;
         let at = p.at;
         let v = p.sig.view();
-        let mut env = imp.env.clone();
+        let mut env = imp.env.copy_in();
         let self_t = v.head_opt(head::SELF_TY).ok_or(Why::Unsupported("an impl with no self type", Range::new(0, 0))).map_err(|w| w.at(at))?;
         let self_ty = self.names.ty(&mut self.tys, &env, &v, lf::TypeId(self_t)).map_err(|w| w.at(at))?;
         env.self_ = SelfTy::Ty(self_ty);
@@ -2320,17 +2338,18 @@ impl<'f> Front<'f> {
             let t = self.names.ty(&mut self.tys, &env, &av, lf::TypeId(t)).map_err(|w| w.at(ap.at))?;
             assoc.push((*name, t));
         }
-        env.self_assoc = assoc.clone();
+        let alloc = *assoc.allocator();
+        env.self_assoc = assoc.to_vec_in(alloc);
         for &f in &imp.fns {
             let row = &mut self.fns[f as usize];
             row.env.self_ = SelfTy::Ty(self_ty);
-            row.env.self_assoc = assoc.clone();
-            let name = self.names.modules[p.module as usize].path.clone();
+            row.env.self_assoc = assoc.to_vec_in(alloc);
+            let name = &*self.names.modules[p.module as usize].path;
             let shown = format!("{}<{}>::{}", if name.is_empty() { "" } else { "::" }, imp.generics, "");
             let _ = shown;
             let self_text = v.text_at(v.type_range(lf::TypeId(self_t)).map_err(|b| Why::from(b).at(at))?).map_err(|t| Why::from(t).at(at))?;
-            let fname = self.fns[f as usize].path.clone();
-            self.fns[f as usize].path = self.item_path(p.module, &format!("{self_text}::{fname}"));
+            let full = format!("{self_text}::{}", self.fns[f as usize].path);
+            self.fns[f as usize].path = self.item_path(p.module, &full);
         }
         self.index.insert(imp.key, ItemRef::Impl(self.impls.len() as u32));
         self.impls.push(ImplRow {
@@ -2341,7 +2360,7 @@ impl<'f> Front<'f> {
             trait_args,
             assoc,
             clauses,
-            fns: imp.fns.clone(),
+            fns: imp.fns.to_vec_in(*imp.fns.allocator()),
         });
         Ok(())
     }
@@ -2352,7 +2371,7 @@ impl<'f> Front<'f> {
         let v = sig.view();
         let row = &self.fns[i];
         let (at, text, parent, kind) = (row.at, row.text, row.parent, row.kind);
-        let mut env = row.env.clone();
+        let mut env = row.env.copy_in();
         let mut clauses = Vec::new_in(Global);
         match kind {
             FnKind::Trait(ti) => {
@@ -2550,15 +2569,9 @@ impl<'f> Front<'f> {
                 (None, None) => {}
             }
         }
-        let mut extra = Vec::new_in(Global);
-        for (&(tr, s), _) in self.buckets.iter() {
+        for (&(tr, _), v) in self.buckets.iter_mut() {
             if let Some(b) = self.blankets.get(&tr) {
-                extra.push(((tr, s), b.clone()));
-            }
-        }
-        for (k, b) in extra {
-            if let Some(v) = self.buckets.get_mut(&k) {
-                v.extend_from_slice(&b);
+                v.extend_from_slice(b);
             }
         }
     }
@@ -2736,7 +2749,7 @@ impl World for FrontWorld<'_, '_> {
         } else {
             &[]
         };
-        Ok(Predicates { clauses, types: self.front.tys.view() })
+        Ok(Predicates { clauses, types: self.front.tys.view(), regions: None })
     }
 
     fn adt(&self, _: Seal, item: ItemKey) -> Fetch<Option<tc::Adt<'_>>> {
@@ -2759,6 +2772,7 @@ impl World for FrontWorld<'_, '_> {
                     assoc_types: &i.assoc,
                     types: self.front.tys.view(),
                     polarity: blaze_typeck::ImplPolarity::Positive,
+                    regions: None,
                 }))
     }
 
@@ -2931,5 +2945,41 @@ mod tests {
         assert_eq!(repr_parts("(Rust)", &mut plain), Ok(()));
         assert_eq!(plain, ReprAttrs::default());
         assert_eq!(repr_parts("(rust)", &mut ReprAttrs::default()), Err("this `repr`"));
+        // Macro-expanded `#[repr(C, align(16))]` renders with spaces around `(` and `)`.
+        let mut aligned = ReprAttrs::default();
+        assert_eq!(repr_parts("(C , align ( 16 ))", &mut aligned), Ok(()));
+        assert_eq!(aligned, ReprAttrs { c: true, align: Some(4), ..ReprAttrs::default() });
+        let mut packed_spaced = ReprAttrs::default();
+        assert_eq!(repr_parts("(packed ( 4 ))", &mut packed_spaced), Ok(()));
+        assert_eq!(packed_spaced, ReprAttrs { packed: Some(2), ..ReprAttrs::default() });
+        assert_eq!(repr_parts("(align(16)", &mut ReprAttrs::default()), Err("this `repr`"));
+    }
+
+    #[test]
+    fn linkage_extern_weak_refused_in_front() {
+        use super::{At, BlazeAttrs, Range, Why, lower_sig, read_attrs};
+        use blaze_lower::head;
+        use blaze_own::Alloc;
+
+        let alloc = Alloc::global();
+        let at = At { file: 0, place: 0 };
+        let weak_text = "#[linkage = \"extern_weak\"] fn opt_fn();";
+        let weak_sig = lower_sig(weak_text, at, Range::new(0, weak_text.len() as u32), alloc)
+            .expect("lower weak fn signature");
+        let v = weak_sig.view();
+        let mut blaze = BlazeAttrs::default();
+        let err = read_attrs(&v, v.list(head::ATTRS), at, &mut blaze)
+            .err()
+            .expect("`#[linkage = \"extern_weak\"]` must be refused on non-static items");
+        assert!(matches!(err, Why::Unsupported("`#[linkage]`", _)), "unexpected error: {err:?}");
+
+        // Control: `#[link_name = "..."]` remains accepted on foreign functions.
+        let link_text = "#[link_name = \"c_opt_fn\"] fn opt_fn();";
+        let link_sig = lower_sig(link_text, at, Range::new(0, link_text.len() as u32), alloc)
+            .expect("lower link_name fn signature");
+        let v2 = link_sig.view();
+        let ok = read_attrs(&v2, v2.list(head::ATTRS), at, &mut blaze)
+            .expect("control: `#[link_name]` must remain accepted");
+        assert_eq!(ok.link_name, Some("c_opt_fn"));
     }
 }

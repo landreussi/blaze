@@ -52,11 +52,11 @@ fn check_fns(edition: &str, text: &str, fns: &[&str]) -> Vec<(String, String)> {
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
     let mut front = Front2::new(&names, &frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
-    let prepared = Prepares::new_in(alloc);
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
     let (mut buckets, mut consts) = (None, Consts::default());
     let mut got = Vec::new();
@@ -143,9 +143,9 @@ pub fn main() {}
     let got = check_fns(BLAZE, TEXT, &["one", "two"]);
     let lines = shown("missing", &got);
     assert!(of(&got, "one").starts_with("diags "), "{lines}");
-    assert_eq!(of(&got, "one").matches("MissingFields").count(), 1, "{lines}");
+    assert_eq!(of(&got, "one").matches("(MissingFields,").count(), 1, "{lines}");
     assert!(of(&got, "two").starts_with("diags "), "{lines}");
-    assert_eq!(of(&got, "two").matches("MissingFields").count(), 2, "{lines}");
+    assert_eq!(of(&got, "two").matches("(MissingFields,").count(), 2, "{lines}");
     // Each names its field as the ADT's head spells it (the body never wrote it).
     assert!(of(&got, "one").contains("about `a`"), "{lines}");
     assert!(of(&got, "two").contains("about `a`") && of(&got, "two").contains("about `c`"), "{lines}");

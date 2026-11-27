@@ -47,7 +47,7 @@ use bstd::cx::Cx;
 use bstd::entry::Status;
 use bstd::fs::{Changes, Cursor, Dir, Fs, FsError, HeldChanges, HomeError, JournalError, Lost, PrivateError, ReadWrite, Stamp};
 use bstd::host::{BuildId, build_id_in};
-use bstd::{Io, Stopped};
+use bstd::Stopped;
 use bstd::local::Local;
 use bstd::mem::{Bytes, Frame, MemError, Tag};
 use bstd::net::{Conn, Listener, NetError, NetKind};
@@ -128,7 +128,17 @@ impl fmt::Display for HelperError {
 
 /// `blaze journal-helper [folder]`: the helper of the checkout at `folder` (or here), until its
 /// core ends it.
-pub(crate) fn run(cx: &Cx, io: &Io, args: &Args, out: &Out) -> Result<Status, CliError> {
+#[expect(clippy::too_many_arguments, reason = "the journal helper's edge: each argument one specific capability")]
+pub(crate) fn run(
+    cx: &Cx,
+    fs: &bstd::fs::Fs,
+    clock: &Clock,
+    host: &bstd::host::Host,
+    rng: &mut bstd::rng::Rng,
+    env: Option<&bstd::env::Env>,
+    args: &Args,
+    out: &Out,
+) -> Result<Status, CliError> {
     let mut dir = None;
     for word in args.each().skip(2) {
         match word {
@@ -137,19 +147,16 @@ pub(crate) fn run(cx: &Cx, io: &Io, args: &Args, out: &Out) -> Result<Status, Cl
         }
     }
     let frame = cx.frame();
-    let fs = io.need_fs()?;
-    let clock = io.need_clock()?;
     // The checkout as `check` resolves it (engine_check.rs `edge`): the workspace's root, and
     // its absolute path by the one realpath; the key a command computes from the same call.
     let checkout = crate::checkout::checkout(dir, frame)?;
-    let located = crate::run_package::locate(cx, &fs, &checkout, frame)?;
-    let build = io.need_host()?.build_id()?;
-    let served = crate::engine_script_reads::Served::at_edge(io, located.at, frame).map_err(HelperError::Root)?;
+    let located = crate::run_package::locate(cx, fs, &checkout, frame)?;
+    let build = host.build_id()?;
+    let served = crate::engine_script_reads::Served::at_edge(cx.is_simulated(), located.at, frame).map_err(HelperError::Root)?;
     // `HOME` as the program's start read it (rule 75): the socket is under blaze's folder in
     // it, as a command's ask reaches it (journal_ask.rs `Me::of`, engine_check.rs).
-    let env = io.env();
-    let home_text = env.as_ref().and_then(|env| env.get(&bstd::env::VarName::new("HOME").ok()?).ok().flatten());
-    let home = crate::store::Home::of(cx, &fs, home_text)?;
+    let home_text = env.and_then(|env| env.get(&bstd::env::VarName::new("HOME").ok()?).ok().flatten());
+    let home = crate::store::Home::of(cx, fs, home_text)?;
     let me = Me::of(&build, served.root_text(), home_text, frame);
     let socket_text = core::str::from_utf8(&me.socket_path).unwrap_or("");
     if let SocketFits::TooLong { .. } = me.socket {
@@ -158,13 +165,13 @@ pub(crate) fn run(cx: &Cx, io: &Io, args: &Args, out: &Out) -> Result<Status, Cl
         return Err(HelperError::SocketTooLong(me.socket).into());
     }
     // Its own executable, looked at on each tick: a replaced build ends it.
-    let exe = io.need_host()?.exe()?;
-    let mut own = OwnExe::open(cx, &fs, &exe, build).map_err(|why| HelperError::OwnExe { exe: Arc::clone(&exe), why })?;
+    let exe = host.exe()?;
+    let mut own = OwnExe::open(cx, fs, &exe, build).map_err(|why| HelperError::OwnExe { exe: Arc::clone(&exe), why })?;
     // A new instance per start: a place another helper issued is refused by it (since.rs
     // `CannotVouch::OtherInstance`).
-    let instance = io.need_rng()?.next_u64();
+    let instance = rng.next_u64();
     let paths = (Path::new(helper::SOCKET_FOLDER)?, me.socket_beneath_home()?);
-    let death = serve(cx, &located.root, home.dir(), &clock, me, instance, (&paths.0, &paths.1), &mut own, out)?;
+    let death = serve(cx, &located.root, home.dir(), clock, me, instance, (&paths.0, &paths.1), &mut own, out)?;
     out.line(cx, format_args!("journal helper: ended: {death}"))?;
     Ok(Status::OK)
 }
@@ -225,21 +232,28 @@ fn live(
     out: &Out,
 ) -> Result<Death, CliError> {
     out.line(cx, format_args!("journal helper: answering in the home's {}/{} (instance {instance:016x})", crate::store::HOME_FOLDER, helper::SOCKET_FOLDER))?;
+    let tick_ns = as_ns(TICK);
+    let mut last_exe_check_ns = 0u64;
     loop {
         let told = driver.take(cx, core)?;
         if let Some(death) = driver.steps(cx, core, told)? {
             return Ok(death);
         }
-        let ticked = core.tick(driver.now()).map_err(HelperError::Core)?;
+        let now = driver.now();
+        let ticked = core.tick(now).map_err(HelperError::Core)?;
         if let Some(death) = driver.steps(cx, core, ticked)? {
             return Ok(death);
         }
-        // Its own executable, on the same tick: replaced, the core ends it (`Death::Replaced`).
-        if let Some(change) = conns.scope(|frame| own.look(cx, frame)) {
-            out.line(cx, format_args!("journal helper: its executable {change}"))?;
-            let replaced = core.binary_replaced().map_err(HelperError::Core)?;
-            if let Some(death) = driver.steps(cx, core, replaced)? {
-                return Ok(death);
+        // Its own executable, checked at most once per tick (1 s) so rapid back-to-back asks
+        // avoid redundant `stat` syscalls while a replaced build still ends promptly (`Death::Replaced`).
+        if now.0.saturating_sub(last_exe_check_ns) >= tick_ns {
+            last_exe_check_ns = now.0;
+            if let Some(change) = conns.scope(|frame| own.look(cx, frame)) {
+                out.line(cx, format_args!("journal helper: its executable {change}"))?;
+                let replaced = core.binary_replaced().map_err(HelperError::Core)?;
+                if let Some(death) = driver.steps(cx, core, replaced)? {
+                    return Ok(death);
+                }
             }
         }
         let accepted = {
@@ -534,7 +548,7 @@ pub(crate) fn look_at<E>(own: BuildId, was: Stamp, now: Option<Stamp>, read: imp
 impl OwnExe {
     /// The executable at `exe` (absolute, from `Host::exe`), this process's build `build`:
     /// its folder opened as a second tree (`Fs::home`, as the roster does) and its stamp taken.
-    fn open(cx: &Cx, fs: &Fs, exe: &str, build: BuildId) -> Result<OwnExe, OwnExeWhy> {
+    pub(crate) fn open(cx: &Cx, fs: &Fs, exe: &str, build: BuildId) -> Result<OwnExe, OwnExeWhy> {
         let (folder, leaf) = exe.strip_prefix('/').and_then(|rest| rest.rsplit_once('/')).ok_or(OwnExeWhy::NotAPath)?;
         let folder = Path::new(folder).map_err(OwnExeWhy::Path)?;
         let leaf = Path::new(leaf).map_err(OwnExeWhy::Path)?;
@@ -544,7 +558,7 @@ impl OwnExe {
     }
 
     /// One look ([`look_at`]): `None` while it is this build (a moved stamp kept), else why not.
-    fn look(&mut self, cx: &Cx, frame: &Frame) -> Option<ExeChange> {
+    pub(crate) fn look(&mut self, cx: &Cx, frame: &Frame) -> Option<ExeChange> {
         let cx = cx.span("journal helper: its own executable looked at (a stat; its head read when the stat moved)");
         let now = match self.folder.stat(&cx, &self.leaf) {
             Ok(meta) => meta.map(|meta| meta.stamp),

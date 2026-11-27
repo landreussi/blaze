@@ -261,7 +261,7 @@ fn as_env(vars: &[(String, String)]) -> Env<'static> {
 }
 
 fn tree(a: u8, b: u8) -> Tree {
-    Tree::Mem { files: Arc::new(vec![("a.txt".to_owned(), vec![b'a', a]), ("b.txt".to_owned(), vec![b'b', b])]), git: None }
+    Tree::Mem { files: Arc::new(vec![("a.txt".to_owned(), vec![b'a', a]), ("b.txt".to_owned(), vec![b'b', b])]), submodules: Arc::from([]), git: None }
 }
 
 /// D96: a dependency's script runs in `/package` and a member's in `/workspace/<dir>`, and a
@@ -271,7 +271,7 @@ fn tree(a: u8, b: u8) -> Tree {
 #[test]
 fn script_root_mounts_a_dependency_at_package_and_a_member_in_its_workspace() {
     use crate::script_sandbox::ScriptRoot;
-    let dependency = Script { root: ScriptRoot::package(), ..Script::clone(&script("dep", Tree::Mem { files: Arc::new(Vec::new()), git: None }, Vec::new())) };
+    let dependency = Script { root: ScriptRoot::package(), ..Script::clone(&script("dep", Tree::Mem { files: Arc::new(Vec::new()), submodules: Arc::from([]), git: None }, Vec::new())) };
     assert_eq!(dependency.cwd(), "/package");
     let member = Script { root: ScriptRoot::member("crates/app").expect("a plain dir"), ..Script::clone(&dependency) };
     assert_eq!(member.cwd(), "/workspace/crates/app");
@@ -292,6 +292,7 @@ fn script(name: &str, tree: Tree, env: Vec<(String, String)>) -> Arc<Script> {
         limits: LIMITS,
         table: Arc::new(Vec::new()),
         probes: None,
+        c_probes: None,
         spawner: None,
         step: blaze_ids::ContentId::default(),
         spawn_setting: Arc::new(crate::spawn_route::SpawnSetting::off()),
@@ -577,8 +578,8 @@ fn no_repository_is_gits_own_answer() {
 fn git_refuses_by_name_what_it_cannot_answer_exactly() {
     let (_, unborn) = checkout("git-refusals", &[(".git/HEAD", "ref: refs/heads/unborn\n")]);
     assert_eq!(ask(&unborn, "", &["rev-parse", "HEAD"]).0, Err(git::Refused::NoCommit));
-    assert_eq!(ask(&unborn, "", &["rev-parse", "--short", "HEAD"]).0, Err(git::Refused::Short));
-    assert_eq!(ask(&unborn, "", &["rev-parse", "--short=8", "HEAD"]).0, Err(git::Refused::Short));
+    assert_eq!(ask(&unborn, "", &["rev-parse", "--short", "HEAD"]).0, Err(git::Refused::NoCommit));
+    assert_eq!(ask(&unborn, "", &["rev-parse", "--short=8", "HEAD"]).0, Err(git::Refused::NoCommit));
     assert_eq!(ask(&unborn, "", &["status", "--porcelain"]).0, Err(git::Refused::NoCommit));
     assert_eq!(ask(&unborn, "", &["status", "--short"]).0, Err(git::Refused::Dirty));
     // `--dirty` is answered (from the tracked status); another mark is not.
@@ -606,7 +607,7 @@ fn git_refuses_by_name_what_it_cannot_answer_exactly() {
 #[test]
 fn git_answers_a_fetched_source_from_its_commit() {
     let commit = git::Oid::parse_hex(COMMIT_A.as_bytes()).expect("hex");
-    let fetched = Tree::Mem { files: Arc::new(vec![("crates/node/core/build.rs".to_owned(), Vec::new())]), git: Some(commit) };
+    let fetched = Tree::Mem { files: Arc::new(vec![("crates/node/core/build.rs".to_owned(), Vec::new())]), submodules: Arc::from([]), git: Some(commit) };
     let (head, reads) = ask(&fetched, "crates/node/core", &["rev-parse", "HEAD"]);
     assert_eq!(head, Ok((0, format!("{COMMIT_A}\n"))));
     assert!(reads.is_empty(), "no `.git` is looked for: {reads:?}");
@@ -623,7 +624,7 @@ fn git_answers_a_fetched_source_from_its_commit() {
     assert_eq!(ask(&fetched, "", &["describe"]).0, Ok((128, String::new())));
     // The fact is keyed by the commit: another commit's record answers differently.
     let subject = "git:crates/node/core\nrev-parse HEAD";
-    let other = Tree::Mem { files: Arc::new(Vec::new()), git: git::Oid::parse_hex(COMMIT_B.as_bytes()) };
+    let other = Tree::Mem { files: Arc::new(Vec::new()), submodules: Arc::from([]), git: git::Oid::parse_hex(COMMIT_B.as_bytes()) };
     assert_ne!(answer_now(&fetched, subject), answer_now(&other, subject));
 }
 
@@ -640,9 +641,13 @@ fn a_git_fact_reruns_its_script_only_when_its_answer_changes() {
     // fact does not: no rerun.
     std::fs::write(root.join(".git/HEAD"), format!("{COMMIT_A}\n")).expect("detach");
     assert_eq!(answer_now(&tree, subject), Ok(first));
-    // The answer flips: rerun. And a question refused now is an answer that differs.
+    // The answer flips: rerun. And removing HEAD yields git's own failure answer (exit 128),
+    // a distinct digest from both commits (`no_repository_is_gits_own_answer`).
     std::fs::write(root.join(".git/HEAD"), format!("{COMMIT_B}\n")).expect("move");
-    assert_ne!(answer_now(&tree, subject), Ok(first));
+    let moved = answer_now(&tree, subject).expect("moved git subject");
+    assert_ne!(moved, first);
     std::fs::remove_file(root.join(".git/HEAD")).expect("break");
-    assert_eq!(answer_now(&tree, subject), Ok(None));
+    let broken = answer_now(&tree, subject).expect("broken git subject");
+    assert_ne!(broken, first);
+    assert_ne!(broken, moved);
 }

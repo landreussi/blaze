@@ -43,22 +43,24 @@ use crate::engine_answer::Stored;
 /// `reach`: which member units reach each file (engine_body_plan.rs `Reach`, D191), made once a
 /// request by engine_bodies.rs `BodiesStage::plan_reach`: a body's row is planned at each unit
 /// that reaches its file; `None` (no crate list) plans each body's base row alone.
-pub(crate) fn file_tasks<'h>(outlined: &[crate::engine_tasks::Outlined<'_>], skipped: &[Name], heads: bool, rules: &blaze_lint::RuleSet, reach: Option<&crate::engine_body_plan::Reach>, alloc: blaze_own::SharedAlloc<'h>, into: &mut SVec<'h, blaze_engine::Planned>) {
+pub(crate) fn file_tasks<'h>(outlined: &[crate::engine_tasks::Outlined<'_>], skipped: &[Name], external: &[Name], heads: bool, rules: &blaze_lint::RuleSet, reach: Option<&crate::engine_body_plan::Reach>, alloc: blaze_own::SharedAlloc<'h>, into: &mut SVec<'h, blaze_engine::Planned>) {
     for one in outlined.iter() {
         into.push(blaze_engine::Planned { name: one.name, phase: blaze_engine::Phase::new(blaze_engine::Stage::Outlines, 0), source: one.outline_source, file: one.name });
     }
-    into.extend(crate::engine_bodies::plan_views::<blaze_drive::view::Production>(outlined, skipped, reach, alloc));
+    into.extend(crate::engine_bodies::plan_views::<blaze_drive::view::Production>(outlined, skipped, external, reach, alloc));
     if heads {
-        into.extend(crate::engine_heads::plan_items(outlined, alloc));
+        into.extend(crate::engine_heads::plan_items(outlined, external, alloc));
     }
-    into.extend(crate::engine_lints::plan(outlined, rules, alloc));
+    into.extend(crate::engine_lints::plan(outlined, external, rules, alloc));
 }
 
-/// Which driver `check` runs an edit on (`--driver=ready|phases`, main.rs `Flags::driver`): the
-/// phase path (engine_check.rs) or the ready set (this file's plan run on blaze-engine's
-/// `Ready`). `Phases` until both give byte-equal stored answers on tempo (D187).
+/// Which driver `check` runs an edit on (`--driver=auto|ready|phases`, main.rs `Flags::driver`):
+/// `Auto` (the default) runs the fast ready path whenever the edit is eligible and falls back
+/// cleanly to the phase path on any typed [`ReadyRefused`]; `Ready` is strict (refuses rather than
+/// falling back, for tests and diagnostics); `Phases` runs the phase path explicitly (D187).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Driver {
+    Auto,
     Phases,
     Ready,
 }
@@ -66,6 +68,7 @@ pub(crate) enum Driver {
 impl Driver {
     pub(crate) fn parse(word: &str) -> Option<Driver> {
         match word {
+            "auto" => Some(Driver::Auto),
             "phases" => Some(Driver::Phases),
             "ready" => Some(Driver::Ready),
             _ => None,
@@ -172,9 +175,9 @@ pub(crate) enum Chosen {
 }
 
 /// The kinds the `Ready` edit path runs (engine_ready_check.rs: one `TaskKind` each). An
-/// entering task of any other kind (a signature, a crate's scope, an impl bucket) is refused by
-/// [`admit`] until its stage is ported.
-pub(crate) const READY_KINDS: [blaze_drive::Kind; 3] = [blaze_drive::Kind::FileItems, blaze_drive::Kind::Lint, blaze_drive::Kind::BodyCheck];
+/// entering task of any other kind (a signature, a crate's scope, an impl bucket, a build script)
+/// is refused by [`admit`] until its stage is ported.
+pub(crate) const READY_KINDS: [blaze_drive::Kind; 4] = [blaze_drive::Kind::FileItems, blaze_drive::Kind::Given, blaze_drive::Kind::Lint, blaze_drive::Kind::BodyCheck];
 
 /// Why `--driver=ready` cannot serve this request: the flag asked for a driver that cannot, so
 /// the request stops and says why (rule 3: the other driver is never run in its place; rule
@@ -220,7 +223,7 @@ impl core::fmt::Display for ReadyRefused {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ReadyRefused::Root(why) => write!(f, "--driver=ready cannot serve this request: {} (engine_ready_edit.rs `choose`)", why.words()),
-            ReadyRefused::Kind { name } => write!(f, "--driver=ready cannot serve this request: the edit enters {name}, a {} task, and the ready path runs only FileItems, Lint and BodyCheck tasks yet (engine_ready_edit.rs `admit`)", name.kind.name()),
+            ReadyRefused::Kind { name } => write!(f, "--driver=ready cannot serve this request: the edit enters {name}, a {} task, and the ready path runs only FileItems, Given, Lint and BodyCheck tasks yet (engine_ready_edit.rs `admit`)", name.kind.name()),
             ReadyRefused::Unsorted { at } => write!(f, "the entering names are not sorted and each once at {at} (engine_ready_edit.rs `admit`)"),
             ReadyRefused::NoRow { name } => write!(f, "--driver=ready cannot serve this request: the stored answer holds no row of {name}, which the ready setup reads in place of the units stage (engine_check.rs `ready_setup`)"),
             ReadyRefused::Graph(why) => write!(f, "--driver=ready cannot serve this request: {why} (engine_check.rs `ready_setup`)"),
@@ -235,11 +238,36 @@ impl core::fmt::Display for ReadyRefused {
     }
 }
 
+impl ReadyRefused {
+    /// The [`PhasesWhy`] recorded on the profile's `driver:` line when [`Driver::Auto`] routes a
+    /// ready-ineligible request to the phase path.
+    pub(crate) fn phases_why(self) -> PhasesWhy {
+        match self {
+            ReadyRefused::Root(why) => why,
+            ReadyRefused::Kind { name } => PhasesWhy::ReadyKind(name.kind),
+            ReadyRefused::ModuleTree { .. } => PhasesWhy::ModuleTree,
+            ReadyRefused::Members { .. } => PhasesWhy::Members,
+            ReadyRefused::Unsorted { .. }
+            | ReadyRefused::NoRow { .. }
+            | ReadyRefused::Graph(_)
+            | ReadyRefused::NoList
+            | ReadyRefused::ListFact { .. }
+            | ReadyRefused::NoPlace { .. }
+            | ReadyRefused::SkippedTargets { .. } => PhasesWhy::ReadySetup,
+        }
+    }
+}
+
 /// The second step of the precondition: the wake's entering names (sorted, each once) admitted
-/// to the `Ready` path when every one is of a kind it runs ([`READY_KINDS`]); else the first
-/// that is not, by name. Reads no page: a name carries its kind.
+/// to the `Ready` path when every one is of a kind it runs ([`READY_KINDS`]); a woken `Script`
+/// task refuses with [`ReadyRefused::Root`]`(`[`PhasesWhy::ScriptRead`]`)`, else the first
+/// unsupported task is refused by name ([`ReadyRefused::Kind`]). Reads no page: a name carries
+/// its kind.
 pub(crate) fn admit(names: &[Name]) -> Result<EditPath<'_>, ReadyRefused> {
     let entering = Entering::new(names).map_err(|unsorted| ReadyRefused::Unsorted { at: unsorted.at })?;
+    if names.iter().any(|name| name.kind == blaze_drive::Kind::Script) {
+        return Err(ReadyRefused::Root(PhasesWhy::ScriptRead));
+    }
     match names.iter().find(|name| !READY_KINDS.contains(&name.kind)) {
         Some(&name) => Err(ReadyRefused::Kind { name }),
         None => Ok(EditPath::Ready(entering)),
@@ -249,7 +277,7 @@ pub(crate) fn admit(names: &[Name]) -> Result<EditPath<'_>, ReadyRefused> {
 /// Why a `check` takes the phase path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PhasesWhy {
-    /// `--driver=phases` (the default until both drivers give byte-equal answers on tempo).
+    /// `--driver=phases` asked explicitly for the phase path.
     Chosen,
     /// No stored answer for this checkout: a first check.
     NoAnswer,
@@ -276,6 +304,16 @@ pub(crate) enum PhasesWhy {
     /// had none): its leaves were all followed here and its journal places are not this
     /// checkout's, so no wake from changed files is proved; the phase path plans every file.
     OtherCheckout,
+    /// The forward wake entered a task whose kind is not yet on the ready path (e.g. a
+    /// signature, crate scope, or impl bucket).
+    ReadyKind(blaze_drive::Kind),
+    /// An edited file's outline changed the module tree (`mod ...;` added, removed, or moved).
+    ModuleTree,
+    /// No compatible members record opened over today's unit graph.
+    Members,
+    /// The stored answer lacked a ready-setup precondition (graph row, crate list, file place, or
+    /// skipped-target note).
+    ReadySetup,
 }
 
 /// What the stored answer a request starts from is to it: a precondition of the certificate
@@ -303,6 +341,15 @@ impl PhasesWhy {
             PhasesWhy::NothingMoved => "nothing moved",
             PhasesWhy::ToolsMoved => "a tool moved since the stored answer (its rows are entered by their keys)",
             PhasesWhy::OtherCheckout => "the stored answer is another checkout's (this one had none)",
+            PhasesWhy::ReadyKind(kind) => match kind {
+                blaze_drive::Kind::Signature => "the edit enters a Signature task (not on the ready path yet)",
+                blaze_drive::Kind::CrateScope => "the edit enters a CrateScope task (not on the ready path yet)",
+                blaze_drive::Kind::ImplBucket => "the edit enters an ImplBucket task (not on the ready path yet)",
+                _ => "the edit enters a task kind not on the ready path yet",
+            },
+            PhasesWhy::ModuleTree => "an edited file's module tree moved",
+            PhasesWhy::Members => "no compatible members record opens over today's unit graph",
+            PhasesWhy::ReadySetup => "the stored answer lacked a ready-setup precondition",
         }
     }
 }
@@ -319,33 +366,109 @@ impl core::fmt::Display for EditPath<'_> {
 /// The first step of the precondition, from the driver chosen, the stored answer's root
 /// (`None`: none stored), what that answer is to this request ([`StoredBase`]), and the sweep's
 /// changed leaves. Reads no row and no header. Under `--driver=phases` the phase path; under
-/// `--driver=ready` the wake, or the refusal that stops the request ([`ReadyRefused::Root`]).
+/// `--driver=auto` the wake when eligible else the phase path; under `--driver=ready` the wake,
+/// or the refusal that stops the request ([`ReadyRefused::Root`]).
 pub(crate) fn choose(driver: Driver, root: Option<&blaze_engine::pages::Root<'_>>, base: StoredBase, changed: &[Changed]) -> Result<Chosen, ReadyRefused> {
     if driver == Driver::Phases {
         return Ok(Chosen::Phases(PhasesWhy::Chosen));
     }
-    let Some(root) = root else { return Err(ReadyRefused::Root(PhasesWhy::NoAnswer)) };
+    let refuse = |why: PhasesWhy| match driver {
+        Driver::Auto => Ok(Chosen::Phases(why)),
+        Driver::Ready => Err(ReadyRefused::Root(why)),
+        Driver::Phases => Ok(Chosen::Phases(PhasesWhy::Chosen)),
+    };
+    let Some(root) = root else { return refuse(PhasesWhy::NoAnswer) };
     match base {
         StoredBase::Own => {}
-        StoredBase::ToolsMoved => return Err(ReadyRefused::Root(PhasesWhy::ToolsMoved)),
-        StoredBase::OtherCheckout => return Err(ReadyRefused::Root(PhasesWhy::OtherCheckout)),
+        StoredBase::ToolsMoved => return refuse(PhasesWhy::ToolsMoved),
+        StoredBase::OtherCheckout => return refuse(PhasesWhy::OtherCheckout),
     }
     if !root.owed_tasks.is_empty() || !root.owed_cells.is_empty() {
-        return Err(ReadyRefused::Root(PhasesWhy::Owed { tasks: root.owed_tasks.len(), cells: root.owed_cells.len() }));
+        return refuse(PhasesWhy::Owed { tasks: root.owed_tasks.len(), cells: root.owed_cells.len() });
     }
     if changed.is_empty() {
-        return Err(ReadyRefused::Root(PhasesWhy::NothingMoved));
+        return refuse(PhasesWhy::NothingMoved);
     }
-    if changed.iter().any(|one| one.kind.by_script()) {
-        return Err(ReadyRefused::Root(PhasesWhy::ScriptRead));
+    if changed.iter().any(|one| !matches!(one.kind, crate::sweep::LeafKind::Slot) && !one.kind.by_script()) {
+        return refuse(PhasesWhy::Layout);
     }
-    if changed.iter().any(|one| !matches!(one.kind, crate::sweep::LeafKind::Slot)) {
-        return Err(ReadyRefused::Root(PhasesWhy::Layout));
-    }
-    if changed.iter().any(|one| !one.both) {
-        return Err(ReadyRefused::Root(PhasesWhy::FileAddedOrRemoved));
+    if changed.iter().any(|one| matches!(one.kind, crate::sweep::LeafKind::Slot) && !one.both) {
+        return refuse(PhasesWhy::FileAddedOrRemoved);
     }
     Ok(Chosen::Wake { files: changed.len() })
+}
+
+/// Fast pre-check before `ready_preflight` when the sweep reports a moved `by_script()` leaf
+/// (`ScriptFile`, `ScriptListing`, `ScriptStat`, `ScriptGit`): checks whether any moved or
+/// removed `Kind::Given` cell wakes a `Kind::Script` task whose stored read list saw another
+/// digest (exact short-circuit of [`wake`] + [`forward`] + [`admit`] for
+/// [`PhasesWhy::ScriptRead`]). Avoids running and discarding `ready_setup`, `plan_reach`,
+/// outlining, and `wake` when a build script's checkout read moved.
+pub(crate) fn wakes_script(
+    stored: &Stored<'_>,
+    followed: &crate::sweep::Followed<'_>,
+    tools: &blaze_engine::Tools,
+    alloc: blaze_own::SharedAlloc<'_>,
+) -> Result<bool, CliError> {
+    let given_planned = crate::engine_script_reads::plan(&followed.now, alloc);
+    let mut moved: SVec<'_, Moved> = SVec::new_in(alloc);
+    for (one, answer, _) in given_planned.iter() {
+        let name = one.name;
+        let unchanged = stored
+            .root
+            .files
+            .get(&name)
+            .copied()
+            .flatten()
+            .is_some_and(|was| was == blaze_engine::pages::plan_digest(name, core::slice::from_ref(one), tools, alloc));
+        if unchanged {
+            continue;
+        }
+        let now = [(crate::engine_tasks::WHOLE, *answer)];
+        if let Some(row) = page_for(stored, name, blaze_engine::Ask::Row)?.and_then(|page| page.row(name)) {
+            moved_cells(name, row.defines(), &now, &mut moved);
+        } else {
+            moved_cells(name, core::iter::empty(), &now, &mut moved);
+        }
+    }
+    for &file in stored.root.files.keys() {
+        if file.kind == blaze_drive::Kind::Given
+            && given_planned.binary_search_by_key(&file, |(one, _, _)| one.name).is_err()
+            && let Some(row) = page_for(stored, file, blaze_engine::Ask::Row)?.and_then(|page| page.row(file))
+        {
+            moved_cells(file, row.defines(), &[], &mut moved);
+        }
+    }
+    if moved.is_empty() {
+        return Ok(false);
+    }
+    moved.sort_unstable_by_key(|one| one.id);
+    let mut scripts: SVec<'_, Name> = SVec::new_in(alloc);
+    for item in moved.iter() {
+        let Some(page) = page_for(stored, blaze_engine::pages::readers_slot(&item.id), blaze_engine::Ask::Readers)? else {
+            continue;
+        };
+        scripts.extend(page.readers(&item.id).filter(|name| name.kind == blaze_drive::Kind::Script));
+    }
+    if scripts.is_empty() {
+        return Ok(false);
+    }
+    scripts.sort_unstable();
+    scripts.dedup();
+    for &script in scripts.iter() {
+        let Some(row) = page_for(stored, script, blaze_engine::Ask::Row)?.and_then(|page| page.row(script)) else {
+            continue;
+        };
+        for (read, digest) in row.reads() {
+            if let Ok(at) = moved.binary_search_by(|one| one.id.cmp(&read))
+                && let Some(entry) = moved.get(at)
+                && entry.now != digest
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// The edit's scope on `Ready`: exactly the names the forward wake entered ([`forward`]'s
@@ -446,8 +569,47 @@ pub(crate) fn moved_cells(file: Name, stored: impl Iterator<Item = (Cell, Conten
 
 /// Step 2: the parts of a file's outline whose source moved between its stored record (`old`)
 /// and today's (`new`), each once, appended as [`Woken::Keyed`]. A part only in one of them
-/// moved (a body added or removed).
+/// moved (a body added or removed). Linear merge when both slices are sorted by name (always true
+/// for outline records), falling back to a scan otherwise.
 pub(crate) fn keyed(old: &[Part], new: &[Part], into: &mut SVec<'_, (Name, Woken)>) {
+    if old.is_sorted_by_key(|p| p.name) && new.is_sorted_by_key(|p| p.name) {
+        let mut old_it = old.iter().peekable();
+        let mut new_it = new.iter().peekable();
+        while let (Some(&o), Some(&n)) = (old_it.peek(), new_it.peek()) {
+            match o.name.cmp(&n.name) {
+                core::cmp::Ordering::Less => {
+                    if matches!(o.locate, Locate::Source(_)) {
+                        into.push((o.name, Woken::Keyed));
+                    }
+                    let _ = old_it.next();
+                }
+                core::cmp::Ordering::Greater => {
+                    if matches!(n.locate, Locate::Source(_)) {
+                        into.push((n.name, Woken::Keyed));
+                    }
+                    let _ = new_it.next();
+                }
+                core::cmp::Ordering::Equal => {
+                    if (matches!(o.locate, Locate::Source(_)) || matches!(n.locate, Locate::Source(_))) && o.locate != n.locate {
+                        into.push((n.name, Woken::Keyed));
+                    }
+                    let _ = old_it.next();
+                    let _ = new_it.next();
+                }
+            }
+        }
+        for o in old_it {
+            if matches!(o.locate, Locate::Source(_)) {
+                into.push((o.name, Woken::Keyed));
+            }
+        }
+        for n in new_it {
+            if matches!(n.locate, Locate::Source(_)) {
+                into.push((n.name, Woken::Keyed));
+            }
+        }
+        return;
+    }
     let source_of = |parts: &[Part], name: Name| parts.iter().find(|part| part.name == name).map(|part| part.locate);
     for part in new.iter().chain(old.iter().filter(|part| new.iter().all(|now| now.name != part.name))) {
         if matches!(part.locate, Locate::Source(_)) && source_of(new, part.name) != source_of(old, part.name) {
@@ -522,6 +684,7 @@ pub(crate) fn wake<'a>(
     stored: &Stored<'_>,
     tools: &blaze_engine::Tools,
     outlined: &[crate::engine_tasks::Outlined<'_>],
+    given: &[(Name, ContentId)],
     files: &[(Name, &[blaze_engine::Planned])],
     alloc: blaze_own::SharedAlloc<'a>,
 ) -> Result<(SVec<'a, Name>, Woke), CliError> {
@@ -530,8 +693,36 @@ pub(crate) fn wake<'a>(
     let mut moved: SVec<'a, Moved> = SVec::new_in(alloc);
     let mut woken: SVec<'a, (Name, Woken)> = SVec::new_in(alloc);
     for &(file, group) in files.iter() {
-        // An entry of the edit that is no source file's (a crate's, a script read's): its own
-        // task enters by its key, and `admit` names it when its kind is not the ready path's.
+        // A moved checkout read (`Kind::Given`): its `WHOLE` cell moves to today's answer digest,
+        // waking its stored readers (bodies reading an `include_str!` data file stay on `ready`;
+        // any woken `Script` task is refused by `admit` with `PhasesWhy::ScriptRead`).
+        if file.kind == blaze_drive::Kind::Given {
+            if group.is_empty() {
+                if let Some(row) = page_for(stored, file, blaze_engine::Ask::Row)?.and_then(|page| page.row(file)) {
+                    moved_cells(file, row.defines(), &[], &mut moved);
+                }
+                continue;
+            }
+            let answer = given
+                .binary_search_by_key(&file, |(name, _)| *name)
+                .ok()
+                .and_then(|at| given.get(at))
+                .map(|&(_, answer)| answer)
+                .ok_or_else(|| EngineCheckError::ReadyHost {
+                    task: file,
+                    what: "a moved `Given` task with no planned checkout read answer (engine_ready_edit.rs `wake`)",
+                })?;
+            let now = [(crate::engine_tasks::WHOLE, answer)];
+            if let Some(row) = page_for(stored, file, blaze_engine::Ask::Row)?.and_then(|page| page.row(file)) {
+                moved_cells(file, row.defines(), &now, &mut moved);
+            } else {
+                moved_cells(file, core::iter::empty(), &now, &mut moved);
+            }
+            woken.push((file, Woken::Keyed));
+            continue;
+        }
+        // An entry of the edit that is no source file's or checkout read's: its own task enters by
+        // its key, and `admit` names it when its kind is not the ready path's.
         if file.kind != blaze_drive::Kind::FileItems {
             woken.push((file, Woken::Keyed));
             continue;

@@ -128,7 +128,7 @@ impl<'a> AsyncInteriors<'a> {
             return;
         }
         for (i, x) in view.exprs.iter().enumerate() {
-            if !matches!(x, tc::Expr::AsyncBlock { .. }) {
+            if !matches!(x, tc::Expr::AsyncBlock { .. } | tc::Expr::Closure { is_async: true, .. }) {
                 continue;
             }
             let block = tc::ExprId(i as u32);
@@ -179,8 +179,8 @@ fn storage_tuple<'a>(
     let saved = w.saved(alloc).map_err(|_| tc::CheckError::FutureWitness {
         reason: "saved-local analysis exceeded its bound", at: w.range(),
     })?;
-    // The witness lays one argument per whole-binding row of the block (its layout's count).
-    let rows = done.captures.column::<0>().iter().filter(|b| **b == block).count();
+    // The witness lays one argument per captured place field (`coroutine.rs::run_async`).
+    let rows = done.env_fields_by::<tc::Places>(block).count();
     if rows != w.args() as usize {
         return Err(invalid);
     }
@@ -283,7 +283,7 @@ impl<'a> Decision<'a> {
 /// rows pushed into `reads` (the module doc).
 pub fn decide_stalled_goals<'n, 'a, S: NamesSource<'n>>(
     r: &mut Records<'_, 'n, S>,
-    body: &Body<'n>,
+    body: &Body<'_>,
     done: &tc::Checked<'_>,
     interiors: &AsyncInteriors<'a>,
     reads: &mut AVec<'a, Read>,
@@ -328,17 +328,44 @@ pub fn decide_stalled_goals<'n, 'a, S: NamesSource<'n>>(
     for _ in 0..MOST_ROUNDS {
         r.store.hidden.set_leaking(&leaks);
         let mut failed_fields = AVec::new_in(alloc);
-        let (got, fills, gaps) = {
-            let tys = match body.tys.view(&r.store.tys) {
-                Ok(t) => t,
-                Err(error) => return check(error),
-            };
-            let view = body.typeck.view(tys);
-            let world = world_at(r, &scope);
-            let got = done.decide_stalled_with_storage(&view, out, &interiors.exact, &world, alloc, |d, block, field| {
-                failed_fields.push((d, block, field));
-            });
-            (got, world.fills.into_inner(), world.gaps.into_inner())
+        let taken = match r.store.round_scratch.take() {
+            Some(frame) => Ok(frame),
+            None => blaze_mem::Frame::with_reserve(1 << 30, blaze_mem::Tag::Infer),
+        };
+        let round_res = match taken {
+            Ok(mut rf) => {
+                let res = rf.scope(|frame| {
+                    let erased = blaze_own::Erased::new(frame);
+                    let tys = match body.tys.view(&r.store.tys) {
+                        Ok(t) => t,
+                        Err(error) => return Err(error),
+                    };
+                    let view = body.typeck.view(tys);
+                    let world = world_at(r, &scope);
+                    let got = done.decide_stalled_with_storage_in(&view, out, &interiors.exact, &world, erased.handle(), alloc, |d, block, field| {
+                        failed_fields.push((d, block, field));
+                    });
+                    Ok((got, world.fills.into_inner(), world.gaps.into_inner()))
+                });
+                r.store.round_scratch = Some(rf);
+                res
+            }
+            Err(_) => {
+                let tys = match body.tys.view(&r.store.tys) {
+                    Ok(t) => t,
+                    Err(error) => return check(error),
+                };
+                let view = body.typeck.view(tys);
+                let world = world_at(r, &scope);
+                let got = done.decide_stalled_with_storage_in(&view, out, &interiors.exact, &world, alloc, alloc, |d, block, field| {
+                    failed_fields.push((d, block, field));
+                });
+                Ok((got, world.fills.into_inner(), world.gaps.into_inner()))
+            }
+        };
+        let (got, fills, gaps) = match round_res {
+            Ok(triple) => triple,
+            Err(error) => return check(error),
         };
         // A failed candidate makes the decision no answer, as it makes a check's.
         if !gaps.is_empty() {
@@ -373,6 +400,14 @@ pub fn decide_stalled_goals<'n, 'a, S: NamesSource<'n>>(
             // leaked and still unknown, the gap stands, naming the opaque.
             Err(tc::StalledError::Check(error @ tc::CheckError::OpaqueHiddenUnknown { .. })) => {
                 match super::opaque_auto::after_auto_gap(r, owner, &error, &mut leaks) {
+                    Ok(true) => continue,
+                    Ok(false) => return check(error),
+                    Err(fail) => return Decision::Refused(Refused::Check(fail)),
+                }
+            }
+            Err(tc::StalledError::Check(error @ tc::CheckError::ForeignWitness { item, ordinal: None, .. })) => {
+                let probe = tc::CheckError::OpaqueHiddenUnknown { opaque: item, trait_: tc::ItemKey(0) };
+                match super::opaque_auto::after_auto_gap(r, owner, &probe, &mut leaks) {
                     Ok(true) => continue,
                     Ok(false) => return check(error),
                     Err(fail) => return Decision::Refused(Refused::Check(fail)),
@@ -455,7 +490,7 @@ pub fn decide_stalled_goals<'n, 'a, S: NamesSource<'n>>(
     }
     let mut questions = Vec::new_in(Global);
     questions.extend(last);
-    Decision::Refused(Refused::Check(super::check::rounds_fail(r, owner, "deciding the stalled goals of an async body", made, questions)))
+    Decision::Refused(Refused::Check(super::check::rounds_fail(r, owner, "deciding the stalled goals of an async body", made, MOST_ROUNDS, questions)))
 }
 
 impl AsyncInteriors<'_> {
@@ -576,7 +611,7 @@ impl AsyncInteriors<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use blaze_own::AVec;
     use blaze_typeck as tc;
 
@@ -584,6 +619,11 @@ mod tests {
     use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
     use crate::front2::project::{BodyRef, ProjectWorld};
     use crate::refusal::SourceFile;
+
+    pub(crate) fn fixture_toolchain() -> Toolchain {
+        let home = std::env::var("HOME").expect("HOME");
+        Toolchain::open(&mut DirShelf::new(format!("{home}/.blaze/v2/toolchain"))).expect("fixture toolchain")
+    }
 
     /// WHEN an async block's interior is exact: its witness was lowered (blaze-flow-lower
     /// `lower_async_witness`) and kept ([`AsyncInteriors::keep`]), or the check's own record is
@@ -612,17 +652,17 @@ fn local_send() {
 fn main() {}
 "#;
         let alloc = blaze_own::testing::heap().alloc();
-        let home = std::env::var("HOME").expect("HOME");
-        let tc = Toolchain::open(&mut DirShelf::new(format!("{home}/.blaze/v2/toolchain"))).expect("fixture toolchain");
+        let tc = fixture_toolchain();
         let files = [("/refused/src/main.rs".to_owned(), SOURCE.to_owned())];
         let user = UserCrate {
             name: "refused", dir: "/refused/", root: "/refused/src/main.rs", files: &files,
             edition: edition::PackageEdition::of_manifest("2024").expect("Rust 2024"), panic: blaze_build::Panic::Unwind,
         };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
+        let erased = blaze_own::Erased::new(&frame);
         let inputs = Inputs::new(&user, &tc).expect("fixture crate");
         let crates = inputs.crates();
-        let names = inputs.resolve(&crates, alloc).expect("fixture names");
-        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
         let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
         let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("fixture world");
         let bodies = world.bodies(alloc);
@@ -660,5 +700,199 @@ fn main() {}
         assert!(!verdict.is_clean() && verdict.reads.is_none(), "{verdict:?}");
         let shown = format!("{:?}", verdict.refused);
         assert!(shown.contains(PLANTED), "the refusal names the witness: {shown}");
+    }
+
+    /// `check_body` (`LazyProgram::check_one` — the `blaze run`/`blaze test` path) must decide
+    /// stalled async `Send` goals on their exact witness interior rather than refusing with
+    /// `INTERIOR_GAP`, while still rejecting a future that genuinely holds `!Send` across an
+    /// `.await` with E0277.
+    #[test]
+    fn check_body_decides_stalled_async_send_and_rejects_rc_across_await() {
+        use crate::front2::keys::checker_of;
+        use crate::front2::program::lazy::LazyProgram;
+        use crate::seam::FrontEnd;
+
+        const SEND_OK: &str = r#"
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
+
+fn accept(_: Pin<Box<dyn Future<Output = ()> + Send>>) {}
+
+fn main() {
+    let fut: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
+        let local = Rc::new(1u8);
+        drop(local);
+        async {}.await;
+    });
+    accept(fut);
+}
+"#;
+        const NOT_SEND: &str = r#"
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
+
+fn accept(_: Pin<Box<dyn Future<Output = ()> + Send>>) {}
+
+fn main() {
+    let fut: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
+        let local = Rc::new(1u8);
+        async {}.await;
+        drop(local);
+    });
+    accept(fut);
+}
+"#;
+        let alloc = blaze_own::testing::heap().alloc();
+        let tc = fixture_toolchain();
+        let check_main = |name: &'static str, source: &'static str| {
+            let dir = format!("/{name}/");
+            let root = format!("/{name}/src/main.rs");
+            let files = [(root.clone(), source.to_owned())];
+            let user = UserCrate {
+                name, dir: &dir, root: &root, files: &files,
+                edition: edition::PackageEdition::of_manifest("2024").expect("Rust 2024"), panic: blaze_build::Panic::Unwind,
+            };
+            let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
+            let erased = blaze_own::Erased::new(&frame);
+            let inputs = Inputs::new(&user, &tc).expect("fixture crate");
+            let crates = inputs.crates();
+            let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+            let sources = [SourceFile { path: "src/main.rs", text: source }];
+            let main_key = names
+                .items(0)
+                .find_map(|(item, _, _)| (names.item_text(item).and_then(|t| t.name) == Some("main")).then_some(checker_of(item)))
+                .expect("fixture `main`");
+            let mut lazy = LazyProgram::new(&names, &frame, &sources, Some(main_key), alloc).expect("lazy program");
+            lazy.check_one(main_key).map(|_| ())
+        };
+
+        check_main("stalled_ok", SEND_OK).expect("dropped-before-await Rc must check clean via LazyProgram::check_one");
+        let err = check_main("stalled_err", NOT_SEND).expect_err("held-across-await Rc must be rejected by LazyProgram::check_one");
+        let shown = format!("{err:?}");
+        assert!(
+            shown.contains("E0277") && shown.contains("Send"),
+            "expected E0277 Send diagnostic for non-Send future, got: {shown}"
+        );
+    }
+
+    /// An impl's where-clause `T::Future: Send` where `T = ServiceFn<closure>` returns an async
+    /// block (`reqwest::connect::connect_local_transport` / `hyper_rustls::HttpsConnector`) must
+    /// normalize `T::Future` when classifying stalled auto-trait clauses so the exact witness
+    /// interior decides `Send` (clean when `Send`, E0277 when holding `Rc` across `.await`)
+    /// rather than failing with E0283.
+    #[test]
+    fn check_body_decides_projected_future_send_clause_in_impl_where_bound() {
+        use crate::front2::keys::checker_of;
+        use crate::front2::program::lazy::LazyProgram;
+        use crate::seam::FrontEnd;
+
+        const COMMON: &str = r#"
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
+
+struct Uri;
+struct Io;
+trait Service<Request> {
+    type Response;
+    type Error;
+    type Future: Future<Output = Result<Self::Response, Self::Error>>;
+    fn call(&mut self, req: Request) -> Self::Future;
+}
+struct ServiceFn<T> { f: T }
+fn service_fn<T>(f: T) -> ServiceFn<T> { ServiceFn { f } }
+impl<T, F, Request, R, E> Service<Request> for ServiceFn<T>
+where
+    T: FnMut(Request) -> F,
+    F: Future<Output = Result<R, E>>,
+{
+    type Response = R;
+    type Error = E;
+    type Future = F;
+    fn call(&mut self, req: Request) -> Self::Future { (self.f)(req) }
+}
+struct HttpsConnector<T>(T);
+impl<T> Service<Uri> for HttpsConnector<T>
+where
+    T: Service<Uri>,
+    T::Response: Send + Unpin + 'static,
+    T::Future: Send + 'static,
+    T::Error: Send + 'static,
+{
+    type Response = T::Response;
+    type Error = T::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<T::Response, T::Error>> + Send>>;
+    fn call(&mut self, dst: Uri) -> Self::Future {
+        let f = self.0.call(dst);
+        Box::pin(f)
+    }
+}
+"#;
+        let send_ok = format!(
+            "{COMMON}\n\
+            async fn connect(dst: Uri) -> Result<Io, ()> {{\n\
+                let svc = service_fn(move |_| {{\n\
+                    let fut = core::future::ready(Ok::<Io, ()>(Io));\n\
+                    async move {{\n\
+                        let io = fut.await?;\n\
+                        Ok::<_, ()>(io)\n\
+                    }}\n\
+                }});\n\
+                let mut http = HttpsConnector(svc);\n\
+                http.call(dst).await\n\
+            }}\n\
+            fn main() {{ let _ = connect(Uri); }}\n"
+        );
+        let not_send = format!(
+            "{COMMON}\n\
+            async fn connect(dst: Uri) -> Result<Io, ()> {{\n\
+                let svc = service_fn(move |_| {{\n\
+                    let fut = core::future::ready(Ok::<Io, ()>(Io));\n\
+                    async move {{\n\
+                        let local = Rc::new(1u8);\n\
+                        let io = fut.await?;\n\
+                        drop(local);\n\
+                        Ok::<_, ()>(io)\n\
+                    }}\n\
+                }});\n\
+                let mut http = HttpsConnector(svc);\n\
+                http.call(dst).await\n\
+            }}\n\
+            fn main() {{ let _ = connect(Uri); }}\n"
+        );
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let tc = fixture_toolchain();
+        let check_connect = |name: &'static str, source: &str| {
+            let dir = format!("/{name}/");
+            let root = format!("/{name}/src/main.rs");
+            let files = [(root.clone(), source.to_owned())];
+            let user = UserCrate {
+                name, dir: &dir, root: &root, files: &files,
+                edition: edition::PackageEdition::of_manifest("2024").expect("Rust 2024"), panic: blaze_build::Panic::Unwind,
+            };
+            let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
+            let erased = blaze_own::Erased::new(&frame);
+            let inputs = Inputs::new(&user, &tc).expect("fixture crate");
+            let crates = inputs.crates();
+            let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+            let sources = [SourceFile { path: "src/main.rs", text: source }];
+            let connect_key = names
+                .items(0)
+                .find_map(|(item, _, _)| (names.item_text(item).and_then(|t| t.name) == Some("connect")).then_some(checker_of(item)))
+                .expect("fixture `connect`");
+            let mut lazy = LazyProgram::new(&names, &frame, &sources, Some(connect_key), alloc).expect("lazy program");
+            lazy.check_one(connect_key).map(|_| ())
+        };
+
+        check_connect("proj_future_ok", &send_ok).expect("projected Send future in HttpsConnector<ServiceFn<closure>> must check clean");
+        let err = check_connect("proj_future_err", &not_send).expect_err("projected !Send future holding Rc across await must fail");
+        let shown = format!("{err:?}");
+        assert!(
+            shown.contains("E0277") && shown.contains("Send"),
+            "expected E0277 Send diagnostic for projected !Send future, got: {shown}"
+        );
     }
 }

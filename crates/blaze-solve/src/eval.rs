@@ -65,6 +65,12 @@ pub enum Rule {
     HostEffect,
     /// `where const { COND }` (`Pred::ConstHolds`): see [`const_holds`].
     ConstHolds,
+    /// `for<F in fields(container)> F: Trait<args...>` matched against a param-env assumption
+    /// at index `Cand::n`.
+    ForFieldsEnv,
+    /// `for<F in fields(container)> F: Trait<args...>` proved structurally over the fields of
+    /// `Cand::a` (normalized container).
+    ForFieldsStructural,
     /// Two terms equal (an equation goal of the tests and of coherence).
     Eq,
 }
@@ -97,6 +103,7 @@ enum Kind {
     Trait,
     Alias,
     WellFormed,
+    ForFields,
     Other,
 }
 
@@ -105,6 +112,7 @@ fn kind_of(p: Pred) -> Kind {
         Pred::Trait { .. } => Kind::Trait,
         Pred::Projection { .. } | Pred::NormalizesTo { .. } => Kind::Alias,
         Pred::WellFormed(_) => Kind::WellFormed,
+        Pred::ForFields { .. } => Kind::ForFields,
         _ => Kind::Other,
     }
 }
@@ -209,6 +217,9 @@ pub struct Solver<'a, E = NoDerivation> {
     tmp: Vec<u32, Alloc<'a>>,
     frames: Vec<Frame, Alloc<'a>>,
     cands: Vec<Cand, Alloc<'a>>,
+    /// Reusable scratch buffer for `assemble` and `next_cand` so candidate assembly does not
+    /// allocate a fresh `Vec<Cand>` in the body's bump frame on every frame.
+    cands_buf: Vec<Cand, Alloc<'a>>,
     dones: Vec<Done, Alloc<'a>>,
     merge_dones: Vec<Done, Alloc<'a>>,
     goals: Vec<Pending, Alloc<'a>>,
@@ -242,17 +253,21 @@ pub struct Solver<'a, E = NoDerivation> {
     maybe: MaybeLog<'a>,
     /// Whether [`Solver::why_maybe`] is running: every hook of its rows tests this one flag.
     maybe_on: bool,
-    /// The plain-goal memo: a goal with no inference variable, by its own identity (mode,
-    /// env id, interned predicate handles, bound count), to its interned canonical input.
-    /// Such a goal's canonical words are a function of those handles alone (`goal_input`
-    /// reads `tys` only to resolve variables), so a hit skips the canonical walk. Only goals
-    /// whose canonical form has no variable are kept; at most [`MAX_PLAIN`] entries.
-    plain: Map<(TypingMode, Goal), u32, FixedState, Alloc<'a>>,
+    /// The plain-goal memo: a goal whose shallow-resolved top-level terms hold no bindable
+    /// inference variable, keyed by its resolved handles (mode, env id, bound count, resolved
+    /// predicate), to its interned canonical input. Such a goal's canonical words are a function
+    /// of those handles alone (`goal_input` reads `tys` only to resolve variables), so a hit
+    /// skips the canonical walk. Only goals whose canonical form has no variable are kept; at
+    /// most [`MAX_PLAIN`] entries.
+    plain: Map<PlainKey, u32, FixedState, Alloc<'a>>,
     /// Whether the root being solved shares its goals (its source hands a table:
     /// `facts::Source::goals`): `finish` then keeps each final goal in `share_new`.
     sharing: bool,
     /// The final goals of the root being solved, put when it ends (share.rs `NewGoal`).
     share_new: Vec<NewGoal, Alloc<'a>>,
+    /// Refused final-goal counts buffered during the current root (flushed in `share_after`),
+    /// avoiding pushing refused entries into `share_new`: `[Vars, Local, ConstHolds, Overflow, Scope, Full]`.
+    share_refused_pending: [u64; 6],
     /// The shared goals this solver took, in order (share.rs `GoalHit`): the one read each.
     share_hits: Vec<GoalHit, Alloc<'a>>,
     /// Scratch of the sharing: a key's words, an entry copied out, read ids, reads, a walk.
@@ -261,6 +276,11 @@ pub struct Solver<'a, E = NoDerivation> {
     share_ids: Vec<u32, Alloc<'a>>,
     share_reads: Vec<Read, Alloc<'a>>,
     share_work: Vec<(Ty, u32), Alloc<'a>>,
+    /// Per-body memo of facts already verified and replayed under [`share::ReplayMode::SameScope`]
+    /// (capped at [`MAX_PLAIN`], rule 18): maps `Question -> (digest, Option<read_id>)` so
+    /// repeated shared-goal hits verify and collect interned read ids in O(1) without calling
+    /// `Ask::replay`, `Source::fill`, or `ReadLog::intern` again.
+    share_verified: Map<Question, (u64, Option<u32>), FixedState, Alloc<'a>>,
     /// The step count ([`Solver::steps_now`]) when the root being solved started.
     steps_at: u64,
 }
@@ -493,6 +513,80 @@ impl<'a> Solver<'a, Derivations<'a>> {
     }
 }
 
+/// Key of the plain-goal memo (`Solver::plain`): a goal whose shallow-resolved top-level terms
+/// hold no bindable inference variable. Storing shallow-resolved term handles for the common
+/// predicate shapes avoids re-canonicalizing nested goals whose arguments are already-bound
+/// inference variables or freshly interned argument lists.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PlainKey {
+    mode: TypingMode,
+    env: EnvId,
+    bound: u32,
+    pred: PlainPred,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum PlainPred {
+    Trait1(Def, Polarity, Ty),
+    Trait2(Def, Polarity, Ty, Ty),
+    Trait3(Def, Polarity, Ty, Ty, Ty),
+    WellFormed(Ty),
+    NormalizesTo(Ty, Ty),
+    Projection(Ty, Ty),
+    Other(Pred),
+}
+
+fn plain_key<T: Tys>(tys: &T, mode: TypingMode, goal: Goal) -> Result<Option<PlainKey>, Stop> {
+    let infer_flags = if T::REGIONS_BIND { Flags::HAS_INFER | Flags::HAS_RE_INFER } else { Flags::HAS_INFER };
+    let resolve_plain = |t: Ty| -> Option<Ty> {
+        let r = tys.shallow_resolve(t);
+        (!tys.flags(r).has(infer_flags)).then_some(r)
+    };
+    let pred = match goal.pred {
+        Pred::Trait { trait_, args, polarity } if args.len == 1 => {
+            let Some(a0) = resolve_plain(tys.list_get(args, 0)) else { return Ok(None) };
+            PlainPred::Trait1(trait_, polarity, a0)
+        }
+        Pred::Trait { trait_, args, polarity } if args.len == 2 => {
+            let Some(a0) = resolve_plain(tys.list_get(args, 0)) else { return Ok(None) };
+            let Some(a1) = resolve_plain(tys.list_get(args, 1)) else { return Ok(None) };
+            PlainPred::Trait2(trait_, polarity, a0, a1)
+        }
+        Pred::Trait { trait_, args, polarity } if args.len == 3 => {
+            let Some(a0) = resolve_plain(tys.list_get(args, 0)) else { return Ok(None) };
+            let Some(a1) = resolve_plain(tys.list_get(args, 1)) else { return Ok(None) };
+            let Some(a2) = resolve_plain(tys.list_get(args, 2)) else { return Ok(None) };
+            PlainPred::Trait3(trait_, polarity, a0, a1, a2)
+        }
+        Pred::WellFormed(t) => {
+            let Some(r) = resolve_plain(t) else { return Ok(None) };
+            PlainPred::WellFormed(r)
+        }
+        Pred::NormalizesTo { alias, term } => {
+            let Some(a) = resolve_plain(alias) else { return Ok(None) };
+            let Some(t) = resolve_plain(term) else { return Ok(None) };
+            PlainPred::NormalizesTo(a, t)
+        }
+        Pred::Projection { alias, term } => {
+            let Some(a) = resolve_plain(alias) else { return Ok(None) };
+            let Some(t) = resolve_plain(term) else { return Ok(None) };
+            PlainPred::Projection(a, t)
+        }
+        other => {
+            let mut ok = true;
+            pred_terms(tys, other, &mut |t| {
+                ok &= !tys.flags(t).has(infer_flags);
+                Ok(())
+            })?;
+            if !ok {
+                return Ok(None);
+            }
+            PlainPred::Other(other)
+        }
+    };
+    Ok(Some(PlainKey { mode, env: goal.env, bound: goal.bound, pred }))
+}
+
 impl<'a, E: Emit> Solver<'a, E> {
     /// A solver recording into `emit`. A recording solver turns the auto-trait summaries off
     /// (every structural step is then a goal of its own, with its own choice) and skips the
@@ -519,6 +613,7 @@ impl<'a, E: Emit> Solver<'a, E> {
             tmp: Vec::new_in(alloc),
             frames: Vec::new_in(alloc),
             cands: Vec::new_in(alloc),
+            cands_buf: Vec::new_in(alloc),
             dones: Vec::new_in(alloc),
             merge_dones: Vec::new_in(alloc),
             goals: Vec::new_in(alloc),
@@ -542,12 +637,14 @@ impl<'a, E: Emit> Solver<'a, E> {
             plain: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             sharing: false,
             share_new: Vec::new_in(alloc),
+            share_refused_pending: [0; 6],
             share_hits: Vec::new_in(alloc),
             share_key: Vec::new_in(alloc),
             share_got: Taken::new_in(alloc),
             share_ids: Vec::new_in(alloc),
             share_reads: Vec::new_in(alloc),
             share_work: Vec::new_in(alloc),
+            share_verified: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
             steps_at: 0,
         };
         if E::ON {
@@ -750,6 +847,30 @@ impl<'a, E: Emit> Solver<'a, E> {
         goal: Goal,
         reads: &mut Vec<Read, Alloc<'a>>,
     ) -> Result<Answer, Stop> {
+        self.evaluate_from_opt(tys, src, mode, goal, Some(reads))
+    }
+
+    /// Like [`Solver::evaluate_from`], without exporting the solver's read list into a caller
+    /// `Vec<Read>` (used when the caller records reads through `src` and discards the exported
+    /// log, avoiding growing an unused `Vec<Read>` in the body's bump frame).
+    pub fn evaluate_from_quiet<T: Tys, S: FactSource<T>>(
+        &mut self,
+        tys: &mut T,
+        src: &mut S,
+        mode: TypingMode,
+        goal: Goal,
+    ) -> Result<Answer, Stop> {
+        self.evaluate_from_opt(tys, src, mode, goal, None)
+    }
+
+    fn evaluate_from_opt<T: Tys, S: FactSource<T>>(
+        &mut self,
+        tys: &mut T,
+        src: &mut S,
+        mode: TypingMode,
+        goal: Goal,
+        reads: Option<&mut Vec<Read, Alloc<'a>>>,
+    ) -> Result<Answer, Stop> {
         // The trace's root row (witness.rs): one test of `None` when off.
         let traced = match &self.trace {
             Some(t) => t.ask().matches(&*tys, goal.pred),
@@ -802,7 +923,7 @@ impl<'a, E: Emit> Solver<'a, E> {
         self.scratch.why_no = true;
         self.why.clear();
         self.why_on = true;
-        let r = self.evaluate_once(tys, src, mode, goal, reads);
+        let r = self.evaluate_once(tys, src, mode, goal, Some(reads));
         self.why_on = false;
         self.scratch.why_no = false;
         self.scratch.off = off;
@@ -834,7 +955,7 @@ impl<'a, E: Emit> Solver<'a, E> {
         self.maybe.clear();
         self.why_on = true;
         self.maybe_on = true;
-        let r = self.evaluate_once(tys, src, mode, goal, reads);
+        let r = self.evaluate_once(tys, src, mode, goal, Some(reads));
         self.why_on = false;
         self.maybe_on = false;
         self.scratch.off = off;
@@ -945,6 +1066,7 @@ impl<'a, E: Emit> Solver<'a, E> {
         let child = self.input_of(&*tys, f.mode, Goal { env: f.goal.env, pred: g.pred, bound: g.bound })?;
         let above = match f.goal.pred {
             Pred::Trait { args, .. } if args.len > 0 => Some(tys.kind(tys.shallow_resolve(tys.list_get(args, 0)))),
+            Pred::ForFields { container, .. } => Some(tys.kind(tys.shallow_resolve(container))),
             _ => None,
         };
         let reached = Reached::of(Some(Choice::of(&f.cand)), g.source, g.reach, above);
@@ -968,13 +1090,13 @@ impl<'a, E: Emit> Solver<'a, E> {
         src: &mut S,
         mode: TypingMode,
         goal: Goal,
-        reads: &mut Vec<Read, Alloc<'a>>,
+        mut reads: Option<&mut Vec<Read, Alloc<'a>>>,
     ) -> Result<Answer, Stop> {
         self.scratch.stats.evaluations += 1;
         // A recording solver frames every goal (`with_emit_in`), as `why_no` does.
         if !E::ON
             && !self.why_on
-            && let Some(a) = self.fast_path(tys, mode, goal, reads)
+            && let Some(a) = self.fast_path(tys, mode, goal, reads.as_deref_mut())
         {
             self.scratch.stats.fast_path += 1;
             return Ok(a);
@@ -988,7 +1110,9 @@ impl<'a, E: Emit> Solver<'a, E> {
                 self.origs.truncate(orig_lo as usize);
                 let answer = answer?;
                 self.remember_marker(tys, mode, goal, answer, reads_lo);
-                self.reads.export(reads_lo, reads);
+                if let Some(reads) = reads {
+                    self.reads.export(reads_lo, reads);
+                }
                 self.reads.seg.truncate(reads_lo);
                 self.resps.truncate_scratch((0, 0));
                 Ok(answer)
@@ -1036,12 +1160,14 @@ impl<'a, E: Emit> Solver<'a, E> {
 
     /// The ground fast path (solve.md (c)): a global ground type's answer for a marker trait,
     /// kept in its `markers` byte, with the reads it was valid by.
-    fn fast_path<T: Tys>(&mut self, tys: &T, mode: TypingMode, goal: Goal, reads: &mut Vec<Read, Alloc<'a>>) -> Option<Answer> {
+    fn fast_path<T: Tys>(&mut self, tys: &T, mode: TypingMode, goal: Goal, reads: Option<&mut Vec<Read, Alloc<'a>>>) -> Option<Answer> {
         let (t, m) = self.marker_of(tys, mode, goal)?;
         let holds = tys.markers(t).get(m)?;
         let &(s, l) = self.marker_reads.get(&(t.0, m as u8))?;
-        for &id in &self.marker_pool[s as usize..(s + l) as usize] {
-            reads.push(self.reads.read(id));
+        if let Some(reads) = reads {
+            for &id in &self.marker_pool[s as usize..(s + l) as usize] {
+                reads.push(self.reads.read(id));
+            }
         }
         Some(if holds { Answer::Yes } else { Answer::No })
     }
@@ -1084,14 +1210,10 @@ impl<'a, E: Emit> Solver<'a, E> {
     /// (`canonicalized`). `self.words` holds the canonical words only after a walk: read them
     /// back by `Inputs::words_of`.
     fn input_of<T: Tys>(&mut self, tys: &T, mode: TypingMode, goal: Goal) -> Result<u32, Stop> {
-        let mut plain = !self.scratch.off.memo;
-        if plain {
-            pred_terms(tys, goal.pred, &mut |t| {
-                plain &= !tys.flags(t).has(Flags::HAS_INFER | Flags::HAS_RE_INFER);
-                Ok(())
-            })?;
-        }
-        if plain && let Some(&input) = self.plain.get(&(mode, goal)) {
+        let key = if !self.scratch.off.memo { plain_key(tys, mode, goal)? } else { None };
+        if let Some(k) = key
+            && let Some(&input) = self.plain.get(&k)
+        {
             self.canon.clear();
             self.scratch.stats.canon_skipped += 1;
             return Ok(input);
@@ -1100,8 +1222,11 @@ impl<'a, E: Emit> Solver<'a, E> {
         self.scratch.stats.canonicalized += 1;
         self.scratch.stats.canon_words += self.words.len() as u64;
         let input = self.inputs.intern(&self.words)?;
-        if plain && self.canon.orig.is_empty() && self.plain.len() < MAX_PLAIN {
-            let _ = self.plain.insert((mode, goal), input);
+        if let Some(k) = key
+            && self.canon.orig.is_empty()
+            && self.plain.len() < MAX_PLAIN
+        {
+            let _ = self.plain.insert(k, input);
         }
         Ok(input)
     }
@@ -1161,6 +1286,7 @@ impl<'a, E: Emit> Solver<'a, E> {
         }
         self.sharing = src.goals().is_some();
         self.share_new.clear();
+        self.share_refused_pending = [0; 6];
         self.steps_at = self.steps_now();
         let mut snaps: Vec<T::Snapshot, Alloc<'a>> = Vec::new_in(self.alloc);
         let mut probes: Vec<Option<T::Snapshot>, Alloc<'a>> = Vec::new_in(self.alloc);
@@ -1175,6 +1301,7 @@ impl<'a, E: Emit> Solver<'a, E> {
             Err(e) => Err(e),
         };
         self.share_new.clear();
+        self.share_refused_pending = [0; 6];
         match r {
             Ok(ans) => Ok((ans, orig_lo)),
             Err(e) => {
@@ -1313,16 +1440,31 @@ impl<'a, E: Emit> Solver<'a, E> {
         if !found {
             return Ok(Shared::Miss);
         }
+        let plant = opts.plant_hit_without_read;
+        let record_ids = !opts.one_read_only && !plant && !opts.audit;
+        let mut ids = core::mem::replace(&mut self.share_ids, Vec::new_in(self.alloc));
+        ids.clear();
         // THE SCOPE: the entry is taken only if every fact it read answers the same digest in
         // this body's facts (filled where they lack one, as solving the goal here would).
-        if !opts.one_read_only && !self.share_replay(tys, src, &got.reads)? {
-            self.count_refused(Refuse::Scope);
-            return Ok(Shared::Miss);
+        if !opts.one_read_only {
+            let replayed = self.share_replay(tys, src, &got.reads, opts.replay, record_ids, &mut ids);
+            match replayed {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.share_ids = ids;
+                    self.count_refused(Refuse::Scope);
+                    return Ok(Shared::Miss);
+                }
+                Err(e) => {
+                    self.share_ids = ids;
+                    return Err(e);
+                }
+            }
         }
-        let plant = opts.plant_hit_without_read;
         self.scratch.stats.shared_hits += 1;
         self.share_hits.push(GoalHit { key: digest, reads_digest: got.reads_digest });
         if opts.audit {
+            self.share_ids = ids;
             // THE AUDIT: the hit is solved again by the caller (`evaluate_root`), the fresh
             // solve's reads are the ones recorded, and `share_after` compares.
             let hit_reads = if plant || opts.one_read_only { share::reads_digest(&[]) } else { got.reads_digest };
@@ -1334,11 +1476,11 @@ impl<'a, E: Emit> Solver<'a, E> {
             Some((c, via)) => Some(self.resps.push_cached(&got.words, c, via)?),
             None => None,
         };
-        let mut ids = core::mem::replace(&mut self.share_ids, Vec::new_in(self.alloc));
-        ids.clear();
-        if !opts.one_read_only && !plant {
-            for &r in got.reads.iter() {
-                ids.push(self.reads.intern(r)?);
+        if record_ids {
+            if matches!(opts.replay, share::ReplayMode::Standard) {
+                for &r in got.reads.iter() {
+                    ids.push(self.reads.intern(r)?);
+                }
             }
             // SOUND WITH TODAY'S ENGINE (plan row A4, this piece): the hit ALSO appends the
             // goal's own reads to the body's list, exactly as solving the goal in the body
@@ -1361,14 +1503,64 @@ impl<'a, E: Emit> Solver<'a, E> {
     /// the digest the entry holds. A fact the facts lack is filled by the source (and noted in
     /// the body's own list by it, as solving would); one it does not fill stops the root
     /// (`Stop::Need`), and the caller fills it and asks again.
-    fn share_replay<T: Tys, S: FactSource<T>>(&mut self, tys: &mut T, src: &mut S, reads: &[Read]) -> Result<bool, Stop> {
+    ///
+    /// Under [`share::ReplayMode::SameScope`], verified non-opaque questions and their interned
+    /// read ids are memoized in `share_verified` so repeated hits in the same body verify and
+    /// populate `ids` in O(1).
+    fn share_replay<T: Tys, S: FactSource<T>>(
+        &mut self,
+        tys: &mut T,
+        src: &mut S,
+        reads: &[Read],
+        mode: share::ReplayMode,
+        record_ids: bool,
+        ids: &mut Vec<u32, Alloc<'a>>,
+    ) -> Result<bool, Stop> {
+        let same_scope = matches!(mode, share::ReplayMode::SameScope);
         for r in reads {
+            if same_scope
+                && let Some(&(seen, cached_id)) = self.share_verified.get(&r.question)
+            {
+                if seen != r.digest {
+                    return Ok(false);
+                }
+                if record_ids {
+                    let id = match cached_id {
+                        Some(id) => id,
+                        None => {
+                            let id = self.reads.intern(*r)?;
+                            if let Some(slot) = self.share_verified.get_mut(&r.question) {
+                                slot.1 = Some(id);
+                            }
+                            id
+                        }
+                    };
+                    ids.push(id);
+                }
+                continue;
+            }
             let mut filled = 0u32;
             loop {
                 let got = Ask::new(src.facts()).replay(r.question);
                 match got {
-                    Ok(d) if d == r.digest => break,
-                    Ok(_) => return Ok(false),
+                    Ok(d) => {
+                        if d != r.digest {
+                            return Ok(false);
+                        }
+                        let mut cached_id = None;
+                        if same_scope && record_ids {
+                            let id = self.reads.intern(*r)?;
+                            ids.push(id);
+                            cached_id = Some(id);
+                        }
+                        if same_scope
+                            && !matches!(r.question, Question::Opaque(_) | Question::OpaqueHidden(_) | Question::ConstHolds(..))
+                            && self.share_verified.len() < MAX_PLAIN
+                        {
+                            let _ = self.share_verified.insert(r.question, (d, cached_id));
+                        }
+                        break;
+                    }
                     Err(Stop::Need(q)) if S::PULLS && filled < MAX_PULLS => {
                         if !src.fill(tys, q) {
                             return Err(Stop::Need(q));
@@ -1387,6 +1579,15 @@ impl<'a, E: Emit> Solver<'a, E> {
     /// audit's comparison when the root was a hit solved again.
     fn share_after<T: Tys, S: FactSource<T>>(&mut self, tys: &T, src: &S, root_ans: Ans, root_lo: usize, goal: Goal, audit: Option<Audit<'a>>) -> Result<(), Stop> {
         let Some(table) = src.goals() else { return Ok(()) };
+        let pending = core::mem::take(&mut self.share_refused_pending);
+        let s = &mut self.scratch.stats;
+        s.shared_refused += pending[0] + pending[1] + pending[2] + pending[3] + pending[4] + pending[5];
+        s.shared_refused_vars += pending[0];
+        s.shared_refused_local += pending[1];
+        s.shared_refused_const_holds += pending[2];
+        s.shared_refused_overflow += pending[3];
+        s.shared_refused_scope += pending[4];
+        s.shared_refused_full += pending[5];
         let news = core::mem::replace(&mut self.share_new, Vec::new_in(self.alloc));
         let mut kw = core::mem::replace(&mut self.share_key, Vec::new_in(self.alloc));
         let mut rs = core::mem::replace(&mut self.share_reads, Vec::new_in(self.alloc));
@@ -1441,22 +1642,49 @@ impl<'a, E: Emit> Solver<'a, E> {
                 self.count_refused(why);
                 continue;
             }
-            rs.clear();
             let mut const_holds = false;
+            let mut local_read = false;
             for &id in self.inputs.reads_of(&n.entry) {
-                let read = self.reads.read(id);
-                const_holds |= matches!(read.question, Question::ConstHolds(..));
-                rs.push(read);
+                match self.reads.read(id).question {
+                    Question::ConstHolds(..) => const_holds = true,
+                    // An opaque's hidden type (and its digest when read inside its defining body)
+                    // and any closure/coroutine impl bucket depend on the asking body's scope:
+                    // never put into the shared table, lest another body replay reads that sort
+                    // before the scope mismatch (rules 21, 25).
+                    Question::Opaque(_)
+                    | Question::OpaqueHidden(_)
+                    | Question::Impls(_, crate::term::Shape::Closure(_) | crate::term::Shape::Coroutine(_)) => {
+                        local_read = true;
+                    }
+                    _ => {}
+                }
             }
             if const_holds {
                 self.count_refused(Refuse::ConstHolds);
                 continue;
             }
+            if local_read {
+                self.count_refused(Refuse::Local);
+                continue;
+            }
+            self.key_words(n.input, kw)?;
+            let key = GoalKey { digest: share::key_digest(&kw[..]), words: &kw[..] };
+            match table.contains(key) {
+                Ok(true) => {
+                    self.scratch.stats.shared_present += 1;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(ShareRefused::Collision { digest }) => return Err(Stop::Error(SolveError::Share(ShareError::Collision { digest }))),
+                Err(ShareRefused::Full { .. }) => {}
+            }
+            rs.clear();
+            for &id in self.inputs.reads_of(&n.entry) {
+                rs.push(self.reads.read(id));
+            }
             rs.sort_unstable();
             rs.dedup();
             let reads_digest = share::reads_digest(rs);
-            self.key_words(n.input, kw)?;
-            let key = GoalKey { digest: share::key_digest(&kw[..]), words: &kw[..] };
             let ans = n.entry.ans.map(|id| SharedAns { certainty: self.resps.certainty(id), via: self.resps.via(id), words: self.resps.words_of(id) });
             let put = table.put(key, SharedGoal { ans, required_depth: n.entry.required_depth, overflow: n.overflow, reads: &rs[..], reads_digest });
             match put {
@@ -1593,7 +1821,7 @@ impl<'a, E: Emit> Solver<'a, E> {
                 self.nested(tys, snaps, probes, top)?;
             }
             Phase::Merge => {
-                let ans = self.pull(tys, src, top, |s, _, facts| s.merge(facts, top))?;
+                let ans = self.merge(tys, src, top)?;
                 return self.finish(tys, snaps, probes, top, ans);
             }
         }
@@ -1723,7 +1951,7 @@ impl<'a, E: Emit> Solver<'a, E> {
         // `step_kind_for_source` through `CurrentGoalKind`: a coinductive trait's nested goals
         // are coinductive steps, a projection's unknown, any other goal's forced ambiguity.
         let to_nested = match goal.pred {
-            Pred::Trait { trait_, .. } => {
+            Pred::Trait { trait_, .. } | Pred::ForFields { trait_, .. } => {
                 let d = cx.trait_def(trait_)?;
                 if d.flags.has(TraitFlags::AUTO) || d.flags.has(TraitFlags::COINDUCTIVE) {
                     PathKind::Coinductive
@@ -1754,38 +1982,44 @@ impl<'a, E: Emit> Solver<'a, E> {
         // `out` holds the candidates of earlier stages: a stage may keep a row there for a
         // later one (alias.rs's stash) and remove it. The rows stay in `cands` until the stage
         // answered, so a pulled stage starts again from them.
-        let (r, out, st) = self.pull(tys, src, top, |s, tys, facts| {
-            let mut out: Vec<Cand, Alloc<'a>> = Vec::new_in(s.alloc);
+        let (r, st) = self.pull(tys, src, top, |s, tys, facts| {
+            let mut out = core::mem::replace(&mut s.cands_buf, Vec::new_in(s.alloc));
+            out.clear();
             out.extend_from_slice(&s.cands[f.cands_lo as usize..]);
             let mut st = f.tstate;
-            let mut cx = s.cx(tys, facts, top);
-            let r = match f.kind {
-                Kind::Trait => trait_goals::assemble(&mut cx, stage, &mut st, &mut out)?,
-                Kind::Alias => crate::alias::assemble(&mut cx, stage, &mut out)?,
-                Kind::WellFormed => {
-                    let Pred::WellFormed(t) = f.goal.pred else { return Err(Stop::Error(SolveError::Malformed(crate::error::bad_pred()))) };
-                    crate::structural::assemble_wf(&mut cx, t, &mut out)?;
-                    AStep::Done
-                }
-                Kind::Other => {
-                    let rule = match f.goal.pred {
-                        Pred::TypeOutlives { .. } | Pred::RegionOutlives { .. } => Rule::Outlives,
-                        Pred::Subtype { .. } | Pred::Coerce { .. } => Rule::Relate,
-                        Pred::ConstEvaluatable(_) => Rule::ConstEvaluatable,
-                        Pred::DynCompatible(_) => Rule::DynCompatible,
-                        Pred::ConstArgHasType { .. } => Rule::ConstArgHasType,
-                        Pred::HostEffect { .. } => Rule::HostEffect,
-                        Pred::ConstHolds { .. } => Rule::ConstHolds,
-                        _ => Rule::Eq,
-                    };
-                    out.push(Cand::new(Source::Builtin(crate::assembly::BuiltinSource::Misc), CandRule::Other(rule)));
-                    AStep::Done
+            let res = {
+                let mut cx = s.cx(tys, facts, top);
+                match f.kind {
+                    Kind::Trait => trait_goals::assemble(&mut cx, stage, &mut st, &mut out),
+                    Kind::Alias => crate::alias::assemble(&mut cx, stage, &mut out),
+                    Kind::WellFormed => {
+                        let Pred::WellFormed(t) = f.goal.pred else {
+                            return Err(Stop::Error(SolveError::Malformed(crate::error::bad_pred())));
+                        };
+                        crate::structural::assemble_wf(&mut cx, t, &mut out).map(|()| AStep::Done)
+                    }
+                    Kind::ForFields => assemble_for_fields(&mut cx, stage, &mut st, &mut out),
+                    Kind::Other => {
+                        let rule = match f.goal.pred {
+                            Pred::TypeOutlives { .. } | Pred::RegionOutlives { .. } => Rule::Outlives,
+                            Pred::Subtype { .. } | Pred::Coerce { .. } => Rule::Relate,
+                            Pred::ConstEvaluatable(_) => Rule::ConstEvaluatable,
+                            Pred::DynCompatible(_) => Rule::DynCompatible,
+                            Pred::ConstArgHasType { .. } => Rule::ConstArgHasType,
+                            Pred::HostEffect { .. } => Rule::HostEffect,
+                            Pred::ConstHolds { .. } => Rule::ConstHolds,
+                            _ => Rule::Eq,
+                        };
+                        out.push(Cand::new(Source::Builtin(crate::assembly::BuiltinSource::Misc), CandRule::Other(rule)));
+                        Ok(AStep::Done)
+                    }
                 }
             };
-            Ok((r, out, st))
+            s.cands_buf = out;
+            Ok((res?, st))
         })?;
         self.cands.truncate(f.cands_lo as usize);
-        self.cands.extend_from_slice(&out);
+        self.cands.extend_from_slice(&self.cands_buf);
         self.take_added();
         let fr = &mut self.frames[top];
         fr.tstate = st;
@@ -1843,15 +2077,19 @@ impl<'a, E: Emit> Solver<'a, E> {
             let done = &self.dones[f.dones_lo as usize..];
             if trait_goals::wants_impls(f.mode, &f.tstate, &self.resps, done) {
                 let st = f.tstate;
-                let out = self.pull(tys, src, top, |s, tys, facts| {
-                    let mut out: Vec<Cand, Alloc<'a>> = Vec::new_in(s.alloc);
-                    let mut cx = s.cx(tys, facts, top);
-                    trait_goals::assemble_impls(&mut cx, &st, &mut out)?;
-                    Ok(out)
+                self.pull(tys, src, top, |s, tys, facts| {
+                    let mut out = core::mem::replace(&mut s.cands_buf, Vec::new_in(s.alloc));
+                    out.clear();
+                    let res = {
+                        let mut cx = s.cx(tys, facts, top);
+                        trait_goals::assemble_impls(&mut cx, &st, &mut out)
+                    };
+                    s.cands_buf = out;
+                    res
                 })?;
-                self.scratch.stats.impl_candidates += out.iter().filter(|c| matches!(c.source, Source::Impl(_))).count() as u64;
+                self.scratch.stats.impl_candidates += self.cands_buf.iter().filter(|c| matches!(c.source, Source::Impl(_))).count() as u64;
                 self.added.clear();
-                self.cands.extend_from_slice(&out);
+                self.cands.extend_from_slice(&self.cands_buf);
                 return Ok(());
             }
         }
@@ -1881,7 +2119,7 @@ impl<'a, E: Emit> Solver<'a, E> {
                 CandRule::Structural(r) => crate::structural::step(&mut cx, &mut cand, r, stage)?,
                 CandRule::Alias(r) => crate::alias::step(&mut cx, &mut cand, r, stage)?,
                 CandRule::Coherence(r) => crate::coherence::step(&mut cx, &mut cand, r, stage)?,
-                CandRule::Other(r) => step_other(&mut cx, r)?,
+                CandRule::Other(r) => step_other(&mut cx, &cand, r)?,
             };
             Ok((r, cand))
         })?;
@@ -2030,6 +2268,7 @@ impl<'a, E: Emit> Solver<'a, E> {
             };
             let above = match f.goal.pred {
                 Pred::Trait { args, .. } if args.len > 0 => Some(tys.kind(tys.shallow_resolve(tys.list_get(args, 0)))),
+                Pred::ForFields { container, .. } => Some(tys.kind(tys.shallow_resolve(container))),
                 _ => None,
             };
             let reached = Reached::of(cand, g.source, g.reach, above);
@@ -2284,26 +2523,46 @@ impl<'a, E: Emit> Solver<'a, E> {
         Ok(Got::Pushed)
     }
 
-    fn merge<F: Facts>(&mut self, facts: &F, top: usize) -> Result<Ans, Stop> {
+    fn merge<T: Tys, S: FactSource<T>>(&mut self, tys: &mut T, src: &mut S, top: usize) -> Result<Ans, Stop> {
         let f = self.frames[top];
         self.merge_dones.clear();
         self.merge_dones.extend_from_slice(&self.dones[f.dones_lo as usize..]);
         let mut m = Merger { resps: &mut self.resps, vars: f.vars, bail: None };
         // Specialization between two impl candidates, a fact of the impls read like any other
-        // (the frame's read list keeps it).
-        let ask = Ask::new(facts);
+        // (the frame's read list keeps it). Pull missing pairs in place so `filter_specialized_impls`
+        // does not restart from `(0, 0)` on every miss (avoiding O(N^4) rescans).
         self.reads.lo = f.reads_lo;
         let reads = &mut self.reads;
         let dones = &mut self.merge_dones;
-        let mut specializes = |a: Def, b: Def| ask.specializes(reads, a, b);
-        let ans = match f.kind {
-            Kind::Trait => match trait_goals::merge(&mut m, f.mode, &f.tstate, dones, &mut specializes)? {
-                Some((r, via)) => Some(m.with_via(r, via)?),
-                None => None,
-            },
-            Kind::Alias => crate::alias::merge(&mut m, f.mode, f.goal.pred, dones, &mut specializes)?,
-            Kind::WellFormed | Kind::Other => m.merge_responses(dones)?,
+        let mut pulls = 0u32;
+        let mut specializes = |a: Def, b: Def| -> Result<bool, Stop> {
+            loop {
+                match Ask::new(src.facts()).specializes(reads, a, b) {
+                    Ok(v) => return Ok(v),
+                    Err(Stop::Need(q)) if S::PULLS => {
+                        if pulls >= MAX_PULLS {
+                            return Err(Stop::Error(SolveError::Limit(Limit::Pulls)));
+                        }
+                        if !src.fill(tys, q) {
+                            return Err(Stop::Need(q));
+                        }
+                        pulls += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
         };
+        let merged = match f.kind {
+            Kind::Trait => match trait_goals::merge(&mut m, f.mode, &f.tstate, dones, &mut specializes) {
+                Ok(Some((r, via))) => Ok(Some(m.with_via(r, via)?)),
+                Ok(None) => Ok(None),
+                Err(e) => Err(e),
+            },
+            Kind::Alias => crate::alias::merge(&mut m, f.mode, f.goal.pred, dones, &mut specializes),
+            Kind::WellFormed | Kind::ForFields | Kind::Other => m.merge_responses(dones).map_err(Stop::Error),
+        };
+        self.scratch.stats.pulls += u64::from(pulls);
+        let ans = merged?;
         let bail = m.bail;
         if self.maybe_on {
             self.maybe_merged(top, ans, bail);
@@ -2435,7 +2694,15 @@ impl<'a, E: Emit> Solver<'a, E> {
             // alone (share.rs). A nested goal's overflow holds only at its depth: not put.
             if let Some(why) = share_why {
                 let why = if why.is_none() && f.overflow && top != 0 { Some(Refuse::Overflow) } else { why };
-                self.share_new.push(NewGoal { input: f.input, entry, overflow: f.overflow, why });
+                match why {
+                    Some(Refuse::Vars) => self.share_refused_pending[0] += 1,
+                    Some(Refuse::Local) => self.share_refused_pending[1] += 1,
+                    Some(Refuse::ConstHolds) => self.share_refused_pending[2] += 1,
+                    Some(Refuse::Overflow) => self.share_refused_pending[3] += 1,
+                    Some(Refuse::Scope) => self.share_refused_pending[4] += 1,
+                    Some(Refuse::Full) => self.share_refused_pending[5] += 1,
+                    None => self.share_new.push(NewGoal { input: f.input, entry, overflow: f.overflow, why: None }),
+                }
             }
         } else if let Some(highest) = heads.highest() {
             self.scratch.stats.provisional += 1;
@@ -2539,6 +2806,10 @@ fn pred_terms<T: Tys>(tys: &T, p: Pred, f: &mut impl FnMut(Ty) -> Result<(), Sol
     };
     match p {
         Pred::Trait { args, .. } | Pred::HostEffect { args, .. } | Pred::ConstHolds { args, .. } => list(args, f),
+        Pred::ForFields { container, args_after_self, .. } => {
+            f(container)?;
+            list(args_after_self, f)
+        }
         Pred::Projection { alias: a, term: b }
         | Pred::NormalizesTo { alias: a, term: b }
         | Pred::TypeOutlives { ty: a, region: b }
@@ -2577,6 +2848,11 @@ fn import_pred<T: Tys>(
         Pred::ConstHolds { cond, args: a } => {
             Pred::ConstHolds { cond, args: fold::import_list_at(tys, s, p, a, inst, at)? }
         }
+        Pred::ForFields { container, trait_, args_after_self } => Pred::ForFields {
+            container: fold::import_at(tys, s, p, container, inst, at)?,
+            trait_,
+            args_after_self: fold::import_list_at(tys, s, p, args_after_self, inst, at)?,
+        },
         Pred::Projection { alias: a, term: b }
         | Pred::TypeOutlives { ty: a, region: b }
         | Pred::RegionOutlives { a, b } => {
@@ -2597,7 +2873,7 @@ fn import_pred<T: Tys>(
 }
 
 /// The steps of [`Rule`].
-fn step_other<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, rule: Rule) -> Result<Step, Stop> {
+fn step_other<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand, rule: Rule) -> Result<Step, Stop> {
     let bad = || Stop::Error(SolveError::Malformed(crate::error::bad_pred()));
     let is_var = |k: TyKind| matches!(k, TyKind::Infer(v) if v.kind == VarKind::Ty);
     Ok(match rule {
@@ -2637,12 +2913,138 @@ fn step_other<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, rule: Rule) -> Result
             let Pred::ConstHolds { cond, args } = cx.goal.pred else { return Err(bad()) };
             const_holds(cx, cond, args)?
         }
+        Rule::ForFieldsEnv => step_for_fields_env(cx, cand.n)?,
+        Rule::ForFieldsStructural => step_for_fields_structural(cx, cand.a)?,
         Rule::HostEffect => {
             let Pred::HostEffect { trait_, args, .. } = cx.goal.pred else { return Err(bad()) };
             cx.add(GoalSource::Misc, Pred::Trait { trait_, args, polarity: Polarity::Positive });
             Step::Done(Certainty::Yes)
         }
     })
+}
+
+/// Assembles candidates for `Pred::ForFields { container, trait_, args_after_self }`:
+/// stage 0 normalizes a non-rigid alias container via `Projection`; stage 1 emits one
+/// `ParamEnv` candidate per matching `ForFields` assumption plus one structural candidate.
+fn assemble_for_fields<T: Tys, F: Facts>(
+    cx: &mut Cx<'_, '_, T, F>,
+    stage: u8,
+    st: &mut trait_goals::State,
+    out: &mut Vec<Cand, Alloc<'_>>,
+) -> Result<AStep, Stop> {
+    let Pred::ForFields { container, trait_, .. } = cx.goal.pred else {
+        return Err(Stop::Error(SolveError::Malformed(crate::error::bad_pred())));
+    };
+    if stage == 0 {
+        let container = cx.resolve(container);
+        st.self_ty = container;
+        if crate::alias::needs_normalizing(cx, container)? {
+            let v = cx.fresh_ty()?;
+            cx.add(GoalSource::NormalizeGoal, Pred::Projection { alias: container, term: v });
+            st.self_ty = v;
+            return Ok(AStep::Then(1));
+        }
+    }
+    let container = cx.resolve(st.self_ty);
+    // Step A: ParamEnv assumptions for the same trait.
+    for (i, c) in (0u32..).zip(cx.env.iter()) {
+        if let Pred::ForFields { trait_: env_tr, .. } = c.pred
+            && env_tr == trait_
+        {
+            let mut cand = Cand::new(Source::ParamEnv { global: false }, CandRule::Other(Rule::ForFieldsEnv));
+            cand.d = trait_;
+            cand.n = i;
+            out.push(cand);
+        }
+    }
+    // Steps B, C, D: structural decomposition of `container`.
+    let mut cand = Cand::new(Source::Builtin(crate::assembly::BuiltinSource::Misc), CandRule::Other(Rule::ForFieldsStructural));
+    cand.a = container;
+    cand.d = trait_;
+    out.push(cand);
+    Ok(AStep::Done)
+}
+
+/// Step A: match `Pred::ForFields` against param-env clause `idx`.
+fn step_for_fields_env<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, idx: u32) -> Result<Step, Stop> {
+    let bad = || Stop::Error(SolveError::Malformed(crate::error::bad_pred()));
+    let Pred::ForFields { container, trait_, args_after_self } = cx.goal.pred else { return Err(bad()) };
+    let Some(&clause) = usize::try_from(idx).ok().and_then(|i| cx.env.get(i)) else { return Err(bad()) };
+    let Pred::ForFields { container: env_c, trait_: env_tr, args_after_self: env_args } = clause.pred else {
+        return Err(bad());
+    };
+    if env_tr != trait_ {
+        return Ok(Step::No);
+    }
+    let (env_c, env_args) = if clause.bound > 0 {
+        let with = cx.fresh_args(clause.bound)?;
+        let env_c = cx.instantiate_bound(env_c, with)?;
+        let mut f = |cx: &mut Cx<'_, '_, T, F>, t: Ty| cx.instantiate_bound(t, with);
+        let env_args = cx.map_list(env_args, &mut f)?;
+        (env_c, env_args)
+    } else {
+        (env_c, env_args)
+    };
+    if !cx.eq(container, env_c)? || !cx.eq_lists(args_after_self, env_args)? {
+        return Ok(Step::No);
+    }
+    Ok(Step::Done(Certainty::Yes))
+}
+
+/// Steps B, C, D: structurally prove `Pred::ForFields` over a concrete product type
+/// (struct ADT, structural record, or tuple), stall on `TyKind::Infer`, and reject all
+/// other types (including primitives, enums, unions, and unassumed generic params).
+fn step_for_fields_structural<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, container: Ty) -> Result<Step, Stop> {
+    let Pred::ForFields { trait_, args_after_self, .. } = cx.goal.pred else {
+        return Err(Stop::Error(SolveError::Malformed(crate::error::bad_pred())));
+    };
+    let container = cx.resolve(container);
+    match cx.tys.kind(container) {
+        TyKind::Infer(_) => Ok(Step::Done(Certainty::Ambiguous)),
+        TyKind::Error => Ok(Step::Done(Certainty::Yes)),
+        TyKind::Adt(adt_def, adt_args) => {
+            let adt = cx.adt(adt_def)?;
+            if !adt.flags.has(crate::facts::AdtFlags::STRUCT) {
+                return Ok(Step::No);
+            }
+            let mut fields: Vec<Ty, Alloc<'_>> = Vec::new_in(cx.alloc);
+            crate::builtin::adt_fields(cx, adt_def, adt_args, &mut fields)?;
+            add_for_fields_goals(cx, trait_, args_after_self, &fields, true)?;
+            Ok(Step::Done(Certainty::Yes))
+        }
+        TyKind::Record(_, fields_list) => {
+            let fields = cx.list_small(fields_list);
+            add_for_fields_goals(cx, trait_, args_after_self, &fields, false)?;
+            Ok(Step::Done(Certainty::Yes))
+        }
+        TyKind::Tuple(elems_list) => {
+            let elems = cx.list_small(elems_list);
+            add_for_fields_goals(cx, trait_, args_after_self, &elems, false)?;
+            Ok(Step::Done(Certainty::Yes))
+        }
+        _ => Ok(Step::No),
+    }
+}
+
+/// Adds `F_i: trait_<args_after_self...>` as an `ImplWhereBound` nested goal for every field `F_i`.
+fn add_for_fields_goals<T: Tys, F: Facts>(
+    cx: &mut Cx<'_, '_, T, F>,
+    trait_: Def,
+    args_after_self: crate::term::List,
+    fields: &[Ty],
+    is_adt: bool,
+) -> Result<(), Stop> {
+    let rest = cx.list_small(args_after_self);
+    let mut args = crate::assembly::SmallTys::new_with_len(1 + rest.len(), cx.alloc);
+    args[1..].copy_from_slice(&rest);
+    for (i, &field_ty) in (0u32..).zip(fields.iter()) {
+        args[0] = field_ty;
+        let list = cx.mk_list(&args)?;
+        let pred = Pred::Trait { trait_, args: list, polarity: Polarity::Positive };
+        let reach = if is_adt { Reach::Field(i) } else { Reach::Element(i) };
+        cx.add_from(GoalSource::ImplWhereBound, pred, reach);
+    }
+    Ok(())
 }
 
 /// `where const { COND }` at `args` (extensions.md, `where const`). The clause is a nested goal
@@ -2696,7 +3098,7 @@ fn arg_shape<T: Tys>(tys: &T, t: Ty) -> crate::error::ArgShape {
     use crate::error::ArgShape;
     let k = tys.kind(tys.shallow_resolve(t));
     match k {
-        TyKind::ReStatic | TyKind::ReParam(_) | TyKind::ReErased => ArgShape::Region,
+        TyKind::ReStatic | TyKind::ReParam(_) | TyKind::ReErased | TyKind::ReBound(..) | TyKind::RePlaceholder(..) => ArgShape::Region,
         TyKind::Infer(v) if v.kind == VarKind::Region => ArgShape::Region,
         TyKind::Infer(v) if v.kind == VarKind::Const => ArgShape::Const,
         TyKind::ConstValue(..) | TyKind::ConstParam(_) => ArgShape::Const,
@@ -2730,6 +3132,18 @@ fn bad_pred_of<T: Tys>(tys: &T, p: Pred) -> crate::error::BadPred {
             out.n_args = args.len;
             for i in 0..args.len.min(4) {
                 out.args[i as usize] = Some(arg_shape(tys, tys.list_get(args, i)));
+            }
+        }
+        Pred::ForFields { container, trait_, args_after_self } => {
+            out.kind = PredKind::ForFields;
+            out.def = trait_;
+            out.n_args = args_after_self.len.saturating_add(1);
+            out.args[0] = Some(arg_shape(tys, container));
+            for (i, slot) in (0u32..).zip(out.args[1..].iter_mut()) {
+                if i >= args_after_self.len {
+                    break;
+                }
+                *slot = Some(arg_shape(tys, tys.list_get(args_after_self, i)));
             }
         }
         Pred::Projection { alias, term } => {

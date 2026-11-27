@@ -41,6 +41,7 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+use blaze_own::Share;
 use crate::{FileName, Meta};
 #[cfg(unix)]
 use crate::{Names, Stamp};
@@ -1004,8 +1005,8 @@ pub(crate) fn list(dir: &Path, name: &crate::DirName) -> io::Result<Vec<(FileNam
     while let Some(at) = todo.pop() {
         let parent = match at {
             // clone: the directory's name, a refcount: `found` grows under it.
-            Some(at) => crate::DirName::Named(found[at].0.clone()),
-            None => name.clone(),
+            Some(at) => crate::DirName::Named(found[at].0.share()),
+            None => name.share(),
         };
         let first = found.len();
         blaze_mem::scratch::with_path(|path| {
@@ -1604,7 +1605,7 @@ fn open_dir(root: &Path) -> io::Result<std::os::fd::OwnedFd> {
 
 /// One name's stamp, relative to the directory `dir`.
 #[cfg(unix)]
-fn stamp_at(dir: std::os::fd::BorrowedFd<'_>, name: &std::ffi::CStr) -> Stamp {
+pub(crate) fn stamp_at(dir: std::os::fd::BorrowedFd<'_>, name: &core::ffi::CStr) -> Stamp {
     match crate::raw::stat_at(dir, name) {
         Ok(stat) => stamp_of(&stat),
         Err(error) => match error.raw_os_error() {
@@ -1669,7 +1670,7 @@ pub(crate) fn entries(dir: &Path, name: &crate::DirName) -> io::Result<crate::Li
     use std::os::{fd::AsFd as _, unix::ffi::OsStrExt as _};
     let fd = open_dir(dir)?;
     // clone: the listing's directory, a refcount.
-    let mut found = crate::ListingBuilder::new(name.clone());
+    let mut found = crate::ListingBuilder::new(name.share());
     // alloc: once per listing, std's handle of the directory.
     let read = std::fs::read_dir(dir)
         .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", dir.display())));
@@ -1688,7 +1689,7 @@ fn clone_file(_: &Path, _: &Path) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "no call that shares blocks on this system"))
 }
 
-/// The invariant: a sync and a barrier of a file sealed read-only (mode 0444, as the store
+/// Invariant: a sync and a barrier of a file sealed read-only (mode 0444, as the store
 /// seals a placed output) succeed on the real file system through `driver`, which runs at
 /// `root`, a directory of the test's own; a sync or a barrier of a missing file makes it, as
 /// before; and a file a sync kept (`uring.rs`'s `Kept::read_only`) is appended to after it.

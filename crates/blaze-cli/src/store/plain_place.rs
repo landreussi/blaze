@@ -25,7 +25,7 @@ use std::alloc::Allocator;
 
 use blaze_cas::Key as CasKey;
 use blaze_own::Alloc;
-use blaze_cas::plain::{Driven, Lent, LentCounts, LentError, Liveness, PlaceName, PlainConfig, Probes, ROOT_LIFE_NS, Settings, Snapshot, SnapshotError, Visibility};
+use blaze_cas::plain::{Driven, Lent, LentCounts, LentError, Liveness, Par, PlaceName, PlainConfig, Probes, ROOT_LIFE_NS, Serial, Settings, Snapshot, SnapshotError, Visibility};
 use blaze_core::{Driver, FileName};
 use blaze_drive::Key;
 use blaze_keyed::kind::{Namespace, ReservedTag, Tag};
@@ -102,7 +102,14 @@ impl Joined {
 const STORE_TAGS: u64 = 1 << 50;
 
 /// Past this many uncommitted bytes in the arena, a put commits first.
-pub(crate) const COMMIT_BYTES: u64 = 256 << 20;
+/// 32 MiB bounds the transient `Arena + lay_out` commit spike to ~64 MiB on large cold builds
+/// while incremental edits (a few KB to a few MB) still commit once after the answer.
+pub(crate) const COMMIT_BYTES: u64 = 32 << 20;
+
+/// Minimum uncommitted arena size before a stage boundary (`flush_puts_if_large`) flushes eagerly
+/// so large cold-stage arenas (`Names`/`Heads`) free before the next stage allocates while tiny
+/// incremental edits stay in the shared `InArena` and commit once in `after_answer`.
+pub(crate) const STAGE_FLUSH_BYTES: u64 = 16 << 20;
 
 /// THE PUT PATH'S SEAM (blaze-cas plain/arena.rs, rule 78): where a reader finds a record this
 /// command put and has not committed. `AfterCommit` (today's): each phase commits its puts
@@ -110,7 +117,7 @@ pub(crate) const COMMIT_BYTES: u64 = 256 << 20;
 /// `InArena`: the one copy a put makes is read in place by every reader and snapshot; a phase
 /// boundary is a checkpoint ([`PlainPlace::checkpoint`]: a commit only past [`COMMIT_BYTES`] or
 /// [`CHECKPOINT_AGE_NS`]), and the commit after the answer writes the rest.
-pub(crate) const VISIBILITY: Visibility = Visibility::AfterCommit;
+pub(crate) const VISIBILITY: Visibility = Visibility::InArena { shared: blaze_mem::Kept(blaze_mem::Tag::Store) };
 
 /// Under `Visibility::InArena`, a phase boundary commits what is put when the oldest of it has
 /// waited this long (first value, accepted 2026-11-21): a command killed after a long phase
@@ -124,6 +131,12 @@ pub(crate) const CHECKPOINT_AGE_NS: u64 = 30_000_000_000;
 /// and not committed, the oldest seen `waited_ns` ago at a phase boundary.
 pub(crate) fn checkpoint_due(uncommitted: u64, waited_ns: u64) -> bool {
     uncommitted > COMMIT_BYTES || (uncommitted > 0 && waited_ns >= CHECKPOINT_AGE_NS)
+}
+
+/// The stage-boundary flush rule (`checkpoint_tests` below): flush early at a stage boundary
+/// only when uncommitted puts have grown to at least [`STAGE_FLUSH_BYTES`].
+pub(crate) fn stage_flush_due(uncommitted: u64) -> bool {
+    uncommitted >= STAGE_FLUSH_BYTES
 }
 
 /// Why the store refused, by name (rule 19).
@@ -183,19 +196,12 @@ pub(crate) fn config(dir: FileName, settings: &Settings, facts: Facts, alloc: St
         machine: Vec::new_in(alloc),
         writes: settings.writes(alloc),
         reads: settings.reads(alloc),
-        // Everything, until the switch to the engine path (plan row D5) turns the sweep on:
-        // `Reached`, which keeps what the roots reach and what a running command's lease keeps.
-        // On the engine path every record a later command reads by key is reached now
-        // (store/roots.rs, the census): the program root (code entries, pointers, the start list,
-        // the `run_ids` and `run_names` tables of its certificate), the toolchain root (std's
-        // code, std's names records and their expansion records), the answer's `.pages` root
-        // (every standing row's record, and each names record's expansion records through the
-        // index beside it), the dependency-heads root and the rows-form answer's roots. The old
-        // drive answer graph under the sealed last answer (`set_last` roots only the sealed
-        // record, not its `cert`, page table, pages or rows' records) is old-path work, not
-        // rooted by decision: it goes with the old path, and a sweep before the switch would
-        // drop it after each command.
-        liveness: Liveness::Everything,
+        // Reachability GC (`Liveness::Reached`, runtime.md C5): keeps what unexpired roots reach
+        // (store/roots.rs: program root, toolchain root, answer `.pages` root and expansion
+        // indexes, dependency-heads root, rows-form roots) and what any running command's lease
+        // keeps, sweeping superseded/expired records in post-answer compaction slices. The old
+        // drive path is deleted.
+        liveness: Liveness::Reached,
         // The jittered doubling, its jitter the nonce (drawn from the granted `Rng`: the
         // simulation's draw under it); `Fixed` is a test's control only.
         lock_step: blaze_cas::plain::LockStep::Backoff,
@@ -205,8 +211,18 @@ pub(crate) fn config(dir: FileName, settings: &Settings, facts: Facts, alloc: St
 /// The store opened lazily over `driver` (nothing mapped: a segment is mapped at its first
 /// probe), owned by a [`Lent`] whose arena is in `alloc`, the caller's (rule 75).
 pub fn open<D: Driver>(driver: D, cfg: PlainConfig<StoreAlloc>, alloc: StoreAlloc) -> Result<Lent<D, StoreAlloc>, PlaceError> {
+    open_par(driver, cfg, alloc, &Serial)
+}
+
+/// Parallel twin of [`open`]: verifies large earlier-boot segments through `par`.
+pub fn open_par<D: Driver, P: Par>(
+    driver: D,
+    cfg: PlainConfig<StoreAlloc>,
+    alloc: StoreAlloc,
+    par: &P,
+) -> Result<Lent<D, StoreAlloc>, PlaceError> {
     // The root path is read only by the native pread path, which this module never takes.
-    let store = Driven::with(driver, std::path::Path::new("/"), cfg, alloc).map_err(|why| PlaceError::Open { why })?;
+    let store = Driven::with_par(driver, std::path::Path::new("/"), cfg, alloc, par).map_err(|why| PlaceError::Open { why })?;
     Ok(Lent::with_visibility(store, alloc, VISIBILITY))
 }
 
@@ -247,6 +263,17 @@ pub(crate) fn snapshot_get<'s, A: Allocator>(snapshot: &'s Snapshot<A>, key: Key
         let (bytes, proof) = Checked::of_snapshot(proved);
         Held { bytes, proof, place: blaze_cas::plain::Aligned16::new(bytes).map_err(blaze_cas::plain::NotInPlace::Misaligned) }
     }))
+}
+
+/// Reads `key`'s bytes with the store's proof inside `f` without lending them past the call
+/// (never pins an uncommitted shared arena, and hands `Checked` to readers that skip re-hashing
+/// bytes the store already proved, rule 74).
+pub(crate) fn lent_with_checked<D: Driver, R>(
+    lent: &Lent<D, StoreAlloc>,
+    key: Key,
+    f: impl FnOnce(&[u8], Checked<'_>) -> R,
+) -> Result<Option<R>, PlaceError> {
+    Ok(lent.with_bytes(&CasKey(key.0), |_tag, _ns, bytes| f(bytes, Checked { _private: PhantomData }))?)
 }
 
 /// A record lent in place for `'m`, the life of the [`Lent`] borrowed.
@@ -327,6 +354,11 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
         PlainPlace { lent, public_writer, plant, commits: 0, segments_written: 0, aging_since: None }
     }
 
+    /// Whether this machine is a trusted builder that may write [`Namespace::PUBLIC`].
+    pub fn is_public_writer(&self) -> bool {
+        self.public_writer
+    }
+
     /// The record's namespace (drive.md ruling 2): `PUBLIC` only when every name in it is
     /// public AND this machine is a trusted builder; else `LOCAL`.
     pub fn namespace(&self, all_names_public: bool) -> Namespace {
@@ -346,6 +378,69 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
         Ok(lent.get(&CasKey(key.0))?.map(|lend| Held { bytes: lend.bytes, proof: Checked { _private: PhantomData }, place: lend.in_place() }))
     }
 
+    /// Committed-only in-place lookup: borrows a committed segment for `'m` without pinning any
+    /// uncommitted arena; returns [`CommittedLend::InArena`] when the record is an uncommitted put.
+    pub fn get_committed(&self, key: Key) -> Result<super::Committed<'m>, PlaceError> {
+        let lent: &'m Lent<D, StoreAlloc> = self.lent;
+        Ok(match lent.get_committed(&CasKey(key.0))? {
+            blaze_cas::plain::CommittedLend::Found(lend) => {
+                super::Committed::Found(Held { bytes: lend.bytes, proof: Checked { _private: PhantomData }, place: lend.in_place() })
+            }
+            blaze_cas::plain::CommittedLend::InArena => super::Committed::InArena,
+            blaze_cas::plain::CommittedLend::Absent => super::Committed::Absent,
+        })
+    }
+
+    /// Non-lending existence check (uncommitted puts or committed segments); never pins an arena.
+    pub fn contains(&self, key: Key) -> Result<bool, PlaceError> {
+        Ok(self.lent.tag_of(&CasKey(key.0))?.is_some())
+    }
+
+    /// Reads `key`'s bytes inside `f` without lending them past the call; never pins an arena.
+    pub fn with_bytes<R>(&self, key: Key, f: impl FnOnce(&[u8]) -> R) -> Result<Option<R>, PlaceError> {
+        Ok(self.lent.with_bytes(&CasKey(key.0), |_tag, _ns, bytes| f(bytes))?)
+    }
+
+    /// Commits uncommitted puts at a stage boundary only when they reach [`STAGE_FLUSH_BYTES`]
+    /// (16 MiB) — or past [`CHECKPOINT_AGE_NS`] via [`PlainPlace::checkpoint`], or always under
+    /// `Visibility::AfterCommit`. Frees large cold-stage arenas before the next stage allocates
+    /// while avoiding tiny intermediate segments and manifest flips on incremental edits (where
+    /// `Visibility::InArena` serves uncommitted puts in place across stages and [`after_answer`]
+    /// commits everything durably once). Returns `true` when a commit ran.
+    pub fn flush_puts_if_large(&mut self) -> Result<bool, PlaceError> {
+        let uncommitted = self.lent.uncommitted_bytes();
+        if self.lent.visibility() == Visibility::AfterCommit {
+            if uncommitted > 0 {
+                self.commit()?;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        if stage_flush_due(uncommitted) {
+            self.commit()?;
+            return Ok(true);
+        }
+        self.checkpoint()
+    }
+
+    /// Stage-boundary flush: delegates to [`PlainPlace::flush_puts_if_large`] so intermediate
+    /// stages flush large (`>= STAGE_FLUSH_BYTES`) arenas while small edits stay in the shared
+    /// `InArena` until [`after_answer`].
+    pub fn flush_puts(&mut self) -> Result<(), PlaceError> {
+        let _ = self.flush_puts_if_large()?;
+        Ok(())
+    }
+
+    /// Number of commits completed through this handle so far.
+    pub fn commits(&self) -> u32 {
+        self.commits
+    }
+
+    /// Number of shared arenas pinned past commit on the underlying `Lent`.
+    pub fn kept_arenas(&self) -> usize {
+        self.lent.kept_arenas()
+    }
+
     /// `bytes` under `key`, copied once into the arena. A key held with equal bytes is left as
     /// it is (rule 25); with other bytes it is refused (rule 21). Past [`COMMIT_BYTES`]
     /// uncommitted, one commit first.
@@ -356,8 +451,13 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     /// [`PlainPlace::put`] of the concatenation of `parts`, never joined (blaze-cas
     /// `Lent::put_parts`).
     pub fn put_parts(&mut self, key: Key, all_names_public: bool, parts: &[&[u8]]) -> Result<(), PlaceError> {
+        self.put_parts_par(key, all_names_public, parts, &Serial)
+    }
+
+    /// Parallel twin of [`PlainPlace::put_parts`]: commits past [`COMMIT_BYTES`] through `par`.
+    pub fn put_parts_par<P: Par>(&mut self, key: Key, all_names_public: bool, parts: &[&[u8]], par: &P) -> Result<(), PlaceError> {
         if self.lent.uncommitted_bytes() > COMMIT_BYTES {
-            self.commit()?;
+            self.commit_par(par)?;
         }
         self.lent.put_parts(&CasKey(key.0), self.namespace(all_names_public), ReservedTag::Drive.tag(), parts)?;
         Ok(())
@@ -370,6 +470,11 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     /// workspace crate's local one share it; else put in the namespace `all_names_public` (its
     /// owner's) says. Other bytes under `key` are refused (rule 21).
     pub fn put_record(&mut self, key: Key, all_names_public: bool, tag: Tag, bytes: &[u8]) -> Result<blaze_keyed::store::Put, PlaceError> {
+        self.put_record_par(key, all_names_public, tag, bytes, &Serial)
+    }
+
+    /// Parallel twin of [`PlainPlace::put_record`]: commits past [`COMMIT_BYTES`] through `par`.
+    pub fn put_record_par<P: Par>(&mut self, key: Key, all_names_public: bool, tag: Tag, bytes: &[u8], par: &P) -> Result<blaze_keyed::store::Put, PlaceError> {
         // Asked by comparison, never by a get: a get of this command's own put keeps its arena
         // chunk, and every record put beside it, out of place after the commit (blaze-cas
         // lent.rs `holds`). An expansion record two units of one wave both put did that to
@@ -378,17 +483,18 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
             return Ok(blaze_keyed::store::Put::Same);
         }
         if self.lent.uncommitted_bytes() > COMMIT_BYTES {
-            self.commit()?;
+            self.commit_par(par)?;
         }
         Ok(self.lent.put_parts(&CasKey(key.0), self.namespace(all_names_public), tag, &[bytes])?)
     }
 
     /// The record the root `name` is, in place (its bytes the 32-byte keys it names, in order):
     /// a root is a name in the newest manifest, not a probe (drive.md ruling 7). `None`: no
-    /// root of that name.
+    /// root of that name. Uses the root's creation generation as a segment-locality hint so warm
+    /// reads avoid mapping older/larger segments.
     pub fn root(&self, name: &str) -> Result<Option<Held<'m>>, PlaceError> {
-        let Some((_, at)) = self.lent.roots().into_iter().find(|(it, _)| it == name) else { return Ok(None) };
-        self.get(Key(at.0))
+        let lent: &'m Lent<D, StoreAlloc> = self.lent;
+        Ok(lent.get_root(name)?.map(|lend| Held { bytes: lend.bytes, proof: Checked { _private: PhantomData }, place: lend.in_place() }))
     }
 
     /// Keeps `keys` under the root `name` from the next commit on, for blaze-cas
@@ -427,24 +533,21 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
         Ok(Rooted::new(self.lent.root_through(name, &indexes, ROOT_LIFE_NS)?))
     }
 
-    /// The unexpired root `name` set again, naming what it names, for `life_ns` from the next
-    /// commit: a command that answered from what the root reaches without writing it again
-    /// (`engine-check` whose certificate stood) still renews it, so a checkout built every day
-    /// never sees its answer expire. Answers whether there was such a root (an expired one is
-    /// never named again: a slice may have swept what it named). Equal bytes within a day of the
-    /// last renewal write nothing (blaze-cas `set_root`).
+    /// The unexpired root `name` renewed in O(1) for `life_ns` from the next commit without
+    /// reading, probing, sorting, or hashing the keys it holds (`Lent::renew_root`): a command
+    /// that answered from what the root reaches without writing it again (`engine-check` whose
+    /// certificate stood) still renews it, so a checkout built every day never sees its answer
+    /// expire. Answers whether there was such a live root (an expired one is never named again: a
+    /// slice may have swept what it named). Within `TOUCH_NS` of its full life nothing is queued
+    /// and no flip is owed.
     pub(crate) fn renew(&self, name: &str, life_ns: u64) -> Result<bool, PlaceError> {
-        let Some(key) = self.lent.root_named(name) else { return Ok(false) };
-        let Some(held) = self.lent.get(&key)? else { return Ok(false) };
-        let indexed = ReservedTag::IndexedRoot.is(held.tag);
-        let mut named: Vec<CasKey, StoreAlloc> = Vec::with_capacity_in(held.bytes.len() / 32, *self.lent.alloc());
-        named.extend(held.bytes.chunks_exact(32).map(|it| CasKey(blaze_ids::ContentId(it.try_into().expect("32 bytes")))));
-        if indexed {
-            self.lent.root_through(name, &named, life_ns)?;
-        } else {
-            self.lent.root_for(name, &named, life_ns)?;
-        }
-        Ok(true)
+        Ok(self.lent.renew_root(name, life_ns).is_live())
+    }
+
+    /// O(segments + roots + retired) check of whether compaction or GC housekeeping is due at
+    /// `now_ns` (`Lent::needs_housekeeping`).
+    pub fn needs_housekeeping(&self, now_ns: u64) -> bool {
+        self.lent.needs_housekeeping(now_ns)
     }
 
     /// The index of the records `owner` was put with, filed beside it (blaze-cas
@@ -459,7 +562,7 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     /// its tag): `None` when `owner` was put with no records beside it.
     pub(crate) fn beside(&self, owner: Key) -> Result<Option<CasKey>, PlaceError> {
         let key = blaze_cas::plain::beside_key(CasKey(owner.0));
-        Ok(self.lent.get(&key)?.filter(|held| ReservedTag::Index.is(held.tag)).map(|_| key))
+        Ok(self.lent.tag_of(&key)?.filter(|tag| ReservedTag::Index.is(*tag)).map(|_| key))
     }
 
     /// The store's owner, for a class root of store/roots.rs written beside the engine's
@@ -471,12 +574,23 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     /// Every segment named mapped, and every one parked checked: asked once, when the
     /// request's first pool task is about to start (blaze-cas `Driven::map_all`).
     pub fn map_all(&self) -> Result<(), PlaceError> {
-        Ok(self.lent.map_all()?)
+        self.map_all_par(&Serial)
+    }
+
+    /// Parallel twin of [`PlainPlace::map_all`]: verifies large earlier-boot segments through `par`.
+    pub fn map_all_par<P: Par>(&self, par: &P) -> Result<(), PlaceError> {
+        Ok(self.lent.map_all_par(par)?)
     }
 
     /// What is not yet committed, laid out as one segment per namespace, and one flip.
     pub fn commit(&mut self) -> Result<(), PlaceError> {
-        let committed = self.lent.commit()?;
+        self.commit_par(&Serial)
+    }
+
+    /// Parallel twin of [`PlainPlace::commit`]: runs `TwoValues` verification, BLAKE3 segment
+    /// sealing, and Bloom construction through `par`.
+    pub fn commit_par<P: Par>(&mut self, par: &P) -> Result<(), PlaceError> {
+        let committed = self.lent.commit_par(par)?;
         self.aging_since = None;
         self.commits += 1;
         self.segments_written += u32::try_from(committed.segments.len()).unwrap_or(u32::MAX);
@@ -590,47 +704,73 @@ pub fn after_answer<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u32)
 }
 
 /// [`after_answer`] at the class choice `qos`: the seam's two sides, for its test.
+///
+/// When `slices == 0` (foreground CLI commit-and-exit where background `blaze gc --background`
+/// handles compaction and exit-tail sealing asynchronously), the calling thread stays at its
+/// foreground QoS class (never throttled onto E-cores or behind background GC) and performs ONE
+/// commit flip with ZERO redundant `F_BARRIERFSYNC` / second flip. When `slices > 0` (inline
+/// compaction + seal), `qos` scopes the lowering to `AFTER_ANSWER` (`utility`) and restores the
+/// caller's class on every exit.
 pub(crate) fn after_answer_at<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u32, qos: AfterAnswerQos) -> Result<AfterAnswer, PlaceError> {
     let called_at = qos_now()?;
-    #[cfg(target_os = "macos")]
-    let _held = match qos {
-        AfterAnswerQos::Scoped => {
-            Some(blaze_core::threads::qos::Lowered::at_most(blaze_core::threads::qos::AFTER_ANSWER).map_err(PlaceError::Qos)?)
-        }
-        AfterAnswerQos::AsCalled => None,
-    };
-    #[cfg(not(target_os = "macos"))]
-    let (AfterAnswerQos::AsCalled | AfterAnswerQos::Scoped) = qos;
-    let mut done = after_answer_steps(cx, lent, slices)?;
-    done.qos = QosSeen { called_at, ran_at: qos_now()? };
+    let lower_scoped = slices > 0 && qos == AfterAnswerQos::Scoped;
+    let (mut done, ran_at) = after_answer_steps(cx, lent, slices, lower_scoped)?;
+    done.qos = QosSeen { called_at, ran_at };
     Ok(done)
 }
 
-/// [`after_answer`]'s steps, on the calling thread at the class it has.
-fn after_answer_steps<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u32) -> Result<AfterAnswer, PlaceError> {
+/// [`after_answer`]'s steps: keeps `lent.commit()` at caller QoS (P-cores), while scoping
+/// inline cleanup (`fold_slice`, `clean_on`) and exit-tail sealing (`seal`) to `AFTER_ANSWER`
+/// when `lower_scoped` is true.
+fn after_answer_steps<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u32, lower_scoped: bool) -> Result<(AfterAnswer, u32), PlaceError> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = lower_scoped;
     let cx = cx.span("store after answer");
     // The put path's tally up to here: the phases' commits and every copy before the answer.
     let before = lent.put_tally();
     if slices > 0 {
         let _cx = cx.span("store after answer: fold a cleanup slice (map, merge copy hashed whole)");
+        #[cfg(target_os = "macos")]
+        let _fold_qos = if lower_scoped {
+            Some(blaze_core::threads::qos::Lowered::at_most(blaze_core::threads::qos::AFTER_ANSWER).map_err(PlaceError::Qos)?)
+        } else {
+            None
+        };
         lent.fold_slice()?;
     }
     lent.release_lease();
     let committed = {
-        let _cx = cx.span("store after answer: commit (batch copy, layout copy, segment digest, flip)");
-        lent.commit()?
+        let commit_cx = cx.span("store after answer: commit (batch copy, layout copy, segment digest, flip)");
+        let par = super::CxPar::new(&commit_cx);
+        lent.commit_par(&par)?
     };
     let first = lent.take_sliced();
+    #[cfg(target_os = "macos")]
+    let _tail_qos = if lower_scoped {
+        Some(blaze_core::threads::qos::Lowered::at_most(blaze_core::threads::qos::AFTER_ANSWER).map_err(PlaceError::Qos)?)
+    } else {
+        None
+    };
     let (slice, swept) = if slices > 0 {
-        let _cx = cx.span("store after answer: more cleanup slices (each a merge copy hashed whole, a flip)");
-        lent.clean_on(first)?
+        let clean_cx = cx.span("store after answer: more cleanup slices (each a merge copy hashed whole, a flip)");
+        let par = super::CxPar::new(&clean_cx);
+        lent.clean_on_par(first, &par)?
     } else {
         (first, 0)
     };
-    let sealed = {
+    // Only run the exit-tail barrier + second manifest flip (`lent.seal()`) when running inline
+    // maintenance (`slices > 0`). On the foreground exit path (`slices == 0`), `lent.commit()`
+    // already persisted the new segment atomically with this boot's id (`proved == boot`, zero
+    // re-hashing on subsequent same-boot reads), while `blaze gc --background` seals segments
+    // asynchronously for cross-reboot fast-open (and across a power cut, blaze-cas verifies any
+    // unsealed segment whole on first read, preserving 100% crash durability).
+    let sealed = if slices > 0 {
         let _cx = cx.span("store after answer: seal (a barrier a segment of this boot unsealed, a flip)");
         lent.seal()?
+    } else {
+        false
     };
+    let ran_at = qos_now()?;
     let mut cleanup = {
         let _cx = cx.span("store after answer: the cleanup line");
         super::roots::CleanupLine::of(lent, slice)
@@ -639,13 +779,16 @@ fn after_answer_steps<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u3
         cleanup.slices = swept;
     }
     cleanup.put = super::roots::PutLine { before_answer: before, after_answer: lent.put_tally().since(before) };
-    Ok(AfterAnswer {
-        segments_written: u32::try_from(committed.segments.len()).unwrap_or(u32::MAX),
-        sealed,
-        compaction_slices: cleanup.slices,
-        cleanup,
-        qos: QosSeen::default(),
-    })
+    Ok((
+        AfterAnswer {
+            segments_written: u32::try_from(committed.segments.len()).unwrap_or(u32::MAX),
+            sealed,
+            compaction_slices: cleanup.slices,
+            cleanup,
+            qos: QosSeen::default(),
+        },
+        ran_at,
+    ))
 }
 
 /// The tests' context for [`after_answer`] (its spans): a simulated world's root, its own
@@ -667,7 +810,16 @@ mod tests;
 /// falls where its tape says.
 #[cfg(test)]
 mod checkpoint_tests {
-    use super::{CHECKPOINT_AGE_NS, COMMIT_BYTES, checkpoint_due};
+    use blaze_cas::plain::Settings;
+    use blaze_core::FileName;
+    use blaze_core::sim::{Faults, Sim};
+    use blaze_drive::Key;
+    use blaze_ids::ContentId;
+
+    use super::{
+        CHECKPOINT_AGE_NS, COMMIT_BYTES, Facts, PlainPlace, STAGE_FLUSH_BYTES, after_answer, checkpoint_due, config, open,
+        stage_flush_due, test_cx,
+    };
 
     #[test]
     fn a_checkpoint_is_due_past_the_bytes_or_the_age_and_never_with_nothing_put() {
@@ -675,12 +827,39 @@ mod checkpoint_tests {
         assert!(checkpoint_due(COMMIT_BYTES + 1, 0), "past the bytes, at once");
         assert!(!checkpoint_due(COMMIT_BYTES, CHECKPOINT_AGE_NS - 1), "at the bytes and under the age: not yet");
         assert!(checkpoint_due(1, CHECKPOINT_AGE_NS), "one byte, waited the age");
+        assert!(!stage_flush_due(0), "zero bytes never triggers stage flush");
+        assert!(!stage_flush_due(STAGE_FLUSH_BYTES - 1), "below 16 MiB stays in shared arena");
+        assert!(stage_flush_due(STAGE_FLUSH_BYTES), "at 16 MiB flushes stage arena");
+    }
+
+    #[test]
+    fn small_stage_flush_stays_in_arena_visible_to_snapshots_and_commits_once_after_answer() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let cfg = config(FileName::new("store").expect("a name"), &Settings::default(), Facts { boot: Some(1), nonce: 5151 }, alloc);
+        let lent = open(Sim::new(11, Faults::default()), cfg, alloc).expect("the store opens");
+        let mut place = PlainPlace::new(&lent, false);
+        let k = Key(ContentId::of("small stage flush key", b"v1"));
+        place.put(k, false, b"small edit record").expect("put");
+        assert!(!place.flush_puts_if_large().expect("flush_puts_if_large"), "small stage must not commit mid-command");
+        assert_eq!(place.commits(), 0, "zero intermediate commits on small edit");
+        // In-process readers and snapshots see the uncommitted InArena put immediately.
+        let snap = place.snapshot_in(alloc).expect("snapshot");
+        assert_eq!(
+            snap.get(&blaze_cas::Key(k.0)).expect("snapshot get"),
+            Some(&b"small edit record"[..]),
+            "InArena snapshot sees uncommitted record across stages"
+        );
+        drop(snap);
+        drop(place);
+        let done = after_answer(&test_cx(), &lent, 0).expect("after_answer");
+        assert_eq!(done.segments_written, 1, "after_answer commits everything once");
     }
 }
 
-/// The after-answer class's seam, on the simulation's store: scoped, the steps run at `utility`
-/// and the caller's class comes back; the control (as called, the cause removed) leaves the
-/// caller lowered after, blaze-cas's `lower_this_thread` never giving it back.
+/// The after-answer class's seam, on the simulation's store: with `slices > 0` (inline cleanup +
+/// seal), scoped runs at `utility` and restores the caller's class while `AsCalled` leaves it
+/// lowered; with `slices == 0` (foreground CLI commit-and-exit), it runs at full foreground QoS
+/// (`UserInitiated`) with 1 commit and 0 seal barriers/flips.
 #[cfg(all(test, target_os = "macos"))]
 mod qos_tests {
     use blaze_cas::plain::Settings;
@@ -689,10 +868,12 @@ mod qos_tests {
         sim::{Faults, Sim},
         threads::qos::{self, Qos},
     };
+    use blaze_drive::Key;
+    use blaze_ids::ContentId;
 
-    use super::{AfterAnswerQos, Facts, after_answer_at, config, open, test_cx};
+    use super::{AfterAnswerQos, Facts, PlainPlace, after_answer_at, config, open, test_cx};
 
-    fn at(choice: AfterAnswerQos) -> (super::QosSeen, Qos) {
+    fn at(slices: u32, choice: AfterAnswerQos) -> (super::AfterAnswer, Qos) {
         std::thread::scope(|scope| {
             scope
                 .spawn(|| {
@@ -700,8 +881,11 @@ mod qos_tests {
                     let alloc = blaze_own::testing::heap().alloc();
                     let cfg = config(FileName::new("store").expect("a name"), &Settings::default(), Facts { boot: Some(1), nonce: 4242 }, alloc);
                     let lent = open(Sim::new(1, Faults::default()), cfg, alloc).expect("the store opens");
-                    let done = after_answer_at(&test_cx(), &lent, 0, choice).expect("the work after the answer");
-                    (done.qos, qos::this_thread().expect("the class after").0)
+                    let mut place = PlainPlace::new(&lent, false);
+                    place.put(Key(ContentId::of("qos test key", b"v1")), false, b"payload").expect("put");
+                    drop(place);
+                    let done = after_answer_at(&test_cx(), &lent, slices, choice).expect("the work after the answer");
+                    (done, qos::this_thread().expect("the class after").0)
                 })
                 .join()
                 .expect("the caller's thread")
@@ -710,11 +894,22 @@ mod qos_tests {
 
     #[test]
     fn scoped_the_work_after_the_answer_runs_at_utility_and_the_caller_gets_its_class_back() {
-        let (seen, after) = at(AfterAnswerQos::Scoped);
-        assert_eq!(seen, super::QosSeen { called_at: Qos::UserInitiated.raw(), ran_at: qos::AFTER_ANSWER.raw() });
+        let (done, after) = at(1, AfterAnswerQos::Scoped);
+        assert_eq!(done.qos, super::QosSeen { called_at: Qos::UserInitiated.raw(), ran_at: qos::AFTER_ANSWER.raw() });
         assert_eq!(after, Qos::UserInitiated, "the caller's class given back");
-        let (seen, after) = at(AfterAnswerQos::AsCalled);
-        assert_eq!(seen.called_at, Qos::UserInitiated.raw());
-        assert_eq!(after, Qos::Utility, "as called, blaze-cas's lowering stays");
+        assert!(done.sealed, "inline maintenance (`slices > 0`) seals the exit tail");
+        let (done, after) = at(1, AfterAnswerQos::AsCalled);
+        assert_eq!(done.qos.called_at, Qos::UserInitiated.raw());
+        assert_eq!(after, Qos::Utility, "as called with inline maintenance, blaze-cas's lowering stays");
+    }
+
+    #[test]
+    fn foreground_zero_slice_commit_keeps_foreground_qos_and_skips_second_seal_barrier() {
+        let (done, after) = at(0, AfterAnswerQos::Scoped);
+        assert_eq!(done.segments_written, 1, "one segment committed");
+        assert!(!done.sealed, "zero-slice foreground commit does not run a redundant second seal flip");
+        assert_eq!(done.cleanup.put.after_answer.disk.barriers, 0, "zero foreground barriers on commit");
+        assert_eq!(done.qos, super::QosSeen { called_at: Qos::UserInitiated.raw(), ran_at: Qos::UserInitiated.raw() });
+        assert_eq!(after, Qos::UserInitiated, "foreground commit never throttles the calling thread onto E-cores");
     }
 }

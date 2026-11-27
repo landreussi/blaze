@@ -177,6 +177,14 @@ impl<'a, P: FrontEnd> FrontEnd for Asked<'a, P> {
         self.inner.fn_index(key)
     }
 
+    fn specialized_row(&self, i: usize, args: &[PTy], ground: PTys<'_>) -> Option<usize> {
+        self.inner.specialized_row(i, args, ground)
+    }
+
+    fn specialize_inline_for(&mut self, i: usize, args: &[PTy], ground: PTys<'_>) -> Result<Option<(usize, Option<Checked<'static>>)>, RunError> {
+        self.inner.specialize_inline_for(i, args, ground)
+    }
+
     fn soft_float_routines(&self, alloc: Alloc<'_>) -> Builtins {
         let r = self.inner.soft_float_routines(alloc);
         self.note(format_args!("soft_float_routines"), |o| write!(o, "{r:?}"));
@@ -253,6 +261,12 @@ impl<'a, P: FrontEnd> FrontEnd for Asked<'a, P> {
     fn lang_trait_fn(&self, trait_: LangItem, name: &str) -> Option<ItemKey> {
         let r = self.inner.lang_trait_fn(trait_, name);
         self.note(format_args!("lang_trait_fn {trait_:?} {name}"), |o| write!(o, "{r:?}"));
+        r
+    }
+
+    fn termination_report(&self) -> Option<ItemKey> {
+        let r = self.inner.termination_report();
+        self.note(format_args!("termination_report"), |o| write!(o, "{r:?}"));
         r
     }
 
@@ -370,6 +384,14 @@ impl<'a, P: FrontEnd> FrontEnd for Asked<'a, P> {
         r
     }
 
+    fn opaque_filed(&self, opaque: ItemKey) -> ItemKey {
+        self.inner.opaque_filed(opaque)
+    }
+
+    fn opaque_head(&mut self, opaque: ItemKey) -> Result<bool, blaze_ladder::run::RunError> {
+        self.inner.opaque_head(opaque)
+    }
+
     fn alias_definer(&self, alias: ItemKey) -> Result<ItemKey, blaze_ladder::front2::tait::DefinerMiss> {
         let r = self.inner.alias_definer(alias);
         self.note(format_args!("alias_definer {alias:?}"), |o| write!(o, "{r:?}"));
@@ -389,12 +411,12 @@ impl<'a, P: FrontEnd> FrontEnd for Asked<'a, P> {
         r
     }
 
-    fn const_at(&mut self, need: ConstNeed, from: PTys<'_>, args: &[PTy], closures: &ClosureTable) -> Result<SeamData, ConstAtWhy> {
+    fn const_at(&mut self, need: ConstNeed, from: PTys<'_>, args: &[PTy], build: blaze_ladder::front2::const_at::BuildFacts<'_>) -> Result<SeamData, ConstAtWhy> {
         let mut q = self.text();
         write!(q, "const_at {need:?} <").expect(WRITES);
         shown::types(&mut q, from, args).expect(WRITES);
         q.push_str(">");
-        let r = self.inner.const_at(need, from, args, closures);
+        let r = self.inner.const_at(need, from, args, build);
         let mut o = self.text();
         match &r {
             Ok(d) => shown::data(&mut o, d),
@@ -415,6 +437,20 @@ impl<'a, P: FrontEnd> FrontEnd for Asked<'a, P> {
         .expect(WRITES);
         let mut q = self.text();
         write!(q, "const_fn_instance {key:?}").expect(WRITES);
+        self.push(q, o);
+        r
+    }
+
+    fn const_vtable_ref(&self, key: blaze_build::vtable::VtableKey, ground: &mut PortableTys<'_>, scratch: Alloc<'_>) -> Option<blaze_build::vtable::VtableRef> {
+        let r = self.inner.const_vtable_ref(key, ground, scratch);
+        let mut o = self.text();
+        match &r {
+            Some(v) => write!(o, "{v:?}"),
+            None => o.write_str("none"),
+        }
+        .expect(WRITES);
+        let mut q = self.text();
+        write!(q, "const_vtable_ref {key:?}").expect(WRITES);
         self.push(q, o);
         r
     }
