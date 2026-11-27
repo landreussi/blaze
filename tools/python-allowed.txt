@@ -53,9 +53,6 @@ tools/astlog/scan.py
 tools/bench/remote-cache/cas_v1.py
 tools/bench/remote-cache/gateway_v0.py
 tools/cpus.py
-tools/nix/life_launch.py
-tools/nix/unit_build.py
-tools/nix/unit_graph.py
 tools/remote-cache/smoke.py
 tools/typed-input/src/typed_input/__init__.py
 tools/unicode/casefold.py

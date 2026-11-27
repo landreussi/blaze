@@ -15,7 +15,9 @@ Everything blaze downloads from blaze's own releases comes from one place, the R
 `blaze-releases` at its custom domain `https://blaze-releases.ix.dev`, served from Cloudflare's
 edge: a pinned release's archive and sums, the channels'
 pointers, the standard library's source (`crates/blaze-toolchain`), install.sh's
-download (CI's stage 0 too, `.github/actions/blaze`) and the pinned LLVM
+download (CI's stage 0 too, `.github/actions/blaze`), the flake's package (the archive of the
+release `.github/blaze-cli-version` names, by the sha256 `tools/nix/SHA256SUMS` keeps of it,
+which a change of that version replaces with the release's `SHA256SUMS`) and the pinned LLVM
 (`pins/llvm.json`'s `release`, which blaze's native inputs and `llvm.py fetch`
 read). GitHub's release CDN ran at 0.3 to 0.55 MB/s per download from a
 developer's Mac on 2026-11-05, minutes for a 155 MB archive. GitHub is no fallback: a key R2

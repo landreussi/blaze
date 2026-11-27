@@ -112,19 +112,6 @@ All the details: [what works and what doesn't yet](docs/usage.md#what-works-and-
 - [CI runner](docs/v2/plan.md) and [roadmap](docs/v2/plan.md): where blaze is going
 - [Contributing](docs/contributing.md)
 
-## Demo: a Game of Life you can edit
-
-```sh
-nix run github:indexable-inc/blaze#life
-```
-
-This opens a Game of Life window. On macOS on Apple silicon you can change its rules, colours and
-speed while it runs (live edits are blaze v1's; v2 does not have them yet); elsewhere the window
-runs without live edits. It needs Nix, and builds blaze
-from source the first time.
-
-![Editing the running Game of Life: rule, colours and speed change live](docs/demo.avif)
-
 ## Updates
 
 [What's new](https://ix.dev/blaze/updates) has every change worth knowing, each as a short lesson on the course,

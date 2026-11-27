@@ -149,11 +149,11 @@ tooling knows it by.
 ## With Nix
 
 ```sh
-nix profile install github:indexable-inc/blaze
+nix profile add github:indexable-inc/blaze
 ```
 
-Or try it without installing anything: in a project, `nix run github:indexable-inc/blaze -- build`
-is `blaze build`. In a flake, take the package from the input:
+Or try it without installing anything: in a project, `nix run github:indexable-inc/blaze -- run`
+is `blaze run`. In a flake, take the package from the input:
 
 ```nix
 {
@@ -162,12 +162,13 @@ is `blaze build`. In a flake, take the package from the input:
 }
 ```
 
-Nix compiles blaze from source; there is no binary cache yet. Such a build, like one from
-`cargo install --git` or `--path`, is a build of blaze's tree (`blaze 0.0.0-dev`), not a
-release: in a project that pins a release of blaze (`[workspace.metadata.blaze] version`) it
-runs that release, fetched once, saying so in one line on stderr, as a release does;
-`blaze --ignore-pin <command>` runs the build itself there
-([cargo.md](cargo.md#pinning-a-release-of-blaze)).
+The package is a release, not a build of the flake's tree: the release
+`.github/blaze-cli-version` names, the archive the install script downloads
+([release.md](release.md#where-the-bytes-are)), checked by the sha256 that release's
+`SHA256SUMS` gives (`tools/nix/SHA256SUMS` is that file). On Linux, Nix points its
+interpreter and `libgcc_s` into the store, so it runs on NixOS too. The flake builds no blaze
+from source: only blaze builds blaze, and its build fetches what the Nix sandbox has no network
+for.
 
 ## With MacPorts
 

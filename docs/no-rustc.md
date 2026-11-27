@@ -81,11 +81,5 @@ Two more places ask `$RUSTC` and are listed on every run, not counted, because t
 asked is blaze: `crates/blaze-code/src/lib.rs`'s `compiler`, a build script's `-vV` for
 the code identity, under an `// asks blaze:` comment (end state 3).
 
-Outside `crates/`, which the counter does not read, cargo or rustc still run in:
-
-| Place | What runs | What removes it |
-|---|---|---|
-| `tools/nix/unit_graph.py` and `tools/nix/unit_build.py` | cargo's unit graph, and one rustc per unit in the flake's per-unit builds | deleting the flake (decided 2026-11-04) |
-
 The long form of this page (the measurements of October 2026, each step's design and the lanes
 that did them) is in git: `git show 9112d5e40e:docs/no-rustc.md`.

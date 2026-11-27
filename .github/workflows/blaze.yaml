@@ -1,6 +1,7 @@
 # blaze: the merge gate (zero Python, zero uv).
 #
-#   every change: gate checks (`scripts`), workflow validation (`workflows`), Lean proofs (`lean`);
+#   every change: gate checks (`scripts`), workflow validation (`workflows`), Lean proofs (`lean`),
+#     the flake (`nix`);
 #   code changes: workspace check, parallel tests, and blaze-sys import audit (`cargo`).
 #
 # `ci` is the single required status check for branch protection and the merge queue.
@@ -136,6 +137,25 @@ jobs:
           tar -xzf "$tgz" -C "$RUNNER_TEMP" actionlint
       - run: '"$RUNNER_TEMP/actionlint" -color -shellcheck='
 
+  # The flake: every output of every system evaluates, and the package `nix profile add
+  # github:indexable-inc/blaze` installs builds and starts. flake.nix reads files by path and
+  # nothing else evaluates it, so a change that deletes or moves one of them breaks only the people
+  # installing blaze with Nix (#2443).
+  nix:
+    name: nix flake
+    runs-on: [ix, arm64]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/nix
+      - name: nix flake check --no-build --all-systems
+        run: timeout -k 30 600 nix flake check --no-build --all-systems
+      - name: the default package builds and starts
+        run: |
+          set -euo pipefail
+          out=$(timeout -k 30 300 nix build --no-link --print-out-paths .#default)
+          timeout -k 10 60 "$out/bin/blaze" --version
+
   # Workspace check, parallel unit tests, and blaze-sys symbol import audit.
   cargo:
     name: check and test, linux arm64
@@ -190,7 +210,7 @@ jobs:
   # Single required status check summarizing every job expected for this tier.
   ci:
     name: ci
-    needs: [changes, scripts, workflows, lean, cargo]
+    needs: [changes, scripts, workflows, lean, nix, cargo]
     if: always()
     runs-on: [ix, arm64]
     timeout-minutes: 5
@@ -201,6 +221,7 @@ jobs:
           R_SCRIPTS: ${{ needs.scripts.result }}
           R_WORKFLOWS: ${{ needs.workflows.result }}
           R_LEAN: ${{ needs.lean.result }}
+          R_NIX: ${{ needs.nix.result }}
           R_CARGO: ${{ needs.cargo.result }}
         run: |
           set -euo pipefail
@@ -209,14 +230,15 @@ jobs:
             "$R_SCRIPTS" scripts \
             "$R_WORKFLOWS" workflows \
             "$R_LEAN" lean \
+            "$R_NIX" nix \
             "$R_CARGO" cargo
           case "$TIER" in
-            none) expected="changes scripts workflows lean" ;;
-            gate|warm) expected="changes scripts workflows lean cargo" ;;
+            none) expected="changes scripts workflows lean nix" ;;
+            gate|warm) expected="changes scripts workflows lean nix cargo" ;;
             *) echo "::error::unexpected tier '$TIER'"; exit 1 ;;
           esac
           failed=0
-          for r in "$R_CHANGES" "$R_SCRIPTS" "$R_WORKFLOWS" "$R_LEAN" "$R_CARGO"; do
+          for r in "$R_CHANGES" "$R_SCRIPTS" "$R_WORKFLOWS" "$R_LEAN" "$R_NIX" "$R_CARGO"; do
             if [ "$r" = failure ] || [ "$r" = cancelled ]; then failed=1; fi
           done
           result_of() {
@@ -225,6 +247,7 @@ jobs:
               scripts) printf '%s' "$R_SCRIPTS" ;;
               workflows) printf '%s' "$R_WORKFLOWS" ;;
               lean) printf '%s' "$R_LEAN" ;;
+              nix) printf '%s' "$R_NIX" ;;
               cargo) printf '%s' "$R_CARGO" ;;
             esac
           }
