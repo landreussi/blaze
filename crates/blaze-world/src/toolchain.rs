@@ -24,11 +24,11 @@ const PROFILE: &[(&str, Option<&str>)] = &[("debug_assertions", None)];
 /// 2026-10-27) prints for each target blaze builds for. Every print of that script, with its
 /// condition:
 /// - line 13 `cargo:rustc-cfg=netbsd10`: `target_os == "netbsd"` and `RUSTC_STD_NETBSD10` set;
-///   neither target.
+///   no target here.
 /// - line 76 `cargo:rustc-cfg=restricted_std`: a `target_os` outside the list at lines 20..33
-///   (which holds "linux", line 20, and "macos", line 28); neither target.
-/// - line 80 `cargo:rustc-cfg=backtrace_in_libstd`: always; both targets (the rows below).
-/// - line 82 `cargo:rustc-env=STD_ENV_ARCH=<CARGO_CFG_TARGET_ARCH>`: always, `aarch64` on both.
+///   (which holds "linux", line 20, and "macos", line 28); no target here.
+/// - line 80 `cargo:rustc-cfg=backtrace_in_libstd`: always; every target (the rows below).
+/// - line 82 `cargo:rustc-env=STD_ENV_ARCH=<CARGO_CFG_TARGET_ARCH>`: always, the target's `target_arch`.
 ///   NOT CARRIED, and std reads it: `pub const ARCH: &str = env!("STD_ENV_ARCH");`
 ///   (library/std/src/env.rs:1112, `std::env::consts::ARCH`). A toolchain crate's environment
 ///   (list.rs, `EnvFacts { package: None, script: None, .. }`) holds no such pair, so
@@ -38,12 +38,14 @@ const PROFILE: &[(&str, Option<&str>)] = &[("debug_assertions", None)];
 ///   of `EnvFacts` and of the crate list's row (crate_list.rs `ROW`, read back by body jobs
 ///   through `env_facts`), is the pair from this table: the pair's value is the target's
 ///   `target_arch`, which is in the crate's key through its cfg.
-/// - line 89 `cargo:rustc-cfg=vxworks_lt_25_09`: `target_os == "vxworks"`; neither target.
+/// - line 89 `cargo:rustc-cfg=vxworks_lt_25_09`: `target_os == "vxworks"`; no target here.
 const STD_SCRIPT_CFG: &[(&str, &[&str])] = &[
     // build.rs:80 `println!("cargo:rustc-cfg=backtrace_in_libstd");`
     ("aarch64-apple-darwin", &["backtrace_in_libstd"]),
     // build.rs:80 `println!("cargo:rustc-cfg=backtrace_in_libstd");`
     ("aarch64-unknown-linux-gnu", &["backtrace_in_libstd"]),
+    // build.rs:80 `println!("cargo:rustc-cfg=backtrace_in_libstd");`
+    ("x86_64-unknown-linux-gnu", &["backtrace_in_libstd"]),
 ];
 
 /// std's build-script cfg for `triple` ([`STD_SCRIPT_CFG`]); a target with no row is refused.

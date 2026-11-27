@@ -110,65 +110,97 @@
           aarch64-linux = "aarch64-unknown-linux-gnu";
           aarch64-darwin = "aarch64-apple-darwin";
         }.${system};
-        # What `nix profile add github:indexable-inc/blaze` installs: the release
-        # .github/blaze-cli-version names (the stage 0 release.yaml builds a release with), its
-        # archive for this system from blaze's R2 bucket, as site/install.sh downloads it
-        # (docs/release.md, "Where the bytes are"), checked by the sha256 the release's SHA256SUMS
-        # gives it. tools/nix/SHA256SUMS is that release's SHA256SUMS, byte for byte, so a change
-        # of the version replaces it in the same commit:
-        #
-        #   curl -fsSL -o tools/nix/SHA256SUMS "https://blaze-releases.ix.dev/v$(cat .github/blaze-cli-version)/SHA256SUMS"
-        #
-        # A release is the binary blaze exported of itself (release.yaml). Nix builds no blaze of
-        # this tree: only blaze builds blaze, and its export fetches the toolchain and the crates,
-        # for which the Nix sandbox has no network (#2443). On Linux the binary's interpreter and
-        # libgcc_s are pointed into the store, so it runs on NixOS too; nothing else is rewritten.
-        release =
-          let
-            version = pkgs.lib.fileContents ./.github/blaze-cli-version;
-            name = "blaze-v${version}-${triple}";
-            sum = text:
-              let found = builtins.match "([0-9a-f]{64})  ([^ ]+)" text;
-              in if found == null
-                then throw "tools/nix/SHA256SUMS: `${text}` is not a line of a SHA256SUMS (a sha256, two spaces, a name)"
-                else { name = builtins.elemAt found 1; value = builtins.elemAt found 0; };
-            sums = builtins.listToAttrs (map sum (builtins.filter (text: text != "")
-              (pkgs.lib.splitString "\n" (builtins.readFile ./tools/nix/SHA256SUMS))));
-          in pkgs.stdenv.mkDerivation {
-            pname = "blaze";
-            inherit version;
-            src = pkgs.fetchurl {
-              url = "https://blaze-releases.ix.dev/v${version}/${name}.tar.xz";
-              sha256 = sums."${name}.tar.xz" or (throw ("tools/nix/SHA256SUMS has no ${name}.tar.xz, so it is "
-                + "not the SHA256SUMS of ${version}, the release .github/blaze-cli-version names: copy "
-                + "https://blaze-releases.ix.dev/v${version}/SHA256SUMS over it"));
-            };
-            nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.autoPatchelfHook ];
-            buildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.stdenv.cc.cc.lib ];
-            dontConfigure = true;
-            dontBuild = true;
-            dontStrip = true;
-            installPhase = ''
-              runHook preInstall
-              install -Dm755 blaze $out/bin/blaze
-              runHook postInstall
-            '';
-            # The check release.yaml makes of each archive it ships: the binary starts and names
-            # its version.
-            doInstallCheck = true;
-            installCheckPhase = ''
-              runHook preInstallCheck
-              $out/bin/blaze --version | grep -F ${version}
-              runHook postInstallCheck
-            '';
-            meta = {
-              description = "blaze, as its release ships it";
-              homepage = "https://ix.dev/blaze";
-              license = with pkgs.lib.licenses; [ mit asl20 ];
-              sourceProvenance = [ pkgs.lib.sourceTypes.binaryNativeCode ];
-              mainProgram = "blaze";
-            };
+        # Every registry crate of a lock as the `.crate` crates.io serves, by the sha256 the lock
+        # gives it. The name and hash are rustPlatform.importCargoLock's, so a crate both fetch is
+        # one store path.
+        crates = lock: map (p: {
+          name = "${p.name}-${p.version}.crate";
+          path = pkgs.fetchurl {
+            name = "crate-${p.name}-${p.version}.tar.gz";
+            url = "https://crates.io/api/v1/crates/${p.name}/${p.version}/download";
+            sha256 = p.checksum;
           };
+        }) (builtins.filter (p: (p.source or "") == "registry+https://github.com/rust-lang/crates.io-index")
+          (builtins.fromTOML (builtins.readFile lock)).package);
+        # The registry the toolchain cut reads (`<name>-<version>.crate`, as cargo's cache holds
+        # them): the workspace's crates beneath bstd and library/'s.
+        registry = pkgs.linkFarm "blaze-registry"
+          (pkgs.lib.unique (crates ./Cargo.lock ++ crates ./library/Cargo.lock));
+        # What the blaze build reads of the tree: the workspace, the library it cuts the toolchain
+        # from, and the pins. A doc or a site page changes no build.
+        src = pkgs.lib.fileset.toSource {
+          root = ./.;
+          fileset = pkgs.lib.fileset.unions [
+            ./Cargo.toml ./Cargo.lock ./.cargo ./crates ./library ./vendor ./scripts ./tools ./pins
+            ./LICENSE-MIT ./LICENSE-APACHE
+          ];
+        };
+        rustPlatform = pkgs.makeRustPlatform { cargo = rust; rustc = rust; };
+        # What `nix profile add github:indexable-inc/blaze` installs: blaze built from this tree
+        # with the pinned nightly, and the toolchain shelf it opens (docs/v2/plan/design/toolchain.md).
+        # The binary opens one toolchain by the id compiled into it (crates/blaze-toolchain/PINNED),
+        # and that id is of the cut for one target set: so the shelf is cut here, for this
+        # system's triple and the macro side, `write_pin` writes its id into the tree, and blaze is
+        # built against it. Binary and shelf agree by construction, on every system; the
+        # committed PINNED is the id of the host its committer cut on.
+        #
+        # blaze reads the shelf at `~/.blaze/v2/toolchain` only, which a store path cannot be:
+        # `bin/blaze` copies this package's shelf there when its manifest is not, then runs the
+        # binary. One stat a command; each file is written under a temporary name and renamed,
+        # and blaze checks every file's digest when it opens it.
+        blaze = rustPlatform.buildRustPackage {
+          pname = "blaze";
+          version = "0.0.0-dev";
+          inherit src;
+          cargoLock.lockFile = ./Cargo.lock;
+          # rust-overlay's rustc links x86-64 Linux with its own rust-lld, past the wrapper that
+          # writes the store's libraries into the binary's RUNPATH (as in the dev shell below).
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "-Cforce-frame-pointers=yes -Clinker-features=-lld";
+          # The cut first: it writes PINNED, which blaze-toolchain reads at compile time.
+          preBuild = ''
+            cargo build --release --offline --locked --target ${triple} -p scripts --bin toolchain_cut
+            mkdir -p $out/share/blaze/toolchain
+            cut='${builtins.toJSON {
+              tree = "@tree@"; targets = [ triple ]; registry = "${registry}"; shelf = "@shelf@";
+              write_pin = true; macro_side = true;
+            }}'
+            cut=''${cut/@tree@/$PWD}
+            target/${triple}/release/toolchain_cut "''${cut/@shelf@/$out/share/blaze/toolchain}"
+          '';
+          cargoBuildFlags = [ "-p" "blaze-cli" "--bin" "blaze" ];
+          doCheck = false;
+          postInstall = ''
+            mv $out/bin/blaze $out/share/blaze/blaze
+            pin=$(cat crates/blaze-toolchain/PINNED)
+            test -f $out/share/blaze/toolchain/$pin
+            cat > $out/bin/blaze <<EOF
+            #!${pkgs.runtimeShell}
+            shelf="\''${HOME:?blaze reads its toolchain under HOME, which is not set}/.blaze/v2/toolchain"
+            if [ ! -f "\$shelf/$pin" ]; then
+              mkdir -p "\$shelf"
+              for f in $out/share/blaze/toolchain/*; do
+                n="\$shelf/\''${f##*/}"
+                [ -f "\$n" ] || { cp "\$f" "\$n.\$\$" && chmod 444 "\$n.\$\$" && mv -f "\$n.\$\$" "\$n"; } || exit
+              done
+            fi
+            exec $out/share/blaze/blaze "\$@"
+            EOF
+            chmod 755 $out/bin/blaze
+          '';
+          doInstallCheck = true;
+          installCheckPhase = ''
+            runHook preInstallCheck
+            HOME=$TMPDIR $out/bin/blaze --version | grep -F ${pkgs.lib.fileContents ./pins/toolchain}
+            test -f $TMPDIR/.blaze/v2/toolchain/$(cat crates/blaze-toolchain/PINNED)
+            runHook postInstallCheck
+          '';
+          meta = {
+            description = "blaze, built from this tree, with its toolchain shelf";
+            homepage = "https://ix.dev/blaze";
+            license = with pkgs.lib.licenses; [ mit asl20 ];
+            mainProgram = "blaze";
+          };
+        };
         # `nix run .#duckdb`: the DuckDB `blaze debug sql`, `blaze explain` and the explorer run,
         # nixpkgs' at the locked rev, parquet built in, so nothing downloads. Pinned: a nixpkgs
         # bump that changes it stops here, a visible change.
@@ -178,9 +210,9 @@
       in {
         packages = {
           # `nix profile add github:indexable-inc/blaze`, and `nix run github:indexable-inc/blaze`
-          # (its `meta.mainProgram`): the pinned release. `#blaze` names it too.
-          default = release;
-          blaze = release;
+          # (its `meta.mainProgram`): blaze built from this tree. `#blaze` names it too.
+          default = blaze;
+          inherit blaze;
           inherit duckdb;
           # The pinned LLVM: its tools (llvm-dwarfdump), which CI puts on PATH where the harnesses
           # read debug info, and the prefix a build of the `llvm` feature links.

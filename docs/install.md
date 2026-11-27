@@ -162,13 +162,13 @@ is `blaze run`. In a flake, take the package from the input:
 }
 ```
 
-The package is a release, not a build of the flake's tree: the release
-`.github/blaze-cli-version` names, the archive the install script downloads
-([release.md](release.md#where-the-bytes-are)), checked by the sha256 that release's
-`SHA256SUMS` gives (`tools/nix/SHA256SUMS` is that file). On Linux, Nix points its
-interpreter and `libgcc_s` into the store, so it runs on NixOS too. The flake builds no blaze
-from source: only blaze builds blaze, and its build fetches what the Nix sandbox has no network
-for.
+The package is blaze built from the flake's tree with the pinned nightly (`blaze 0.0.0`), with
+the toolchain shelf it opens ([toolchain.md](v2/plan/design/toolchain.md)). The shelf is cut
+in the build for this system's target and the macro side, and the binary is built against
+the id of that cut, so the two always agree. blaze reads the shelf at `~/.blaze/v2/toolchain`
+only: the package's `blaze` copies its shelf there on the first command that finds the
+manifest missing, then runs the binary. `blaze run` and `blaze test` make native code for
+arm64 only; on x86-64 Linux, `blaze check` works and they stop with an error that says so.
 
 ## With MacPorts
 
