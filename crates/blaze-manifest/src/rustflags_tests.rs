@@ -2,7 +2,7 @@
 //! `[target.'cfg(target_vendor = "apple")']` tables both carry `--cfg=tokio_unstable`, and tokio
 //! exports `runtime::RngSeed` only under that cfg.
 
-use super::{CfgSpecError, Chosen, FlagsFrom, RustflagsConfig, RustflagsEnv, RustflagsError, Unit, cfg_spec, choose, target_variable};
+use super::{CfgSpecError, Chosen, FlagsFrom, RustflagsConfig, RustflagsEnv, Unit, cfg_spec, choose, target_variable};
 
 const TRIPLE: &str = "aarch64-apple-darwin";
 /// Part of what the pinned toolchain states for [`TRIPLE`].
@@ -110,8 +110,22 @@ fn a_cfg_spec_is_one_atom() {
     assert!(matches!(cfg_spec("a b", alloc), Err(CfgSpecError::Parse(_))));
     let dangling = chosen(&["[build]\nrustflags = [\"--cfg\"]\n"], RustflagsEnv::default(), &APPLE, LIB).expect_err("a lone --cfg");
     assert!(dangling.contains("build.rustflags") && dangling.contains("no spec"), "{dangling}");
-    let config = RustflagsConfig::new(alloc);
-    let merged = RustflagsEnv { build: Some("--cfg x"), ..RustflagsEnv::default() };
-    assert!(matches!(choose(&config, merged, TRIPLE, &APPLE, LIB, alloc), Err(RustflagsError::NotMerged { var: "CARGO_BUILD_RUSTFLAGS" })));
     assert_eq!(target_variable("aarch64-apple-darwin", alloc).as_str(), "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS");
+}
+
+/// cargo's `get_env_list`: `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` is split on whitespace and joined
+/// after the files' `target.<triple>.rustflags`, before a `cfg(..)` table's flags; alone it makes
+/// the target the source, over `build.rustflags`. `CARGO_BUILD_RUSTFLAGS` joins after
+/// `build.rustflags` the same way. CONTROL: `RUSTFLAGS` still wins over both.
+#[test]
+fn rustflags_variables_join_their_keys() {
+    let target = RustflagsEnv { target: Some(" --cfg=env  -Clinker-features=-lld "), ..RustflagsEnv::default() };
+    let text = "[target.aarch64-apple-darwin]\nrustflags = [\"--cfg=file\"]\n[target.'cfg(target_vendor = \"apple\")']\nrustflags = [\"--cfg=apple\"]\n";
+    assert_eq!(chosen(&[text], target, &APPLE, LIB), Ok((FlagsFrom::Target, vec!["file".into(), "env".into(), "apple".into()], vec!["-Clinker-features=-lld".into()], true)));
+    assert_eq!(chosen(&[BUILD], target, &APPLE, LIB).map(|c| (c.0, c.1)), Ok((FlagsFrom::Target, vec!["env".into()])));
+    let build = RustflagsEnv { build: Some("--cfg b"), ..RustflagsEnv::default() };
+    assert_eq!(chosen(&[BUILD], build, &APPLE, LIB).map(|c| (c.0, c.1)), Ok((FlagsFrom::Build, vec!["tokio_unstable".into(), "b".into()])));
+    assert_eq!(chosen(&[], build, &APPLE, LIB).map(|c| (c.0, c.1)), Ok((FlagsFrom::Build, vec!["b".into()])));
+    let plain = RustflagsEnv { plain: Some("--cfg=p"), ..target };
+    assert_eq!(chosen(&[text], plain, &APPLE, LIB).map(|c| (c.0, c.1)), Ok((FlagsFrom::Env, vec!["p".into()])));
 }

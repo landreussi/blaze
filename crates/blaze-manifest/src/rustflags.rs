@@ -21,11 +21,13 @@
 //! The one `--cfg` parser ([`cfg_spec`]) reads a spec by the cfg grammar (blaze-cond `cfg`):
 //! `name` or `name = "value"`, nothing else.
 //!
+//! `CARGO_BUILD_RUSTFLAGS` and `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` are the environment's
+//! `build.rustflags` and `target.<triple>.rustflags`: split on whitespace and joined after the
+//! files' list for the key, as cargo's `get_env_list` joins them.
+//!
 //! Not read yet, each named where it matters: config files above the checkout and
-//! `$CARGO_HOME/config.toml` (the caller reads the checkout's own); `CARGO_BUILD_RUSTFLAGS` and
-//! `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` (cargo merges them into the files' values: refused by name,
-//! [`RustflagsError::NotMerged`]); an `include` inside an included file
-//! ([`RustflagsError::NestedInclude`]).
+//! `$CARGO_HOME/config.toml` (the caller reads the checkout's own); an `include` inside an
+//! included file ([`RustflagsError::NestedInclude`]).
 
 use core::fmt;
 
@@ -209,8 +211,8 @@ impl fmt::Display for FlagsFrom {
         f.write_str(match self {
             FlagsFrom::EncodedEnv => "`CARGO_ENCODED_RUSTFLAGS`",
             FlagsFrom::Env => "`RUSTFLAGS`",
-            FlagsFrom::Target => "the cargo config's `target.<triple>.rustflags` and matching `target.'cfg(..)'.rustflags`",
-            FlagsFrom::Build => "the cargo config's `build.rustflags`",
+            FlagsFrom::Target => "the cargo config's `target.<triple>.rustflags` (with `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`) and matching `target.'cfg(..)'.rustflags`",
+            FlagsFrom::Build => "the cargo config's `build.rustflags` (with `CARGO_BUILD_RUSTFLAGS`)",
             FlagsFrom::Unset => "no rustflags source",
             FlagsFrom::HostOfTarget => "no source (a host unit of a `--target` build)",
         })
@@ -240,12 +242,6 @@ pub struct Chosen<'a> {
 /// The flags cargo gives a unit of target `triple`, whose `--print cfg` atoms are `atoms`, and
 /// what of them blaze applies (module docs).
 pub fn choose<'a>(config: &RustflagsConfig<'_>, env: RustflagsEnv<'_>, triple: &str, atoms: &[(&str, Option<&str>)], unit: Unit, alloc: Alloc<'a>) -> Result<Chosen<'a>, RustflagsError<'a>> {
-    if env.build.is_some() {
-        return Err(RustflagsError::NotMerged { var: "CARGO_BUILD_RUSTFLAGS" });
-    }
-    if env.target.is_some() {
-        return Err(RustflagsError::NotMerged { var: "CARGO_TARGET_<TRIPLE>_RUSTFLAGS" });
-    }
     if unit.target_given && unit.host_unit {
         return Ok(Chosen { from: FlagsFrom::HostOfTarget, cfg: Vec::new_in(alloc), not_applied: Vec::new_in(alloc), settled: true });
     }
@@ -286,9 +282,13 @@ fn pick<'a>(config: &RustflagsConfig<'_>, env: RustflagsEnv<'_>, triple: &str, t
         return Ok((FlagsFrom::Env, out));
     }
     // cargo's `rustflags_from_target`: the triple's table first, then each matching `cfg(..)`
-    // table in key order.
+    // table in key order. `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` is the triple's key in the
+    // environment: cargo's `get_env_list` splits it on whitespace and joins it after the files'.
     if let Some((_, value)) = config.tables.iter().find(|(key, _)| key.as_str() == triple) {
         out.extend(value.list.iter().map(|flag| String::from_str_in(flag, alloc)));
+    }
+    if let Some(var) = env.target {
+        out.extend(var.split_whitespace().map(|flag| String::from_str_in(flag, alloc)));
     }
     if let Some(has) = target_cfg {
         for (key, value) in config.tables.iter() {
@@ -303,13 +303,17 @@ fn pick<'a>(config: &RustflagsConfig<'_>, env: RustflagsEnv<'_>, triple: &str, t
     if !out.is_empty() {
         return Ok((FlagsFrom::Target, out));
     }
-    match &config.build {
-        Some(build) => {
-            out.extend(build.list.iter().map(|flag| String::from_str_in(flag, alloc)));
-            Ok((FlagsFrom::Build, out))
-        }
-        None => Ok((FlagsFrom::Unset, out)),
+    // `CARGO_BUILD_RUSTFLAGS` joins after the files' `build.rustflags` the same way.
+    if config.build.is_none() && env.build.is_none() {
+        return Ok((FlagsFrom::Unset, out));
     }
+    if let Some(build) = &config.build {
+        out.extend(build.list.iter().map(|flag| String::from_str_in(flag, alloc)));
+    }
+    if let Some(var) = env.build {
+        out.extend(var.split_whitespace().map(|flag| String::from_str_in(flag, alloc)));
+    }
+    Ok((FlagsFrom::Build, out))
 }
 
 /// The flags split into the ones blaze does not apply and the `--cfg` atoms (`--cfg X` or
@@ -376,8 +380,6 @@ pub enum RustflagsError<'a> {
     DanglingCfg { from: FlagsFrom },
     /// A `target.'cfg(..)'` key whose predicate does not parse.
     Predicate { key: Text<'a>, error: blaze_cond::ParseError },
-    /// A variable cargo merges into the config's values, which blaze does not merge yet.
-    NotMerged { var: &'static str },
 }
 
 impl fmt::Display for RustflagsError<'_> {
@@ -395,7 +397,6 @@ impl fmt::Display for RustflagsError<'_> {
             },
             RustflagsError::DanglingCfg { from } => write!(f, "the rustflags of {from}: a `--cfg` with no spec after it"),
             RustflagsError::Predicate { key, error } => write!(f, "`target.'{}'`: its predicate does not parse: {error}", key.as_str()),
-            RustflagsError::NotMerged { var } => write!(f, "`{var}` is set: cargo merges it into the config's rustflags, which blaze does not do yet, so it refuses rather than guess (rule 3)"),
         }
     }
 }
